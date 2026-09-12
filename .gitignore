@@ -1,0 +1,32 @@
+# 敏感文件 - 密钥和配置文件
+.env
+.jcode/.env
+*.env
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+desktop.ini
+
+# Logs
+*.log
+
+# Backup
+*.bak
+*.backup

@@ -1,0 +1,80 @@
+{
+  "port": 8900,
+  "host": "127.0.0.1",
+  "defaultModel": "deepseek-flash",
+  "models": [
+    "deepseek-flash",
+    "mimo-v2.5-pro",
+    "glm5.3"
+  ],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "accessLog": true,
+  "modelsCacheSeconds": 300,
+  "thinking": {
+    "passthrough": true,
+    "cacheSize": 500
+  },
+  "upstreams": {
+    "cch": {
+      "protocol": "anthropic",
+      "baseUrl": "http://127.0.0.1:15721",
+      "apiKey": "",
+      "anthropicVersion": "2023-06-01",
+      "default": true,
+      "fetchModels": false,
+      "autoModels": false,
+      "models": [
+        "deepseek-flash",
+        "mimo-v2.5-pro",
+        "glm5.3"
+      ]
+    },
+    "go": {
+      "protocol": "openai",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_API_KEY",
+      "sessionHeader": true,
+      "models": [
+        "glm-5.3-flash",
+        "glm-5.3",
+        "glm-5.2",
+        "glm-5.1",
+        "kimi-k3",
+        "kimi-k2.7-code",
+        "kimi-k2.6",
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-pro",
+        "deepseek-flash",
+        "minimax-m3",
+        "minimax-m2.5",
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "mimo-v2.5-pro",
+        "mimo-v2.5",
+        "longcat-2.0",
+        "hy4-preview",
+        "hy3",
+        "omen-alpha"
+      ]
+    },
+    "zen": {
+      "protocol": "openai",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "apiKey": "",
+      "sessionHeader": true,
+      "models": [
+        "mimo-v2.5-free",
+        "ling-3.0-flash-fin-free",
+        "nemotron-3-ultra-free",
+        "nemotron-3.5-lightning-free",
+        "big-pickle"
+      ]
+    }
+  }
+}
