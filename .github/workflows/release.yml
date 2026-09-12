@@ -1,0 +1,197 @@
+name: Release
+
+# 发布口只留 tag：tag 指向唯一提交，发布链路的可追溯性正建立于此。
+# 刻意不把 workflow_dispatch 挂在发布口上 —— 否则「这次发布的到底是哪个提交」会变含糊
+# （tag 与分支可指向不同提交）。要演练请用 scripts/retrigger-release.sh --dry-run。
+on:
+  push:
+    tags: ['v*']
+
+# 同名 tag 重复触发不互相踩
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+# 建 release、传资产需要写权限（只读会 403）
+permissions:
+  contents: write
+
+env:
+  PRODUCT: model-bridge
+
+jobs:
+  # ── 1. 先建 draft：中间任何环节失败，release 停在 draft，用户看不到半成品 ──
+  create-release:
+    name: 建 draft release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # 需要 tag 与 git 历史
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 版本与 tag 一致性校验
+        id: meta
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME 与 package.json 版本 $version 不一致"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "版本一致：v$version"
+
+      - name: 渲染发行说明（changelog 缺失即失败）
+        run: |
+          set -euo pipefail
+          node scripts/render-notes.mjs "${{ steps.meta.outputs.version }}" \
+            --repo "$GITHUB_REPOSITORY" > NOTES.md
+          cat NOTES.md
+
+      - name: 建或更新 draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "::error::release $GITHUB_REF_NAME 已经公开，拒绝覆盖（tag 不可变：发新的 patch 版本）"
+              exit 1
+            fi
+            gh release edit "$GITHUB_REF_NAME" --notes-file NOTES.md
+            echo "已更新既有 draft 的发行说明"
+          else
+            gh release create "$GITHUB_REF_NAME" --draft \
+              --title "v${{ steps.meta.outputs.version }}" --notes-file NOTES.md
+            echo "已创建 draft release"
+          fi
+
+  # ── 2. 门禁 + 打包 + 产物自检 ──
+  package:
+    name: 打包与自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # 全历史对象扫描需要完整对象库
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 敏感信息扫描（工作区 + 全历史对象）
+        run: bash scripts/scan-sensitive.sh --all-history
+
+      - name: 语法自检
+        run: |
+          set -euo pipefail
+          while IFS= read -r f; do
+            node --check "$f"
+            echo "ok: $f"
+          done < <(git ls-files '*.js' '*.mjs')
+
+      - name: 打包（显式必达清单，排除 .git / dist / 未跟踪文件）
+        run: bash scripts/build-package.sh
+
+      - name: 产物自检（条目集合 + 解包语法 + 真实启动 smoke）
+        run: bash scripts/verify-package.sh "dist/${PRODUCT}-${GITHUB_REF_NAME}.zip"
+
+      - name: 生成 SHA256SUMS
+        run: bash scripts/generate_checksums.sh dist SHA256SUMS .zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            dist/*.zip
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── 3. 收尾：必达资产校验 → 上传 → 转 public → 发布后自检 ──
+  # 只以「draft 已建」为前置条件：打包失败也要进来收尾，并把「保持 draft」写进日志
+  finalize:
+    name: 校验资产并发布
+    runs-on: ubuntu-latest
+    needs: [create-release, package]
+    if: ${{ always() && needs.create-release.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1              # 终态作业不需要历史
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 打包未成功则保持 draft
+        if: ${{ needs.package.result != 'success' }}
+        run: |
+          echo "::error::打包未成功（package=${{ needs.package.result }}），release 保持 draft，未发布任何资产"
+          exit 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+
+      - name: 必达资产集合校验（缺一即保持 draft）
+        env:
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected_zip="dist/${PRODUCT}-v${VERSION}.zip"
+          mapfile -t got < <(find . -maxdepth 2 -type f \( -name '*.zip' -o -name 'SHA256SUMS' \) | sed 's|^\./||' | sort)
+          expected="$(printf '%s\n%s\n' "$expected_zip" "SHA256SUMS" | sort)"
+          if [ "$(printf '%s\n' "${got[@]}")" != "$expected" ]; then
+            echo "::error::资产集合不符，保持 draft"
+            printf '实际：\n%s\n期望：\n%s\n' "$(printf '%s\n' "${got[@]}")" "$expected"
+            exit 1
+          fi
+          for f in "${got[@]}"; do
+            [ -s "$f" ] || { echo "::error::资产为空：$f"; exit 1; }
+          done
+          echo "必达资产齐全：${got[*]}"
+
+      - name: 上传资产与校验和
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" \
+            "dist/${PRODUCT}-v${VERSION}.zip" "SHA256SUMS" --clobber
+
+      - name: 幂等追加资产与校验方式说明
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash scripts/append-assets-section.sh "$GITHUB_REF_NAME" \
+            "${PRODUCT}-v${VERSION}.zip" "SHA256SUMS"
+
+      - name: 转 public（已是 public 则跳过）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true" ]; then
+            gh release edit "$GITHUB_REF_NAME" --draft=false
+            echo "已转为 public"
+          else
+            echo "已是 public，跳过"
+          fi
+
+      # 自检失败不让已公开的 release 变红卡，但日志里留下明确信号
+      - name: 发布后自检（反向拉取已公开产物核对）
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/verify-release.sh "$GITHUB_REF_NAME"

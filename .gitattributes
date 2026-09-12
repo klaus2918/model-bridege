@@ -1,0 +1,24 @@
+# 统一行尾策略：Windows 上 core.autocrlf=true 且缺本文件时，会产生大量「假改动」
+* text=auto
+
+# 批处理必须 CRLF —— LF 换行的 .cmd 会被 cmd.exe 解析成碎片（报 'f' is not recognized 之类）
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 其余文本一律 LF
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# 二进制不做行尾转换
+*.zip  binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.exe  binary

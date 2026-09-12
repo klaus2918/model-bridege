@@ -1,0 +1,23 @@
+{
+  "name": "model-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "本地单文件协议桥：把 OpenAI 格式请求按模型名或 URL 前缀分发给 cch / go / zen 三条上游",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node model-bridge.js",
+    "probe": "node probe-upstream.mjs",
+    "test": "node test-bridge.mjs"
+  },
+  "keywords": [
+    "openai",
+    "anthropic",
+    "proxy",
+    "llm",
+    "local"
+  ]
+}

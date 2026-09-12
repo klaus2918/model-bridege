@@ -457,3 +457,64 @@ DeepSeek 思考模式要求：多轮对话（尤其带工具调用）必须把�
 | `bridge.config.json` | 配置（三条上游定义） |
 | `start-bridge.cmd` | 一键启动 |
 | `README.md` | 本说明 |
+| `package.json` | 版本唯一真源（`version` 字段）与 `type: module` |
+| `changelog/v<版本>.json` | 每个版本的发行说明来源（缺失时发布流水线直接失败） |
+| `scripts/` | 发布流水线脚本（扫描 / 打包 / 校验和 / 自检），CI 与本地共用 |
+| `.github/workflows/release.yml` | tag 驱动的发布流水线
+
+---
+
+## 十四、发布流程（维护者）
+
+发布口只有一个：推 `v*` tag，其余全自动。
+
+```
+push tag v1.2.3
+  └─ create-release：校验 tag 与 package.json 版本一致 → 由 changelog/v1.2.3.json 渲染说明 → 建 draft release
+       └─ package：敏感信息扫描（工作区 + 全历史对象）→ 语法自检 → 打包（显式清单，不含 .git）→ 产物自检（真实启动 smoke）→ 生成 SHA256SUMS
+            └─ finalize：必达资产校验（缺一即保持 draft）→ 上传资产 → 转 public → 发布后自检（重新下载已公开产物核对）
+```
+
+### 本地演练（不触碰远程）
+
+```bash
+bash scripts/scan-sensitive.sh --all-history          # 敏感信息门禁
+bash scripts/build-package.sh                         # 产出 dist/model-bridge-v<版本>.zip
+bash scripts/verify-package.sh dist/model-bridge-v1.0.0.zip   # 产物自检（含真实启动）
+bash scripts/generate_checksums.sh dist SHA256SUMS .zip       # 生成校验和
+```
+
+### 正式发布
+
+```bash
+# 1. 先补 changelog/v<版本>.json（缺失时 CI 会直接失败，不会静默发出去）
+# 2. 提交版本与 changelog
+git add package.json changelog/ && git commit -m "release: v1.2.3"
+git push origin master
+# 3. 推 tag 触发流水线
+git tag -a v1.2.3 -m "release: v1.2.3" && git push origin v1.2.3
+```
+
+### tag 事件被丢弃 / 发布链路刚改过
+
+```bash
+bash scripts/retrigger-release.sh --dry-run v1.2.3     # 只查前提，不动任何东西
+bash scripts/retrigger-release.sh --at HEAD v1.2.3     # 重建到 HEAD 后重推（--at 必需：tag 指旧提交会跑旧 workflow）
+```
+
+### 发布后独立复核
+
+```bash
+bash scripts/verify-release.sh v1.2.3                  # 会重新下载已公开资产，核对元数据/资产集合/校验和/产物内容
+# 下载资产后本地核对
+sha256sum -c SHA256SUMS                                # Linux/macOS
+Get-FileHash model-bridge-v1.2.3.zip -Algorithm SHA256 # Windows
+```
+
+### 硬规则
+
+- **版本唯一真源**是 `package.json` 的 `version`，tag 名必须与它一致（CI 强制校验，防止「tag 是 v1.0.0 但产物报别的版本」）
+- **tag 只增不改**：已公开的 release 绝不删 tag 重推（会破坏消费者与校验和的可追溯性），要改就发新的 patch 版本
+- **发布提交只放三类文件**：版本声明（`package.json`）+ changelog；不要混入代码改动
+- **词表与扫描器分离**：扫描规则在 `scripts/scan-sensitive.sh` 里可入库；组织专有敏感词放不入库的 `.sensitive-terms`
+- **改写历史后必须复核**：推送后独立克隆再扫一遍，本地视角不能证明远程状态（见知识库《Git 仓库开源发布安全流程》）

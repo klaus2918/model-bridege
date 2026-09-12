@@ -1,0 +1,19 @@
+{
+  "version": "1.0.0",
+  "date": "2026-09-12",
+  "title": "首个发布版本：三条上游的本地协议桥",
+  "highlights": [
+    "单文件零依赖（只用 Node 内置模块），默认监听 127.0.0.1:8900，把 OpenAI 格式请求分发给三条上游",
+    "两条上游协议都能对接：cch 走 Anthropic /v1/messages，go 与 zen 走 OpenAI /v1/chat/completions",
+    "两种指定上游的方式可混用：按模型名自动分发，或用 URL 前缀 /cch、/go、/zen 强制指定（前缀写错会明确报错，不静默走错）"
+  ],
+  "improvements": [
+    "thinking 回传：缓存上游 thinking + signature 并在后续轮次补回，避免多轮会话思考链断裂",
+    "强制 tool_choice 自动降级为 auto，绕开上游 thinking 模式的 503 限制",
+    "会话头注入：为需要 x-opencode-session 的上游自动补头，客户端无需感知",
+    "密钥来源支持 apiKeyEnv 从 .env 读取，环境变量优先；apiKey 为空串表示不发送鉴权头",
+    "响应头 x-bridge-upstream / x-bridge-upstream-model 标注本次实际走的上游，流式同样带",
+    "访问日志一行一请求，含模型、上游、状态码、耗时、tokens 与 thinking 回传条数"
+  ],
+  "fixes": []
+}

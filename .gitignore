@@ -30,3 +30,11 @@ desktop.ini
 # Backup
 *.bak
 *.backup
+
+# 打包产物（由 scripts/build-package.sh 生成，不入库）
+/dist/
+/SHA256SUMS
+model-bridge-v*.zip
+
+# 本地敏感词表（词表与扫描器分离，绝不入库）
+.sensitive-terms
