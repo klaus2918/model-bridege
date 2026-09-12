@@ -65,16 +65,25 @@ repo_slug() {
 
 have_gh() { command -v gh >/dev/null 2>&1; }
 
+# Windows 的 curl 走 schannel 时 CRL 检查可能失败（CRYPT_E_NO_REVOCATION_CHECK），
+# MSYS/MinGW 下加 --ssl-no-revoke 规避；Linux 的 curl 没有该选项，故按平台判断。
+curl_ssl_opts() {
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) printf '%s' "--ssl-no-revoke" ;;
+  esac
+}
+
 # GitHub REST GET：stdout 输出 body
 # 返回：0=200  1=404  2=其它（网络/凭据问题，调用方必须按「无法判定」处理）
 gh_api_get() {
   local path="$1"
   command -v curl >/dev/null 2>&1 || return 2
   local token; token="$(resolve_token || true)"
+  local ssl; ssl="$(curl_ssl_opts)"
   local -a args=(-sS -w '\n%{http_code}' -H 'Accept: application/vnd.github+json')
   [ -n "$token" ] && args+=(-H "Authorization: Bearer $token")
   local resp code
-  resp="$(curl "${args[@]}" "https://api.github.com/$path" 2>/dev/null)" || return 2
+  resp="$(curl $ssl "${args[@]}" "https://api.github.com/$path" 2>/dev/null)" || return 2
   code="${resp##*$'\n'}"
   printf '%s' "${resp%$'\n'*}"
   case "$code" in
@@ -115,13 +124,14 @@ download_release_assets() {
     });
   ' > "$dir/.assets.tsv" || return 1
   local token; token="$(resolve_token || true)"
+  local ssl; ssl="$(curl_ssl_opts)"
   local name url
   while IFS=$'\t' read -r name url; do
     [ -z "$name" ] && continue
     if [ -n "$token" ]; then
-      curl -sSL -H "Authorization: Bearer $token" -o "$dir/$name" "$url" || return 1
+      curl $ssl -sSL -H "Authorization: Bearer $token" -o "$dir/$name" "$url" || return 1
     else
-      curl -sSL -o "$dir/$name" "$url" || return 1
+      curl $ssl -sSL -o "$dir/$name" "$url" || return 1
     fi
   done < "$dir/.assets.tsv"
   rm -f "$dir/.assets.tsv"
