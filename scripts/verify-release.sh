@@ -41,8 +41,12 @@ ok()  { printf '  [ok]   %s\n' "$*"; }
 bad() { printf '  [fail] %s\n' "$*" >&2; fail=$((fail + 1)); }
 
 # ── 0. 拉 release 元数据（含草稿：by-tag 接口对草稿返回 404，故走 release_json）──
-json="$(release_json "$TAG")"
-rc=$?
+# set -e 下用 if 捕获，避免非零返回导致静默退出
+if json="$(release_json "$TAG")"; then
+  rc=0
+else
+  rc=$?
+fi
 if [ "$rc" -ne 0 ]; then
   bad "查不到 release：$TAG（HTTP 非 200；tag 是否已推、workflow 是否被启用？）"
   echo

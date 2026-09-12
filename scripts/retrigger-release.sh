@@ -70,8 +70,9 @@ git cat-file -e "$TARGET:.github/workflows/release.yml" 2>/dev/null \
 if [ "$ASSUME_NO_RELEASE" -eq 1 ]; then
   warn "按 --assume-no-release 跳过 release 存在性检查"
 else
-  release_state "$TAG"
-  case "$?" in
+  # set -e 下必须用 &&/|| 捕获退出码，否则非零返回会让脚本静默退出（连错误信息都看不到）
+  release_state "$TAG" && _rc=0 || _rc=$?
+  case "$_rc" in
     0) refuse "该 tag 已有 release（含草稿）：覆写已发布内容不可接受。改发新的 patch 版本，或先手动清理草稿" ;;
     1) log "已确认 $TAG 尚无 release" ;;
     *) refuse "无法判定 $TAG 是否已有 release（网络或凭据受限）。确认没有发布后，可显式加 --assume-no-release" ;;

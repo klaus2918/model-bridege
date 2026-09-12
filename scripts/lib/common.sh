@@ -99,8 +99,13 @@ gh_api_get() {
 # 返回：0=找到（stdout 输出 JSON） 1=不存在 2=无法判定
 release_json() {
   local tag="$1" body rc
-  body="$(gh_api_get "repos/$(repo_slug)/releases/tags/$tag")"
-  rc=$?
+  # 注意：本脚本开了 set -e，直接写 body="$(...)"; rc=$? 会在命令失败时静默退出，
+  # 必须放在 if/|| 里捕获退出码。
+  if body="$(gh_api_get "repos/$(repo_slug)/releases/tags/$tag")"; then
+    rc=0
+  else
+    rc=$?
+  fi
   if [ "$rc" -eq 0 ]; then
     printf '%s' "$body"
     return 0
@@ -125,11 +130,11 @@ release_json() {
 
 # release 是否存在（含草稿）：0=存在 1=不存在 2=无法判定（无法判定时调用方必须拒绝放行）
 release_state() {
-  local out
-  out="$(release_json "$1")"
-  local rc=$?
-  [ -z "$out" ] || true
-  return "$rc"
+  if release_json "$1" >/dev/null; then
+    return 0
+  else
+    return $?
+  fi
 }
 
 # 下载 release 资产（gh 优先，退化到 browser_download_url + curl）
