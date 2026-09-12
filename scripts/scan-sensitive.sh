@@ -99,7 +99,8 @@ while IFS= read -r hit; do
 done < <(grep -aEn -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- "${FILES[@]}" 2>/dev/null || true)
 
 # ── 3. 非白名单外部地址 ──
-# 放行：本机地址、产品自身上游、代码托管、示例域名；模板串（host 运行时决定）不算命中
+# 放行：本机地址、产品自身上游、代码托管、示例域名；模板串（host 运行时决定）不算命中。
+# 只提取「形状合法的主机名」，否则会把正则字面量（如 sed 里的 https://|http）误判成地址。
 ALLOW_SUFFIXES="127.0.0.1 localhost opencode.ai github.com githubusercontent.com example.com"
 while IFS= read -r hit; do
   [ -z "$hit" ] && continue
@@ -110,12 +111,17 @@ while IFS= read -r hit; do
     case "$url" in *'$'*) continue ;; esac
     host="${url#*://}"; host="${host%%/*}"; host="${host%%:*}"
     [ -z "$host" ] && continue
+    case "$host" in
+      *[!A-Za-z0-9.-]*) continue ;;   # 主机名里混有 | \ # ( 等字符 → 不是真地址，跳过
+      *.*) ;;                         # 至少含一个点才当域名
+      *) continue ;;
+    esac
     allowed=0
     for suf in $ALLOW_SUFFIXES; do
       case "$host" in "$suf"|*."$suf") allowed=1 ;; esac
     done
-    [ "$allowed" -eq 0 ] && flagged="$url"
-  done < <(printf '%s' "$text" | grep -aoE 'https?://[^"'"'"' )>,;]+' || true)
+    [ "$allowed" -eq 0 ] && flagged="$host"
+  done < <(printf '%s' "$text" | grep -aoE 'https?://[A-Za-z0-9.-]+(:[0-9]+)?' || true)
   [ -z "$flagged" ] && continue
   report_line '非白名单外部地址' "$file" "$line" "$text"
   fail
