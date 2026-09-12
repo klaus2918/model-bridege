@@ -36,13 +36,13 @@ ok()   { printf '  [ok]   %s\n' "$*"; }
 bad()  { printf '  [fail] %s\n' "$*" >&2; fail=$((fail + 1)); }
 
 # ── 1. 条目集合 ──
-mapfile -t EXPECTED < <(bash "$SCRIPT_DIR/build-package.sh" --list | sort)
+mapfile -t EXPECTED < <(bash "$SCRIPT_DIR/build-package.sh" --list | LC_ALL=C sort)
 mapfile -t ACTUAL < <(python3 -c '
 import sys, zipfile
 with zipfile.ZipFile(sys.argv[1]) as z:
     for n in z.namelist():
         sys.stdout.write(n + "\n")
-' "$ZIP" | tr -d '\r' | sort)
+' "$ZIP" | tr -d '\r' | LC_ALL=C sort)
 
 log "包内条目 ${#ACTUAL[@]} 个，期望 ${#EXPECTED[@]} 个"
 diff_out="$(diff <(printf '%s\n' "${EXPECTED[@]}") <(printf '%s\n' "${ACTUAL[@]}") || true)"

@@ -60,7 +60,8 @@ node -e '
   fs.writeFileSync(process.argv[2], r.body ?? "");
   fs.writeFileSync(process.argv[3], ((r.assets ?? []).map((a) => a.name).sort().join("\n") || "") + "\n");
   console.log(JSON.stringify({ isDraft: !!r.isDraft, prerelease: !!r.prerelease }));
-' "$TMP/release.json" "$TMP/body.md" "$TMP/assets.txt" > "$TMP/flags.json"
+' "$TMP/release.json" "$TMP/body.md" "$TMP/assets.raw" > "$TMP/flags.json"
+LC_ALL=C sort "$TMP/assets.raw" > "$TMP/assets.txt"
 
 # ── 1. 元数据 ──
 if grep -q '"isDraft":false' "$TMP/flags.json"; then
@@ -75,7 +76,9 @@ else
 fi
 
 # ── 2. 资产集合 ──
-printf '%s\n%s\n' "$ZIP_NAME" "SHA256SUMS" | sort > "$TMP/expected.txt"
+# 两侧都用 LC_ALL=C 排序：node 的 sort 是码位序，shell sort 受 locale 影响（本机 en_US 与 CI C 序不同），
+# 不统一口径会做出「集合不符」的假失败
+printf '%s\n%s\n' "$ZIP_NAME" "SHA256SUMS" | LC_ALL=C sort > "$TMP/expected.txt"
 if diff -q "$TMP/expected.txt" "$TMP/assets.txt" >/dev/null 2>&1; then
   ok "资产集合恰好等于 { $ZIP_NAME, SHA256SUMS }"
 else

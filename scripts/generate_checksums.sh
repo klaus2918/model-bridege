@@ -37,7 +37,7 @@ while IFS= read -r f; do
         ;;
     esac
   done
-done < <(cd "$DIR" && ls -1 | sort)
+done < <(cd "$DIR" && ls -1 | LC_ALL=C sort)
 
 [ "${#MATCHED[@]}" -gt 0 ] || die "目录 $DIR 下没有匹配的发布资产（扩展名：${EXTS[*]}）"
 
