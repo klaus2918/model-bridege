@@ -40,8 +40,8 @@ fail=0
 ok()  { printf '  [ok]   %s\n' "$*"; }
 bad() { printf '  [fail] %s\n' "$*" >&2; fail=$((fail + 1)); }
 
-# ── 0. 拉 release 元数据 ──
-json="$(gh_api_get "repos/$(repo_slug)/releases/tags/$TAG")"
+# ── 0. 拉 release 元数据（含草稿：by-tag 接口对草稿返回 404，故走 release_json）──
+json="$(release_json "$TAG")"
 rc=$?
 if [ "$rc" -ne 0 ]; then
   bad "查不到 release：$TAG（HTTP 非 200；tag 是否已推、workflow 是否被启用？）"

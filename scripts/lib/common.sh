@@ -93,16 +93,42 @@ gh_api_get() {
   esac
 }
 
-# release 是否存在：0=存在 1=不存在 2=无法判定（无法判定时调用方必须拒绝放行）
-release_state() {
-  local tag="$1"
-  if have_gh && [ -n "${GH_TOKEN:-}" ]; then
-    gh release view "$tag" >/dev/null 2>&1 && return 0
-  fi
-  local body rc
+# 取 release JSON（含草稿）。
+# 注意：/releases/tags/{tag} 对 draft 返回 404（GitHub 行为），必须退化为列表匹配；
+# 且列表接口对草稿只在带令牌时可见，无令牌时无法判定 → 返回 2。
+# 返回：0=找到（stdout 输出 JSON） 1=不存在 2=无法判定
+release_json() {
+  local tag="$1" body rc
   body="$(gh_api_get "repos/$(repo_slug)/releases/tags/$tag")"
   rc=$?
-  [ -z "$body" ] || true
+  if [ "$rc" -eq 0 ]; then
+    printf '%s' "$body"
+    return 0
+  fi
+  [ "$rc" -eq 1 ] || return 2
+  local token; token="$(resolve_token || true)"
+  [ -n "$token" ] || return 2
+  body="$(gh_api_get "repos/$(repo_slug)/releases?per_page=100")" || return 2
+  printf '%s' "$body" | node -e '
+    let s = "";
+    process.stdin.on("data", (d) => (s += d)).on("end", () => {
+      const tag = process.argv[1];
+      let j;
+      try { j = JSON.parse(s); } catch { process.exit(2); }
+      if (!Array.isArray(j)) process.exit(2);
+      const hit = j.find((r) => r.tag_name === tag);
+      if (!hit) process.exit(1);
+      process.stdout.write(JSON.stringify(hit));
+    });
+  ' "$tag"
+}
+
+# release 是否存在（含草稿）：0=存在 1=不存在 2=无法判定（无法判定时调用方必须拒绝放行）
+release_state() {
+  local out
+  out="$(release_json "$1")"
+  local rc=$?
+  [ -z "$out" ] || true
   return "$rc"
 }
 
