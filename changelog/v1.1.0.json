@@ -1,0 +1,20 @@
+{
+  "version": "1.1.0",
+  "date": "2026-09-13",
+  "title": "新增 CommandCode 上游：四条上游、三套协议",
+  "highlights": [
+    "新增 commandcode 上游（CommandCode 订阅）：把 OpenAI 请求翻译成它私有的 POST /alpha/generate，再把返回的 NDJSON 事件流翻回 OpenAI 流，Agent 侧无感",
+    "三条上游的请求转换与流解析收敛为统一协议适配层（anthropic / openai / commandcode），既有两条路径行为等价（零回归，离线回归已固定）",
+    "第四种指定上游的方式：URL 前缀 /commandcode，与按模型名自动分发可混用；前缀写错仍明确报错并列出全部可用前缀"
+  ],
+  "improvements": [
+    "凭据按 CommandCode 自身顺序解析：COMMAND_CODE_API_KEY → 本机 ~/.commandcode/auth.json；密钥只驻内存，不落盘、不进日志；两处都没有时本地直接 401，不把必然失败的请求打到上游",
+    "版本头 x-command-code-version 自动探测（优先读本机 CLI，读不到退回 npm registry 并缓存 30 分钟），也可用 cliVersion 固定",
+    "模型清单 = 配置声明 ＋ 本机 CLI 自带权威目录合并，并按账号套餐过滤超出档位的模型；/health 报 models / modelsAll / plan / planError 便于排障",
+    "pause_turn 自动续跑：用同一份请求体重发把回答接完（最多续 5 次），续跑期间正文、思考与工具调用连续下发，usage 跨次累加；可用 pauseTurn 关闭",
+    "缓存命中量透出为 usage.prompt_tokens_details.cached_tokens，并同步写进访问日志",
+    "新增上游级短别名 modelMap（短名 → 真实模型 id），不污染全局 aliases",
+    "新增离线回归 test-commandcode.mjs（自带 stub 上游，零外网，124 项），并内置既有两协议的零回归红线"
+  ],
+  "fixes": []
+}

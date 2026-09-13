@@ -1,9 +1,9 @@
 {
   "name": "model-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "本地单文件协议桥：把 OpenAI 格式请求按模型名或 URL 前缀分发给 cch / go / zen 三条上游",
+  "description": "本地单文件协议桥：把 OpenAI 格式请求按模型名或 URL 前缀分发给 cch / go / zen / commandcode 四条上游",
   "license": "MIT",
   "engines": {
     "node": ">=18"
@@ -17,6 +17,7 @@
   "keywords": [
     "openai",
     "anthropic",
+    "commandcode",
     "proxy",
     "llm",
     "local"
