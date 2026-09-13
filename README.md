@@ -56,7 +56,7 @@ curl http://127.0.0.1:8900/go/v1/models
 
 前缀写错会明确报错并列出可用前缀，**不会静默走错上游**：
 ```json
-{"error":{"message":"未知的上游前缀 \"nosuch\"。可用前缀：/cch、/go、/zen；..."}}
+{"error":{"message":"未知的上游前缀 \"nosuch\"。可用前缀：/cch、/go、/zen、/commandcode；..."}}
 ```
 
 ### 怎么知道这次实际用了哪个上游
@@ -94,10 +94,11 @@ curl http://127.0.0.1:8900/health
 
 两个痛点：
 
-1. **协议错配**：Agent 只会发 OpenAI 格式的 `/v1/chat/completions`，而 CCH 那条上游只认 Anthropic 格式的 `/v1/messages`，需要在中间翻译
+1. **协议错配**：Agent 只会发 OpenAI 格式的 `/v1/chat/completions`，而 CCH 那条上游只认 Anthropic 格式的 `/v1/messages`、CommandCode 只认自己的 `POST /alpha/generate`（返回 **NDJSON 事件流**而非 SSE），都得在中间翻译
 2. **opencode 的会话头要求**：opencode.ai 要求每个请求带 `x-opencode-session` 头，缺失直接 400 拒绝（`MissingSessionID`），而普通客户端不会发这个头
+3. **CLI 专属的凭据与版本门槛**：CommandCode 要求 `x-command-code-version` 头（缺失或过旧直接 403 `upgrade_required`），凭据也只存在 CLI 自己的登录文件里
 
-model-bridge 把这两件事都收敛到一个进程里，Agent 只需指向一个地址。
+model-bridge 把这些差异都收敛到一个进程里，Agent 只需指向一个地址。
 
 ---
 
@@ -119,7 +120,9 @@ node model-bridge.js
   上游 cch        anthropic http://127.0.0.1:15721  [默认]
   上游 go         openai    https://opencode.ai/zen/go  会话头注入
   上游 zen        openai    https://opencode.ai/zen  会话头注入
+  上游 commandcode commandcode https://api.commandcode.ai
 [model-bridge] 声明的模型: deepseek-flash, glm-5.3-flash, ...
+[model-bridge] thinking 回传: 开启（缓存上限 500 条）
 ```
 
 > 窗口要**保持开着**，关掉即服务停止。
@@ -209,6 +212,7 @@ set OPENAI_API_KEY=any-key
   图片需为 data URL（非 data URL 会被跳过）；
   下游若要求**强制工具选择**（`tool_choice: required`），本桥不下发该字段、按 `auto` 处理并打日志（与 cch 分支的降级行为一致）；
   套餐档位**在启动时探测一次**，升级套餐后需重启桥才会刷新清单。
+- **缓存用量**：上游的缓存命中量透出为 `usage.prompt_tokens_details.cached_tokens`，访问日志同步可见。
 - **`pause_turn` 自动续跑**：上游有时会在回答中途返回 `pause_turn`（表示"这一轮先到这，请继续"）。
   本桥收到后会**用同一份请求体重发**把回答接完，最多续 **5 次**（共 6 次请求）——与上游 CLI 的做法一致，
   续跑期间正文/思考/工具调用连续下发，`usage` 跨次累加。想关掉就设 `"pauseTurn": false`（此时收到就收尾，并在访问日志里标 `pause_turn 未续完`）。
@@ -227,8 +231,15 @@ set OPENAI_API_KEY=any-key
   "modelCatalogPlan": "auto",
   "pauseTurn": true,
   "fetchModels": false,
-  "modelMap": { "cc-flash": "deepseek/deepseek-v4.1-flash" },
-  "models": ["deepseek/deepseek-v4.1-flash"]
+  "models": [
+    "deepseek/deepseek-v4.1-flash",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-flash",
+    "moonshotai/Kimi-K3",
+    "zai-org/GLM-5.3",
+    "MiniMaxAI/MiniMax-M3",
+    "xiaomi/mimo-v2.5-pro"
+  ]
 }
 ```
 
@@ -248,7 +259,7 @@ set OPENAI_API_KEY=any-key
 >
 > `/health` 每个上游会报 `models`（对外数量）、`modelsAll`（全集）、`plan`、`planError`，便于排障。
 >
-> `modelMap` 是**上游级**短别名（不污染全局 `aliases`）：配置后下游可直接用 `cc-flash`，
+> `modelMap` 是**上游级**短别名（可选，本仓库默认未配；不污染全局 `aliases`）：配置后下游可直接用 `cc-flash`，
 > 桥按「上游级别名 → 全局别名 → 原样」解析，并把短名原样回给下游。
 > **`cliVersion`** 留 `"auto"` 即可（读本机安装的 command-code 版本）；要固定版本就写死如 `"1.53.1"`。
 
@@ -273,10 +284,13 @@ curl http://127.0.0.1:8900/go/v1/chat/completions -H "Content-Type: application/
 
 > 上表是 2026-09-12 的实测快照。上游随时可能调整，想重新确认可以给 go 加 `"autoModels": true` 拉全量对比（见第七节）。
 
-### 两个上游的限制
+### 各上游的限制
 
 - **Zen 免费模型有限流**：用多了返回 `429 FreeUsageLimitError`，稍等恢复。上游配额策略，非本工具问题
 - **Go 需要密钥**：从 `~/.jcode/.env` 的 `OPENCODE_API_KEY` 读取（见第六节）
+- **CommandCode 需要本机已登录**：凭据按 `COMMAND_CODE_API_KEY` → `~/.commandcode/auth.json` 的顺序取，两处都没有时**本地直接 401**（不打上游）
+- **CommandCode 版本头是硬门槛**：`x-command-code-version` 缺失或过旧会 `403 upgrade_required`；桥默认自动读本机 CLI 版本（见第五节）
+- **CommandCode 套餐外模型**：清单启动时按套餐过滤一次，超出套餐的模型仍可直呼，但会得到终态 `403 MODEL_NOT_IN_PLAN`（不重试）；换套餐后需重启桥刷新清单
 
 ### 想自己核对上游到底有哪些模型
 
@@ -295,6 +309,7 @@ curl http://127.0.0.1:8900/v1/models
   "port": 8900,
   "host": "127.0.0.1",
   "defaultModel": "deepseek-flash",
+  "models": ["deepseek-flash", "mimo-v2.5-pro", "glm5.3"],
   "maxTokens": 8192,
   "timeoutSeconds": 600,
   "accessLog": true,
@@ -304,16 +319,19 @@ curl http://127.0.0.1:8900/v1/models
     "cch": {
       "protocol": "anthropic",
       "baseUrl": "http://127.0.0.1:15721",
-      "apiKey": "any-key",
+      "apiKey": "",
+      "anthropicVersion": "2023-06-01",
       "default": true,
-      "models": ["deepseek-flash"]
+      "fetchModels": false,
+      "autoModels": false,
+      "models": ["deepseek-flash", "mimo-v2.5-pro", "glm5.3"]
     },
     "go": {
       "protocol": "openai",
       "baseUrl": "https://opencode.ai/zen/go/v1",
       "apiKeyEnv": "OPENCODE_API_KEY",
       "sessionHeader": true,
-      "models": ["glm-5.3-flash", "..."]
+      "models": ["glm-5.3-flash", "kimi-k3", "deepseek-v4-pro", "..."]
     },
     "zen": {
       "protocol": "openai",
@@ -321,6 +339,17 @@ curl http://127.0.0.1:8900/v1/models
       "apiKey": "",
       "sessionHeader": true,
       "models": ["mimo-v2.5-free", "..."]
+    },
+    "commandcode": {
+      "protocol": "commandcode",
+      "baseUrl": "https://api.commandcode.ai",
+      "apiKeyEnv": "COMMAND_CODE_API_KEY",
+      "apiKeyFile": "~/.commandcode/auth.json",
+      "cliVersion": "auto",
+      "modelCatalog": "auto",
+      "modelCatalogPlan": "auto",
+      "pauseTurn": true,
+      "models": ["deepseek/deepseek-v4.1-flash", "..."]
     }
   }
 }
@@ -337,21 +366,32 @@ curl http://127.0.0.1:8900/v1/models
 | `accessLog` | 是否打印每请求一行日志 |
 | `modelsCacheSeconds` | 模型列表缓存秒数（默认 300） |
 | `thinking.passthrough` | 是否自动回传思考内容（多轮会话必需，见第九节） |
+| `thinking.cacheSize` | 思考内容缓存条数上限，默认 `500` |
+| `tools.downgradeForcedChoice` | 上游 thinking 模式下把强制的 `tool_choice` 降级为 `auto`（默认 `true`） |
+| `models` | 顶层模型白名单，配了则 `/v1/models` 只返回这几个（见第七节） |
 | `envFile` | 密钥文件路径，默认 `~/.jcode/.env`；设 `false` 禁用 |
 
 ### 每个上游的字段
 
 | 字段 | 含义 |
 |------|------|
-| `protocol` | `anthropic`（走 `/v1/messages`）或 `openai`（走 `/v1/chat/completions`） |
+| `protocol` | `anthropic`（走 `/v1/messages`）、`openai`（走 `/v1/chat/completions`）或 `commandcode`（走 `/alpha/generate`）；不写则按 `baseUrl` 推断 |
 | `baseUrl` | 上游地址。**带不带 `/v1` 都行**，工具会自动规范化，不会拼出 `/v1/v1` |
 | `apiKey` | 直接写密钥；**写空字符串 `""` 表示不发送鉴权头**（Zen 免费模型就是这种） |
 | `apiKeyEnv` | 从环境变量/`.env` 文件读取密钥（推荐，避免密钥落盘） |
+| `apiKeyFile` | 从凭据文件读取密钥（如 `~/.commandcode/auth.json`），优先级在 `apiKeyEnv` 之后 |
+| `anthropicVersion` | `anthropic` 协议的 `anthropic-version` 头，默认 `2023-06-01` |
 | `default` | 设为 `true` 的上游承接未匹配到任何模型的请求 |
 | `models` | 该上游负责的模型名清单，用于按名分发 |
-| `sessionHeader` | 是否注入 `x-opencode-session`（opencode 类上游必须为 `true`） |
-| `fetchModels` | 是否从上游拉取模型清单（默认 `true`） |
+| `modelMap` | 上游级短别名（短名 → 真实模型 id），不污染全局 `aliases`，见第五节 |
+| `sessionHeader` | 是否注入 `x-opencode-session`（opencode 类上游必须为 `true`；`commandcode` 不适用，默认关闭） |
+| `fetchModels` | 是否从上游拉取模型清单（默认 `true`；`commandcode` 没有该端点，默认 `false`） |
 | `autoModels` | 是否把上游**全部**模型也暴露给下游（默认 `false`，只暴露 `models` 里声明的） |
+| `cliVersion` | `commandcode` 专用：`x-command-code-version` 取值，默认 `"auto"`（读本机 CLI 版本，读不到则查 npm registry） |
+| `cliEnvironment` | `commandcode` 专用：`x-cli-environment` 头，默认 `"production"` |
+| `modelCatalog` | `commandcode` 专用：模型目录来源，`"auto"`（读本机 CLI，默认）/ `false`（只用配置声明）/ 具体文件路径 |
+| `modelCatalogPlan` | `commandcode` 专用：按套餐过滤对外清单，`"auto"`（探测，默认）/ `go` / `goat` / `pro` / `max` / `false`（不过滤） |
+| `pauseTurn` | `commandcode` 专用：收到 `pause_turn` 时用同一请求体自动续跑（默认 `true`，最多续 5 次） |
 
 **改完配置需重启才生效。**
 
@@ -383,6 +423,9 @@ node model-bridge.js
   "models": ["some-model"]
 }
 ```
+
+`protocol` 可写 `anthropic` / `openai` / `commandcode`；省略时按 `baseUrl` 推断（opencode 系 → `openai`，
+commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议还得在 `model-bridge.js` 的协议适配层加一个适配器。
 
 ---
 
@@ -419,6 +462,7 @@ node model-bridge.js
 | `/cch/v1/models` | cch 的清单（3 个） |
 | `/go/v1/models` | go 的清单（25 个） |
 | `/zen/v1/models` | zen 的清单（5 个） |
+| `/commandcode/v1/models` | commandcode 的清单（配置声明 ＋ 本机 CLI 权威目录合并，再按账号套餐过滤，数量随套餐变） |
 
 ### 上游拉取的相关开关
 
@@ -472,7 +516,8 @@ DeepSeek 思考模式要求：多轮对话（尤其带工具调用）必须把�
 
 出现「思考链可能断裂」告警说明该轮需要思考内容但缓存没有（如服务重启后客户端发了带历史的请求），属提示而非错误。
 
-**仅对 `protocol: anthropic` 的上游生效**（cch）。openai 类上游原样透传，不做处理。
+**仅对 `protocol: anthropic` 的上游生效**（cch）。openai 类上游原样透传，不做处理；
+CommandCode 的思考内容由它自己的事件流直接透出（不依赖这个缓存），`pause_turn` 续跑期间也连续下发。
 
 ---
 
@@ -486,7 +531,11 @@ DeepSeek 思考模式要求：多轮对话（尤其带工具调用）必须把�
 ```
 [2026-09-12T17:46:20.123Z] deepseek-flash -> cch:deepseek-flash 200 782ms tokens=336+25 think=1
 [2026-09-12T17:46:22.456Z] glm-5.3-flash -> go:glm-5.3-flash 200 1090ms stream tokens=289+55
+[2026-09-13T10:00:00.000Z] deepseek/deepseek-v4.1-flash -> commandcode:deepseek/deepseek-v4.1-flash 200 3200ms stream tokens=7599+120 cache=7424+0
 ```
+
+`tokens=` 之后按上游协议追加附加信息：`think=补回条数`（anthropic）、
+`cache=缓存读+缓存写`、`截断(无 finish)`、`pause_turn 未续完`、`上游错误: ...`（后四项来自 CommandCode 协议）。
 
 ---
 
@@ -495,13 +544,17 @@ DeepSeek 思考模式要求：多轮对话（尤其带工具调用）必须把�
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `EADDRINUSE` | 8900 被占用 | 换端口，或结束占用进程（提示里已给出命令） |
-| 请求 502 | 上游连不上 | cch：确认 15721 在监听；go/zen：确认能访问 opencode.ai |
+| 请求 502 | 上游连不上 | cch：确认 15721 在监听；go/zen：确认能访问 opencode.ai；commandcode：确认能访问 api.commandcode.ai |
 | **429 限流** | Zen 免费模型配额用尽 | 稍后重试，或改用其他模型 |
 | **401 Invalid API key** | 该上游不该带 key 却带了，或 key 无效 | Zen 免费模型的 `apiKey` 必须是 `""`；Go 需要有效 `OPENCODE_API_KEY` |
 | 401 Missing API key | Go 没读到密钥 | 检查 `~/.jcode/.env` 里的 `OPENCODE_API_KEY` |
 | 400 `MissingSessionID` | 该上游未注入会话头 | 确认该上游 `sessionHeader` 不为 `false` |
 | 模型报不存在 | 该模型不在任何上游的 `models` 里，被送到默认上游 | 把模型名加到对应上游的 `models` |
 | 流式没有 `[DONE]` | 部分上游（如 minimax-m3）本身不发 | 上游行为，客户端按连接关闭结束即可 |
+| CommandCode 本地 401 | 没读到凭据（不打上游） | 先在本机登录 command-code，或设 `COMMAND_CODE_API_KEY` |
+| 403 `upgrade_required` | `x-command-code-version` 缺失或过旧 | 装/升级本机 command-code CLI，或给该上游写死 `cliVersion` |
+| 403 `MODEL_NOT_IN_PLAN` | 模型超出当前套餐档位 | 改用套餐内模型；终态错误，桥不重试 |
+| CommandCode 报模型不存在 | 该上游按完整 id 匹配，不接受缩写 | 写全如 `deepseek/deepseek-v4.1-flash`，或给该上游配 `modelMap` 短名 |
 
 ---
 
@@ -511,6 +564,7 @@ DeepSeek 思考模式要求：多轮对话（尤其带工具调用）必须把�
 - **cch 上游**：需本地代理在 `127.0.0.1:15721` 运行
 - **go 上游**：需 `OPENCODE_API_KEY` 且在 `~/.jcode/.env` 里
 - **zen 上游**：无需密钥
+- **commandcode 上游**：需本机登录过 command-code（凭据 `~/.commandcode/auth.json`）或设 `COMMAND_CODE_API_KEY`；`x-command-code-version` 默认自动探测，读不到时可显式配 `cliVersion`
 - **系统**：Windows（`start-bridge.cmd`）；`model-bridge.js` 本身跨平台
 
 ---
@@ -522,8 +576,59 @@ DeepSeek 思考模式要求：多轮对话（尤其带工具调用）必须把�
 | `model-bridge.js` | 主程序，零依赖单文件 |
 | `bridge.config.json` | 配置（四条上游定义） |
 | `start-bridge.cmd` | 一键启动 |
+| `restart-bridge.cmd` | 一键重启（先结束旧进程再启动） |
 | `README.md` | 本说明 |
 | `package.json` | Node 工程信息（零依赖，声明 `type: module`） |
 | `test-bridge.mjs` | 冒烟测试：对着**运行中**的真实上游跑全链路（`npm test`） |
-| `test-commandcode.mjs` | commandcode 协议**离线**回归：自带 stub 上游与独立实例，零外网（`node test-commandcode.mjs`） |
+| `test-commandcode.mjs` | commandcode 协议**离线**回归：自带 stub 上游与独立实例，零外网（`npm run test:commandcode`） |
+| `probe-upstream.mjs` | 探测本地 cch 代理（cc-switch）支持哪些协议与模型名（`npm run probe`） |
+| `changelog/` | 发行说明源：每版本一份 `v<版本>.json`，`index.json` 为索引（见第十四节） |
+| `scripts/` | 打包发布脚本（打包、产物自检、校验和、发行说明渲染、重触发），CI 与本地共用 |
+| `.github/workflows/release.yml` | tag 驱动的发布流水线 |
+| `dist/`、`SHA256SUMS` | 打包产物与校验和（`.gitignore` 排除，不入库） |
+
+---
+
+## 十四、版本与发布
+
+版本号唯一来源是 `package.json` 的 `version`，发布口只留 tag，两者必须一致。
+
+### 发布前要同步的位置
+
+| 位置 | 内容 |
+|------|------|
+| `package.json` → `version` | 本次版本号（如 `1.1.0`） |
+| `changelog/v<版本>.json` | 发行说明源：`title` / `date` / `highlights` / `improvements` / `fixes`（写给用户看效果，纯内部改动不列） |
+| `changelog/index.json` | 在 `entries` 里补一条索引（版本、日期、标题、文件名） |
+
+缺 `changelog/v<版本>.json` 时流水线第一步就失败，**不允许**退化成自动提交清单。
+
+### 怎么发
+
+```bat
+git tag -a v1.1.0 -m "v1.1.0"    :: 注释标签，指向当前提交
+git push origin v1.1.0           :: 推送 tag 即触发发布
+```
+
+### 流水线做什么（`.github/workflows/release.yml`）
+
+1. **建 draft release**：校验 tag 与 `package.json` 版本一致 → 渲染发行说明 → 建 draft（或更新既有 draft）；已公开的 release 拒绝覆盖
+2. **门禁 + 打包 + 自检**：敏感信息扫描（工作区 + 全历史对象）→ 语法自检 → 按显式必达清单打包 → 产物自检（条目集合、解包后语法、真实启动 smoke）→ 生成 `SHA256SUMS`
+3. **收尾**：校验资产集合齐全才上传 → 幂等追加「资产与校验方式」说明 → 转 public → 反向拉取已公开产物自检
+
+任一环节失败，release **停在 draft**，用户看不到半成品。
+
+### 产物
+
+`dist/model-bridge-v<版本>.zip` ＋ `SHA256SUMS`。zip 内是显式列出的产品文件（`model-bridge.js`、`bridge.config.json`、`start-bridge.cmd`、`restart-bridge.cmd`、`test-bridge.mjs`、`probe-upstream.mjs`、`README.md`、`.gitignore`），不含 `.git` / `dist` / 未跟踪文件；打包时间戳固定，**同一份源码两次打包得到同一 SHA256**。
+
+### 本地复核与重跑
+
+```bat
+bash scripts/build-package.sh --list              :: 只看将入包的文件清单
+bash scripts/build-package.sh                     :: 本地打包
+bash scripts/verify-release.sh v1.1.0             :: 独立下载已发布资产逐项核对
+bash scripts/retrigger-release.sh --dry-run v1.1.0   :: 只查重触发前提，不动任何东西
+bash scripts/retrigger-release.sh --at HEAD v1.1.0   :: 删除并按 HEAD 重建同名 tag 后重推
+```
 
