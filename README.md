@@ -1,15 +1,16 @@
 # model-bridge — 使用说明
 
-一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**三条上游**，并自动处理各上游的协议差异。
+一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**四条上游**，并自动处理各上游的协议差异。
 
 ```
 Agent（OpenAI 格式）
    ↓  http://127.0.0.1:8900/v1            ← 按模型名自动分发
    ↓  http://127.0.0.1:8900/go/v1         ← 用 URL 前缀强制指定上游
 model-bridge
-   ├─ cch   (Anthropic 协议) → 127.0.0.1:15721 → CCH → DeepSeek
-   ├─ go    (OpenAI 协议)    → opencode.ai/zen/go/v1  ← Go 订阅套餐
-   └─ zen   (OpenAI 协议)    → opencode.ai/zen/v1     ← 免费模型
+   ├─ cch         (Anthropic 协议)   → 127.0.0.1:15721 → CCH → DeepSeek
+   ├─ go          (OpenAI 协议)      → opencode.ai/zen/go/v1  ← Go 订阅套餐
+   ├─ zen         (OpenAI 协议)      → opencode.ai/zen/v1     ← 免费模型
+   └─ commandcode (CommandCode 协议) → api.commandcode.ai/alpha/generate ← CommandCode 订阅
 ```
 
 ---
@@ -40,6 +41,7 @@ model: (未声明的名字)     → 默认上游（cch）
 | `http://127.0.0.1:8900/cch/v1` | 强制走 cch |
 | `http://127.0.0.1:8900/go/v1` | 强制走 go |
 | `http://127.0.0.1:8900/zen/v1` | 强制走 zen |
+| `http://127.0.0.1:8900/commandcode/v1` | 强制走 commandcode |
 
 例：
 ```bat
@@ -185,6 +187,70 @@ set OPENAI_API_KEY=any-key
 | 模型 | 说明 |
 |------|------|
 | `mimo-v2.5-free`、`ling-3.0-flash-fin-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、`big-pickle` | 免费，**有限流** |
+
+### commandcode（CommandCode 订阅，复用你已登录的凭据）
+
+| 模型 | 说明 |
+|------|------|
+| `deepseek/deepseek-v4-pro`、`deepseek/deepseek-v4-flash`、`deepseek/deepseek-v4.1-flash`、`moonshotai/Kimi-K3`、`zai-org/GLM-5.3`、`MiniMaxAI/MiniMax-M3`、`xiaomi/mimo-v2.5-pro` | 配置里已声明；完整目录见 CommandCode 的 `/model` |
+
+- **协议**：CommandCode 是私有接口（`POST /alpha/generate`），既不是 OpenAI 也不是 Anthropic。
+  本桥在内部把 OpenAI 请求翻译过去、再把它的 **NDJSON 事件流**翻译回 OpenAI 流，**Agent 侧无感**。
+- **凭据**：桥按 CommandCode 自己的顺序取 key——先 `COMMAND_CODE_API_KEY` 环境变量，
+  再本机 `~/.commandcode/auth.json` 的 `apiKey`。所以**只要本机 `cmd` 登录过就能直接跑**，无需额外配置；
+  两处都没有时本地直接返回 401，不会把必然失败的请求打到上游。密钥只驻内存，不落盘、不进日志。
+- **版本头**：`x-command-code-version` 是服务端硬门槛（缺失或过旧 → 403 `upgrade_required`）。
+  桥默认读本机已安装的 command-code 版本，读不到则退回 npm registry（30 分钟缓存），
+  也可用 `cliVersion` 固定一个值。
+- **前缀**：`http://127.0.0.1:8900/commandcode/v1`
+- **模型名必须精确**：上游按完整 id 匹配，不接受缩写（如要写 `deepseek/deepseek-v4.1-flash`，
+  而不是 `deepseek-v4.1-flash`）。需要短名可给该上游配 `modelMap`。
+- **已知差异**：本桥不复刻 CLI 的机器指纹上报与遥测（与生成请求无关）；
+  图片需为 data URL（非 data URL 会被跳过）；
+  下游若要求**强制工具选择**（`tool_choice: required`），本桥不下发该字段、按 `auto` 处理并打日志（与 cch 分支的降级行为一致）；
+  套餐档位**在启动时探测一次**，升级套餐后需重启桥才会刷新清单。
+- **`pause_turn` 自动续跑**：上游有时会在回答中途返回 `pause_turn`（表示"这一轮先到这，请继续"）。
+  本桥收到后会**用同一份请求体重发**把回答接完，最多续 **5 次**（共 6 次请求）——与上游 CLI 的做法一致，
+  续跑期间正文/思考/工具调用连续下发，`usage` 跨次累加。想关掉就设 `"pauseTurn": false`（此时收到就收尾，并在访问日志里标 `pause_turn 未续完`）。
+
+配置形态（`bridge.config.json` 已内置，密钥只以引用形式出现）：
+
+```json
+"commandcode": {
+  "protocol": "commandcode",
+  "baseUrl": "https://api.commandcode.ai",
+  "apiKeyEnv": "COMMAND_CODE_API_KEY",
+  "apiKeyFile": "~/.commandcode/auth.json",
+  "cliVersion": "auto",
+  "cliEnvironment": "production",
+  "modelCatalog": "auto",
+  "modelCatalogPlan": "auto",
+  "pauseTurn": true,
+  "fetchModels": false,
+  "modelMap": { "cc-flash": "deepseek/deepseek-v4.1-flash" },
+  "models": ["deepseek/deepseek-v4.1-flash"]
+}
+```
+
+> **模型清单怎么来**：CommandCode 没有 `/v1/models` 端点，所以清单 = 配置里 `models` 声明的
+> **＋ 本机 CLI 自带权威目录**（`command-code/dist/bundled/.../models.md`）合并去重。
+> `modelCatalog` 取值：`"auto"`（读本机 CLI，默认）/ `false`（只用配置声明）/ 具体文件路径。
+> 本机没装 CLI 时自动退回配置声明的那几个，不报错。
+>
+> **清单会自动按你的套餐过滤**：桥启动后查一次 `/alpha/billing/subscriptions` 取套餐档位
+> （如 `individual-goat` → GOAT），再用目录里的「Min plan」列剔除超出套餐的模型。
+> 实测（GOAT 账号）：目录 70 个 → 对外 **50** 个；Max 档 `claude-opus-5`、Pro 档 `claude-sonnet-5` 被剔除。
+> `modelCatalogPlan` 取值：`"auto"`（探测，默认）/ `go` / `goat` / `pro` / `max`（显式指定）/ `false`（不过滤）。
+> 探测失败时**不过滤**，原因写在 `/health` 的 `planError` 里。
+>
+> **被过滤掉的模型仍可按名直呼**（例如你临时买了按需额度）：桥照旧路由到 CommandCode，
+> 放行与否交给上游——超出套餐会得到 403 `MODEL_NOT_IN_PLAN`（终态错误，不重试）。
+>
+> `/health` 每个上游会报 `models`（对外数量）、`modelsAll`（全集）、`plan`、`planError`，便于排障。
+>
+> `modelMap` 是**上游级**短别名（不污染全局 `aliases`）：配置后下游可直接用 `cc-flash`，
+> 桥按「上游级别名 → 全局别名 → 原样」解析，并把短名原样回给下游。
+> **`cliVersion`** 留 `"auto"` 即可（读本机安装的 command-code 版本）；要固定版本就写死如 `"1.53.1"`。
 
 ### 同名冲突说明
 
@@ -454,67 +520,10 @@ DeepSeek 思考模式要求：多轮对话（尤其带工具调用）必须把�
 | 文件 | 作用 |
 |------|------|
 | `model-bridge.js` | 主程序，零依赖单文件 |
-| `bridge.config.json` | 配置（三条上游定义） |
+| `bridge.config.json` | 配置（四条上游定义） |
 | `start-bridge.cmd` | 一键启动 |
 | `README.md` | 本说明 |
-| `package.json` | 版本唯一真源（`version` 字段）与 `type: module` |
-| `changelog/v<版本>.json` | 每个版本的发行说明来源（缺失时发布流水线直接失败） |
-| `scripts/` | 发布流水线脚本（扫描 / 打包 / 校验和 / 自检），CI 与本地共用 |
-| `.github/workflows/release.yml` | tag 驱动的发布流水线
+| `package.json` | Node 工程信息（零依赖，声明 `type: module`） |
+| `test-bridge.mjs` | 冒烟测试：对着**运行中**的真实上游跑全链路（`npm test`） |
+| `test-commandcode.mjs` | commandcode 协议**离线**回归：自带 stub 上游与独立实例，零外网（`node test-commandcode.mjs`） |
 
----
-
-## 十四、发布流程（维护者）
-
-发布口只有一个：推 `v*` tag，其余全自动。
-
-```
-push tag v1.2.3
-  └─ create-release：校验 tag 与 package.json 版本一致 → 由 changelog/v1.2.3.json 渲染说明 → 建 draft release
-       └─ package：敏感信息扫描（工作区 + 全历史对象）→ 语法自检 → 打包（显式清单，不含 .git）→ 产物自检（真实启动 smoke）→ 生成 SHA256SUMS
-            └─ finalize：必达资产校验（缺一即保持 draft）→ 上传资产 → 转 public → 发布后自检（重新下载已公开产物核对）
-```
-
-### 本地演练（不触碰远程）
-
-```bash
-bash scripts/scan-sensitive.sh --all-history          # 敏感信息门禁
-bash scripts/build-package.sh                         # 产出 dist/model-bridge-v<版本>.zip
-bash scripts/verify-package.sh dist/model-bridge-v1.0.0.zip   # 产物自检（含真实启动）
-bash scripts/generate_checksums.sh dist SHA256SUMS .zip       # 生成校验和
-```
-
-### 正式发布
-
-```bash
-# 1. 先补 changelog/v<版本>.json（缺失时 CI 会直接失败，不会静默发出去）
-# 2. 提交版本与 changelog
-git add package.json changelog/ && git commit -m "release: v1.2.3"
-git push origin master
-# 3. 推 tag 触发流水线
-git tag -a v1.2.3 -m "release: v1.2.3" && git push origin v1.2.3
-```
-
-### tag 事件被丢弃 / 发布链路刚改过
-
-```bash
-bash scripts/retrigger-release.sh --dry-run v1.2.3     # 只查前提，不动任何东西
-bash scripts/retrigger-release.sh --at HEAD v1.2.3     # 重建到 HEAD 后重推（--at 必需：tag 指旧提交会跑旧 workflow）
-```
-
-### 发布后独立复核
-
-```bash
-bash scripts/verify-release.sh v1.2.3                  # 会重新下载已公开资产，核对元数据/资产集合/校验和/产物内容
-# 下载资产后本地核对
-sha256sum -c SHA256SUMS                                # Linux/macOS
-Get-FileHash model-bridge-v1.2.3.zip -Algorithm SHA256 # Windows
-```
-
-### 硬规则
-
-- **版本唯一真源**是 `package.json` 的 `version`，tag 名必须与它一致（CI 强制校验，防止「tag 是 v1.0.0 但产物报别的版本」）
-- **tag 只增不改**：已公开的 release 绝不删 tag 重推（会破坏消费者与校验和的可追溯性），要改就发新的 patch 版本
-- **发布提交只放三类文件**：版本声明（`package.json`）+ changelog；不要混入代码改动
-- **词表与扫描器分离**：扫描规则在 `scripts/scan-sensitive.sh` 里可入库；组织专有敏感词放不入库的 `.sensitive-terms`
-- **改写历史后必须复核**：推送后独立克隆再扫一遍，本地视角不能证明远程状态（见知识库《Git 仓库开源发布安全流程》）

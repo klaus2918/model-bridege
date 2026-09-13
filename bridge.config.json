@@ -75,6 +75,27 @@
         "nemotron-3.5-lightning-free",
         "big-pickle"
       ]
+    },
+    "commandcode": {
+      "protocol": "commandcode",
+      "baseUrl": "https://api.commandcode.ai",
+      "apiKeyEnv": "COMMAND_CODE_API_KEY",
+      "apiKeyFile": "~/.commandcode/auth.json",
+      "cliVersion": "auto",
+      "cliEnvironment": "production",
+      "modelCatalog": "auto",
+      "modelCatalogPlan": "auto",
+      "pauseTurn": true,
+      "fetchModels": false,
+      "models": [
+        "deepseek/deepseek-v4.1-flash",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
+        "moonshotai/Kimi-K3",
+        "zai-org/GLM-5.3",
+        "MiniMaxAI/MiniMax-M3",
+        "xiaomi/mimo-v2.5-pro"
+      ]
     }
   }
 }

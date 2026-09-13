@@ -11,7 +11,8 @@
   "scripts": {
     "start": "node model-bridge.js",
     "probe": "node probe-upstream.mjs",
-    "test": "node test-bridge.mjs"
+    "test": "node test-bridge.mjs",
+    "test:commandcode": "node test-commandcode.mjs"
   },
   "keywords": [
     "openai",

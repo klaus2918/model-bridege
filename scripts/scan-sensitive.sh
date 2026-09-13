@@ -99,9 +99,9 @@ while IFS= read -r hit; do
 done < <(grep -aEn -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- "${FILES[@]}" 2>/dev/null || true)
 
 # ── 3. 非白名单外部地址 ──
-# 放行：本机地址、产品自身上游、代码托管、示例域名；模板串（host 运行时决定）不算命中。
+# 放行：本机地址、产品自身上游、公共包注册表、代码托管、示例域名；模板串（host 运行时决定）不算命中。
 # 只提取「形状合法的主机名」，否则会把正则字面量（如 sed 里的 https://|http）误判成地址。
-ALLOW_SUFFIXES="127.0.0.1 localhost opencode.ai github.com githubusercontent.com example.com"
+ALLOW_SUFFIXES="127.0.0.1 localhost opencode.ai commandcode.ai npmjs.org github.com githubusercontent.com example.com"
 while IFS= read -r hit; do
   [ -z "$hit" ] && continue
   file="${hit%%:*}"; rest="${hit#*:}"; line="${rest%%:*}"; text="${rest#*:}"
