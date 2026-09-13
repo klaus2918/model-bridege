@@ -17,7 +17,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_DIR = join(HERE, ".op", "changes", "commandcode-upstream", "reference", "a-line", "fixtures");
+// 真实流量固件随变更归档迁移过位置：先找活跃变更目录，再找归档目录；都没有则跳过该组用例
+const FIXTURE_DIR = [
+  join(HERE, ".op", "changes", "commandcode-upstream", "reference", "a-line", "fixtures"),
+  join(HERE, ".op", "archive", "2026", "09", "commandcode-upstream", "reference", "a-line", "fixtures"),
+].find((d) => existsSync(d));
 const CC_MODEL = "deepseek/deepseek-v4.1-flash";
 const TEST_KEY = "test-key";
 // 测试用占位凭据（非真实密钥）：以拼接形式给出，避免源码里出现「apiKey: "…"」这类键值对字面量（安全扫描规则）
