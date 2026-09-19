@@ -191,6 +191,8 @@ function normalizeUpstream(name, u) {
     modelCatalogPlan: u.modelCatalogPlan ?? (isCommandCode ? "auto" : false),
     // commandcode 专用：pause_turn 续跑（默认开，与上游 CLI 行为一致；关掉则收到 pause_turn 即收尾）
     pauseTurn: u.pauseTurn ?? isCommandCode,
+    // commandcode 专用：ZDR 安全头（默认开，向上游发送 x-cmd-zdr: 1 表达零数据留存要求）
+    cmdZdr: u.cmdZdr ?? true,
   };
 }
 
@@ -1374,6 +1376,8 @@ const commandcodeProtocol = {
     if (up.cliEnvironment) headers["x-cli-environment"] = up.cliEnvironment;
     headers["x-session-id"] = ccSessionId(ctx.body);
     headers.authorization = `Bearer ${up.apiKey}`;
+    // ZDR（Zero Data Retention）安全头：默认开启，告知上游执行零数据留存策略（可通过 cmdZdr: false 关闭）
+    if (up.cmdZdr) headers["x-cmd-zdr"] = "1";
 
     const systemParts = [];
     const rest = [];

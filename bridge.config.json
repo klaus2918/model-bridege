@@ -86,6 +86,7 @@
       "modelCatalog": "auto",
       "modelCatalogPlan": "auto",
       "pauseTurn": true,
+      "cmdZdr": true,
       "fetchModels": false,
       "models": [
         "deepseek/deepseek-v4.1-flash",

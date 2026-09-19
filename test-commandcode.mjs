@@ -353,7 +353,7 @@ async function main() {
     check("不发 x-project-slug", h["x-project-slug"] === undefined);
     check("不发 x-taste-learning", h["x-taste-learning"] === undefined);
     check("不发 traceparent", h.traceparent === undefined);
-    check("不发 x-cmd-zdr", h["x-cmd-zdr"] === undefined);
+    check("x-cmd-zdr=1（ZDR 安全头）", h["x-cmd-zdr"] === "1");
 
     console.log("\n[H] 请求体形状（/alpha/generate 契约）");
     const sent = JSON.parse(stub.state.body ?? "{}");
