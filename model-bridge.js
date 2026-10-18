@@ -1743,8 +1743,19 @@ function readBody(req) {
   });
 }
 
+/** 日志时间戳：本机时区的 ISO 风格时间，带 UTC 偏移（toISOString 只有 UTC，看日志对不上本地时间） */
+function stamp(d = new Date()) {
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  const offsetMin = -d.getTimezoneOffset();
+  const sign = offsetMin < 0 ? "-" : "+";
+  const abs = Math.abs(offsetMin);
+  const date = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  const time = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+  return `${date}T${time}${sign}${p(Math.floor(abs / 60))}:${p(abs % 60)}`;
+}
+
 function log(line) {
-  console.log(`[${new Date().toISOString()}] ${line}`);
+  console.log(`[${stamp()}] ${line}`);
 }
 
 const server = createServer((req, res) => {

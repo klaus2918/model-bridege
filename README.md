@@ -1,5 +1,15 @@
 # model-bridge — 使用说明
 
+> **桌面版（推荐）**：`dist\Model-Gate.exe` 是同一套能力的 Windows 桌面版：本地代理 + 模型配置面板
+> + token 用量统计（SQLite 落库）。启动后访问 `http://127.0.0.1:8900/ui/` 打开面板；
+> 无 GUI 环境可用 `Model-Gate.exe --no-gui --port 8911` 以纯代理模式运行。
+> 本文其余小节描述的行为对 Node 版（`node model-bridge.js`）与桌面版**完全一致**。
+>
+> **密钥安全**：桌面包会把**非空明文 `apiKey` 拦在内存里**，不写入 `bridge.config.json`
+> 与 SQLite。要长期使用请用 `apiKeyEnv`（读 `~/.jcode/.env`）或 `apiKeyFile`
+> （读 `~/.commandcode/auth.json`）；分享配置用 `bridge.config.example.json`（零明文）。
+> `bridge.config.json` 已在 `.gitignore` 中，不会进版本库。
+
 一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**四条上游**，并自动处理各上游的协议差异。
 
 ```
@@ -25,8 +35,8 @@ model-bridge
 
 ```
 model: deepseek-flash    → cch
-model: glm-5.3-flash     → go
-model: big-pickle        → zen
+model: mimo-v2.6-flash    → go
+model: space-bunny-free   → zen
 model: (未声明的名字)     → 默认上游（cch）
 ```
 
@@ -106,26 +116,29 @@ model-bridge 把这些差异都收敛到一个进程里，Agent 只需指向一�
 
 ### 1. 启动
 
-双击 `start-bridge.cmd`，或：
+桌面版（推荐）：双击 `dist\Model-Gate.exe`。托盘出现图标，面板自动打开 `http://127.0.0.1:8900/ui/`；**关窗不退出**，托盘菜单退出才停。
+
+旧版 Node 单文件仍可用（行为一致）：`node model-bridge.js`（窗口要开着，关掉即停）。
+
+### 两种运行模式（同一个 exe）
+
+| 模式 | 启动 | 形态 | 适用 |
+|---|---|---|---|
+| 桌面（默认） | `Model-Gate.exe` | 面板 + 托盘；关窗不退出 | 本机日常 |
+| 无界面（headless） | `Model-Gate.exe --no-gui --port 8911` | 纯代理，无窗口无托盘，Ctrl+C 停 | 服务器 / CI / 远程开发 |
+
+**关系**：同一份 exe、同一套配置解析、同一个库结构，差别只在「有没有窗口」；`--no-gui` 不会跳过任何代理能力。
+
+**不能共用同一个数据目录**：单实例锁以 `modelgate.db` 所在目录为粒度，第二个实例会被判为重复启动并退出。要并存（灰度切换 / 并行验证）必须同时满足「端口不同 + `--db` 指向不同目录」，配置也建议用副本：
 
 ```bat
-cd /d D:\githup-workspace\Model-Gate
-node model-bridge.js
+:: 桌面实例：默认 8900，读写 dist\bridge.config.json + dist\data\modelgate.db
+Model-Gate.exe
+:: 并行验证实例：8911 + 独立配置副本 + 独立库
+Model-Gate.exe --no-gui --port 8911 --config D:\tmp\mg\bridge.config.json --db D:\tmp\mg\data\modelgate.db
 ```
 
-启动成功会列出各上游：
-
-```
-[model-bridge] 已启动 http://127.0.0.1:8900/v1
-  上游 cch        anthropic http://127.0.0.1:15721  [默认]
-  上游 go         openai    https://opencode.ai/zen/go  会话头注入
-  上游 zen        openai    https://opencode.ai/zen  会话头注入
-  上游 commandcode commandcode https://api.commandcode.ai
-[model-bridge] 声明的模型: deepseek-flash, glm-5.3-flash, ...
-[model-bridge] thinking 回传: 开启（缓存上限 500 条）
-```
-
-> 窗口要**保持开着**，关掉即服务停止。
+切换版本时按 PID 停旧实例（`dist\bridge.config.json` 与 `dist\data` 不动），客户端 `base_url` 无需修改。
 
 ### 2. 验证
 
@@ -171,9 +184,21 @@ set OPENAI_API_KEY=any-key
 > 实测佐证：用任意编造的名字（如 `made-up-xyz`）请求，同样返回 200，响应 `model` 字段恒为
 > cc-switch 当前选中的模型。
 
-### go（opencode Go 订阅，需 `OPENCODE_API_KEY`）
+### go（opencode Go 订阅）
 
-已实测在 chat 路径可用的 **25 个**：
+上游 `/zen/go/v1/models` 当前列 **43 个**（2026-10-08 快照）。但 `bridge.config.json` 里 go 只声明了 **4 个**
+——按名分发**只认这份手工清单**，上游有的模型不写进来就路由不到：
+
+| 配置中已声明 | 说明 |
+|------|------|
+| `glm-5.3-flash` | GLM 系列的 flash 档 |
+| `deepseek-v4.1-flash` | DeepSeek 系列的 flash 档 |
+| `mimo-v2.6-flash` | MiMo V2.6，与 CommandCode 上的 MiMo V2.6 Flash 同款 |
+| `longcat-2.5-preview-free` | 免费层，在 go 上可外部调用（同名模型在 zen 上是 403） |
+
+2026-09-22 曾逐个实测 chat 路径可用 29 个；2026-10-08 抽查其中 9 个（`glm-5.3-flash`、
+`deepseek-v4.1-flash`、`mimo-v2.6-flash`、`longcat-2.5-preview-free`、`space-bunny`、`hy4-preview`、
+`hy3`、`omen-alpha`、`minimax-m3`）**全部仍返回 200**：
 
 | 系列 | 模型 |
 |------|------|
@@ -182,14 +207,35 @@ set OPENAI_API_KEY=any-key
 | DeepSeek | `deepseek-v4.1-flash`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`deepseek-v4-pro`、`deepseek-flash` |
 | MiniMax | `minimax-m3`、`minimax-m2.5` |
 | Qwen | `qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-max`、`qwen3.7-plus`、`qwen3.6-plus` |
-| MiMo | `mimo-v2.5-pro`、`mimo-v2.5` |
-| 其它 | `longcat-2.0`、`hy4-preview`、`hy3`、`omen-alpha` |
+| MiMo | `mimo-v2.6-flash`、`mimo-v2.6-pro`、`mimo-v2.5-pro`、`mimo-v2.5` |
+| 其它 | `longcat-2.0`、`longcat-2.5-preview-free`、`hy4-preview`、`hy3`、`omen-alpha`、`space-bunny` |
+
+> ⚠️ **`mimo-v2.6-flash-free` 不在 go 上**（2026-10-08 实测 400 `Model is unavailable`）：它只存在于 zen 目录，
+> 而 zen 侧又被免费层限制挡住（见下一节）。配到 go 里只会稳定报 400，已移除。
 
 ### zen（免费，无需密钥）
 
+上游 `/zen/v1/models` 当前列 **87 个**（2026-10-08 快照），但能被外部客户端调用的仍然**只有 1 个**
+（2026-09-22 与 2026-10-08 两轮复测结论一致）：
+
 | 模型 | 说明 |
 |------|------|
-| `mimo-v2.5-free`、`ling-3.0-flash-fin-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、`big-pickle` | 免费，**有限流** |
+| `space-bunny-free` | 免费、无需密钥，**有限流** |
+
+> **其余 86 个为什么没列**：
+> - 所有 `-free` 后缀的免费层模型 → 403 `FreeTierError: OpenCode's free tier can only be used from
+>   within OpenCode`（**带上 API key 也一样**，只能在 OpenCode 客户端内部用，外部代理进不去）：
+>   `mimo-v2.6-flash-free`、`longcat-2.5-preview-free`、`ling-3.1-flash-free`、`ling-3.0-flash-fin-free`、
+>   `fledge-alpha-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、`exo-free`
+> - `muse-spark-1.2-contributor-free`、`muse-spark-1.3-contributor-free` → 403 `RegionError`（地区限制）
+> - `jev-1.13-free` → 500（上游自身故障）
+> - 付费档（`claude-*`、`gpt-*`、`grok-*`、`mistral-large-4`、`qwen3.8-max` 等）→ 不带 key 直接 401
+>   `AuthError`；带 key 后 `claude-*` / `gpt-6*` / `grok-*` 又是 400 `ModelProtocolUnsupported`（需
+>   `/v1/responses` 协议），而 `qwen3.8-max`、`deepseek-v4.1-flash` 虽可用，go 里已有同名、按名分发优先
+>   命中 go，配进 zen 毫无意义
+>
+> **旧清单已全部失效**：`mimo-v2.5-free`（401 `ModelError`）、`big-pickle`（403 `FreeTierError`）
+> 已从配置移除。
 
 ### commandcode（CommandCode 订阅，复用你已登录的凭据）
 
@@ -276,18 +322,20 @@ curl http://127.0.0.1:8900/go/v1/chat/completions -H "Content-Type: application/
 
 | 模型 | 状态 | 原因 |
 |------|------|------|
-| `grok-4.6`、`grok-4.5` | ✗ | 需 `/v1/responses` 协议，走 chat 报 `not supported for format oa-compat` / `Model unavailable` |
-| `gpt-5.6-luna` | ✗ | 需 `/v1/responses` 协议，走 chat 报 500 |
-| `muse-spark-1.3-contributor`、`muse-spark-1.2-contributor` | ✗ | 403 `not available in your country`（地区限制） |
-| `minimax-m2.7` | ✗ | 500 Internal server error（重试两次均失败） |
+| `grok-4.6`、`grok-4.7`、`gpt-5.6-luna`、`gpt-6-luna`、`claude-haiku-5-5`、`minimax-m2.7` | ✗ | 400 `ModelProtocolUnsupported: Model does not support this protocol.`——需 `/v1/responses` 协议，本桥只发 chat（2026-09-22 同日早些时候这几个报的是 503 `Endpoint is unavailable`，上游当天有波动） |
+| `muse-spark-1.3-contributor`、`muse-spark-1.2-contributor` | ✗ | 403 `RegionError: This model is not available in your country`（同日早些时候报的是 400「需开启允许在请求数据上训练的付费端点」，两种都过不去） |
+| `grok-4.5` | ✗ | 需 `/v1/responses` 协议；当前上游 `/models` 已不列出 |
 | `kimi-k2.5`、`glm-5`、`qwen3.5-plus`、`mimo-v2-pro`、`mimo-v2-omni`、`hy3-preview` | ✗ | 400 `Model is unavailable`（套餐内未开通或已下线） |
+| `mimo-v2.6-flash-free` | ✗ | 400 `Model is unavailable`——go 目录里根本没有这个模型，它只存在于 zen，而 zen 侧被免费层挡住 |
 
-> 上表是 2026-09-12 的实测快照。上游随时可能调整，想重新确认可以给 go 加 `"autoModels": true` 拉全量对比（见第七节）。
+> 上表初版为 2026-09-12 快照，2026-09-22 与 2026-10-08 两次复测更新（2026-10-08 复测 `gpt-6-luna`、
+> `grok-4.7` 仍是协议不支持，`muse-spark-1.3-contributor` 仍是地区限制，`mimo-v2-pro`、`mimo-v2-omni`
+> 仍是 400 无此模型）。上游随时可能调整；注意桥的 go 清单是**手工声明**的，不会自动跟着上游变，新模型上线后需手动补进 `models`。
 
 ### 各上游的限制
 
 - **Zen 免费模型有限流**：用多了返回 `429 FreeUsageLimitError`，稍等恢复。上游配额策略，非本工具问题
-- **Go 需要密钥**：从 `~/.jcode/.env` 的 `OPENCODE_API_KEY` 读取（见第六节）
+- **Go 的密钥**：配置里是 `apiKeyEnv: OPENCODE_API_KEY`，但 2026-10-08 实测没配也能调通（见第十二节）
 - **CommandCode 需要本机已登录**：凭据按 `COMMAND_CODE_API_KEY` → `~/.commandcode/auth.json` 的顺序取，两处都没有时**本地直接 401**（不打上游）
 - **CommandCode 版本头是硬门槛**：`x-command-code-version` 缺失或过旧会 `403 upgrade_required`；桥默认自动读本机 CLI 版本（见第五节）
 - **CommandCode 套餐外模型**：清单启动时按套餐过滤一次，超出套餐的模型仍可直呼，但会得到终态 `403 MODEL_NOT_IN_PLAN`（不重试）；换套餐后需重启桥刷新清单
@@ -298,9 +346,16 @@ curl http://127.0.0.1:8900/go/v1/chat/completions -H "Content-Type: application/
 :: 只看 go 声明了什么（不联网）
 curl http://127.0.0.1:8900/go/v1/models
 
-:: 看上游实时全量（需给该上游配 "autoModels": true）
+:: 看上游实时全量（需给该上游配 "autoModels": true，且顶层 models 白名单为空）
 curl http://127.0.0.1:8900/v1/models
 ```
+
+> **两个容易踩的前提**：
+> 1. `/v1/models`（不带前缀）的"实时全量"要求 ① 该上游配了 `"autoModels": true`；② 顶层 `models`
+>    白名单为空——配了白名单时**严格只返回那几个**，根本不碰上游。带前缀的 `/go/v1/models`
+>    则永远只列配置里声明的，不联网。
+> 2. `autoModels` 只影响**列表展示**，不影响按名分发。新模型要能被不带前缀的 `/v1` 路由到，
+>    必须写进该上游的 `models`；否则会被当成"未声明的名字"落到默认上游（见第一节「方式一」）。
 
 ## 六、配置文件 `bridge.config.json`
 
@@ -331,14 +386,14 @@ curl http://127.0.0.1:8900/v1/models
       "baseUrl": "https://opencode.ai/zen/go/v1",
       "apiKeyEnv": "OPENCODE_API_KEY",
       "sessionHeader": true,
-      "models": ["glm-5.3-flash", "kimi-k3", "deepseek-v4-pro", "..."]
+      "models": ["glm-5.3-flash", "deepseek-v4.1-flash", "mimo-v2.6-flash", "longcat-2.5-preview-free"]
     },
     "zen": {
       "protocol": "openai",
       "baseUrl": "https://opencode.ai/zen/v1",
       "apiKey": "",
       "sessionHeader": true,
-      "models": ["mimo-v2.5-free", "..."]
+      "models": ["space-bunny-free"]
     },
     "commandcode": {
       "protocol": "commandcode",
@@ -396,21 +451,35 @@ curl http://127.0.0.1:8900/v1/models
 
 **改完配置需重启才生效。**
 
-### 密钥放哪
+### 密钥放哪：两种凭据模式
 
-推荐用 `apiKeyEnv`，密钥从 `~/.jcode/.env` 读取（可用 `envFile` 改路径）：
+| 模式 | 配置写法 | 密钥存放 | 适用 |
+|---|---|---|---|
+| **环境变量**（推荐） | `"apiKeyEnv": "OPENCODE_API_KEY"` | 进程环境优先，其次 `~/.jcode/.env`（`envFile` 可改路径） | 长期使用、多上游共用、轮换方便 |
+| **本地凭据文件** | `"apiKeyFile": "~/.commandcode/auth.json"` | 该 JSON 的 `apiKey` 字段（厂商 CLI 已登录的凭据） | 复用已登录凭据，不复制明文 |
 
-```
-# ~/.jcode/.env
-OPENCODE_API_KEY=sk-xxxxx
+```json
+"upstreams": {
+  "go":  { "protocol": "openai", "baseUrl": "https://opencode.ai/zen/go", "apiKeyEnv": "OPENCODE_API_KEY", "models": ["deepseek-v4.1-flash"] },
+  "cc":  { "protocol": "commandcode", "baseUrl": "https://api.commandcode.ai", "apiKeyFile": "~/.commandcode/auth.json", "models": [] }
+}
 ```
 
-也可以启动前设环境变量：
-```bat
-set OPENCODE_API_KEY=sk-xxxxx
-node model-bridge.js
-```
-环境变量优先于 `.env` 文件。
+**关系：同一上游按此顺序取第一个非空值**
+
+1. `apiKeyEnv` —— 进程环境 > `~/.jcode/.env`
+2. `apiKeyFile` —— 文件里的 `apiKey` 字段
+3. `apiKey` —— 面板里直接粘贴；**只驻内存**，不写 `bridge.config.json`、不写 SQLite，进程重启即丢
+4. 都没配 —— 用占位 `any-key`（本地不校验；上游会回 401）
+
+同一上游同时写 `apiKeyEnv` 与 `apiKeyFile` 时**前者生效**，后者被忽略；两个都写不算错，但配置页会以「实际生效来源」提示（`keySource` = env / file / literal / none）。
+
+**敏感隔离（不变式）**
+
+- `bridge.config.json` 里**永远不出现明文密钥**：面板保存时先剥离 `apiKey` 再落盘，明文只进内存。
+- `.gitignore` 已覆盖 `/bridge.config.json`、`/data/`、`*.env`、`**/auth.json`、`**/credentials*.json`、`*.key|*.pem|*.token`；对外分享只用 `bridge.config.example.json`（零明文）。
+- 只读接口不回显密钥：`/api/config` 与 `/api/upstreams` 仅给 `apiKeyEnv` / `apiKeyFile` 引用、`keySource` 与 `keyConfigured` 布尔值。
+- 日志只记上游名、状态码与耗时，不记请求头；用量导出（CSV/JSON）只含统计字段与模型名。
 
 ### 加新上游
 
@@ -461,8 +530,8 @@ commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议�
 | 地址 | 返回 |
 |------|------|
 | `/cch/v1/models` | cch 的清单（3 个） |
-| `/go/v1/models` | go 的清单（25 个） |
-| `/zen/v1/models` | zen 的清单（5 个） |
+| `/go/v1/models` | go 的清单（4 个） |
+| `/zen/v1/models` | zen 的清单（1 个） |
 | `/commandcode/v1/models` | commandcode 的清单（配置声明 ＋ 本机 CLI 权威目录合并，再按账号套餐过滤，数量随套餐变） |
 
 ### 上游拉取的相关开关
@@ -528,11 +597,14 @@ CommandCode 的思考内容由它自己的事件流直接透出（不依赖这�
 [时间] 请求模型 -> 上游名:实际模型 状态码 耗时 [stream] tokens=输入+输出 [think=补回条数]
 ```
 
+时间戳是**本机时区**的 ISO 风格时间，带 UTC 偏移（`+08:00` 这种），直接和本地时间对得上；
+进程时区跟随系统（`TZ` 环境变量可改），不会像 `Z` 结尾那样只能看到 UTC。
+
 例：
 ```
-[2026-09-12T17:46:20.123Z] deepseek-flash -> cch:deepseek-flash 200 782ms tokens=336+25 think=1
-[2026-09-12T17:46:22.456Z] glm-5.3-flash -> go:glm-5.3-flash 200 1090ms stream tokens=289+55
-[2026-09-13T10:00:00.000Z] deepseek/deepseek-v4.1-flash -> commandcode:deepseek/deepseek-v4.1-flash 200 3200ms stream tokens=7599+120 cache=7424+0
+[2026-09-12T17:46:20.123+08:00] deepseek-flash -> cch:deepseek-flash 200 782ms tokens=336+25 think=1
+[2026-09-12T17:46:22.456+08:00] glm-5.3-flash -> go:glm-5.3-flash 200 1090ms stream tokens=289+55
+[2026-09-13T10:00:00.000+08:00] deepseek/deepseek-v4.1-flash -> commandcode:deepseek/deepseek-v4.1-flash 200 3200ms stream tokens=7599+120 cache=7424+0
 ```
 
 `tokens=` 之后按上游协议追加附加信息：`think=补回条数`（anthropic）、
@@ -563,7 +635,9 @@ CommandCode 的思考内容由它自己的事件流直接透出（不依赖这�
 
 - **Node.js**：需要（本机已装）。无第三方依赖，不用 `npm install`
 - **cch 上游**：需本地代理在 `127.0.0.1:15721` 运行
-- **go 上游**：需 `OPENCODE_API_KEY` 且在 `~/.jcode/.env` 里
+- **go 上游**：配置里写的是 `apiKeyEnv: OPENCODE_API_KEY`。但 2026-10-08 实测本机 **Process / User / Machine
+  三处都没有这个变量**，go 的模型照样全部返回 200——即当前 Go 订阅的可用性并不依赖这个 key；
+  `/zen/go/v1/models` 更是公开可读。若哪天开始 401，再去 `~/.jcode/.env` 补 key 不迟
 - **zen 上游**：无需密钥
 - **commandcode 上游**：需本机登录过 command-code（凭据 `~/.commandcode/auth.json`）或设 `COMMAND_CODE_API_KEY`；`x-command-code-version` 默认自动探测，读不到时可显式配 `cliVersion`
 - **系统**：Windows（`start-bridge.cmd`）；`model-bridge.js` 本身跨平台

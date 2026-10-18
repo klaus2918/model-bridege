@@ -41,3 +41,47 @@ model-bridge-v*.zip
 
 # op 变更工作区（会话资产：含本机绝对路径与源码证据片段，不入库）
 .op/
+
+# ── 本地凭据与运行数据（禁止入库）──────────────────────────
+# 真实配置文件含本机路径与密钥引用；只提交 bridge.config.example.json 模板
+/bridge.config.json
+/data/
+# 凭据兜底：即使被放到别处也拦一手
+.env
+.env.*
+*.env
+.jcode/
+**/auth.json
+**/credentials*.json
+*.key
+*.pem
+*.token
+# PyInstaller / Inno Setup 产物
+/build/
+*.spec.bak
+# 探测脚本的临时输出
+probe.out
+probe.err
+coldstart.out
+coldstart.err
+gui.out
+gui.err
+/e2e.config.json
+
+
+# 过程噪音（构建中间目录 / 临时运行目录 / 临时脚本与日志）
+/build_v*/
+/run-*/
+_tmp_*
+*.out
+*.err
+*.bak-*
+/.pytest_cache/
+
+# Python 字节码
+__pycache__/
+*.pyc
+*.pyo
+
+# 敏感扫描自测临时文件
+_secret_selftest.tmp

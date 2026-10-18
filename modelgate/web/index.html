@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model-Gate</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◧</span>
+    <span>Model-Gate</span>
+    <span class="version" id="version">—</span>
+  </div>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="overview">概览</button>
+    <button class="tab-btn" data-tab="model">模型</button>
+    <button class="tab-btn" data-tab="config">配置</button>
+    <button class="tab-btn" data-tab="usage">用量</button>
+    <button class="tab-btn" data-tab="logs">日志</button>
+  </nav>
+  <div class="conn" id="conn">连接中…</div>
+  <div class="topbar-actions">
+    <button type="button" class="ghost" id="theme-toggle" title="切换深色 / 浅色主题">◐</button>
+  </div>
+</header>
+
+<main>
+  <!-- ══════════ 概览 ══════════ -->
+  <section class="panel active" id="panel-overview">
+    <div class="kpi-row" id="overview-cards"></div>
+
+    <div class="section-head">
+      <h2>上游</h2>
+      <div class="section-actions">
+        <button type="button" class="ghost" id="probe-health">连通性自检</button>
+        <span class="hint" id="health-hint"></span>
+      </div>
+    </div>
+    <div id="health-results" class="bars" hidden></div>
+    <div class="table-wrap">
+      <table id="upstream-table" class="sortable-table">
+        <thead>
+          <tr>
+            <th class="sortable" data-up-sort="name">名称</th>
+            <th class="sortable" data-up-sort="protocol">协议</th>
+            <th>Base URL</th>
+            <th class="num sortable" data-up-sort="models">模型数</th>
+            <th class="sortable" data-up-sort="plan">套餐</th>
+            <th class="sortable" data-up-sort="key">密钥</th>
+            <th class="sortable" data-up-sort="default">默认</th>
+            <th>测试</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="hint" id="upstream-table-hint">点表头切换排序 · 点任意行展开上游详情</div>
+
+    <div class="section-head">
+      <h2>代理接入信息</h2>
+      <button type="button" class="ghost" id="copy-endpoint">复制地址</button>
+    </div>
+    <div class="callouts" id="endpoint-callouts"></div>
+  </section>
+
+  <!-- ══════════ 模型 ══════════ -->
+  <section class="panel" id="panel-model">
+    <div class="toolbar">
+      <input type="search" id="model-search" class="filter-input" placeholder="搜索模型 / 别名 / 上游">
+      <select id="model-upstream" class="filter-select"></select>
+      <button class="ghost" id="refresh-catalog">刷新</button>
+      <span class="hint" id="model-hint"></span>
+    </div>
+
+    <!-- 与用量页同构的服务端快捷筛选：先筛后分页，total 才不会自相矛盾 -->
+    <div class="chips" id="model-only-chips">
+      <span class="chip-label">单价</span>
+      <button class="chip active" data-price="">全部</button>
+      <button class="chip" data-price="missing">未配置</button>
+      <button class="chip" data-price="priced">已配置</button>
+      <span class="chip-label">来源</span>
+      <button class="chip active" data-source="">全部</button>
+      <button class="chip" data-source="explicit">白名单</button>
+      <button class="chip" data-source="fetched">目录拉取</button>
+      <button class="chip" data-source="catalog">套餐门槛</button>
+    </div>
+
+    <div class="kpi-row" id="model-kpis"></div>
+
+    <div class="box">
+      <div class="section-head">
+        <h2>模型清单</h2>
+        <span class="hint" id="model-meta"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="model-table" class="sortable-table">
+          <thead>
+            <tr>
+              <th class="sortable" data-model-sort="model">模型</th>
+              <th class="sortable" data-model-sort="upstream">上游</th>
+              <th>协议</th><th>来源</th>
+              <th>别名</th>
+              <th class="sortable" data-model-sort="plan">套餐门槛</th>
+              <th class="sortable" data-model-sort="price">单价（/百万）</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="model-table-hint">点表头切换排序 · 单价为空表示未配置</div>
+      <div class="pager">
+        <button class="ghost" id="model-first" title="首页">« 首页</button>
+        <button class="ghost" id="model-prev">上一页</button>
+        <span id="model-page-info">—</span>
+        <label class="inline-field">跳至
+          <input type="number" id="model-jump" class="filter-input num-input" min="1" value="1">
+        </label>
+        <button class="ghost" id="model-next">下一页</button>
+        <button class="ghost" id="model-last" title="末页">末页 »</button>
+        <select id="model-page-size" class="filter-select" title="每页条数">
+          <option value="25" selected>25 条/页</option>
+          <option value="50">50 条/页</option>
+          <option value="100">100 条/页</option>
+        </select>
+      </div>
+    </div>
+
+    <details class="box fold" id="pricing-fold" data-fold="pricing">
+      <summary>
+        <span class="fold-title">单价表（费用估算）</span>
+        <span class="hint">单位：金额 / 百万 token；未配置时费用显示「未配置」，不影响代理转发</span>
+      </summary>
+      <div class="grid">
+        <label>币种
+          <input id="pricing-currency" type="text" placeholder="CNY">
+        </label>
+        <label class="check"><input type="checkbox" id="pricing-recompute"> 保存后重算历史费用</label>
+      </div>
+      <label class="span-2">单价表（JSON，含 default 与 rules）
+        <textarea id="pricing-json" rows="10" spellcheck="false"
+          placeholder='{"currency":"CNY","default":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"rules":{"go/glm-5.3-flash":{"input":0.6,"output":2.4}}}'></textarea>
+      </label>
+      <div class="actions">
+        <button type="button" class="primary" id="save-pricing">保存单价表</button>
+        <span class="hint" id="pricing-hint"></span>
+      </div>
+    </details>
+  </section>
+
+  <!-- ══════════ 配置 ══════════ -->
+  <section class="panel" id="panel-config">
+    <form id="config-form" autocomplete="off">
+      <!-- 未保存提示 + 字段级校验汇总：保存前就能看到会拦下什么 -->
+      <div class="dirty-bar" id="config-dirty-bar" hidden>
+        <span class="dirty-dot"></span>
+        <span id="config-dirty-text">有未保存的改动</span>
+        <button type="button" class="ghost tiny" id="config-discard">放弃改动</button>
+      </div>
+      <div class="issues" id="config-issues" hidden></div>
+
+      <details class="box fold" id="config-group-service" data-fold="config-service" open>
+      <summary title="监听地址、端口、默认模型、限额与访问日志">
+        <span class="fold-title">服务与全局</span>
+        <span class="svc-strip">
+          <span class="svc-chip" title="面板地址"><b>面板</b><code id="svc-url">—</code></span>
+          <span class="svc-chip" title="进程实际监听的端口"><b>当前端口</b><span id="svc-cur-port">—</span></span>
+          <span class="svc-chip" title="客户端不指定模型时使用"><b>默认模型</b><span id="svc-cur-model">—</span></span>
+          <span class="svc-chip clickable" id="svc-max-chip" title="点击跳到「最大输出 token」输入框"><b>上限</b><span id="svc-cur-max">—</span></span>
+          <span class="svc-chip" title="请求超时秒数"><b>超时</b><span id="svc-cur-timeout">—</span></span>
+        </span>
+        <span class="svc-actions">
+          <button type="button" class="ghost tiny" id="svc-copy-url">复制面板</button>
+          <button type="button" class="ghost tiny" id="svc-open-url">打开</button>
+          <button type="button" class="ghost tiny" id="svc-reset">恢复默认</button>
+        </span>
+      </summary>
+
+      <div class="grid svc-grid">
+        <label title="默认仅本机可访问；填 0.0.0.0 会暴露到局域网（保存时会提醒）">监听地址
+          <input name="host" type="text" placeholder="127.0.0.1">
+        </label>
+        <label title="改端口需重启进程才生效；当前运行端口见上方胶囊">端口
+          <input name="port" type="number" min="1" max="65535">
+        </label>
+        <label title="客户端不指定模型时使用；候选项来自配置白名单与各上游声明">默认模型
+          <input name="defaultModel" type="text" list="svc-model-options">
+          <datalist id="svc-model-options"></datalist>
+        </label>
+        <label title="可自填任意值：300000 / 30万 / 384K / 1M（K、M 按 1024 算）；留空按 8192。该值是向上游请求时的默认上限；DeepSeek 官方上限 384K（393,216），超出会被上游拒绝或截断。">最大输出 token（可自填）
+          <input name="maxTokens" type="text" inputmode="numeric" list="max-tokens-options" placeholder="384K / 30万 / 300000">
+          <datalist id="max-tokens-options">
+            <option value="8192">8192（默认）</option>
+            <option value="65536">65536 = 64K</option>
+            <option value="131072">131072 = 128K</option>
+            <option value="393216">393216 = 384K（DeepSeek 官方上限）</option>
+          </datalist>
+        </label>
+        <label title="长流式请求建议 ≥ 300 秒">请求超时（秒）
+          <input name="timeoutSeconds" type="number" min="1">
+        </label>
+        <label title="0 = 每次都向上游拉取；默认 300 秒">清单缓存（秒）
+          <input name="modelsCacheSeconds" type="number" min="0">
+        </label>
+        <label title="0 = 永久保留；用量页「立即清理」也用这个值">数据保留（天）
+          <input name="retentionDays" type="number" min="0">
+        </label>
+      </div>
+      <div class="hint" id="svc-restart-hint"></div>
+
+      <div class="section-head"><h2>全局</h2></div>
+      <div class="grid grid-2">
+        <label>对外模型清单（留空 = 合并各上游声明；精确白名单）
+          <textarea name="models" rows="3" placeholder="每行一个模型名"></textarea>
+        </label>
+        <label>别名（每行「别名 = 真实模型」，留空 = 无）
+          <textarea name="aliases" rows="3" placeholder="fast = deepseek-flash"></textarea>
+        </label>
+      </div>
+      <div class="grid grid-2">
+        <label class="check"><input type="checkbox" name="accessLog"> 访问日志</label>
+        <label class="check"><input type="checkbox" name="thinkingPassthrough">
+          thinking 回传（多轮会话必需）</label>
+      </div>
+
+      </details>
+
+      <details class="box fold" id="config-group-upstreams" data-fold="config-upstreams" open>
+      <summary>
+        <span class="fold-title">上游</span>
+        <span class="hint">每个上游需要：名称、Base URL、至少一个模型（或开启自动拉取）</span>
+        <button type="button" class="ghost" id="add-upstream">＋ 新增上游</button>
+      </summary>
+      <div class="table-wrap">
+        <table id="upstream-cfg-table" class="sortable-table">
+          <thead><tr>
+            <th>名称</th><th>协议</th><th>Base URL</th><th class="num">模型</th>
+            <th>密钥</th><th>默认</th><th class="num">操作</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="upstream-cfg-hint">点击任意行展开详情 ·「编辑」在弹窗里改字段</div>
+      <div id="upstream-editor" hidden></div>
+      </details>
+
+      <div class="actions sticky-actions">
+        <button type="submit" class="primary" id="save-config">保存配置</button>
+        <button type="button" class="ghost" id="reload-config">重新载入</button>
+        <span class="hint" id="config-hint"></span>
+      </div>
+    </form>
+  </section>
+
+  <!-- ══════════ 用量 ══════════ -->
+  <section class="panel" id="panel-usage">
+    <div class="toolbar">
+      <div class="seg" id="range-seg">
+        <button data-range="1h">1 小时</button>
+        <button data-range="24h" class="active">24 小时</button>
+        <button data-range="7d">7 天</button>
+        <button data-range="30d">30 天</button>
+        <button data-range="all">全部</button>
+      </div>
+      <div class="seg" id="group-seg">
+        <button data-group="day" class="active">按天</button>
+        <button data-group="model">按模型</button>
+        <button data-group="upstream">按上游</button>
+        <button data-group="session">按会话</button>
+      </div>
+      <label class="inline-field">自动刷新
+        <select id="usage-auto" class="filter-select" title="自动刷新间隔（不影响代理，仅重新拉取统计）">
+          <option value="0">关闭</option>
+          <option value="10">10 秒</option>
+          <option value="30" selected>30 秒</option>
+          <option value="60">1 分钟</option>
+        </select>
+      </label>
+      <button class="ghost" id="refresh-usage">刷新</button>
+      <button class="ghost" id="export-usage-csv" title="导出当前筛选与区间的明细">导出 CSV</button>
+      <button class="ghost" id="export-usage-json" title="导出 JSON（含筛选条件与截断标记）">导出 JSON</button>
+      <button class="ghost" id="clear-usage" title="清空当前区间的用量明细">清空</button>
+      <span class="hint" id="usage-fresh">—</span>
+    </div>
+
+    <div class="kpi-row" id="usage-kpis"></div>
+
+    <!-- Token 构成 + 耗时分布：构成比与分位数一眼可见 -->
+    <div class="split-2">
+      <div class="box">
+        <div class="box-head"><h2>Token 构成</h2><span class="hint" id="mix-hint"></span></div>
+        <div class="bar-seg" id="token-mix">
+          <i class="in" style="width:0%"></i><i class="out" style="width:0%"></i><i class="cache" style="width:0%"></i>
+        </div>
+        <div class="legend">
+          <div class="legend-row"><div class="legend-head">
+            <span class="label"><i class="dot in"></i> 输入</span><span class="val" id="mix-in">—</span></div></div>
+          <div class="legend-row"><div class="legend-head">
+            <span class="label"><i class="dot out"></i> 输出</span><span class="val" id="mix-out">—</span></div></div>
+          <div class="legend-row"><div class="legend-head">
+            <span class="label"><i class="dot cache"></i> 缓存命中</span><span class="val" id="mix-cache">—</span><span class="badge" id="mix-cache-rate" title="缓存命中率 = 命中输入 / 总输入">—</span></div></div>
+        </div>
+      </div>
+      <div class="box">
+        <div class="box-head"><h2>耗时分布</h2><span class="hint">本地口径：均值 / P50 / P95 / 最长</span></div>
+        <div class="legend" id="latency-rows"></div>
+      </div>
+    </div>
+
+    <!-- 趋势 / 占比已上移到「模型用量」之前：先看走势，再看分布与明细 -->
+    <div class="split-2" id="usage-trend-row">
+      <div class="box">
+        <div class="box-head">
+          <h2 id="trend-title">趋势</h2>
+          <div class="seg small" id="trend-metric-seg">
+            <button data-metric="total_tokens" class="active">总 token</button>
+            <button data-metric="requests">请求数</button>
+            <button data-metric="errors">错误</button>
+          </div>
+        </div>
+        <div id="usage-trend" class="chart"></div>
+      </div>
+      <div class="box">
+        <div class="box-head">
+          <h2>占比分布</h2>
+          <div class="seg small" id="pie-seg">
+            <button data-pie="model" class="active">按模型</button>
+            <button data-pie="upstream">按上游</button>
+          </div>
+        </div>
+        <div id="usage-pie" class="chart legend"></div>
+      </div>
+    </div>
+
+    <div class="box">
+      <div class="box-head">
+        <h2>模型用量</h2>
+        <div class="section-actions">
+          <input type="search" id="model-usage-search" class="filter-input" placeholder="搜索模型">
+          <label class="inline-field"><input type="checkbox" id="model-usage-used"> 仅看用过的</label>
+          <select id="model-usage-sort" class="filter-select">
+            <option value="total_tokens">按总 token</option>
+            <option value="requests">按请求数</option>
+            <option value="cost">按费用</option>
+            <option value="p95_duration_ms">按 P95 耗时</option>
+            <option value="avg_ttft_ms">按 TTFT</option>
+            <option value="model">按名称</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="model-usage-table">
+          <thead><tr>
+            <th class="sortable" data-key="model">模型</th>
+            <th class="num sortable" data-key="requests">请求</th>
+            <th class="num sortable" data-key="prompt_tokens">输入</th>
+            <th class="num sortable" data-key="completion_tokens">输出</th>
+            <th class="num sortable" data-key="total_tokens">总 token</th>
+            <th class="num sortable" data-key="cache_read_tokens">缓存</th>
+            <th class="num sortable" data-key="cache_hit_rate">命中率</th>
+            <th class="num sortable" data-key="cost">费用</th>
+            <th class="num sortable" data-key="success_rate">成功率</th>
+            <th class="num sortable" data-key="avg_duration_ms">均耗</th>
+            <th class="num sortable" data-key="p95_duration_ms">P95</th>
+            <th class="num sortable" data-key="avg_ttft_ms">TTFT</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="model-usage-hint"></div>
+    </div>
+
+    <!-- 明细之后不再重复放走势图；数据保留收在下方折叠区 -->
+
+    <div class="box">
+      <div class="section-head">
+        <h2>明细</h2>
+        <div class="section-actions">
+          <select id="filter-upstream" class="filter-select"></select>
+          <select id="filter-model" class="filter-select"></select>
+          <select id="filter-session" class="filter-select"></select>
+          <select id="page-size" class="filter-select" title="每页条数">
+            <option value="25">25 条/页</option>
+            <option value="50" selected>50 条/页</option>
+            <option value="100">100 条/页</option>
+            <option value="200">200 条/页</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- 快捷筛选：把「异常请求」变成一次点击，而不是逐页翻找 -->
+      <div class="chips" id="only-chips">
+        <button class="chip active" data-only="">全部</button>
+        <button class="chip" data-only="error">仅错误</button>
+        <button class="chip" data-only="slow">仅慢请求 ≥10s</button>
+        <button class="chip" data-only="ttft">有首 token</button>
+        <button class="chip" data-only="cache">命中缓存</button>
+        <button class="chip" data-only="truncated">截断</button>
+        <button class="chip" data-only="paused">未续完</button>
+      </div>
+
+      <div class="table-wrap">
+        <table id="usage-table" class="sortable-table">
+          <thead>
+            <tr>
+              <th class="sortable" data-sort="ts">时间</th>
+              <th>模型</th><th>上游</th>
+              <th class="num sortable" data-sort="prompt_tokens">入 / 出</th>
+              <th class="num sortable" data-sort="cache_read_tokens">缓存</th>
+              <th class="num sortable" data-sort="cost">费用</th>
+              <th class="num sortable" data-sort="duration_ms">耗时</th>
+              <th class="num sortable" data-sort="ttft_ms">TTFT</th>
+              <th class="sortable" data-sort="status">状态</th>
+              <th>会话</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="usage-table-hint">点击任意行展开详情 · 点表头切换排序</div>
+      <div class="pager">
+        <button class="ghost" id="first-page" title="首页">« 首页</button>
+        <button class="ghost" id="prev-page">上一页</button>
+        <span id="page-info">—</span>
+        <label class="inline-field">跳至
+          <input type="number" id="page-jump" class="filter-input num-input" min="1" value="1">
+        </label>
+        <button class="ghost" id="next-page">下一页</button>
+        <button class="ghost" id="last-page" title="末页">末页 »</button>
+      </div>
+    </div>
+
+    <details class="box fold" data-fold="usage-retention">
+      <summary>
+        <span class="fold-title">数据保留与清理</span>
+        <span class="hint" id="retention-hint">0 = 永久保留；清理只删超期明细，不影响代理</span>
+      </summary>
+      <div class="section-actions">
+        <label class="inline-field">保留天数
+          <input type="number" id="retention-days" min="0" class="filter-input num-input">
+        </label>
+        <button class="ghost" id="apply-retention">立即清理</button>
+      </div>
+    </details>
+  </section>
+
+  <!-- ══════════ 日志 ══════════ -->
+  <section class="panel" id="panel-logs">
+    <div class="toolbar">
+      <div class="seg" id="log-seg">
+        <button data-level="all" class="active">全部</button>
+        <button data-level="error">只看错误</button>
+        <button data-level="warn">注意/截断</button>
+      </div>
+      <input type="search" id="log-search" class="filter-input" placeholder="搜索关键字（命中会高亮）">
+      <label class="inline-field">行数
+        <select id="log-lines" class="filter-select" title="最多拉取多少行（从文件尾部起算）">
+          <option value="200">200</option>
+          <option value="400" selected>400</option>
+          <option value="800">800</option>
+          <option value="2000">2000</option>
+        </select>
+      </label>
+      <label class="inline-field">自动刷新
+        <select id="log-auto" class="filter-select" title="仅重读日志文件，不影响代理">
+          <option value="0">关闭</option>
+          <option value="4" selected>4 秒</option>
+          <option value="10">10 秒</option>
+          <option value="30">30 秒</option>
+        </select>
+      </label>
+      <button class="ghost" id="refresh-logs">刷新</button>
+      <button class="ghost" id="log-copy" title="复制当前视图的全部行">复制</button>
+      <button class="ghost" id="log-bottom" title="滚到最新一行">跳到末尾</button>
+      <span class="hint" id="log-fresh">—</span>
+      <button class="ghost danger-ghost" id="clear-logs">清空日志</button>
+    </div>
+    <div class="box">
+      <div class="box-head">
+        <h2>运行日志</h2>
+        <span class="hint" id="log-meta"></span>
+      </div>
+      <pre id="log-viewer" class="log-viewer"></pre>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+<div id="modal-root" class="modal-root" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

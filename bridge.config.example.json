@@ -1,4 +1,6 @@
 {
+  "_doc": "Model-Gate 配置模板。复制为 bridge.config.json 后按需修改；切勿把明文 apiKey 写进本文件——请用 apiKeyEnv 或 apiKeyFile 引用。",
+  "_keys": "密钥三选一：apiKey（明文，不推荐）/ apiKeyEnv（环境变量名，密钥放 ~/.jcode/.env）/ apiKeyFile（本地 JSON 的 apiKey 字段，如 ~/.commandcode/auth.json）。工具只读不写这些文件。",
   "port": 8900,
   "host": "127.0.0.1",
   "defaultModel": "deepseek-flash",
@@ -11,15 +13,18 @@
   "timeoutSeconds": 600,
   "accessLog": true,
   "modelsCacheSeconds": 300,
+  "aliases": {},
   "thinking": {
     "passthrough": true,
     "cacheSize": 500
+  },
+  "tools": {
+    "downgradeForcedChoice": true
   },
   "upstreams": {
     "cch": {
       "protocol": "anthropic",
       "baseUrl": "http://127.0.0.1:15721",
-      "apiKey": "",
       "anthropicVersion": "2023-06-01",
       "default": true,
       "fetchModels": false,
@@ -37,43 +42,18 @@
       "sessionHeader": true,
       "models": [
         "glm-5.3-flash",
-        "glm-5.3",
-        "glm-5.2",
-        "glm-5.1",
-        "kimi-k3",
-        "kimi-k2.7-code",
-        "kimi-k2.6",
         "deepseek-v4.1-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-flash-vision-exp",
-        "deepseek-v4-pro",
-        "deepseek-flash",
-        "minimax-m3",
-        "minimax-m2.5",
-        "qwen3.8-max",
-        "qwen3.8-flash",
-        "qwen3.7-max",
-        "qwen3.7-plus",
-        "qwen3.6-plus",
-        "mimo-v2.5-pro",
-        "mimo-v2.5",
-        "longcat-2.0",
-        "hy4-preview",
-        "hy3",
-        "omen-alpha"
+        "mimo-v2.6-flash",
+        "longcat-2.5-preview-free",
+        "step-5-preview-free"
       ]
     },
     "zen": {
       "protocol": "openai",
       "baseUrl": "https://opencode.ai/zen/v1",
-      "apiKey": "",
       "sessionHeader": true,
       "models": [
-        "mimo-v2.5-free",
-        "ling-3.0-flash-fin-free",
-        "nemotron-3-ultra-free",
-        "nemotron-3.5-lightning-free",
-        "big-pickle"
+        "space-bunny-free"
       ]
     },
     "commandcode": {
