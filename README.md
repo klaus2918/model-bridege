@@ -664,46 +664,43 @@ CommandCode 的思考内容由它自己的事件流直接透出（不依赖这�
 
 ---
 
-## 十四、版本与发布
+## 十四、版本与打包
 
-版本号唯一来源是 `package.json` 的 `version`，发布口只留 tag，两者必须一致。
+版本号**唯一来源**：`modelgate/__init__.py` 的 `__version__`（面板资产戳、`/ui/` 注入的 `app.js?v=` 都读它）。
 
-### 发布前要同步的位置
-
-| 位置 | 内容 |
-|------|------|
-| `package.json` → `version` | 本次版本号（如 `1.1.0`） |
-| `changelog/v<版本>.json` | 发行说明源：`title` / `date` / `highlights` / `improvements` / `fixes`（写给用户看效果，纯内部改动不列） |
-| `changelog/index.json` | 在 `entries` 里补一条索引（版本、日期、标题、文件名） |
-
-缺 `changelog/v<版本>.json` 时流水线第一步就失败，**不允许**退化成自动提交清单。
-
-### 怎么发
+### 打包
 
 ```bat
-git tag -a v1.1.0 -m "v1.1.0"    :: 注释标签，指向当前提交
-git push origin v1.1.0           :: 推送 tag 即触发发布
+build.bat
 ```
 
-### 流水线做什么（`.github/workflows/release.yml`）
+它按顺序做：探针解释器 → 生成图标 → **跑测试（失败即停）** → PyInstaller onefile → Inno Setup（本机无 `iscc` 时自动跳过）→ 汇总。
 
-1. **建 draft release**：校验 tag 与 `package.json` 版本一致 → 渲染发行说明 → 建 draft（或更新既有 draft）；已公开的 release 拒绝覆盖
-2. **门禁 + 打包 + 自检**：敏感信息扫描（工作区 + 全历史对象）→ 语法自检 → 按显式必达清单打包 → 产物自检（条目集合、解包后语法、真实启动 smoke）→ 生成 `SHA256SUMS`
-3. **收尾**：校验资产集合齐全才上传 → 幂等追加「资产与校验方式」说明 → 转 public → 反向拉取已公开产物自检
+仓库里**只保留一份**打包定义 `ModelGate.spec`（产物 `dist\Model-Gate.exe`）。v2.3–v2.18 的逐版本 spec 已删除——它们只是同名的拷贝。
 
-任一环节失败，release **停在 draft**，用户看不到半成品。
+### 产出带版本号的产物（升级时用）
+
+正在运行的 exe 文件被系统锁定，PyInstaller 无法覆盖。要与在跑实例并存：
+
+```bat
+copy ModelGate.spec ModelGate.v2.19.spec
+:: 把 spec 里的 name="Model-Gate" 改成 name="Model-Gate-v2.19"
+py -3 -m PyInstaller --noconfirm --clean ModelGate.v2.19.spec
+:: 验证通过、切换完成后删掉这份临时 spec
+```
+
+### 升级（不停机）
+
+1. 新 exe 在**空闲端口 + 独立库**先跑一遍，或直接黑盒验证产物（`scripts/verify_v217_exe.py` 的形态）
+2. 按 **PID** 停旧实例（端口占用者），**不要按进程名**
+3. 用同一 `--config` / `--db` 起新实例——`bridge.config.json` 与 `data/` 全程不动，客户端 `base_url` 无需修改
+4. 实测停机 2.6–3.6 秒
 
 ### 产物
 
-`dist/model-bridge-v<版本>.zip` ＋ `SHA256SUMS`。zip 内是显式列出的产品文件（`model-bridge.js`、`bridge.config.json`、`start-bridge.cmd`、`restart-bridge.cmd`、`test-bridge.mjs`、`probe-upstream.mjs`、`README.md`、`.gitignore`），不含 `.git` / `dist` / 未跟踪文件；打包时间戳固定，**同一份源码两次打包得到同一 SHA256**。
-
-### 本地复核与重跑
-
-```bat
-bash scripts/build-package.sh --list              :: 只看将入包的文件清单
-bash scripts/build-package.sh                     :: 本地打包
-bash scripts/verify-release.sh v1.1.0             :: 独立下载已发布资产逐项核对
-bash scripts/retrigger-release.sh --dry-run v1.1.0   :: 只查重触发前提，不动任何东西
-bash scripts/retrigger-release.sh --at HEAD v1.1.0   :: 删除并按 HEAD 重建同名 tag 后重推
-```
+| 产物 | 说明 |
+|---|---|
+| `dist\Model-Gate.exe` | 绿色版单文件（GUI + `--no-gui` 两种模式） |
+| `dist\Model-Gate-v*.exe` | 升级期间的并存实例（验证完可删） |
+| `dist\bridge.config.json` + `dist\data\` | 运行时配置与库（**不入库**） |
 

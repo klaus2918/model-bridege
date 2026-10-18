@@ -1,0 +1,1073 @@
+{
+ "meta": {
+  "title": "MODEL-GATE EXE · LIVE",
+  "lang": "zh"
+ },
+ "canvas": {
+  "preset": "4:5",
+  "duration": 30,
+  "fps": 30,
+  "preroll": 12
+ },
+ "theme": {
+  "preset": "terminal-dark",
+  "fontSize": 21,
+  "lineHeight": 30,
+  "colors": {
+   "mute": "#aab1c0",
+   "rd": "#f07178"
+  }
+ },
+ "machines": {
+  "reqs": {
+   "type": "counter",
+   "start": 1286,
+   "rate": 7,
+   "format": "comma"
+  },
+  "tokens": {
+   "type": "counter",
+   "start": 128400,
+   "rate": 730,
+   "format": "comma"
+  },
+  "rail": {
+   "type": "triggers",
+   "color": "pu",
+   "period": 4.5,
+   "on": 3.0,
+   "t0": -1.6,
+   "callsStart": 1,
+   "tokens": {
+    "start": 129,
+    "step": 93,
+    "unit": "k"
+   },
+   "items": [
+    {
+     "name": "端口被占用",
+     "adv": [
+      "» +1..+20 降级",
+      "» 记录 lastPort"
+     ]
+    },
+    {
+     "name": "上游 5xx/429",
+     "adv": [
+      "» 未写字节才切换",
+      "» 候补上限 2"
+     ]
+    },
+    {
+     "name": "密钥过期",
+     "adv": [
+      "» 面板粘贴新 key",
+      "» 重新载入生效"
+     ]
+    },
+    {
+     "name": "保留策略",
+     "adv": [
+      "» 启动即跑一次",
+      "» 之后每 24h"
+     ]
+    }
+   ],
+   "onText": "介入中",
+   "offText": "待命",
+   "log": {
+    "who": "运行态回退",
+    "c": "pu",
+    "start": {
+     "m": "{name} · 唤起"
+    },
+    "end": {
+     "m": "{name} · 完成，回到待命"
+    }
+   }
+  },
+  "beat": {
+   "type": "cycle",
+   "period": 3.0,
+   "t0": 0.0,
+   "values": [
+    {
+     "t": "route",
+     "m": "deepseek-flash → go:deepseek-v4.1-flash"
+    },
+    {
+     "t": "stream",
+     "m": "200 · 812ms · ttft=214ms"
+    },
+    {
+     "t": "usage",
+     "m": "prompt=41 completion=49"
+    },
+    {
+     "t": "cache",
+     "m": "模型目录刷新 · 43 models"
+    },
+    {
+     "t": "retention",
+     "m": "保留检查 · 无需清理"
+    }
+   ],
+   "log": {
+    "who": "proxy",
+    "c": "gr"
+   }
+  },
+  "http": {
+   "type": "cycle",
+   "period": 2.2,
+   "t0": 0.4,
+   "values": [
+    {
+     "t": "GET",
+     "m": "/health 200"
+    },
+    {
+     "t": "GET",
+     "m": "/ui/ 200"
+    },
+    {
+     "t": "POST",
+     "m": "/v1/chat/completions 200"
+    },
+    {
+     "t": "GET",
+     "m": "/api/usage/summary 200"
+    }
+   ],
+   "log": {
+    "who": "http",
+    "c": "cy"
+   }
+  }
+ },
+ "elements": [
+  {
+   "type": "box",
+   "x": 40,
+   "y": 146,
+   "w": 324,
+   "h": 1121,
+   "color": "pu",
+   "pad": [
+    13,
+    7,
+    7
+   ],
+   "lines": [
+    {
+     "t": "运行态回退",
+     "c": "pu",
+     "b": 1
+    },
+    {
+     "t": "由代理自动触发",
+     "c": "pu"
+    },
+    "",
+    {
+     "t": "最近建议：",
+     "c": "dim",
+     "align": "left",
+     "indent": 8
+    },
+    {
+     "runs": [
+      {
+       "v": "rail.adv0",
+       "c": "pu",
+       "b": 1
+      }
+     ],
+     "align": "left",
+     "indent": 8
+    },
+    {
+     "runs": [
+      {
+       "v": "rail.adv1",
+       "c": "pu",
+       "b": 1
+      }
+     ],
+     "align": "left",
+     "indent": 8
+    },
+    {
+     "items": [
+      {
+       "w": 182,
+       "runs": [
+        {
+         "t": "调用",
+         "c": "dim"
+        }
+       ]
+      },
+      {
+       "w": 91,
+       "align": "right",
+       "runs": [
+        {
+         "v": "rail.calls",
+         "c": "pu",
+         "b": 1
+        }
+       ]
+      }
+     ],
+     "indent": 8
+    },
+    "",
+    "",
+    "",
+    "",
+    "",
+    {
+     "trigger": [
+      "rail",
+      0
+     ]
+    },
+    "",
+    "",
+    "",
+    "",
+    "",
+    {
+     "trigger": [
+      "rail",
+      1
+     ]
+    },
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    {
+     "trigger": [
+      "rail",
+      2
+     ]
+    },
+    {
+     "trigger": [
+      "rail",
+      3
+     ]
+    }
+   ]
+  },
+  {
+   "type": "text",
+   "x": 0,
+   "w": 1200,
+   "y": 84,
+   "align": "center",
+   "size": 24,
+   "c": "wh",
+   "b": 1,
+   "t": "MODEL-GATE EXE · LIVE"
+  },
+  {
+   "type": "rule",
+   "x": 34,
+   "y": 112,
+   "w": 1132
+  },
+  {
+   "type": "text",
+   "x": 34,
+   "w": 1132,
+   "y": 1452,
+   "runs": [
+    {
+     "t": "请求 ",
+     "c": "dim"
+    },
+    {
+     "t": "[",
+     "c": "gr",
+     "b": 1
+    },
+    {
+     "v": "reqs",
+     "c": "gr",
+     "b": 1
+    },
+    {
+     "t": "]",
+     "c": "gr",
+     "b": 1
+    },
+    {
+     "t": "   tokens ",
+     "c": "dim"
+    },
+    {
+     "t": "[",
+     "c": "gr",
+     "b": 1
+    },
+    {
+     "v": "tokens",
+     "c": "gr",
+     "b": 1
+    },
+    {
+     "t": "]",
+     "c": "gr",
+     "b": 1
+    }
+   ]
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     261
+    ],
+    [
+     784,
+     317
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.7,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     434
+    ],
+    [
+     784,
+     489
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 1.8,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     606
+    ],
+    [
+     784,
+     662
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.1,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     749
+    ],
+    [
+     784,
+     778
+    ],
+    [
+     526,
+     778
+    ],
+    [
+     526,
+     805
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.4,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     749
+    ],
+    [
+     784,
+     805
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.7,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     749
+    ],
+    [
+     784,
+     778
+    ],
+    [
+     1042,
+     778
+    ],
+    [
+     1042,
+     805
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 1.8,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     526,
+     952
+    ],
+    [
+     526,
+     1007
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.1,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     952
+    ],
+    [
+     784,
+     1007
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.4,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     1042,
+     952
+    ],
+    [
+     1042,
+     1007
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.7,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     526,
+     1094
+    ],
+    [
+     526,
+     1150
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 3.0,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     784,
+     1094
+    ],
+    [
+     784,
+     1150
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.1,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "path",
+   "points": [
+    [
+     1042,
+     1094
+    ],
+    [
+     1042,
+     1150
+    ]
+   ],
+   "color": "line",
+   "r": 0,
+   "width": 2,
+   "flow": {
+    "period": 2.4,
+    "offsets": [
+     0,
+     0.9
+    ],
+    "color": "bl"
+   }
+  },
+  {
+   "type": "box",
+   "x": 596,
+   "y": 146,
+   "w": 376,
+   "h": 115,
+   "color": "cy",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "Agent 客户端",
+     "c": "cy",
+     "b": 1
+    },
+    {
+     "t": "opencode · wenzflow · SDK",
+     "c": "mute"
+    },
+    {
+     "t": "→ 127.0.0.1:8900/v1",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 589,
+   "y": 319,
+   "w": 391,
+   "h": 115,
+   "color": "gr",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "Model-Gate.exe · 启动/桌面壳",
+     "c": "gr",
+     "b": 1
+    },
+    {
+     "t": "单实例互斥体 · 崩溃兜底",
+     "c": "mute"
+    },
+    {
+     "t": "pywebview · pystray 托盘",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 596,
+   "y": 491,
+   "w": 376,
+   "h": 115,
+   "color": "pu",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "本地 HTTP 服务 :8900",
+     "c": "pu",
+     "b": 1
+    },
+    {
+     "t": "数据 /v1/* · 控制 /api/*",
+     "c": "mute"
+    },
+    {
+     "t": "静态 /ui/* · 端口 +1..20",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 596,
+   "y": 664,
+   "w": 376,
+   "h": 85,
+   "color": "ye",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "Bridge 代理内核",
+     "c": "ye",
+     "b": 1
+    },
+    {
+     "t": "净化·路由·切换≤2·TTFT",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 408,
+   "y": 807,
+   "w": 236,
+   "h": 145,
+   "color": "bl",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "anthropic 适配",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "→ /v1/messages",
+     "c": "mute"
+    },
+    {
+     "t": "SSE·thinking 回",
+     "c": "mute"
+    },
+    {
+     "t": "传",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 666,
+   "y": 807,
+   "w": 236,
+   "h": 145,
+   "color": "gr",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "openai 适配",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "透传 + 会话头",
+     "c": "mute"
+    },
+    {
+     "t": "usage 抓取",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 924,
+   "y": 807,
+   "w": 236,
+   "h": 145,
+   "color": "pu",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "commandcode 适配",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "NDJSON→SSE",
+     "c": "mute"
+    },
+    {
+     "t": "pause≤5·套餐过滤",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 408,
+   "y": 1009,
+   "w": 236,
+   "h": 85,
+   "color": "ye",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "SQLite 明细",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "WAL·ttft/cost",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 666,
+   "y": 1009,
+   "w": 236,
+   "h": 85,
+   "color": "bl",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "配置与密钥",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "文件优先·仅内存",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 924,
+   "y": 1009,
+   "w": 236,
+   "h": 85,
+   "color": "gr",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "日志",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "log 5MB×3",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 408,
+   "y": 1152,
+   "w": 236,
+   "h": 115,
+   "color": "pu",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "cch · 默认",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "127.0.0.1:15721",
+     "c": "mute"
+    },
+    {
+     "t": "cc-switch→DS",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 666,
+   "y": 1152,
+   "w": 236,
+   "h": 115,
+   "color": "ye",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "go / zen",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "opencode.ai",
+     "c": "mute"
+    },
+    {
+     "t": "订阅 / 免费",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "box",
+   "x": 924,
+   "y": 1152,
+   "w": 236,
+   "h": 115,
+   "color": "bl",
+   "pad": [
+    13,
+    14
+   ],
+   "lines": [
+    {
+     "t": "commandcode",
+     "c": "fg",
+     "b": 1
+    },
+    {
+     "t": "api.commandcode",
+     "c": "mute"
+    },
+    {
+     "t": "NDJSON·≤5",
+     "c": "mute"
+    }
+   ]
+  },
+  {
+   "type": "tarrow",
+   "machine": "rail",
+   "i": 0,
+   "from": [
+    368,
+    534
+   ],
+   "to": [
+    592,
+    534
+   ]
+  },
+  {
+   "type": "tarrow",
+   "machine": "rail",
+   "i": 1,
+   "from": [
+    368,
+    714
+   ],
+   "to": [
+    592,
+    714
+   ]
+  },
+  {
+   "type": "tarrow",
+   "machine": "rail",
+   "i": 2,
+   "from": [
+    368,
+    1044
+   ],
+   "to": [
+    404,
+    1044
+   ]
+  },
+  {
+   "type": "tarrow",
+   "machine": "rail",
+   "i": 3,
+   "from": [
+    368,
+    1074
+   ],
+   "to": [
+    404,
+    1074
+   ]
+  },
+  {
+   "type": "log",
+   "x": 40,
+   "y": 1301,
+   "w": 1120,
+   "rows": 3,
+   "padTop": 16,
+   "padBottom": 29,
+   "padLeft": 20,
+   "title": "访问日志 · modelgate.log",
+   "titleX": 38,
+   "titleW": 342,
+   "cols": [
+    {
+     "key": "time",
+     "x": 0
+    },
+    {
+     "key": "who",
+     "x": 123
+    },
+    {
+     "key": "m",
+     "x": 273
+    },
+    {
+     "key": "g",
+     "x": 779
+    }
+   ]
+  }
+ ],
+ "clock": {
+  "start": "23:48:04",
+  "rate": 3
+ },
+ "titlebar": {
+  "text": "~/model-gate — 127.0.0.1:8900"
+ },
+ "credit": {
+  "text": "基于 Model-Gate v2.7.0 源码 · 数字为示意 · made with live-panel",
+  "y": 1484,
+  "size": 12
+ }
+}

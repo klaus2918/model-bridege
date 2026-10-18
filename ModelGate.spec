@@ -3,6 +3,10 @@
 
 产出：dist/Model-Gate.exe
 版本号唯一来源：modelgate/__init__.py 的 __version__
+
+仓库只保留这一份打包定义。升级时若要与在跑实例并存：
+  复制本文件为 ModelGate.vX.Y.spec，把 name="Model-Gate" 改成 name="Model-Gate-vX.Y"，
+  再用 pyinstaller 打包；验证与切换完成后删掉那份临时 spec。
 """
 import os
 

@@ -1,0 +1,53 @@
+{
+  "theme": "terminal-dark",
+  "canvas": "4:5",
+  "lang": "zh",
+  "title": "MODEL-GATE EXE · LIVE",
+  "titlebar": "~/model-gate — 127.0.0.1:8900",
+  "rows": [
+    [
+      {"name": "Agent 客户端", "lines": ["opencode · wenzflow · SDK", "→ 127.0.0.1:8900/v1"]}
+    ],
+    [
+      {"name": "Model-Gate.exe · 启动/桌面壳", "lines": ["单实例互斥体 · 崩溃兜底", "pywebview · pystray 托盘"]}
+    ],
+    [
+      {"name": "本地 HTTP 服务 :8900", "lines": ["数据 /v1/* · 控制 /api/*", "静态 /ui/* · 端口 +1..20"]}
+    ],
+    [
+      {"name": "Bridge 代理内核", "lines": ["净化·路由·切换≤2·TTFT"]}
+    ],
+    [
+      {"name": "anthropic 适配", "lines": ["→ /v1/messages", "SSE·thinking 回传"]},
+      {"name": "openai 适配", "lines": ["透传 + 会话头", "usage 抓取"]},
+      {"name": "commandcode 适配", "lines": ["NDJSON→SSE", "pause≤5·套餐过滤"]}
+    ],
+    [
+      {"name": "SQLite 明细", "lines": ["WAL·ttft/cost"]},
+      {"name": "配置与密钥", "lines": ["文件优先·仅内存"]},
+      {"name": "日志", "lines": ["log 5MB×3"]}
+    ],
+    [
+      {"name": "cch · 默认", "lines": ["127.0.0.1:15721", "cc-switch→DS"]},
+      {"name": "go / zen", "lines": ["opencode.ai", "订阅 / 免费"]},
+      {"name": "commandcode", "lines": ["api.commandcode", "NDJSON·≤5"]}
+    ]
+  ],
+  "rail": {
+    "name": "运行态回退",
+    "side": "left",
+    "sub": "由代理自动触发",
+    "items": [
+      {"name": "端口被占用", "adv": ["» +1..+20 降级", "» 记录 lastPort"], "row": 2},
+      {"name": "上游 5xx/429", "adv": ["» 未写字节才切换", "» 候补上限 2"], "row": 3},
+      {"name": "密钥过期", "adv": ["» 面板粘贴新 key", "» 重新载入生效"], "row": 5},
+      {"name": "保留策略", "adv": ["» 启动即跑一次", "» 之后每 24h"], "row": 5}
+    ]
+  },
+  "counters": [
+    {"id": "reqs", "label": "请求", "start": 1286, "rate": 7},
+    {"id": "tokens", "label": "tokens", "start": 128400, "rate": 730}
+  ],
+  "log": {"title": "访问日志 · modelgate.log", "rows": 3},
+  "credit": "基于 Model-Gate v2.7.0 源码 · 数字为示意 · made with live-panel"
+}

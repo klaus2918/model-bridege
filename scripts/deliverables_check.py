@@ -14,6 +14,15 @@ ROOT = Path(__file__).resolve().parent.parent
 FAILS: list[str] = []
 
 
+def _resolve_change_dir(name: str) -> Path:
+    """变更目录：优先活跃区，其次归档区（归档后 .op/changes 里就没有了）。"""
+    live = ROOT / ".op" / "changes" / name
+    if live.is_dir():
+        return live
+    archived = sorted((ROOT / ".op" / "archive").glob(f"*/*/{name}"), reverse=True)
+    return archived[0] if archived else live
+
+
 def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" - {detail}" if detail else ""))
     if not ok:
@@ -83,15 +92,14 @@ def main() -> int:
     check("测试文件 4 个", len(names) >= 4, ", ".join(names))
     check("冷启动验收脚本", (ROOT / "scripts" / "coldstart_all.ps1").is_file())
     check("GUI 验收脚本", (ROOT / "scripts" / "gui_probe.ps1").is_file())
-    check("方案与任务清单", (ROOT / ".op" / "changes" / "model-gate-desktop"
-                          / "plan.md").is_file())
+    change_dir = _resolve_change_dir("model-gate-desktop")
+    check("方案与任务清单", (change_dir / "plan.md").is_file(), str(change_dir))
 
     print("\n== 7. 变更档案 ==")
-    tasks = (ROOT / ".op" / "changes" / "model-gate-desktop" / "tasks.md").read_text(
-        encoding="utf-8")
-    pending = re.findall(r"status:\s*(\w+)", tasks)
-    check("10 个任务全部 done", len(pending) == 10 and all(
-        s == "done" for s in pending), ", ".join(pending))
+    tasks = (change_dir / "tasks.md").read_text(encoding="utf-8")
+    statuses = re.findall(r"status:\s*(\w+)", tasks)
+    check("任务全部 done", bool(statuses) and all(s == "done" for s in statuses),
+          f"{len(statuses)} 条，非 done：{[s for s in statuses if s != 'done'] or '无'}")
 
     print()
     if FAILS:

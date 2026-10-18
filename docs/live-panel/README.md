@@ -1,0 +1,51 @@
+# Model-Gate exe · live-panel 动态架构图
+
+用 [live-panel](https://github.com/ythx-101/live-panel-skill) 生成的「一直在运行」的架构图：布局固定，线上有数据包流动、状态条翻转、日志滚动、计数器跳动。数字均为示意（未接入真实遥测）。
+
+## 产物
+
+| 文件 | 说明 |
+|---|---|
+| `model-gate-live-panel.html` | **主产物**：自包含循环网页，双击用浏览器打开即可播放（155 KB） |
+| `preview.png` | 一帧静态预览（1200×1500） |
+| `model-gate-config.json` | live-panel 配置（可直接改文案/坐标/机器） |
+| `model-gate-spec.json` | scaffold 用的极简布局 spec（改完可重新生成） |
+| `patch_log_machines.py` | 给 config 追加 beat/http 日志节奏机器（scaffold 不生成，重生成后执行一次） |
+| `frames/` | `check_frames.py` 导出的校验帧（4 帧） |
+
+## 图里有什么
+
+- 纵向主链：Agent 客户端 → Model-Gate.exe（启动/桌面壳）→ 本地 HTTP 服务 :8900 → Bridge 内核 → 三类协议适配 → 四条上游（cch / go / zen / commandcode）
+- 数据与配置侧栏：SQLite 明细（WAL、ttft/cost）、配置与密钥（文件优先、密钥仅驻内存）、日志（5 MB×3 轮转）
+- 左侧「运行态回退」触发器：端口被占用、上游 5xx/429、密钥过期、保留策略
+- 状态栏：请求数 / tokens 计数器；底部滚动访问日志；数据包沿每条连线流动
+
+## 重新生成
+
+```powershell
+# 1) spec → config（自动布局）
+py -3 D:\Note\tools\live-panel-skill\scripts\scaffold.py `
+  --spec docs\live-panel\model-gate-spec.json `
+  --out  docs\live-panel\model-gate-config.json
+
+# 1.5) 追加日志节奏机器（scaffold 不生成）
+py -3 docs\live-panel\patch_log_machines.py
+
+# 2) 渲染循环 HTML
+py -3 D:\Note\tools\live-panel-skill\scripts\render.py `
+  --config docs\live-panel\model-gate-config.json `
+  --html-out docs\live-panel\model-gate-live-panel.html
+
+# 3) 逐帧自检（布局溢出/重叠 + 重放确定性）
+py -3 D:\Note\tools\live-panel-skill\scripts\check_frames.py `
+  --config docs\live-panel\model-gate-config.json `
+  --out-dir docs\live-panel\frames --repeat
+```
+
+校验结果：124 个时间点、0 布局问题、重放逐像素一致。
+
+> 需要 mp4 时给 `render.py` 加 `--out xxx.mp4`（需 Chrome/Chromium 与 ffmpeg）。网页 URL 加 `?manual` 可关闭自动循环。
+
+## 事实来源
+
+内容基于 Model-Gate v2.7.0 源码静态梳理（`entry.py`、`modelgate/app.py`、`proxy.py`、`api.py`、`db.py`、`config.py`、`protocols/`、`single.py`、`pricing.py`）。数字为动画示意，不代表真实运行数据。
