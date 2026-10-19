@@ -1,9 +1,11 @@
 # 一次性诊断脚本：以 GUI 模式启动 exe，捕获退出码与 stdout/stderr
+# 从仓库根目录运行：powershell -File scripts\diag_gui.ps1
 $ErrorActionPreference = 'Continue'
-$exe  = 'D:\githup-workspace\Model-Gate\dist\Model-Gate.exe'
-$out  = 'D:\githup-workspace\Model-Gate\dist\gui3_out.txt'
-$err  = 'D:\githup-workspace\Model-Gate\dist\gui3_err.txt'
-$db   = 'D:\githup-workspace\Model-Gate\dist\data\probe_gui3.db'
+$root = Split-Path -Parent $PSScriptRoot
+$exe  = Join-Path $root 'dist\Model-Gate.exe'
+$out  = Join-Path $root 'dist\gui3_out.txt'
+$err  = Join-Path $root 'dist\gui3_err.txt'
+$db   = Join-Path $root 'dist\data\probe_gui3.db'
 
 $proc = Start-Process -FilePath $exe `
     -ArgumentList '--port','8904','--db',$db `

@@ -2,7 +2,7 @@
 // 渲染发行说明。
 //
 // 规则（与知识库《GitHub Actions 流水线打包发布》一致）：
-//   - 优先用 changelog/v<version>.json：写给用户看效果，不写实现；纯内部改动（重构/CI/测试）不列
+//   - 优先用 legacy/node-bridge/changelog/v<version>.json：写给用户看效果，不写实现；纯内部改动（重构/CI/测试）不列
 //   - 文件缺失时属于「发布前置条件不满足」→ 默认直接失败；显式加 --allow-fallback 才退化为提交清单
 //   - 末尾始终附 compare/<prev>...<tag> 链接；首发没有上一个 tag 时退化为 commits/<tag>
 //
@@ -33,7 +33,7 @@ const repo = flagValue("--repo");
 const prev = flagValue("--prev");
 const allowFallback = argv.includes("--allow-fallback");
 
-const changelogPath = join(process.cwd(), "changelog", `v${version}.json`);
+const changelogPath = join(process.cwd(), "legacy", "node-bridge", "changelog", `v${version}.json`);
 const out = [];
 
 function commitList(range) {
@@ -56,7 +56,7 @@ if (existsSync(changelogPath)) {
     out.push(`### ${label}`, ...items.map((x) => `- ${x}`), "");
   }
 } else if (allowFallback) {
-  console.error(`[warn] 缺少 changelog/v${version}.json，退化为提交清单（不应用于正式发布）`);
+  console.error(`[warn] 缺少 legacy/node-bridge/changelog/v${version}.json，退化为提交清单（不应用于正式发布）`);
   out.push(`## v${version}`, "", "### 变更（自动生成，未整理）", "");
   const items = commitList(prev ? `${prev}..v${version}` : "v" + version);
   out.push(...(items.length ? items : ["- （无法从 git 历史生成清单）"]), "");

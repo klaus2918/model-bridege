@@ -21,7 +21,7 @@ repo_root() {
   git rev-parse --show-toplevel 2>/dev/null || die "当前目录不在 git 仓库内"
 }
 
-# 版本唯一真源：package.json 的 version
+# 版本唯一真源：legacy/node-bridge/package.json（Node 版冻结于 1.x）
 pkg_version() {
   local root="${1:-$(repo_root)}"
   node -e '
@@ -29,7 +29,7 @@ pkg_version() {
     const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     if (!j.version) { console.error("package.json 缺少 version"); process.exit(2); }
     process.stdout.write(j.version);
-  ' "$root/package.json"
+  ' "$root/legacy/node-bridge/package.json"
 }
 
 # 有 timeout 就用，没有（部分 Git Bash）就直接跑

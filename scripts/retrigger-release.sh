@@ -5,10 +5,10 @@
 # 每条拒绝条件都对应一类真实事故，宁可停下来让人确认。
 #
 # 用法：
-#   bash scripts/retrigger-release.sh --dry-run v1.0.0        # 只查前提，不动任何东西
-#   bash scripts/retrigger-release.sh --at HEAD v1.0.0        # 把 tag 指到 HEAD 后重推
-#   bash scripts/retrigger-release.sh --at <sha> v1.0.0
-#   bash scripts/retrigger-release.sh --at HEAD --assume-no-release v1.0.0
+#   bash scripts/retrigger-release.sh --dry-run legacy-v1.1.0        # 只查前提，不动任何东西
+#   bash scripts/retrigger-release.sh --at HEAD legacy-v1.1.0        # 把 tag 指到 HEAD 后重推
+#   bash scripts/retrigger-release.sh --at <sha> legacy-v1.1.0
+#   bash scripts/retrigger-release.sh --at HEAD --assume-no-release legacy-v1.1.0
 #
 # 环境：GH_TOKEN 或 GITHUB_TOKEN（用于查 release 是否存在）
 
@@ -33,12 +33,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$TAG" ] || die "用法：bash scripts/retrigger-release.sh [--dry-run] [--at <ref>] <tag>"
-case "$TAG" in v*) ;; *) die "tag 必须形如 vX.Y.Z，收到：$TAG" ;; esac
+case "$TAG" in legacy-v*) ;; *) die "tag 必须形如 legacy-vX.Y.Z（当前产品版本不使用此流水线），收到：$TAG" ;; esac
 
 require_cmd git node curl
 ROOT="$(repo_root)"
 cd "$ROOT"
-VERSION="${TAG#v}"
+VERSION="${TAG#legacy-v}"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || die "tag 版本段不合法：$VERSION"
 
 refuse() { die "拒绝执行：$*"; }
@@ -53,16 +53,16 @@ TARGET="$(git rev-parse --verify "$AT^{commit}" 2>/dev/null)" || refuse "解析�
 git merge-base --is-ancestor "$TARGET" origin/master || refuse "目标提交 $TARGET 不在 origin/master 上（不允许发布未合并提交）"
 log "目标提交：$TARGET（$(git log -1 --pretty=%s "$TARGET")）"
 
-# ── 3. 版本同源：目标提交的 package.json 版本必须等于 tag ──
-PKG_VERSION="$(git show "$TARGET:package.json" | node -e '
+# ── 3. 版本同源：目标提交的 legacy/node-bridge/package.json 版本必须等于 tag ──
+PKG_VERSION="$(git show "$TARGET:legacy/node-bridge/package.json" | node -e '
 let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
   try { process.stdout.write(JSON.parse(s).version ?? ""); } catch { process.stdout.write(""); }
 });')"
 [ "$PKG_VERSION" = "$VERSION" ] || refuse "tag $TAG 与目标提交的 package.json 版本（${PKG_VERSION:-无}）不一致"
 
 # ── 4. 发布前置文件必须在目标提交里 ──
-git cat-file -e "$TARGET:changelog/v$VERSION.json" 2>/dev/null \
-  || refuse "目标提交缺少 changelog/v$VERSION.json（发行说明会退化成提交清单）"
+git cat-file -e "$TARGET:legacy/node-bridge/changelog/v$VERSION.json" 2>/dev/null \
+  || refuse "目标提交缺少 legacy/node-bridge/changelog/v$VERSION.json（发行说明会退化成提交清单）"
 git cat-file -e "$TARGET:.github/workflows/release.yml" 2>/dev/null \
   || refuse "目标提交缺少 .github/workflows/release.yml（推了也不会有构建）"
 

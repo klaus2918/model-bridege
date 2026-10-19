@@ -43,7 +43,7 @@ if errorlevel 1 (
 )
 
 REM -- [3/6] test gate -------------------------------------------------------
-REM 逐文件有界跑：整目录一次性跑会出现无界挂起（跑不完 = 没有结论）。
+REM Run tests per file: a single whole-directory run can hang with no conclusion.
 echo [build] [3/6] running tests (bounded, per-file)...
 %PY% scripts\run_tests.py
 if errorlevel 1 (

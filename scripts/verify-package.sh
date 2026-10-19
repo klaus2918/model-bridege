@@ -73,11 +73,11 @@ for f in "${JSF[@]}"; do
   fi
 done
 
-# ── 3. 配置与仓库一致 ──
-if cmp -s "$TMP/pkg/bridge.config.json" "$ROOT/bridge.config.json"; then
-  ok "bridge.config.json 与仓库一致"
+# ── 3. 配置与仓库模板一致 ──
+if cmp -s "$TMP/pkg/bridge.config.json" "$ROOT/bridge.config.example.json"; then
+  ok "包内 bridge.config.json 来自仓库模板 bridge.config.example.json"
 else
-  bad "bridge.config.json 与仓库不一致（产物不是本次源码打出来的？）"
+  bad "包内配置与仓库模板不一致（产物不是本次源码打出来的？）"
 fi
 
 # ── 4. 用包内真实代码启动 ──

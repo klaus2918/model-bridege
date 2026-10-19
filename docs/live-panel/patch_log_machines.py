@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-p = Path(r"D:\githup-workspace\Model-Gate\docs\live-panel\model-gate-config.json")
+p = Path(__file__).with_name("model-gate-config.json")
 d = json.loads(p.read_text(encoding="utf-8"))
 
 d["machines"]["beat"] = {

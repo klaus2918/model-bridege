@@ -141,12 +141,15 @@ id = "mimo-v2.5"
 
 ## 五、自检脚本
 
-`scripts/opencode_go_direct_check.py`——对直连三要素做端到端自检：
+`scripts/archive/one-off/opencode_go_direct_check.py`（一次性脚本，已归档）——对直连三要素做端到端自检：
 
 ```bat
-py -3.11 scripts\opencode_go_direct_check.py
+py -3.11 scripts\archive\one-off\opencode_go_direct_check.py
 :: 可选：--model glm-5.3-flash / --key-env OPENCODE_API_KEY / --env-file <path>
 ```
+
+日常排查优先用统一入口：`py -3 scripts/doctor.py env`（密钥就位）、
+`py -3 scripts/doctor.py upstream go`（端点连通与密钥有效性）。
 
 输出示例（2026-10-17 实测）：
 

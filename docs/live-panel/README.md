@@ -7,11 +7,12 @@
 | 文件 | 说明 |
 |---|---|
 | `model-gate-live-panel.html` | **主产物**：自包含循环网页，双击用浏览器打开即可播放（155 KB） |
+| `model-gate-live-panel.mp4` | 30 秒 H.264 视频（1200×1500@30，含静音音轨，1.9 MB），可直接分享/嵌入；体积较大，**本地生成、不入库** |
 | `preview.png` | 一帧静态预览（1200×1500） |
 | `model-gate-config.json` | live-panel 配置（可直接改文案/坐标/机器） |
 | `model-gate-spec.json` | scaffold 用的极简布局 spec（改完可重新生成） |
 | `patch_log_machines.py` | 给 config 追加 beat/http 日志节奏机器（scaffold 不生成，重生成后执行一次） |
-| `frames/` | `check_frames.py` 导出的校验帧（4 帧） |
+| `frames/` | `check_frames.py` 导出的校验帧（3 帧；其中一帧与 `preview.png` 重复，已去重） |
 
 ## 图里有什么
 
@@ -23,8 +24,11 @@
 ## 重新生成
 
 ```powershell
+# live-panel 工具目录（外部依赖，按本机实际位置设置；仓库不包含该工具）
+$LP = "C:\path\to\live-panel-skill"
+
 # 1) spec → config（自动布局）
-py -3 D:\Note\tools\live-panel-skill\scripts\scaffold.py `
+py -3 "$LP\scripts\scaffold.py" `
   --spec docs\live-panel\model-gate-spec.json `
   --out  docs\live-panel\model-gate-config.json
 
@@ -32,12 +36,12 @@ py -3 D:\Note\tools\live-panel-skill\scripts\scaffold.py `
 py -3 docs\live-panel\patch_log_machines.py
 
 # 2) 渲染循环 HTML
-py -3 D:\Note\tools\live-panel-skill\scripts\render.py `
+py -3 "$LP\scripts\render.py" `
   --config docs\live-panel\model-gate-config.json `
   --html-out docs\live-panel\model-gate-live-panel.html
 
 # 3) 逐帧自检（布局溢出/重叠 + 重放确定性）
-py -3 D:\Note\tools\live-panel-skill\scripts\check_frames.py `
+py -3 "$LP\scripts\check_frames.py" `
   --config docs\live-panel\model-gate-config.json `
   --out-dir docs\live-panel\frames --repeat
 ```
@@ -48,4 +52,4 @@ py -3 D:\Note\tools\live-panel-skill\scripts\check_frames.py `
 
 ## 事实来源
 
-内容基于 Model-Gate v2.7.0 源码静态梳理（`entry.py`、`modelgate/app.py`、`proxy.py`、`api.py`、`db.py`、`config.py`、`protocols/`、`single.py`、`pricing.py`）。数字为动画示意，不代表真实运行数据。
+内容基于 Model-Gate 2.x 源码结构（初版梳理于 v2.7.0，模块划分在 2.x 内保持稳定）：`entry.py`、`modelgate/app.py`、`proxy.py`、`api.py`、`db.py`、`config.py`、`protocols/`、`single.py`、`pricing.py`。数字为动画示意，不代表真实运行数据。

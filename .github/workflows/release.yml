@@ -1,11 +1,14 @@
-name: Release
+name: Legacy Node Release
 
+# 历史 Node 单文件桥（legacy/node-bridge）的专用发布流水线，冻结维护。
+# 当前产品 Model-Gate 桌面版通过 Windows 本机 build.bat + Inno Setup 打包，
+# 不使用本流水线，也不再响应 v* tag（避免与 Model-Gate 2.x 版本冲突）。
 # 发布口只留 tag：tag 指向唯一提交，发布链路的可追溯性正建立于此。
 # 刻意不把 workflow_dispatch 挂在发布口上 —— 否则「这次发布的到底是哪个提交」会变含糊
 # （tag 与分支可指向不同提交）。要演练请用 scripts/retrigger-release.sh --dry-run。
 on:
   push:
-    tags: ['v*']
+    tags: ['legacy-v*']
 
 # 同名 tag 重复触发不互相踩
 concurrency:
@@ -39,10 +42,10 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./legacy/node-bridge/package.json').version")"
+          tag="${GITHUB_REF_NAME#legacy-v}"
           if [ "$version" != "$tag" ]; then
-            echo "::error::tag $GITHUB_REF_NAME 与 package.json 版本 $version 不一致"
+            echo "::error::tag $GITHUB_REF_NAME 与 legacy/node-bridge/package.json 版本 $version 不一致"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -69,7 +72,7 @@ jobs:
             echo "已更新既有 draft 的发行说明"
           else
             gh release create "$GITHUB_REF_NAME" --draft \
-              --title "v${{ steps.meta.outputs.version }}" --notes-file NOTES.md
+              --title "Legacy Node v${{ steps.meta.outputs.version }}" --notes-file NOTES.md
             echo "已创建 draft release"
           fi
 

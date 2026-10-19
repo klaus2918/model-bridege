@@ -29,8 +29,9 @@ KEEP_TMP=0
 require_cmd curl sha256sum git node
 
 ROOT="$(repo_root)"
-VERSION="${TAG#v}"
-ZIP_NAME="model-bridge-$TAG.zip"
+case "$TAG" in legacy-v*) ;; *) die "只支持 legacy-vX.Y.Z 形式的历史 Node 发布 tag，收到：$TAG" ;; esac
+VERSION="${TAG#legacy-v}"
+ZIP_NAME="model-bridge-v$VERSION.zip"
 
 TMP="$(mktemp -d)"
 cleanup() { [ "$KEEP_TMP" -eq 1 ] || rm -rf "$TMP" 2>/dev/null || true; }

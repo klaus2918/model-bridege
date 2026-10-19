@@ -20,23 +20,32 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PRODUCT="model-bridge"
 
-# 必达集合：用户拿到 zip 就能跑起来的最小集合
+# 必达集合：用户拿到 zip 就能跑起来的最小集合（Legacy Node 版，冻结维护）
+# 打包时统一扁平化到 zip 根目录；模板改名为 bridge.config.json，避免把真实配置带入产物。
 PRODUCT_FILES=(
-  "model-bridge.js"
-  "bridge.config.json"
-  "start-bridge.cmd"
-  "restart-bridge.cmd"
-  "test-bridge.mjs"
-  "probe-upstream.mjs"
+  "legacy/node-bridge/model-bridge.js"
+  "bridge.config.example.json"
+  "legacy/node-bridge/start-bridge.cmd"
+  "legacy/node-bridge/restart-bridge.cmd"
+  "legacy/node-bridge/test-bridge.mjs"
+  "legacy/node-bridge/probe-upstream.mjs"
   "README.md"
   ".gitignore"
 )
+
+# 源路径 -> zip 内条目名
+zip_name() {
+  case "$1" in
+    bridge.config.example.json) printf 'bridge.config.json\n' ;;
+    *) printf '%s\n' "${1##*/}" ;;
+  esac
+}
 
 OUT_DIR="dist"
 while [ $# -gt 0 ]; do
   case "$1" in
     --out-dir) OUT_DIR="${2:-dist}"; shift 2 ;;
-    --list)    printf '%s\n' "${PRODUCT_FILES[@]}"; exit 0 ;;
+    --list)    for f in "${PRODUCT_FILES[@]}"; do zip_name "$f"; done; exit 0 ;;
     -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)         die "未知参数：$1" ;;
   esac
@@ -49,7 +58,7 @@ VERSION="$(pkg_version "$ROOT")"
 TAG="v$VERSION"
 ZIP="$OUT_DIR/$PRODUCT-$TAG.zip"
 
-log "版本（package.json）：$VERSION"
+log "版本（legacy/node-bridge/package.json）：$VERSION"
 
 # 必达文件必须存在且受跟踪
 for f in "${PRODUCT_FILES[@]}"; do
@@ -74,16 +83,19 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     for path in files:
         if not os.path.isfile(path):
             sys.exit(f"缺少文件：{path}")
-        info = zipfile.ZipInfo(filename=os.path.basename(path), date_time=FIXED_TIME)
+        name = os.path.basename(path)
+        if name == "bridge.config.example.json":
+            name = "bridge.config.json"
+        info = zipfile.ZipInfo(filename=name, date_time=FIXED_TIME)
         info.compress_type = zipfile.ZIP_DEFLATED
         info.external_attr = 0o644 << 16
         with open(path, "rb") as fh:
             z.writestr(info, fh.read())
 PY
 elif command -v zip >/dev/null 2>&1; then
-  zip -X -q "$ZIP" "${PRODUCT_FILES[@]}"
+  die "需要 python3 完成模板改名打包（zip 命令无法把 example 改名为 bridge.config.json）"
 else
-  die "需要 python3 或 zip 之一来完成打包"
+  die "需要 python3 来完成打包"
 fi
 
 [ -f "$ZIP" ] || die "打包失败：$ZIP 未生成"
