@@ -38,11 +38,68 @@ def _since_ts(params: dict) -> int | None:
     return int(time.time()) - seconds
 
 
+def _parse_ts(value: str) -> int:
+    """解析自定义时间：epoch 秒或本地 ISO 文本（``YYYY-MM-DDTHH:MM``）。"""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("时间不能为空")
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+    from datetime import datetime
+
+    try:
+        return int(datetime.fromisoformat(text).timestamp())
+    except ValueError as exc:
+        raise ValueError(f"无法识别的时间：{text}") from exc
+
+
+def _usage_scope(params: dict) -> tuple[int | None, int | None]:
+    """解析页面级时间窗口：预设 ``range`` 或自定义 ``from``/``to``。
+
+    自定义优先：只给 ``from`` 时右边界为当前时间；只给 ``to`` 时左边界开放。
+    ``from >= to`` 直接报错，不静默回落到 24h（否则用户以为筛选生效了）。
+    """
+    if params.get("from") or params.get("to"):
+        until = _parse_ts(params["to"]) if params.get("to") else int(time.time())
+        since = _parse_ts(params["from"]) if params.get("from") else None
+        if since is not None and since >= until:
+            raise ValueError("起始时间必须早于结束时间")
+        return since, until
+    return _since_ts(params), None
+
+
+def _scope_filters(params: dict) -> dict:
+    """页面级作用域 → DB 过滤参数（与明细列表同一口径）。"""
+    since_ts, until_ts = _usage_scope(params)
+    return {
+        "since_ts": since_ts,
+        "until_ts": until_ts,
+        "upstream": params.get("upstream") or None,
+        "model": params.get("model") or None,
+        "session": params.get("session") or None,
+    }
+
+
+def _invalid_scope(handler, exc: ValueError) -> None:
+    handler.send_json(400, {"error": {
+        "message": str(exc), "type": "invalid_request_error",
+        "code": "invalid_time_range"}})
+
+
 def _previous_window(params: dict) -> tuple[int | None, int | None]:
     """上一等长区间的 (since_ts, until_ts)，用于「与上一区间对比」。
 
     range=all 没有可比区间，返回 (None, None) 由调用方跳过对比。
+    自定义区间按 ``[from, to]`` 的实际跨度向前平移。
     """
+    if params.get("from") or params.get("to"):
+        since, until = _usage_scope(params)
+        if since is None:
+            return None, None
+        span = max(1, int(until) - int(since))
+        return int(since) - span, int(since)
     rng = params.get("range") or "24h"
     seconds = TIME_RANGES.get(rng, 86400)
     if not seconds:
@@ -216,9 +273,10 @@ def export_payload(bridge, params: dict) -> tuple[bytes, str, str, int, bool]:
     import csv
     import io
 
+    since_ts, until_ts = _usage_scope(params)
     rows = bridge.db.list_usage(
         limit=EXPORT_LIMIT + 1, offset=0,
-        since_ts=_since_ts(params),
+        since_ts=since_ts, until_ts=until_ts,
         model=params.get("model") or None,
         upstream=params.get("upstream") or None,
         session=params.get("session") or None,
@@ -371,22 +429,33 @@ def handle_get(handler, raw_path: str) -> None:
         return
 
     if path == "/api/usage/totals":
-        payload = {"totals": bridge.db.totals(since_ts=_since_ts(params))}
+        try:
+            scope = _scope_filters(params)
+        except ValueError as exc:
+            _invalid_scope(handler, exc)
+            return
+        payload = {"totals": bridge.db.totals(**scope)}
         if params.get("compare"):
             # 与「上一等长区间」对比：前端据此展示环比箭头
             prev_since, prev_until = _previous_window(params)
             if prev_since is not None:
                 payload["previous"] = bridge.db.totals(
-                    since_ts=prev_since, until_ts=prev_until)
+                    since_ts=prev_since, until_ts=prev_until,
+                    upstream=scope["upstream"], model=scope["model"],
+                    session=scope["session"])
         handler.send_json(200, payload)
         return
 
     if path == "/api/usage/summary":
         group = params.get("group_by") or "day"
         try:
-            rows = bridge.db.summary(since_ts=_since_ts(params), group_by=group)
+            scope = _scope_filters(params)
+            rows = bridge.db.summary(**scope, group_by=group)
         except ValueError as exc:
-            handler.send_json(400, {"error": str(exc)})
+            if isinstance(exc, ValueError) and "不支持的分组维度" in str(exc):
+                handler.send_json(400, {"error": str(exc)})
+            else:
+                _invalid_scope(handler, exc)
             return
         handler.send_json(200, {"group_by": group, "rows": rows})
         return
@@ -397,14 +466,13 @@ def handle_get(handler, raw_path: str) -> None:
             offset = max(0, int(params.get("offset") or 0))
         except ValueError:
             limit, offset = 100, 0
-        row_filter = {
-            "since_ts": _since_ts(params),
-            "model": params.get("model") or None,
-            "upstream": params.get("upstream") or None,
-            "session": params.get("session") or None,
-            # 快捷筛选（error/slow/truncated/paused/cache/ttft）+ 排序白名单均在 DB 层把关
-            "only": params.get("only") or None,
-        }
+        try:
+            row_filter = _scope_filters(params)
+        except ValueError as exc:
+            _invalid_scope(handler, exc)
+            return
+        # 快捷筛选（error/slow/truncated/paused/cache/ttft）+ 排序白名单均在 DB 层把关
+        row_filter["only"] = params.get("only") or None
         rows = bridge.db.list_usage(
             limit=limit, offset=offset,
             sort=params.get("sort") or "ts",
@@ -422,20 +490,56 @@ def handle_get(handler, raw_path: str) -> None:
         return
 
     if path == "/api/usage/models":
-        # 按模型聚合的用量表（请求/token/缓存/费用/成功率/均耗/P95/TTFT）
+        # 按模型聚合的用量表（请求/token/缓存/费用/命中率/成功率/均耗/P95/TTFT）
         try:
             limit = max(1, min(500, int(params.get("limit") or 100)))
         except ValueError:
             limit = 100
-        rows = bridge.db.model_usage(since_ts=_since_ts(params), limit=limit)
+        try:
+            scope = _scope_filters(params)
+        except ValueError as exc:
+            _invalid_scope(handler, exc)
+            return
+        rows = bridge.db.model_usage(
+            since_ts=scope["since_ts"], until_ts=scope["until_ts"],
+            upstream=scope["upstream"], model=scope["model"],
+            session=scope["session"], limit=limit)
         from .pricing import currency_of, is_configured
 
         table = bridge.config.get("pricing")
         handler.send_json(200, {
             "rows": rows,
             "range": params.get("range") or "24h",
+            "filters": {k: scope[k] for k in ("upstream", "model", "session") if scope[k]},
             "currency": currency_of(table),
             "pricing_configured": is_configured(table),
+        })
+        return
+
+    if path == "/api/usage/upstreams":
+        # 按上游聚合 + 上游×模型下钻：页面级作用域（时间 + 上游 + 模型 + 会话）
+        try:
+            limit = max(1, min(500, int(params.get("limit") or 200)))
+        except ValueError:
+            limit = 200
+        try:
+            scope = _scope_filters(params)
+        except ValueError as exc:
+            _invalid_scope(handler, exc)
+            return
+        rows = bridge.db.upstream_usage(
+            since_ts=scope["since_ts"], until_ts=scope["until_ts"],
+            upstream=scope["upstream"], model=scope["model"],
+            session=scope["session"], limit=limit)
+        models = bridge.db.upstream_model_usage(
+            since_ts=scope["since_ts"], until_ts=scope["until_ts"],
+            upstream=scope["upstream"], model=scope["model"],
+            session=scope["session"], limit=500)
+        handler.send_json(200, {
+            "rows": rows,
+            "models": models,
+            "range": params.get("range") or "24h",
+            "filters": {k: scope[k] for k in ("upstream", "model", "session") if scope[k]},
         })
         return
 
@@ -443,6 +547,9 @@ def handle_get(handler, raw_path: str) -> None:
         # 明细导出（CSV/JSON）。只含统计字段与模型名，不含请求体与任何密钥。
         try:
             body, content_type, filename, count, truncated = export_payload(bridge, params)
+        except ValueError as exc:
+            _invalid_scope(handler, exc)
+            return
         except Exception as exc:  # noqa: BLE001
             handler.send_json(500, {"error": {
                 "message": f"导出失败: {exc}", "type": "server_error",
@@ -760,13 +867,18 @@ def handle_post(handler, raw_path: str) -> None:
         return
 
     if path == "/api/usage/clear":
-        # 清空用量明细（只清明细，不动配置与 settings）
+        # 清空用量明细（只清明细，不动配置与 settings），与页面作用域同口径；
+        # 未给任何区间时保持旧语义「全部清空」。
         rng = str(payload.get("range") or "")
-        since = None
-        if rng in TIME_RANGES:
-            since = _since_ts({"range": rng})
         try:
-            removed = bridge.db.clear_usage(since_ts=since)
+            since, until = (_usage_scope(payload)
+                            if (rng or payload.get("from") or payload.get("to"))
+                            else (None, None))
+        except ValueError as exc:
+            _invalid_scope(handler, exc)
+            return
+        try:
+            removed = bridge.db.clear_usage(since_ts=since, until_ts=until)
         except Exception as exc:  # noqa: BLE001
             handler.send_json(500, {"error": {
                 "message": f"清空失败: {exc}", "type": "server_error",
@@ -774,8 +886,12 @@ def handle_post(handler, raw_path: str) -> None:
             return
         if bridge.access_log:
             log(f"已清空用量明细 {removed} 条"
-                + (f"（区间 {rng}）" if since else "（全部）"))
-        handler.send_json(200, {"ok": True, "removed": removed, "range": rng or "all"})
+                + (f"（区间 {rng or '自定义'}）" if (since or until) else "（全部）"))
+        handler.send_json(200, {
+            "ok": True, "removed": removed, "range": rng or "all",
+            "from": str(payload.get("from") or ""),
+            "to": str(payload.get("to") or ""),
+        })
         return
 
     if path == "/api/logs/clear":

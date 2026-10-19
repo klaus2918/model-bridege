@@ -87,6 +87,20 @@ def percentile(values: list[int], ratio: float) -> float:
     return round(float(values[low]) * (1 - weight) + float(values[high]) * weight, 1)
 
 
+def hit_rate(cache_read: Optional[int], prompt: Optional[int]) -> Optional[float]:
+    """缓存命中率 = 命中输入 / 总输入（prompt 含缓存读取部分）。
+
+    分母为 0 时返回 ``None`` 而不是 0：没有输入 token 时「0% 命中」会把
+    「无数据」误读成「缓存完全没命中」，前端统一显示「—」。
+    """
+    read = int(cache_read or 0)
+    total = int(prompt or 0)
+    if total <= 0:
+        return None
+    return round(read / total, 6)
+
+
+
 # 「只看异常」快捷筛选：SQL 片段白名单，避免任何拼接注入
 USAGE_ONLY_CLAUSES = {
     "error": "status >= 400",
@@ -288,11 +302,17 @@ class Database:
         return int(row["n"])
 
     def summary(self, *, since_ts: Optional[int] = None,
-                group_by: str = "day") -> list[dict]:
+                until_ts: Optional[int] = None,
+                group_by: str = "day",
+                model: Optional[str] = None,
+                upstream: Optional[str] = None,
+                session: Optional[str] = None) -> list[dict]:
         """按 day / hour / model / upstream / session 分组聚合用量。
 
+        过滤口径与明细一致（时间区间 + 上游 + 请求模型 + 会话），
         返回 [{bucket, requests, prompt_tokens, completion_tokens, total_tokens,
-                cache_read_tokens, cost, errors, avg_duration_ms}]，按桶升序。
+                cache_read_tokens, cache_hit_rate, cost, errors,
+                avg_duration_ms, avg_ttft_ms, p50_duration_ms, p95_duration_ms}]，按桶升序。
         """
         if group_by == "day":
             bucket_expr = "substr(created_at, 1, 10)"
@@ -306,8 +326,10 @@ class Database:
             bucket_expr = "COALESCE(NULLIF(session, ''), '(无会话)')"
         else:
             raise ValueError(f"不支持的分组维度: {group_by}")
-        where = " WHERE ts >= ?" if since_ts is not None else ""
-        args = (int(since_ts),) if since_ts is not None else ()
+        where, args = self._usage_filters(
+            since_ts=since_ts, until_ts=until_ts, model=model,
+            upstream=upstream, session=session)
+        args = tuple(args)
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -341,6 +363,8 @@ class Database:
             item = dict(row)
             samples = grouped.get(str(item.get("bucket")), [])
             item["cost"] = round(float(item.get("cost") or 0), 6)
+            item["cache_hit_rate"] = hit_rate(
+                item.get("cache_read_tokens"), item.get("prompt_tokens"))
             item["avg_duration_ms"] = round(float(item.get("avg_duration_ms") or 0), 1)
             item["avg_ttft_ms"] = round(float(item.get("avg_ttft_ms") or 0), 1)
             item["p50_duration_ms"] = percentile(samples, 0.50)
@@ -349,21 +373,20 @@ class Database:
         return out
 
     def totals(self, *, since_ts: Optional[int] = None,
-               until_ts: Optional[int] = None) -> dict:
+               until_ts: Optional[int] = None,
+               model: Optional[str] = None,
+               upstream: Optional[str] = None,
+               session: Optional[str] = None) -> dict:
         """全局合计：请求数、token、费用、成功率、耗时（均值 + P50/P95）+ TTFT。
 
-        ``until_ts`` 供「与上一区间对比」使用：同一条 SQL 加右边界即可。
+        过滤口径与明细列表一致（``_usage_filters``），供页面级作用域复用：
+        时间区间 + 上游 + 请求模型 + 会话。``until_ts`` 同时服务「与上一区间对比」。
         """
-        clauses: list[str] = []
-        raw_args: list = []
-        if since_ts is not None:
-            clauses.append("ts >= ?")
-            raw_args.append(int(since_ts))
-        if until_ts is not None:
-            clauses.append("ts <= ?")
-            raw_args.append(int(until_ts))
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        where, raw_args = self._usage_filters(
+            since_ts=since_ts, until_ts=until_ts, model=model,
+            upstream=upstream, session=session)
         args = tuple(raw_args)
+
         with self._lock:
             row = self._conn.execute(
                 f"""
@@ -397,6 +420,8 @@ class Database:
         data["ok"] = ok
         data["errors"] = int(data.get("errors") or 0)
         data["success_rate"] = round(ok / requests, 4) if requests else 0.0
+        data["cache_hit_rate"] = hit_rate(
+            data.get("cache_read_tokens"), data.get("prompt_tokens"))
         data["cost"] = round(float(data.get("cost") or 0), 6)
         data["avg_duration_ms"] = round(float(data.get("avg_duration_ms") or 0), 1)
         data["avg_ttft_ms"] = round(float(data.get("avg_ttft_ms") or 0), 1)
@@ -407,17 +432,24 @@ class Database:
         return data
 
     def model_usage(self, *, since_ts: Optional[int] = None,
+                    until_ts: Optional[int] = None,
+                    upstream: Optional[str] = None,
+                    model: Optional[str] = None,
+                    session: Optional[str] = None,
                     limit: int = 100) -> list[dict]:
         """按模型聚合用量（供「模型用量」表）。
 
-        返回 ``[{model, requests, errors, success_rate, prompt_tokens,
+        过滤口径与明细一致：时间区间 + 上游 + 会话；返回
+        ``[{model, requests, errors, success_rate, prompt_tokens,
         completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
-        cost, avg_duration_ms, p50_duration_ms, p95_duration_ms, avg_ttft_ms,
-        last_ts}]``，按总 token 降序 —— 用量最大的模型排最前，
+        cache_hit_rate, cost, avg_duration_ms, p50_duration_ms, p95_duration_ms,
+        avg_ttft_ms, last_ts}]``，按总 token 降序 —— 用量最大的模型排最前，
         这样「哪些模型在吃 token」一眼可见。
         """
-        where = " WHERE ts >= ?" if since_ts is not None else ""
-        args = (int(since_ts),) if since_ts is not None else ()
+        where, raw_args = self._usage_filters(
+            since_ts=since_ts, until_ts=until_ts, model=model,
+            upstream=upstream, session=session)
+        args = tuple(raw_args)
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -458,10 +490,134 @@ class Database:
             errors = int(item.get("errors") or 0)
             item["success_rate"] = round((requests - errors) / requests, 4) if requests else 0.0
             item["cost"] = round(float(item.get("cost") or 0), 6)
+            item["cache_hit_rate"] = hit_rate(
+                item.get("cache_read_tokens"), item.get("prompt_tokens"))
             item["avg_duration_ms"] = round(float(item.get("avg_duration_ms") or 0), 1)
             item["avg_ttft_ms"] = round(float(item.get("avg_ttft_ms") or 0), 1)
             item["p50_duration_ms"] = percentile(samples, 0.50)
             item["p95_duration_ms"] = percentile(samples, 0.95)
+            out.append(item)
+        return out
+
+    def upstream_usage(self, *, since_ts: Optional[int] = None,
+                       until_ts: Optional[int] = None,
+                       upstream: Optional[str] = None,
+                       model: Optional[str] = None,
+                       session: Optional[str] = None,
+                       limit: int = 200) -> list[dict]:
+        """按上游聚合用量（供「上游用量」表）。
+
+        过滤口径与明细一致：时间区间 + 上游 + 请求模型 + 会话。返回
+        ``[{upstream, models_count, requests, errors, success_rate,
+        prompt_tokens, completion_tokens, total_tokens, cache_read_tokens,
+        cache_write_tokens, cache_hit_rate, cost, avg_duration_ms,
+        p50_duration_ms, p95_duration_ms, avg_ttft_ms, last_ts}]``。
+        """
+        where, raw_args = self._usage_filters(
+            since_ts=since_ts, until_ts=until_ts, upstream=upstream,
+            model=model, session=session)
+        args = tuple(raw_args)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT COALESCE(upstream, '(unknown)') AS upstream,
+                       COUNT(DISTINCT COALESCE(requested_model, '(unknown)')) AS models_count,
+                       COUNT(*)                AS requests,
+                       COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0) AS errors,
+                       COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0)      AS total_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                       COALESCE(SUM(cost), 0)              AS cost,
+                       COALESCE(AVG(duration_ms), 0)       AS avg_duration_ms,
+                       COALESCE(AVG(NULLIF(ttft_ms, 0)), 0) AS avg_ttft_ms,
+                       MAX(ts)                             AS last_ts
+                FROM usage_records{where}
+                GROUP BY upstream
+                ORDER BY total_tokens DESC
+                LIMIT ?
+                """,
+                (*args, int(limit)),
+            ).fetchall()
+            duration_rows = self._conn.execute(
+                f"SELECT COALESCE(upstream, '(unknown)') AS upstream, duration_ms "
+                f"FROM usage_records{where} ORDER BY upstream, duration_ms",
+                args,
+            ).fetchall()
+
+        grouped: dict[str, list[int]] = {}
+        for item in duration_rows:
+            grouped.setdefault(str(item["upstream"]), []).append(int(item["duration_ms"] or 0))
+
+        out = []
+        for row in rows:
+            item = dict(row)
+            samples = grouped.get(str(item["upstream"]), [])
+            requests = int(item.get("requests") or 0)
+            errors = int(item.get("errors") or 0)
+            item["success_rate"] = round((requests - errors) / requests, 4) if requests else 0.0
+            item["cache_hit_rate"] = hit_rate(
+                item.get("cache_read_tokens"), item.get("prompt_tokens"))
+            item["cost"] = round(float(item.get("cost") or 0), 6)
+            item["avg_duration_ms"] = round(float(item.get("avg_duration_ms") or 0), 1)
+            item["avg_ttft_ms"] = round(float(item.get("avg_ttft_ms") or 0), 1)
+            item["p50_duration_ms"] = percentile(samples, 0.50)
+            item["p95_duration_ms"] = percentile(samples, 0.95)
+            out.append(item)
+        return out
+
+    def upstream_model_usage(self, *, since_ts: Optional[int] = None,
+                             until_ts: Optional[int] = None,
+                             upstream: Optional[str] = None,
+                             model: Optional[str] = None,
+                             session: Optional[str] = None,
+                             limit: int = 500) -> list[dict]:
+        """按「上游 × 请求模型」聚合，供上游行展开下钻。
+
+        返回 ``[{upstream, model, requests, errors, success_rate,
+        prompt_tokens, completion_tokens, total_tokens, cache_read_tokens,
+        cache_hit_rate, cost, avg_duration_ms, avg_ttft_ms, last_ts}]``。
+        """
+        where, raw_args = self._usage_filters(
+            since_ts=since_ts, until_ts=until_ts, upstream=upstream,
+            model=model, session=session)
+        args = tuple(raw_args)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT COALESCE(upstream, '(unknown)') AS upstream,
+                       COALESCE(requested_model, '(unknown)') AS model,
+                       COUNT(*)                AS requests,
+                       COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0) AS errors,
+                       COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0)      AS total_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                       COALESCE(SUM(cost), 0)              AS cost,
+                       COALESCE(AVG(duration_ms), 0)       AS avg_duration_ms,
+                       COALESCE(AVG(NULLIF(ttft_ms, 0)), 0) AS avg_ttft_ms,
+                       MAX(ts)                             AS last_ts
+                FROM usage_records{where}
+                GROUP BY upstream, model
+                ORDER BY upstream, total_tokens DESC
+                LIMIT ?
+                """,
+                (*args, int(limit)),
+            ).fetchall()
+
+        out = []
+        for row in rows:
+            item = dict(row)
+            requests = int(item.get("requests") or 0)
+            errors = int(item.get("errors") or 0)
+            item["success_rate"] = round((requests - errors) / requests, 4) if requests else 0.0
+            item["cache_hit_rate"] = hit_rate(
+                item.get("cache_read_tokens"), item.get("prompt_tokens"))
+            item["cost"] = round(float(item.get("cost") or 0), 6)
+            item["avg_duration_ms"] = round(float(item.get("avg_duration_ms") or 0), 1)
+            item["avg_ttft_ms"] = round(float(item.get("avg_ttft_ms") or 0), 1)
             out.append(item)
         return out
 
@@ -577,14 +733,17 @@ class Database:
     def save_config_override(self, config: dict) -> None:
         self.set_setting("config", json.dumps(config, ensure_ascii=False))
 
-    def clear_usage(self, *, since_ts: Optional[int] = None) -> int:
-        """清空用量明细，返回删除条数。只删 usage_records，不动 settings。"""
+    def clear_usage(self, *, since_ts: Optional[int] = None,
+                    until_ts: Optional[int] = None) -> int:
+        """清空指定时间区间的用量明细，返回删除条数。
+
+        只删 ``usage_records``，不动 settings；两端都为空表示全部清空。
+        与页面作用域同口径，避免自定义区间下「清空」误删全表。
+        """
+        where, args = self._usage_filters(since_ts=since_ts, until_ts=until_ts)
         with self._lock:
-            if since_ts is None:
-                cur = self._conn.execute("DELETE FROM usage_records")
-            else:
-                cur = self._conn.execute(
-                    "DELETE FROM usage_records WHERE ts >= ?", (int(since_ts),))
+            cur = self._conn.execute(
+                f"DELETE FROM usage_records{where}", tuple(args))
             removed = cur.rowcount or 0
             self._conn.commit()
         return int(removed)

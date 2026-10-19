@@ -22,6 +22,8 @@ const state = {
   pageSize: 50,
   listTotal: 0,
   filters: { upstream: "", model: "", session: "" },
+  // 自定义时间区间（datetime-local 值）；为空时使用 range 预设
+  custom: { from: "", to: "" },
   options: { upstreams: [], models: [], sessions: [] },
   pricing: { currency: "CNY", configured: false, pricing: { default: {}, rules: {} } },
   catalog: { page: 1, pageSize: 25, total: 0, q: "", upstream: "", currency: "CNY",
@@ -41,6 +43,12 @@ const state = {
     expanded: "",
     autoTimer: null,
     lastUpdated: null,
+    // 上游用量表：数据、排序、展开的上游
+    upstreams: [],
+    upstreamModels: [],
+    upstreamSortKey: "total_tokens",
+    upstreamSortDir: "desc",
+    upstreamExpanded: "",
   },
   // 概览页的上游表：完整数据、无分页，排序与展开都在前端即可
   overview: { sortKey: "name", sortDir: "asc", expanded: "" },
@@ -49,7 +57,7 @@ const state = {
   // 当前打开的弹窗（同一时间只允许一个）
   modal: null,
   theme: "dark",
-  logs: { level: "all", q: "", timer: null, lines: 400, autoSeconds: 4, lastUpdated: null },
+  logs: { level: "all", q: "", timer: null, lines: 400, autoSeconds: 4, lastUpdated: null, rows: [] },
 };
 
 /* ── 弹窗：维护类操作统一走对话框，不再用原生 confirm ─────────── */
@@ -1373,7 +1381,15 @@ function initUsageControls() {
       const btn = ev.target.closest("button[data-" + key + "]");
       if (!btn) return;
       $$("button[data-" + key + "]", root).forEach((b) => b.classList.toggle("active", b === btn));
-      if (key === "range") { state.range = btn.dataset.range; state.page = 0; }
+      if (key === "range") {
+        state.range = btn.dataset.range;
+        state.custom = { from: "", to: "" };
+        const from = $("#scope-from");
+        const to = $("#scope-to");
+        if (from) from.value = "";
+        if (to) to.value = "";
+        state.page = 0;
+      }
       if (key === "group") { state.group = btn.dataset.group; }
       if (key === "metric") { state.trendMetric = btn.dataset.metric; renderTrend(); }
       if (key === "pie") { state.pieKind = btn.dataset.pie; renderPie(); }
@@ -1390,14 +1406,21 @@ function initUsageControls() {
 
   const clearBtn = $("#clear-usage");
   if (clearBtn) clearBtn.addEventListener("click", async () => {
+    const custom = !!(state.custom.from || state.custom.to);
+    const desc = custom
+      ? `自定义区间 ${state.custom.from || "最早"} ~ ${state.custom.to || "现在"}`
+      : `预设区间 ${state.range}`;
     const ok = await confirmModal({
       title: "清空用量明细",
-      text: `将删除当前区间（${state.range}）的全部用量明细，此操作不可撤销；代理转发不受影响。`,
+      text: `将删除${desc}内的全部用量明细（含所有上游与模型），此操作不可撤销；代理转发不受影响。`,
       confirmLabel: "清空",
     });
     if (!ok) return;
     try {
-      const data = await postJson("/api/usage/clear", { range: state.range });
+      const body = custom
+        ? { from: state.custom.from, to: state.custom.to }
+        : { range: state.range };
+      const data = await postJson("/api/usage/clear", body);
       toast(`已清空 ${data.removed} 条`);
       state.page = 0;
       loadUsage();
@@ -1406,15 +1429,61 @@ function initUsageControls() {
     }
   });
 
-  [["#filter-upstream", "upstream"], ["#filter-model", "model"],
-   ["#filter-session", "session"]].forEach(([sel, key]) => {
+  const scopeUpstream = $("#scope-upstream");
+  if (scopeUpstream) scopeUpstream.addEventListener("change", () => {
+    state.filters.upstream = scopeUpstream.value;
+    state.filters.model = "";  // 上游变了，原模型未必属于该上游
+    state.page = 0;
+    loadUsage();
+  });
+
+  const scopeModel = $("#scope-model");
+  if (scopeModel) scopeModel.addEventListener("change", () => {
+    state.filters.model = scopeModel.value;
+    state.page = 0;
+    loadUsage();
+  });
+
+  [["#scope-from", "from"], ["#scope-to", "to"]].forEach(([sel, key]) => {
     const el = $(sel);
     if (!el) return;
     el.addEventListener("change", () => {
-      state.filters[key] = el.value;
+      state.custom[key] = el.value || "";
+      if (state.custom.from && state.custom.to && state.custom.from >= state.custom.to) {
+        toast("起始时间必须早于结束时间", true);
+        state.custom[key] = "";
+        el.value = "";
+        return;
+      }
       state.page = 0;
-      loadUsageList();
+      // 自定义时间优先于预设：取消预设按钮的 active 态
+      if (state.custom.from || state.custom.to) {
+        $$("#range-seg button").forEach((b) => b.classList.remove("active"));
+      }
+      loadUsage();
     });
+  });
+
+  const clearScope = $("#scope-clear");
+  if (clearScope) clearScope.addEventListener("click", () => {
+    state.filters = { upstream: "", model: "", session: "" };
+    state.custom = { from: "", to: "" };
+    const from = $("#scope-from");
+    const to = $("#scope-to");
+    if (from) from.value = "";
+    if (to) to.value = "";
+    $$("#range-seg button").forEach((b) => {
+      b.classList.toggle("active", b.dataset.range === state.range);
+    });
+    state.page = 0;
+    loadUsage();
+  });
+
+  const sessionFilter = $("#filter-session");
+  if (sessionFilter) sessionFilter.addEventListener("change", () => {
+    state.filters.session = sessionFilter.value;
+    state.page = 0;
+    loadUsage();
   });
 
   const exportCsv = $("#export-usage-csv");
@@ -1500,6 +1569,35 @@ function initUsageControls() {
     });
   }
 
+  const upstreamTable = $("#upstream-usage-table");
+  if (upstreamTable) upstreamTable.addEventListener("click", (ev) => {
+    const only = ev.target.closest("[data-only-upstream]");
+    if (only) {
+      state.filters.upstream = only.dataset.onlyUpstream || "";
+      state.filters.model = "";
+      state.page = 0;
+      loadUsage();
+      return;
+    }
+    const th = ev.target.closest("th.sortable");
+    if (th) {
+      const key = th.dataset.key;
+      if (state.usage.upstreamSortKey === key) {
+        state.usage.upstreamSortDir = state.usage.upstreamSortDir === "desc" ? "asc" : "desc";
+      } else {
+        state.usage.upstreamSortKey = key;
+        state.usage.upstreamSortDir = key === "upstream" ? "asc" : "desc";
+      }
+      renderUpstreamUsage();
+      return;
+    }
+    const tr = ev.target.closest("tr[data-upstream]");
+    if (!tr) return;
+    const name = tr.dataset.upstream;
+    state.usage.upstreamExpanded = state.usage.upstreamExpanded === name ? "" : name;
+    renderUpstreamUsage();
+  });
+
   const auto = $("#usage-auto");
   if (auto) {
     auto.addEventListener("change", () => setAutoRefresh(Number(auto.value) || 0));
@@ -1507,26 +1605,57 @@ function initUsageControls() {
   }
 }
 
-const FILTER_LABELS = { upstreams: "上游", models: "模型", sessions: "会话" };
+/* 页面级作用域 → 查询串：预设/自定义时间 + 上游 + 模型 + 会话。
+ * KPI、趋势、分布、上游表、模型表、明细、导出全部走这里，避免同一屏出现两套口径。 */
+function usageScopeQuery(extra = {}) {
+  const q = new URLSearchParams();
+  if (state.custom.from || state.custom.to) {
+    if (state.custom.from) q.set("from", state.custom.from);
+    if (state.custom.to) q.set("to", state.custom.to);
+  } else {
+    q.set("range", state.range);
+  }
+  ["upstream", "model", "session"].forEach((key) => {
+    if (state.filters[key]) q.set(key, state.filters[key]);
+  });
+  Object.entries(extra).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") q.set(key, value);
+  });
+  return q;
+}
 
 function renderFilterOptions() {
-  [["upstreams", "#filter-upstream"], ["models", "#filter-model"],
-   ["sessions", "#filter-session"]].forEach(([kind, sel]) => {
-    const select = $(sel);
-    if (!select) return;
-    const current = select.value;
-    const options = state.options[kind] || [];
-    select.innerHTML = `<option value="">全部${FILTER_LABELS[kind]}</option>` +
-      options.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
-    if (current && options.includes(current)) select.value = current;
-  });
+  const optionsHtml = (label, values, current) =>
+    `<option value="">全部${label}</option>` +
+    values.map((v) => `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(v)}</option>`).join("");
+
+  const upstream = $("#scope-upstream");
+  if (upstream) {
+    const values = state.options.upstreams || [];
+    if (state.filters.upstream && !values.includes(state.filters.upstream)) state.filters.upstream = "";
+    upstream.innerHTML = optionsHtml("上游", values, state.filters.upstream);
+    upstream.value = state.filters.upstream;
+  }
+
+  const model = $("#scope-model");
+  if (model) {
+    const values = state.options.models || [];
+    if (state.filters.model && !values.includes(state.filters.model)) state.filters.model = "";
+    model.innerHTML = optionsHtml("模型", values, state.filters.model);
+    model.value = state.filters.model;
+  }
+
+  const session = $("#filter-session");
+  if (session) {
+    const values = state.options.sessions || [];
+    if (state.filters.session && !values.includes(state.filters.session)) state.filters.session = "";
+    session.innerHTML = optionsHtml("会话", values, state.filters.session);
+    session.value = state.filters.session;
+  }
 }
 
 function exportUsage(format) {
-  const q = new URLSearchParams({ range: state.range, format });
-  if (state.filters.upstream) q.set("upstream", state.filters.upstream);
-  if (state.filters.model) q.set("model", state.filters.model);
-  if (state.filters.session) q.set("session", state.filters.session);
+  const q = usageScopeQuery({ format });
   const link = document.createElement("a");
   link.href = `/api/usage/export?${q.toString()}`;
   link.download = "";
@@ -1556,17 +1685,16 @@ async function applyRetention() {
 }
 
 async function loadUsage() {
-  const qs = `range=${state.range}&compare=1`;
   if (!state.pricingLoaded) await loadPricing();
   try {
-    const data = await api(`/api/usage/totals?${qs}`);
+    const data = await api(`/api/usage/totals?${usageScopeQuery({ compare: 1 })}`);
     state.usage.previous = data.previous || null;
     renderKpis(data.totals || {});
   } catch (err) {
     $("#usage-kpis").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
   await Promise.all([loadSummary("day"), loadSummary(state.group),
-                     loadUsageList(), loadModelUsage()]);
+                     loadUsageList(), loadModelUsage(), loadUpstreamUsage()]);
   markFresh();
 }
 
@@ -1630,6 +1758,13 @@ function renderKpis(t) {
     ? `${Math.round((t.cache_read_tokens / totalTokens) * 100)}% 占比` : "";
 
   const groups = [
+    ["核心", [
+      kpiCard("缓存命中率", fmtRate(t.cache_read_tokens, t.prompt_tokens),
+        `命中 ${fmtInt(t.cache_read_tokens)} / 输入 ${fmtInt(t.prompt_tokens)}`,
+        "ok"),
+      kpiCard("缓存命中", fmtTok(t.cache_read_tokens), cacheShare, "data"),
+      kpiCard("总 token", fmtTok(t.total_tokens), "", "data"),
+    ]],
     ["吞吐", [
       kpiCard("请求数", fmtInt(t.requests), "区间内合计", "accent",
         prev ? deltaTag(requests, prev.requests, false) : ""),
@@ -1643,11 +1778,6 @@ function renderKpis(t) {
       kpiCard("输入", fmtTok(t.prompt_tokens), "", "data",
         prev ? deltaTag(t.prompt_tokens, prev.prompt_tokens, true) : ""),
       kpiCard("输出", fmtTok(t.completion_tokens), "", "data"),
-      kpiCard("缓存命中", fmtTok(t.cache_read_tokens), cacheShare, "data"),
-      kpiCard("缓存命中率", fmtRate(t.cache_read_tokens, t.prompt_tokens),
-        `命中 ${fmtInt(t.cache_read_tokens)} / 输入 ${fmtInt(t.prompt_tokens)}`,
-        "data"),
-      kpiCard("合计", fmtTok(t.total_tokens), "", "data"),
     ]],
     ["性能", [
       kpiCard("平均耗时", fmtMs(t.avg_duration_ms), "", "",
@@ -1735,7 +1865,7 @@ function renderLatency(t) {
 
 async function loadSummary(group) {
   try {
-    const data = await api(`/api/usage/summary?group_by=${group}&range=${state.range}`);
+    const data = await api(`/api/usage/summary?group_by=${group}&${usageScopeQuery()}`);
     window.__summary = window.__summary || {};
     window.__summary[group] = data.rows || [];
     if (group === state.group) renderTrend();
@@ -1887,22 +2017,25 @@ async function loadUsageList() {
   const tbody = $("#usage-table tbody");
   if (tbody) tbody.setAttribute("aria-busy", "true");
   try {
-    const q = new URLSearchParams({
-      range: state.range,
+    const q = usageScopeQuery({
       limit: state.pageSize,
       offset: state.page * state.pageSize,
       sort: state.usage.listSort,
       order: state.usage.listOrder,
     });
     if (state.usage.only) q.set("only", state.usage.only);
-    if (state.filters.upstream) q.set("upstream", state.filters.upstream);
-    if (state.filters.model) q.set("model", state.filters.model);
-    if (state.filters.session) q.set("session", state.filters.session);
+    // 筛选项本身不能被自身筛选收窄：上游列表只看时间；模型列表跟随上游但忽略已选模型
+    const upQ = usageScopeQuery();
+    ["upstream", "model", "session"].forEach((k) => upQ.delete(k));
+    const modelQ = usageScopeQuery();
+    ["model", "session"].forEach((k) => modelQ.delete(k));
+    const sessionQ = usageScopeQuery();
+    sessionQ.delete("session");
     const [data, byUpstream, byModel, bySession] = await Promise.all([
       api(`/api/usage/list?${q.toString()}`),
-      api(`/api/usage/summary?group_by=upstream&range=${state.range}`),
-      api(`/api/usage/summary?group_by=model&range=${state.range}`),
-      api(`/api/usage/summary?group_by=session&range=${state.range}`),
+      api(`/api/usage/summary?group_by=upstream&${upQ}`),
+      api(`/api/usage/summary?group_by=model&${modelQ}`),
+      api(`/api/usage/summary?group_by=session&${sessionQ}`),
     ]);
     const rows = data.rows || [];
     state.listTotal = data.total || 0;
@@ -2417,9 +2550,86 @@ function initModelUsageControls() {
   });
 }
 
+async function loadUpstreamUsage() {
+  try {
+    const data = await api(`/api/usage/upstreams?${usageScopeQuery({ limit: 200 })}`);
+    state.usage.upstreams = data.rows || [];
+    state.usage.upstreamModels = data.models || [];
+    renderUpstreamUsage();
+  } catch (err) {
+    const tbody = $("#upstream-usage-table tbody");
+    if (tbody) tbody.innerHTML = `<tr><td colspan="10" class="empty">${esc(err.message)}</td></tr>`;
+  }
+}
+
+function renderUpstreamUsage() {
+  const tbody = $("#upstream-usage-table tbody");
+  if (!tbody) return;
+  const pricingReady = !!(state.pricing && state.pricing.configured);
+  const key = state.usage.upstreamSortKey;
+  const dir = state.usage.upstreamSortDir === "asc" ? 1 : -1;
+  const rows = state.usage.upstreams.slice().sort((a, b) => {
+    const va = a[key];
+    const vb = b[key];
+    if (typeof va === "string" || typeof vb === "string") {
+      return String(va || "").localeCompare(String(vb || "")) * dir;
+    }
+    return ((Number(va) || 0) - (Number(vb) || 0)) * dir;
+  });
+
+  $$("#upstream-usage-table th.sortable").forEach((th) => {
+    th.classList.remove("asc", "desc");
+    if (th.dataset.key === key) th.classList.add(dir === 1 ? "asc" : "desc");
+  });
+
+  const hint = $("#upstream-usage-hint");
+  if (hint) {
+    hint.textContent = rows.length
+      ? `共 ${fmtInt(rows.length)} 个上游 · 点击上游行展开其模型`
+      : "该作用域没有上游用量";
+  }
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">暂无上游用量</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map((r) => {
+    const open = state.usage.upstreamExpanded === r.upstream;
+    const models = state.usage.upstreamModels.filter((m) => m.upstream === r.upstream);
+    const rate = fmtRate(r.cache_read_tokens, r.prompt_tokens);
+    const okRate = Number(r.requests)
+      ? (Number(r.success_rate) * 100).toFixed(1).replace(/\.0$/, "") + "%" : "—";
+    const main = `<tr data-upstream="${esc(r.upstream)}" class="usage-row${open ? " open" : ""}">
+      <td><span class="badge">${esc(r.upstream || "—")}</span></td>
+      <td class="num">${fmtInt(r.models_count)}</td>
+      <td class="num" title="命中输入 / 总输入">${esc(rate)}</td>
+      <td class="num">${fmtInt(r.requests)}</td>
+      <td class="num">${fmtTok(r.cache_read_tokens)}</td>
+      <td class="num">${fmtTok(r.total_tokens)}</td>
+      <td class="num">${okRate}</td>
+      <td class="num">${fmtMs(r.avg_duration_ms)}</td>
+      <td class="num">${Number(r.p95_duration_ms) ? fmtMs(r.p95_duration_ms) : "—"}</td>
+      <td class="num">${pricingReady && Number(r.cost) ? Number(r.cost).toFixed(4) : "—"}
+        <button class="ghost tiny" data-only-upstream="${esc(r.upstream)}"
+          title="把页面作用域切到该上游">只看此上游</button></td>
+    </tr>`;
+    if (!open) return main;
+    const detail = models.length
+      ? models.map((m) => `<div class="detail-item">
+          <span class="detail-key">${esc(m.model || "—")}</span>
+          <span class="detail-val mono">命中 ${esc(fmtRate(m.cache_read_tokens, m.prompt_tokens))} ·
+            ${fmtInt(m.requests)} 次 · ${fmtTok(m.total_tokens)} token ·
+            成功率 ${(Number(m.success_rate) * 100).toFixed(1).replace(/\.0$/, "")}% ·
+            均耗 ${fmtMs(m.avg_duration_ms)}</span>
+        </div>`).join("")
+      : '<div class="detail-item"><span class="detail-val">该上游在区间内没有模型明细</span></div>';
+    return main + `<tr class="detail-row"><td colspan="10"><div class="detail-grid">${detail}</div></td></tr>`;
+  }).join("");
+}
+
 async function loadModelUsage() {
   try {
-    const data = await api(`/api/usage/models?range=${state.range}&limit=200`);
+    const data = await api(`/api/usage/models?${usageScopeQuery({ limit: 200 })}`);
     state.usage.models = data.rows || [];
     if (data.pricing_configured !== undefined) {
       state.pricing = Object.assign({}, state.pricing, {
@@ -2480,12 +2690,12 @@ function renderModelUsage() {
       ? (Number(r.success_rate) * 100).toFixed(1).replace(/\.0$/, "") + "%" : "—";
     return `<tr>
       <td class="mono">${esc(r.model || "—")}</td>
+      <td class="num" title="${esc(fmtRate(r.cache_read_tokens, r.prompt_tokens))}">${esc(fmtRate(r.cache_read_tokens, r.prompt_tokens))}</td>
       <td class="num">${fmtInt(r.requests)}</td>
       <td class="num">${fmtTok(r.prompt_tokens)}</td>
       <td class="num">${fmtTok(r.completion_tokens)}</td>
       <td class="num">${fmtTok(r.total_tokens)}</td>
       <td class="num">${fmtTok(r.cache_read_tokens)}</td>
-      <td class="num" title="${esc(fmtRate(r.cache_read_tokens, r.prompt_tokens))}">${esc(fmtRate(r.cache_read_tokens, r.prompt_tokens))}</td>
       <td class="num">${pricingReady && Number(r.cost) ? Number(r.cost).toFixed(4) : "—"}</td>
       <td class="num">${Number(r.errors) ? `<span class="badge warn">${okRate}</span>` : okRate}</td>
       <td class="num">${fmtMs(r.avg_duration_ms)}</td>
@@ -2535,6 +2745,18 @@ function initLogControls() {
   if (copyBtn) copyBtn.addEventListener("click", () => {
     const viewer = $("#log-viewer");
     copyText(viewer ? viewer.textContent || "" : "");
+  });
+
+  // 单行复制：hover 按钮或点击行空白处；正在框选文本时不打断选择
+  const viewer = $("#log-viewer");
+  if (viewer) viewer.addEventListener("click", (ev) => {
+    const selection = window.getSelection ? String(window.getSelection()) : "";
+    if (selection && selection.trim()) return;
+    const line = ev.target.closest(".ln[data-line]");
+    if (!line) return;
+    const row = (state.logs.rows || [])[Number(line.dataset.line)];
+    if (!row) return;
+    copyText(row.text || "");
   });
 
   const bottom = $("#log-bottom");
@@ -2600,13 +2822,14 @@ async function loadLogs() {
   try {
     const data = await api(`/api/logs?${q.toString()}`);
     const rows = data.lines || [];
+    state.logs.rows = rows;
     // 贴底才自动跟随最新：用户往上翻历史时不要把他拽回底部
     const atBottom = viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 40;
     viewer.innerHTML = rows.length
-      ? rows.map((l) => {
+      ? rows.map((l, i) => {
           const cls = classifyLogLine(l.text || "");
-          return `<span class="ln ${cls}"><span class="no">${l.no}</span>${
-            highlightLog(l.text || "", state.logs.q)}</span>`;
+          return `<span class="ln ${cls}" data-line="${i}" title="点击复制本行"><span class="no">${l.no}</span><span class="txt">${
+            highlightLog(l.text || "", state.logs.q)}</span><button type="button" class="ln-copy" tabindex="-1">复制</button></span>`;
         }).join("\n")
       : `<span class="ln">（没有匹配的日志）</span>`;
     const meta = $("#log-meta");

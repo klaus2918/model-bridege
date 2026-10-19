@@ -64,10 +64,18 @@ def test_rule_inherits_unspecified_fields_from_default():
 
 
 def test_cost_math():
+    # prompt_tokens 是总输入（含缓存）；输入费只算未缓存部分，避免重复计费
     cost = cost_of(PRICING, upstream="go", model="glm-5.3-flash",
-                   prompt_tokens=1_000_000, completion_tokens=1_000_000,
+                   prompt_tokens=10_000_000, completion_tokens=1_000_000,
                    cache_read_tokens=1_000_000, cache_write_tokens=1_000_000)
-    assert abs(cost - (0.6 + 2.4 + 0.1 + 0.5)) < 1e-9
+    # 非缓存输入 8M×0.6 + 输出 1M×2.4 + 缓存读 1M×0.1 + 缓存写 1M×0.5
+    assert abs(cost - (4.8 + 2.4 + 0.1 + 0.5)) < 1e-9
+
+    # 缓存量不小于总输入时，输入部分按 0 计，不出现负费用
+    only_cache = cost_of(PRICING, upstream="go", model="glm-5.3-flash",
+                         prompt_tokens=1_000_000, completion_tokens=0,
+                         cache_read_tokens=2_000_000)
+    assert abs(only_cache - 0.2) < 1e-9
 
 
 def test_is_configured_distinguishes_zero_from_unset():

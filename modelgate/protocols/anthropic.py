@@ -13,6 +13,35 @@ from ..util import access_log_enabled, log, push_message, safe_json, text_of
 from .base import BuildResult, Ctx, ProtocolError, SseWriter, iter_sse_blocks, parse_sse_json
 
 
+def _usage_counts(raw: dict) -> tuple[int, int, int]:
+    """Anthropic usage → (总输入, 缓存读, 缓存写)。
+
+    Anthropic 的 input_tokens 不含缓存 token；而前端命中率按 OpenAI 口径
+    ``cache_read / prompt_tokens`` 计算，所以这里把缓存部分并回总输入。
+    """
+    u = raw or {}
+    input_tokens = int(u.get("input_tokens") or 0)
+    cache_read = int(u.get("cache_read_input_tokens") or 0)
+    cache_write = int(u.get("cache_creation_input_tokens") or 0)
+    return input_tokens + cache_read + cache_write, cache_read, cache_write
+
+
+def _usage_out(raw: dict) -> dict:
+    """Anthropic usage → 内部用量（总输入 + 缓存读/写），供落库与日志使用。"""
+    u = raw or {}
+    prompt, cache_read, cache_write = _usage_counts(u)
+    out = {
+        "prompt_tokens": prompt,
+        "completion_tokens": int(u.get("output_tokens") or 0),
+    }
+    if cache_read:
+        out["cacheReadTokens"] = cache_read
+    if cache_write:
+        out["cacheWriteTokens"] = cache_write
+    return out
+
+
+
 class AnthropicAdapter:
     protocol = "anthropic"
 
@@ -172,8 +201,16 @@ class AnthropicAdapter:
                 for i, b in enumerate(tool_uses)
             ]
 
-        prompt = int(((data.get("usage") or {}).get("input_tokens")) or 0)
-        completion = int(((data.get("usage") or {}).get("output_tokens")) or 0)
+        # 对外只暴露 OpenAI 口径字段；缓存读/写由 parse_response 放进 meta 落库
+        usage = _usage_out(data.get("usage") or {})
+        usage_out = {
+            "prompt_tokens": usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"],
+            "total_tokens": usage["prompt_tokens"] + usage["completion_tokens"],
+        }
+        if usage.get("cacheReadTokens"):
+            usage_out["prompt_tokens_details"] = {
+                "cached_tokens": usage["cacheReadTokens"]}
         return {
             "id": data.get("id"),
             "object": "chat.completion",
@@ -184,11 +221,7 @@ class AnthropicAdapter:
                 "message": message,
                 "finish_reason": self.to_finish_reason(data.get("stop_reason")),
             }],
-            "usage": {
-                "prompt_tokens": prompt,
-                "completion_tokens": completion,
-                "total_tokens": prompt + completion,
-            },
+            "usage": usage_out,
         }
 
     # ── 主入口 ───────────────────────────────────────────────────────────
@@ -217,12 +250,34 @@ class AnthropicAdapter:
             data = json.loads(raw)
         except Exception:
             return {"error": f"上游响应不是合法 JSON: {raw[:200]}"}
-        return {"body": self.to_openai(data, ctx.requested_model)}
+        return {
+            "body": self.to_openai(data, ctx.requested_model),
+            "meta": {"usage": _usage_out(data.get("usage") or {})},
+        }
 
     def parse_stream(self, lines: Iterable[str], writer: SseWriter, ctx: Ctx) -> dict:
         """Anthropic SSE 流 → OpenAI SSE 流（逐事件改写）。返回 usage。"""
         finish_reason = "stop"
         usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        input_tokens = 0
+        cache_read = 0
+        cache_write = 0
+
+        def apply_usage(raw: dict) -> None:
+            """合并一次 usage 片段（Anthropic：input 不含缓存，需相加）。"""
+            nonlocal input_tokens, cache_read, cache_write
+            u = raw or {}
+            if "input_tokens" in u:
+                input_tokens = int(u.get("input_tokens") or 0)
+            if "cache_read_input_tokens" in u:
+                cache_read = int(u.get("cache_read_input_tokens") or 0)
+            if "cache_creation_input_tokens" in u:
+                cache_write = int(u.get("cache_creation_input_tokens") or 0)
+            usage["prompt_tokens"] = input_tokens + cache_read + cache_write
+            if cache_read:
+                usage["cacheReadTokens"] = cache_read
+            if cache_write:
+                usage["cacheWriteTokens"] = cache_write
         finished = False
         tool_index = -1
         acc_thinking = ""
@@ -233,8 +288,7 @@ class AnthropicAdapter:
         def emit(event: str, data: dict) -> None:
             nonlocal finish_reason, finished, tool_index, acc_thinking, acc_signature, acc_text
             if event == "message_start":
-                usage["prompt_tokens"] = int(
-                    (((data.get("message") or {}).get("usage") or {}).get("input_tokens")) or 0)
+                apply_usage((data.get("message") or {}).get("usage") or {})
                 writer.write_chunk({"role": "assistant", "content": ""})
                 return
             if event == "content_block_start":
@@ -277,15 +331,20 @@ class AnthropicAdapter:
                 out_tokens = (data.get("usage") or {}).get("output_tokens")
                 if out_tokens is not None:
                     usage["completion_tokens"] = int(out_tokens or 0)
+                apply_usage(data.get("usage") or {})
                 return
             if event == "message_stop":
                 finished = True
                 self.thinking.remember(acc_thinking, acc_signature, acc_text, acc_tool_ids)
-                writer.write_chunk({}, finish_reason=finish_reason, usage={
+                final_usage = {
                     "prompt_tokens": usage["prompt_tokens"],
                     "completion_tokens": usage["completion_tokens"],
                     "total_tokens": usage["prompt_tokens"] + usage["completion_tokens"],
-                })
+                }
+                if usage.get("cacheReadTokens"):
+                    final_usage["prompt_tokens_details"] = {
+                        "cached_tokens": usage["cacheReadTokens"]}
+                writer.write_chunk({}, finish_reason=finish_reason, usage=final_usage)
                 writer.write_done()
 
         for event, data_lines in iter_sse_blocks(lines):

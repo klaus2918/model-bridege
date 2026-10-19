@@ -1,9 +1,12 @@
-# model-bridge — 使用说明
+# Model-Gate — 使用说明
 
-> **桌面版（推荐）**：`dist\Model-Gate.exe` 是同一套能力的 Windows 桌面版：本地代理 + 模型配置面板
+> **桌面版（推荐，当前主线 2.19）**：`dist\Model-Gate.exe` 是 Windows 桌面代理：本地 HTTP 服务 + 模型配置面板
 > + token 用量统计（SQLite 落库）。启动后访问 `http://127.0.0.1:8900/ui/` 打开面板；
 > 无 GUI 环境可用 `Model-Gate.exe --no-gui --port 8911` 以纯代理模式运行。
-> 本文其余小节描述的行为对 Node 版（`node model-bridge.js`）与桌面版**完全一致**。
+>
+> **Legacy Node 版（冻结）**：`legacy/node-bridge/` 保留原始单文件实现（`node model-bridge.js`）。
+> 两者的代理路由与上游协议行为一致；桌面版另外提供面板、SQLite 用量、上游故障切换与配置热重载，
+> Node 版不再新增这些能力，仅做必要兼容修复。
 >
 > **密钥安全**：桌面包会把**非空明文 `apiKey` 拦在内存里**，不写入 `bridge.config.json`
 > 与 SQLite。要长期使用请用 `apiKeyEnv`（读 `~/.jcode/.env`）或 `apiKeyFile`
@@ -118,7 +121,7 @@ model-bridge 把这些差异都收敛到一个进程里，Agent 只需指向一�
 
 桌面版（推荐）：双击 `dist\Model-Gate.exe`。托盘出现图标，面板自动打开 `http://127.0.0.1:8900/ui/`；**关窗不退出**，托盘菜单退出才停。
 
-旧版 Node 单文件仍可用（行为一致）：`node model-bridge.js`（窗口要开着，关掉即停）。
+Legacy Node 版（冻结）：`cd legacy\node-bridge` 后运行 `node model-bridge.js`（或 `start-bridge.cmd`）；无面板与用量统计，终端关闭即停。
 
 ### 两种运行模式（同一个 exe）
 
@@ -495,7 +498,7 @@ curl http://127.0.0.1:8900/v1/models
 ```
 
 `protocol` 可写 `anthropic` / `openai` / `commandcode`；省略时按 `baseUrl` 推断（opencode 系 → `openai`，
-commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议还得在 `model-bridge.js` 的协议适配层加一个适配器。
+commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议需在 `modelgate/protocols/` 增加适配器；Legacy Node 版对应改 `legacy/node-bridge/model-bridge.js`。
 
 ---
 
@@ -610,6 +613,12 @@ CommandCode 的思考内容由它自己的事件流直接透出（不依赖这�
 `tokens=` 之后按上游协议追加附加信息：`think=补回条数`（anthropic）、
 `cache=缓存读+缓存写`、`截断(无 finish)`、`pause_turn 未续完`、`上游错误: ...`（后四项来自 CommandCode 协议）。
 
+**面板用法（桌面版）**：用量页顶部的作用域条（时间预设 / 自定义起止 / 上游 / 模型）控制整页统计——
+KPI、趋势、占比、上游用量、模型用量与明细都会跟随，切换上游后模型下拉只保留该上游的模型。
+「上游用量」表按上游聚合，点击行可展开该上游的模型用量，行内「只看此上游」可直接收窄作用域。
+KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示「—」），成功率放在吞吐组作为健康度参考。
+日志页每行 hover 出现「复制」，点击行空白处也可复制该行（不含行号）；框选文本时不会触发复制。
+
 ---
 
 ## 十一、常见问题
@@ -633,38 +642,63 @@ CommandCode 的思考内容由它自己的事件流直接透出（不依赖这�
 
 ## 十二、运行前提
 
-- **Node.js**：需要（本机已装）。无第三方依赖，不用 `npm install`
+- **桌面版**：Windows 10/11，直接运行 `dist\Model-Gate.exe`，无需安装 Python/Node
+- **源码运行/构建**：Python 3.11+（`entry.py`、`modelgate/`、`build.bat`）
+- **Legacy Node 版与 Node 冒烟测试**：Node.js 18+（无第三方依赖，不用 `npm install`）
 - **cch 上游**：需本地代理在 `127.0.0.1:15721` 运行
 - **go 上游**：配置里写的是 `apiKeyEnv: OPENCODE_API_KEY`。但 2026-10-08 实测本机 **Process / User / Machine
   三处都没有这个变量**，go 的模型照样全部返回 200——即当前 Go 订阅的可用性并不依赖这个 key；
   `/zen/go/v1/models` 更是公开可读。若哪天开始 401，再去 `~/.jcode/.env` 补 key 不迟
 - **zen 上游**：无需密钥
 - **commandcode 上游**：需本机登录过 command-code（凭据 `~/.commandcode/auth.json`）或设 `COMMAND_CODE_API_KEY`；`x-command-code-version` 默认自动探测，读不到时可显式配 `cliVersion`
-- **系统**：Windows（`start-bridge.cmd`）；`model-bridge.js` 本身跨平台
+- **系统**：Windows（桌面 exe 与 `start-bridge.cmd`）；`legacy/node-bridge/model-bridge.js` 本身跨平台
 
 ---
 
-## 十三、文件清单
+## 十三、项目目录与维护
 
-| 文件 | 作用 |
+```
+Model-Gate/
+├─ README.md                      # 本说明
+├─ entry.py                       # 桌面版入口（pywebview/托盘/单实例）
+├─ modelgate/                     # 当前产品源码（Python）
+├─ tests/                         # pytest 测试
+├─ assets/                        # 图标等构建资产
+├─ docs/                          # 文档（architecture / integration / live-panel / maintenance）
+├─ scripts/                       # 活跃工具：构建、测试、安全扫描、发布
+│  └─ archive/                    # 过期的一次性版本验证/探测/文档脚本（只作历史证据）
+├─ legacy/node-bridge/            # 冻结的 Node 单文件桥及其测试、changelog
+├─ ModelGate.spec / ModelGate.iss # PyInstaller / Inno Setup 打包定义
+├─ build.bat                      # 唯一构建入口
+├─ bridge.config.example.json     # 零密钥配置模板（唯一入库配置）
+└─ dist/ build/ data/ .op/        # 本地生成物/运行数据/变更工作区（均不在版本库）
+```
+
+维护规则、清理节奏与敏感信息处理见 [`docs/maintenance/project-layout.md`](docs/maintenance/project-layout.md)；
+文档索引见 [`docs/README.md`](docs/README.md)。新增一次性排查脚本请放 `scripts/archive/`，不要继续堆积在 `scripts/` 根目录。
+日常排查先跑 `py -3 scripts/doctor.py all`（端口/配置/密钥/库/运行时一次看完），再用具体子命令深入。
+
+---
+
+## 十四、文件清单
+
+| 路径 | 作用 |
 |------|------|
-| `model-bridge.js` | 主程序，零依赖单文件 |
-| `bridge.config.json` | 配置（四条上游定义） |
-| `start-bridge.cmd` | 一键启动 |
-| `restart-bridge.cmd` | 一键重启（先结束旧进程再启动） |
-| `README.md` | 本说明 |
-| `package.json` | Node 工程信息（零依赖，声明 `type: module`） |
-| `test-bridge.mjs` | 冒烟测试：对着**运行中**的真实上游跑全链路（`npm test`） |
-| `test-commandcode.mjs` | commandcode 协议**离线**回归：自带 stub 上游与独立实例，零外网（`npm run test:commandcode`） |
-| `probe-upstream.mjs` | 探测本地 cch 代理（cc-switch）支持哪些协议与模型名（`npm run probe`） |
-| `changelog/` | 发行说明源：每版本一份 `v<版本>.json`，`index.json` 为索引（见第十四节） |
-| `scripts/` | 打包发布脚本（打包、产物自检、校验和、发行说明渲染、重触发），CI 与本地共用 |
-| `.github/workflows/release.yml` | tag 驱动的发布流水线 |
-| `dist/`、`SHA256SUMS` | 打包产物与校验和（`.gitignore` 排除，不入库） |
+| `entry.py`、`modelgate/` | 桌面版入口与 Python 源码 |
+| `tests/` | 单元/接口测试（`python -m pytest`） |
+| `ModelGate.spec`、`ModelGate.iss`、`build.bat` | 打包定义与构建入口 |
+| `assets/ModelGate.ico` | 应用图标（由 `scripts/make_icon.py` 生成） |
+| `docs/` | 架构图、集成记录、面板素材与维护规范 |
+| `scripts/` | 活跃工具脚本；`scripts/archive/` 为历史一次性脚本 |
+| `legacy/node-bridge/` | 冻结的 Node 单文件桥、`package.json`、冒烟测试与 `changelog/` |
+| `bridge.config.example.json` | 配置模板（零密钥，可入库） |
+| `bridge.config.json` | 本机真实配置（**不入库**） |
+| `dist/`、`build/`、`data/`、`.op/` | 打包产物、构建中间目录、运行数据、变更工作区（**均不入库**） |
+| `.github/workflows/release.yml` | Legacy Node 的 tag 驱动发布流水线（`legacy-v*`） |
 
 ---
 
-## 十四、版本与打包
+## 十五、版本与打包
 
 版本号**唯一来源**：`modelgate/__init__.py` 的 `__version__`（面板资产戳、`/ui/` 注入的 `app.js?v=` 都读它）。
 
@@ -676,7 +710,9 @@ build.bat
 
 它按顺序做：探针解释器 → 生成图标 → **跑测试（失败即停）** → PyInstaller onefile → Inno Setup（本机无 `iscc` 时自动跳过）→ 汇总。
 
-仓库里**只保留一份**打包定义 `ModelGate.spec`（产物 `dist\Model-Gate.exe`）。v2.3–v2.18 的逐版本 spec 已删除——它们只是同名的拷贝。
+仓库里**只保留一份**打包定义 `ModelGate.spec`（产物 `dist\Model-Gate.exe`）。v2.3–v2.19 的逐版本 spec 已删除——它们只是同名的拷贝。
+
+Legacy Node 版不参与该打包流程；如需发布历史 Node 包，使用 `legacy-v<version>` tag 触发 `.github/workflows/release.yml`，产物为 `dist/model-bridge-v<version>.zip`。
 
 ### 产出带版本号的产物（升级时用）
 
@@ -691,7 +727,7 @@ py -3 -m PyInstaller --noconfirm --clean ModelGate.v2.19.spec
 
 ### 升级（不停机）
 
-1. 新 exe 在**空闲端口 + 独立库**先跑一遍，或直接黑盒验证产物（`scripts/verify_v217_exe.py` 的形态）
+1. 新 exe 在**空闲端口 + 独立库**先跑一遍，或直接黑盒验证产物（可参考 `scripts/archive/versions/verify_v217_exe.py` 的历史形态，或使用 `scripts/upgrade_and_run.ps1`）
 2. 按 **PID** 停旧实例（端口占用者），**不要按进程名**
 3. 用同一 `--config` / `--db` 起新实例——`bridge.config.json` 与 `data/` 全程不动，客户端 `base_url` 无需修改
 4. 实测停机 2.6–3.6 秒

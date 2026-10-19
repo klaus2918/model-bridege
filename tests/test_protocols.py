@@ -144,6 +144,41 @@ def test_anthropic_response_to_openai():
     assert adapter.thinking.recall("答", ["tu"]) is not None
 
 
+def test_anthropic_response_usage_maps_cache_fields():
+    adapter = AnthropicAdapter(ThinkingCache(enabled=True))
+    data = {
+        "id": "msg_cache",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "答"}],
+        "usage": {
+            "input_tokens": 11,
+            "cache_read_input_tokens": 90,
+            "cache_creation_input_tokens": 3,
+            "output_tokens": 5,
+        },
+    }
+    ctx = Ctx(body={}, requested_model="stub-anthropic",
+              upstream_model="m", upstream={"name": "anth"})
+
+    out = adapter.to_openai(data, "stub-anthropic")
+    # 对外是 OpenAI 口径：prompt 含缓存部分，缓存量另放 details
+    assert out["usage"] == {
+        "prompt_tokens": 104,
+        "completion_tokens": 5,
+        "total_tokens": 109,
+        "prompt_tokens_details": {"cached_tokens": 90},
+    }
+
+    parsed = adapter.parse_response(json.dumps(data), ctx)
+    # 落库/日志用内部口径：缓存读写成独立字段
+    assert parsed["meta"]["usage"] == {
+        "prompt_tokens": 104,
+        "completion_tokens": 5,
+        "cacheReadTokens": 90,
+        "cacheWriteTokens": 3,
+    }
+
+
 def test_anthropic_stream_rewrites_to_openai_sse():
     adapter = AnthropicAdapter(ThinkingCache(enabled=True))
     writer, buf = make_writer("stub-anthropic")
@@ -189,6 +224,38 @@ def test_anthropic_stream_without_stop_sends_done():
     ]), writer, ctx)
     assert usage == {"prompt_tokens": 2, "completion_tokens": 0}
     assert buf.getvalue().decode().rstrip().endswith("data: [DONE]")
+
+
+def test_anthropic_stream_usage_maps_cache_fields():
+    adapter = AnthropicAdapter(ThinkingCache(enabled=True))
+    writer, buf = make_writer("stub-anthropic")
+    ctx = Ctx(body={}, requested_model="stub-anthropic", upstream_model="m",
+              upstream={"name": "anth"})
+    usage = adapter.parse_stream(sse_lines([
+        ("message_start", {"message": {"usage": {
+            "input_tokens": 7,
+            "cache_read_input_tokens": 90,
+            "cache_creation_input_tokens": 3,
+        }}}),
+        ("content_block_delta", {"delta": {"type": "text_delta", "text": "x"}}),
+        ("message_delta", {"delta": {"stop_reason": "end_turn"},
+                           "usage": {"output_tokens": 4}}),
+        ("message_stop", {}),
+    ]), writer, ctx)
+
+    assert usage == {
+        "prompt_tokens": 100,
+        "completion_tokens": 4,
+        "cacheReadTokens": 90,
+        "cacheWriteTokens": 3,
+    }
+    final = parse_chunks(buf)[-1]
+    assert final["usage"] == {
+        "prompt_tokens": 100,
+        "completion_tokens": 4,
+        "total_tokens": 104,
+        "prompt_tokens_details": {"cached_tokens": 90},
+    }
 
 
 # ── openai ────────────────────────────────────────────────────────────────

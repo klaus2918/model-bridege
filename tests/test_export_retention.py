@@ -218,3 +218,67 @@ def test_list_total_matches_filters(bridge_factory):
     assert by_model["total"] == 1
     assert handle.client.get(
         f"{handle.base}/api/usage/list?range=all&upstream=b&model=m2").json()["total"] == 0
+
+
+def test_usage_scope_endpoints(bridge_factory):
+    """KPI / 汇总 / 模型表 / 上游表共用同一作用域，并返回命中率派生字段。"""
+    handle = bridge_factory()
+    db = handle.bridge.db
+    for upstream, model in (("a", "m1"), ("a", "m2"), ("b", "m1")):
+        db.record_usage(upstream=upstream, protocol="openai", requested_model=model,
+                        upstream_model=model, prompt_tokens=100,
+                        cache_read_tokens=40, duration_ms=10, status=200)
+
+    totals = handle.client.get(
+        f"{handle.base}/api/usage/totals?range=all&upstream=a").json()["totals"]
+    assert totals["requests"] == 2
+    assert totals["cache_hit_rate"] == 0.4
+
+    summary = handle.client.get(
+        f"{handle.base}/api/usage/summary?group_by=model&range=all&upstream=b").json()
+    assert [r["bucket"] for r in summary["rows"]] == ["m1"]
+
+    models = handle.client.get(
+        f"{handle.base}/api/usage/models?range=all&upstream=a").json()
+    assert {r["model"] for r in models["rows"]} == {"m1", "m2"}
+
+    only_m1 = handle.client.get(
+        f"{handle.base}/api/usage/models?range=all&model=m1").json()
+    assert {r["model"] for r in only_m1["rows"]} == {"m1"}
+
+    ups = handle.client.get(f"{handle.base}/api/usage/upstreams?range=all").json()
+    assert {r["upstream"] for r in ups["rows"]} == {"a", "b"}
+    a = next(r for r in ups["rows"] if r["upstream"] == "a")
+    assert a["models_count"] == 2 and a["cache_hit_rate"] == 0.4
+    assert {(m["upstream"], m["model"]) for m in ups["models"]} == {
+        ("a", "m1"), ("a", "m2"), ("b", "m1")}
+
+    # 页面作用域选定上游后，上游表与其下钻都必须同步收窄，不能只收窄 KPI
+    scoped = handle.client.get(
+        f"{handle.base}/api/usage/upstreams?range=all&upstream=a").json()
+    assert [r["upstream"] for r in scoped["rows"]] == ["a"]
+    assert {m["model"] for m in scoped["models"]} == {"m1", "m2"}
+
+    bad = handle.client.get(
+        f"{handle.base}/api/usage/totals?from=2026-10-03T00:00&to=2026-10-02T00:00")
+    assert bad.status_code == 400
+
+
+def test_clear_usage_respects_custom_window(bridge_factory):
+    """自定义区间清空只删该窗口，不会把窗口外的明细一并删掉。"""
+    handle = bridge_factory()
+    db = handle.bridge.db
+    now = int(time.time())
+    old = db.record_usage(upstream="a", protocol="openai", requested_model="old",
+                          upstream_model="old", prompt_tokens=1, duration_ms=1, status=200)
+    db._conn.execute("UPDATE usage_records SET ts = ? WHERE id = ?", (now - 7200, old))
+    fresh = db.record_usage(upstream="a", protocol="openai", requested_model="fresh",
+                            upstream_model="fresh", prompt_tokens=1, duration_ms=1,
+                            status=200)
+    db._conn.commit()
+
+    res = handle.client.post(f"{handle.base}/api/usage/clear",
+                             json={"from": now - 10800, "to": now - 3600})
+    assert res.status_code == 200
+    assert res.json()["removed"] == 1
+    assert [r["id"] for r in db.list_usage(limit=10)] == [fresh]

@@ -117,13 +117,21 @@ def currency_of(pricing: Any) -> str:
 def cost_of(pricing: Any, *, upstream: Optional[str], model: Optional[str],
             prompt_tokens: int = 0, completion_tokens: int = 0,
             cache_read_tokens: int = 0, cache_write_tokens: int = 0) -> float:
-    """计算单条记录的费用（保留 6 位小数，便于与 SQLite REAL 比对）。"""
+    """计算单条记录的费用（保留 6 位小数，便于与 SQLite REAL 比对）。
+
+    ``prompt_tokens`` 是**总输入**（OpenAI / anthropic 适配后都含缓存部分），
+    所以输入单价只作用于未命中缓存的 token，避免与缓存读写价重复计费。
+    """
     rate, _key = resolve_rate(pricing, upstream, model)
+    prompt = int(prompt_tokens or 0)
+    cache_read = int(cache_read_tokens or 0)
+    cache_write = int(cache_write_tokens or 0)
+    billable_input = max(prompt - cache_read - cache_write, 0)
     total = (
-        int(prompt_tokens or 0) * rate["input"]
+        billable_input * rate["input"]
         + int(completion_tokens or 0) * rate["output"]
-        + int(cache_read_tokens or 0) * rate["cacheRead"]
-        + int(cache_write_tokens or 0) * rate["cacheWrite"]
+        + cache_read * rate["cacheRead"]
+        + cache_write * rate["cacheWrite"]
     ) / PER_UNIT
     return round(total, 6)
 

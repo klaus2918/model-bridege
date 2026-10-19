@@ -263,6 +263,20 @@
         <button data-range="30d">30 天</button>
         <button data-range="all">全部</button>
       </div>
+      <label class="inline-field" title="页面内所有统计按此上游收窄">上游
+        <select id="scope-upstream" class="filter-select"></select>
+      </label>
+      <label class="inline-field" title="选择上游后只列出该上游的模型">模型
+        <select id="scope-model" class="filter-select"></select>
+      </label>
+      <label class="inline-field" title="自定义时间区间，优先于左侧预设">从
+        <input type="datetime-local" id="scope-from" class="filter-input">
+      </label>
+      <label class="inline-field">到
+        <input type="datetime-local" id="scope-to" class="filter-input">
+      </label>
+      <button class="ghost" id="scope-clear" title="清除上游/模型/自定义时间">清除筛选</button>
+      <span class="hint" id="scope-hint">KPI / 趋势 / 分布 / 明细统一跟随此作用域</span>
       <div class="seg" id="group-seg">
         <button data-group="day" class="active">按天</button>
         <button data-group="model">按模型</button>
@@ -335,6 +349,30 @@
 
     <div class="box">
       <div class="box-head">
+        <h2>上游用量</h2>
+        <span class="hint" id="upstream-usage-hint"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="upstream-usage-table" class="sortable-table">
+          <thead><tr>
+            <th class="sortable" data-key="upstream">上游</th>
+            <th class="num sortable" data-key="models_count">模型数</th>
+            <th class="num sortable" data-key="cache_hit_rate">命中率</th>
+            <th class="num sortable" data-key="requests">请求</th>
+            <th class="num sortable" data-key="cache_read_tokens">缓存命中</th>
+            <th class="num sortable" data-key="total_tokens">总 token</th>
+            <th class="num sortable" data-key="success_rate">成功率</th>
+            <th class="num sortable" data-key="avg_duration_ms">均耗</th>
+            <th class="num sortable" data-key="p95_duration_ms">P95</th>
+            <th class="num sortable" data-key="cost">费用</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="box">
+      <div class="box-head">
         <h2>模型用量</h2>
         <div class="section-actions">
           <input type="search" id="model-usage-search" class="filter-input" placeholder="搜索模型">
@@ -353,12 +391,12 @@
         <table id="model-usage-table">
           <thead><tr>
             <th class="sortable" data-key="model">模型</th>
+            <th class="num sortable" data-key="cache_hit_rate">命中率</th>
             <th class="num sortable" data-key="requests">请求</th>
             <th class="num sortable" data-key="prompt_tokens">输入</th>
             <th class="num sortable" data-key="completion_tokens">输出</th>
             <th class="num sortable" data-key="total_tokens">总 token</th>
             <th class="num sortable" data-key="cache_read_tokens">缓存</th>
-            <th class="num sortable" data-key="cache_hit_rate">命中率</th>
             <th class="num sortable" data-key="cost">费用</th>
             <th class="num sortable" data-key="success_rate">成功率</th>
             <th class="num sortable" data-key="avg_duration_ms">均耗</th>
@@ -377,8 +415,6 @@
       <div class="section-head">
         <h2>明细</h2>
         <div class="section-actions">
-          <select id="filter-upstream" class="filter-select"></select>
-          <select id="filter-model" class="filter-select"></select>
           <select id="filter-session" class="filter-select"></select>
           <select id="page-size" class="filter-select" title="每页条数">
             <option value="25">25 条/页</option>

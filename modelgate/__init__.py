@@ -9,6 +9,6 @@
 - app      pywebview 窗口 / 托盘 / 单实例
 """
 
-__version__ = "2.18.0"
+__version__ = "2.19.0"
 APP_NAME = "Model-Gate"
 APP_TITLE = "Model-Gate - 模型代理与用量统计"

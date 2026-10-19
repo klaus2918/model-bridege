@@ -329,11 +329,18 @@ code.ep { font-family: var(--mono); color: var(--data); }
   font-family: var(--mono); font-size: 11.5px; line-height: 1.65; color: var(--text-2);
   white-space: pre-wrap; word-break: break-word;
 }
-.log-viewer .ln { display: block; }
+.log-viewer .ln { display: block; position: relative; padding-right: 52px; }
 .log-viewer .ln:hover { background: var(--surface-3); }
 .log-viewer .ln.err { color: var(--danger); }
 .log-viewer .ln.warn { color: var(--warn); }
 .log-viewer .ln .no { color: var(--text-3); margin-right: 9px; user-select: none; }
+.log-viewer .ln .txt { user-select: text; }
+.log-viewer .ln .ln-copy {
+  position: absolute; right: 4px; top: 0;
+  opacity: 0; pointer-events: none;
+  padding: 0 6px; font-size: 10px; line-height: 1.6;
+}
+.log-viewer .ln:hover .ln-copy { opacity: 1; pointer-events: auto; }
 
 /* ══ 用量面板深化：KPI 分组 / 异常 chips / 可展开明细 ══ */
 .kpi-group { display: grid; gap: 6px; }
