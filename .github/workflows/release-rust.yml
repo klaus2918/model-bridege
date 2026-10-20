@@ -1,0 +1,103 @@
+name: Rust Desktop Release
+
+# Model-Gate Rust 桌面版发布流水线：
+#   - 推送 v* tag（如 v2.19.0）触发构建并发布 GitHub Release；
+#   - 手动 workflow_dispatch 默认只构建产物（可勾选 publish 一并发布）。
+# 版本唯一源：modelgate/__init__.py；tag 触发时校验 tag == v<version>。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "创建 GitHub Release（默认仅构建产物）"
+        type: boolean
+        default: false
+
+concurrency:
+  group: rust-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 构建 Rust 安装包
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/model-gate
+
+      - name: 读取版本并校验 tag
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $text = Get-Content "modelgate\__init__.py" -Raw -Encoding UTF8
+          if ($text -notmatch '__version__\s*=\s*"([^"]+)"') { throw "version not found in modelgate/__init__.py" }
+          $ver = $Matches[1]
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$ver") {
+            throw "tag $($env:GITHUB_REF_NAME) does not match v$ver"
+          }
+          Write-Host "version: $ver"
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: cargo build --release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --manifest-path rust/model-gate/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed: $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "rust/model-gate/target/release/model-gate.exe" "dist/Model-Gate-rust.exe" -Force
+
+      - name: 打包安装包（Inno Setup）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\rust\model-gate\build-installer.ps1 -Version "${{ steps.meta.outputs.version }}"
+          $setup = "dist\Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe"
+          if (-not (Test-Path $setup)) { throw "installer missing: $setup" }
+          $size = (Get-Item $setup).Length
+          if ($size -gt 6MB) { throw ("installer exceeds 6MB: {0:N2} MB" -f ($size / 1MB)) }
+          "installer_size_mb={0:N2}" -f ($size / 1MB) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $setup -Leaf)" | Out-File -FilePath "dist\SHA256SUMS" -Encoding ascii
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-installer
+          path: |
+            dist/Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe
+            dist/Model-Gate-rust.exe
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 发布 GitHub Release
+        if: ${{ github.ref_type == 'tag' || inputs.publish }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.meta.outputs.version) }}
+          name: Model-Gate v${{ steps.meta.outputs.version }} (Rust)
+          body: |
+            Model-Gate Rust 桌面版：托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
+
+            - 安装包：`Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe`（安装时可选安装目录）
+            - 便携版：`Model-Gate-rust.exe`（单文件，免安装）
+            - 校验：`SHA256SUMS`
+          generate_release_notes: true
+          draft: false
+          files: |
+            dist/Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe
+            dist/Model-Gate-rust.exe
+            dist/SHA256SUMS
