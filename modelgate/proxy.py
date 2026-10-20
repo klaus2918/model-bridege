@@ -351,14 +351,26 @@ class Bridge:
         """从某个上游拉取模型列表；失败返回空数组。"""
         if upstream.get("fetchModels") is False:
             return []
-        headers: dict = {}
-        if upstream.get("protocol") == "openai":
-            if upstream.get("apiKey"):
-                headers["authorization"] = f"Bearer {upstream['apiKey']}"
-        elif upstream.get("apiKey"):
-            headers["x-api-key"] = upstream["apiKey"]
+        compat = upstream.get("compat") or {}
+        auth = compat.get("auth") or {}
+        scheme = str(auth.get("scheme") or "bearer").lower()
+        headers: dict = {str(k).lower(): str(v)
+                         for k, v in (compat.get("headers") or {}).items()}
+        key = upstream.get("apiKey")
+        if key and scheme != "none":
+            if scheme == "x-api-key":
+                headers["x-api-key"] = key
+            elif scheme == "both":
+                headers["authorization"] = f"Bearer {key}"
+                headers["x-api-key"] = key
+            elif scheme == "header":
+                headers[str(auth.get("header") or "authorization").lower()] = (
+                    f"{auth.get('prefix') or ''}{key}")
+            else:
+                headers["authorization"] = f"{auth.get('prefix') or 'Bearer '}{key}"
+        path = str((compat.get("endpoint") or {}).get("models") or "/v1/models")
         try:
-            res = self.client.get(f"{upstream['baseUrl']}/v1/models",
+            res = self.client.get(f"{upstream['baseUrl']}{path}",
                                   headers=headers, timeout=8.0)
             if not res.is_success:
                 return []

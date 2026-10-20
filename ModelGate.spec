@@ -28,7 +28,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     # 面板静态页必须随包带上：proxy.handle_ui 按 __file__ 定位
-    datas=[(os.path.join("modelgate", "web"), os.path.join("modelgate", "web"))],
+    # profile 注册表必须随包带上：provider_profiles.py 按 __file__ 同目录定位
+    datas=[
+        (os.path.join("modelgate", "web"), os.path.join("modelgate", "web")),
+        (os.path.join("modelgate", "provider_profiles.json"), os.path.join("modelgate")),
+    ],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

@@ -1,0 +1,22 @@
+{
+  "_doc": "Provider 示例：通用 OpenAI 兼容上游（profile=openai 基线，无会话头）。复制为 bridge.config.json 使用；密钥用 apiKeyEnv 引用，勿写明文。",
+  "port": 8900,
+  "host": "127.0.0.1",
+  "defaultModel": "gpt-5.2",
+  "models": ["gpt-5.2"],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "accessLog": true,
+  "modelsCacheSeconds": 300,
+  "upstreams": {
+    "openai": {
+      "protocol": "openai",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "models": ["gpt-5.2"],
+      "compat": {
+        "profile": "openai"
+      }
+    }
+  }
+}

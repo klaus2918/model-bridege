@@ -1,0 +1,19 @@
+{
+  "_doc": "Provider 示例：opencode Zen/Go（profile 按域名自动判定为 opencode，自动注入 x-opencode-session）。复制为 bridge.config.json 使用。",
+  "port": 8900,
+  "host": "127.0.0.1",
+  "defaultModel": "deepseek-v4.1-flash",
+  "models": ["deepseek-v4.1-flash", "glm-5.3-flash"],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "accessLog": true,
+  "modelsCacheSeconds": 300,
+  "upstreams": {
+    "zen-go": {
+      "protocol": "openai",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_API_KEY",
+      "models": ["deepseek-v4.1-flash", "glm-5.3-flash"]
+    }
+  }
+}

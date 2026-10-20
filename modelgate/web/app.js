@@ -12,6 +12,8 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const state = {
   config: null,
   status: null,
+  profiles: [],
+  effective: [],
   upstreams: [],
   health: {},
   range: "24h",
@@ -650,6 +652,32 @@ function parseAliases(text) {
   return out;
 }
 
+const CAPABILITY_LABELS = {
+  stream: "流式",
+  tools: "工具",
+  vision: "视觉",
+  thinking: "思考",
+  cache: "缓存",
+  systemPrompt: "系统提示",
+};
+
+const FALLBACK_PROFILE_CHOICES = ["openai", "opencode", "anthropic", "deepseek", "commandcode"];
+
+/* 预设下拉：优先用服务端注册表（/api/config 的 profiles）；缺失时回退旧硬编码。 */
+function profileChoices() {
+  const list = (state.profiles || []).filter((p) => p && p.id);
+  return list.length
+    ? list.map((p) => [p.id, p.label || p.id])
+    : FALLBACK_PROFILE_CHOICES.map((id) => [id, id]);
+}
+
+function capabilityBadges(caps) {
+  return Object.entries(CAPABILITY_LABELS)
+    .filter(([key]) => caps && caps[key])
+    .map(([key, label]) => `<span class="badge ok" title="${esc(key)}">${esc(label)}</span>`)
+    .join(" ");
+}
+
 function addUpstream() {
   if (!state.config) return;
   state.config.upstreams = state.config.upstreams || {};
@@ -691,16 +719,17 @@ function upstreamDetailRowCfg(card) {
     return el.type === "checkbox" ? (el.checked ? "开" : "关") : (el.value || "");
   };
   const models = val("models").split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
-  const isCC = val("protocol") === "commandcode";
-  const isOAI = val("protocol") === "openai";
   const items = [
     ["模型清单", models.slice(0, 12).join(", ") + (models.length > 12 ? ` …共 ${models.length} 个` : "")],
     ["密钥环境变量", val("apiKeyEnv") || "未设置（直接用配置文件里的密钥）"],
     ["密钥状态", card.dataset.keyConfigured === "1" ? "已配置" : "未配置（上游会返回 401）"],
     ["自动拉取模型", val("autoModels")],
-    ["会话头注入", isOAI ? val("sessionHeader") : "不适用"],
-    ["pause_turn 续跑", isCC ? val("pauseTurn") : "不适用"],
-    ["ZDR 安全头", isCC ? val("cmdZdr") : "不适用"],
+    ["鉴权方式", val("compatAuthScheme") || "跟随 provider 预设"],
+    ["会话头", val("compatSessionHeader") || "跟随预设 / 不注入"],
+    ["对话端点", val("compatChatPath") || "跟随预设"],
+    ["最大输出", val("compatMaxOutput") || "跟随预设"],
+    ["思考回传", val("compatThinking") === "on" ? "开启" : val("compatThinking") === "off" ? "关闭" : "跟随预设"],
+    ["pause_turn 续跑", val("pauseTurn") === "" ? "—" : val("pauseTurn")],
   ];
   return `<tr class="detail-row"><td colspan="7"><div class="detail-grid">${
     items.map(([k, v]) => {
@@ -788,7 +817,29 @@ function renderUpstreamEditor() {
     const u = ups[name];
     const isCC = (u.protocol || "") === "commandcode";
     const isOAI = (u.protocol || "") === "openai";
+    const compat = u.compat || {};
+    const cProfile = compat.profile || "";
+    const cAuth = (compat.auth && compat.auth.scheme) || "";
+    const cSession = compat.session && compat.session.enabled === false
+      ? "-" : ((compat.session && compat.session.header) || "");
+    const cChat = (compat.endpoint && compat.endpoint.chat) || "";
+    const cHeaders = compat.headers && Object.keys(compat.headers).length
+      ? JSON.stringify(compat.headers, null, 2) : "";
+    const cMaxOut = (compat.limits && compat.limits.maxOutputTokens) || "";
+    const cThink = compat.thinking && typeof compat.thinking.passthrough === "boolean"
+      ? (compat.thinking.passthrough ? "on" : "off") : "";
+    const cDowngrade = compat.toolChoice
+      && typeof compat.toolChoice.downgradeForced === "boolean"
+      ? (compat.toolChoice.downgradeForced ? "on" : "off") : "";
+    const cZdr = typeof compat.zdr === "boolean" ? (compat.zdr ? "on" : "off") : "";
+    const cVersion = Object.prototype.hasOwnProperty.call(compat, "versionHeader")
+      ? (compat.versionHeader || "-") : "";
+    const cEnvironment = Object.prototype.hasOwnProperty.call(compat, "environmentHeader")
+      ? (compat.environmentHeader || "-") : "";
+    const cOverrides = u.modelOverrides && Object.keys(u.modelOverrides).length
+      ? JSON.stringify(u.modelOverrides, null, 2) : "";
     const keyConfigured = u._keyConfigured;
+    const eff = ((state.effective || []).find((row) => row.name === name)) || null;
     const keyWarn = keyConfigured ? "" :
       `<div class="hint" style="color:var(--warn)">未配置密钥：上游会返回 401，请在下方填写 apiKey（或设置 apiKeyEnv）</div>`;
     return `
@@ -796,7 +847,7 @@ function renderUpstreamEditor() {
       <div class="up-head">
         <span class="name">${esc(name)}</span>
         ${u.default ? '<span class="badge brand">默认上游</span>' : ""}
-        <span class="badge">${esc(u.protocol || "anthropic")}</span>
+        <span class="badge">${esc(u.protocol || "anthropic")}${compat.profile ? ` / ${esc(compat.profile)}` : ""}</span>
         <span class="spacer"></span>
         <div class="up-actions">
           <button type="button" class="ghost" data-act="up" ${index === 0 ? "disabled" : ""}>上移</button>
@@ -850,6 +901,66 @@ function renderUpstreamEditor() {
         <label class="check"><input type="checkbox" data-field="cmdZdr" ${u.cmdZdr !== false ? "checked" : ""}>ZDR 安全头 x-cmd-zdr: 1</label>` : ""}
         ${isOAI ? `
         <label class="check"><input type="checkbox" data-field="sessionHeader" ${u.sessionHeader !== false ? "checked" : ""}>注入 x-opencode-session 会话头</label>` : ""}
+        <div class="span-2 hint">兼容能力（compat）：留空 = 跟随 provider 预设；这里只覆盖需要差异化的部分，保存时不会丢失。</div>
+        <label>Provider 预设
+          <select data-field="compatProfile">
+            ${[["", "自动识别"]].concat(profileChoices())
+              .map(([v, label]) => `<option value="${esc(v)}"${cProfile === v ? " selected" : ""}>${esc(label)}</option>`).join("")}
+          </select>
+        </label>
+        <label>鉴权方式
+          <select data-field="compatAuthScheme">
+            ${[["", "跟随预设"], ["bearer", "Bearer"], ["x-api-key", "x-api-key"],
+               ["both", "Bearer + x-api-key"], ["none", "不鉴权"], ["header", "自定义头"]]
+              .map(([v, label]) => `<option value="${v}"${cAuth === v ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <label>会话头名
+          <input type="text" data-field="compatSessionHeader" value="${esc(cSession)}" placeholder="留空 = 跟随预设；填 - 表示不注入">
+        </label>
+        <label class="span-2">对话端点（拼在 Base URL 后）
+          <input type="text" data-field="compatChatPath" value="${esc(cChat)}" placeholder="跟随预设，例如 /v1/chat/completions">
+        </label>
+        <label class="span-2">额外请求头（JSON 对象）
+          <textarea data-field="compatHeaders" rows="2" placeholder='{"x-client-name":"model-gate"}'>${esc(cHeaders)}</textarea>
+        </label>
+        <label>最大输出 token
+          <input type="text" data-field="compatMaxOutput" value="${esc(cMaxOut)}" placeholder="跟随预设">
+        </label>
+        <label>思考回传
+          <select data-field="compatThinking">
+            ${[["", "跟随预设"], ["on", "开启"], ["off", "关闭"]]
+              .map(([v, label]) => `<option value="${v}"${cThink === v ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <label>强制 tool_choice
+          <select data-field="compatDowngrade">
+            ${[["", "跟随预设"], ["on", "降级为 auto"], ["off", "原样下发"]]
+              .map(([v, label]) => `<option value="${v}"${cDowngrade === v ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <label>ZDR 安全头
+          <select data-field="compatZdr">
+            ${[["", "跟随预设"], ["on", "发送"], ["off", "不发送"]]
+              .map(([v, label]) => `<option value="${v}"${cZdr === v ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <label>版本头名
+          <input type="text" data-field="compatVersionHeader" value="${esc(cVersion)}" placeholder="跟随预设；填 - 表示不发">
+        </label>
+        <label>环境头名
+          <input type="text" data-field="compatEnvironmentHeader" value="${esc(cEnvironment)}" placeholder="跟随预设；填 - 表示不发">
+        </label>
+        <label class="span-2">模型级覆盖（JSON 对象，留空 = 无覆盖）
+          <textarea data-field="modelOverrides" rows="3" placeholder='{"deepseek-reasoner":{"limits":{"maxOutputTokens":65536}}}'>${esc(cOverrides)}</textarea>
+        </label>
+        <div class="span-2 hint">键为模型 id，支持单个 * 通配；可设置 limits 与 capabilities，未知字段保存时原样保留。</div>
+        <div class="span-2 hint">当前生效：${eff
+          ? `${esc(eff.profile || "—")} · 鉴权 ${esc(eff.authScheme || "—")} · 会话 ${esc(eff.sessionHeader || "无")} · 端点 ${esc(eff.chatPath || "—")}${eff.maxOutputTokens ? ` · 输出上限 ${fmtInt(eff.maxOutputTokens)}` : ""}${eff.maxContextTokens ? ` · 上下文上限 ${fmtInt(eff.maxContextTokens)}` : ""}`
+          : "保存后显示解析结果"}</div>
+        <div class="span-2 hint">能力：${eff
+          ? (capabilityBadges(eff.capabilities) || "—")
+          : "保存后显示"}${eff ? ` · 模型覆盖 ${fmtInt(Object.keys(eff.modelOverrides || {}).length)} 条` : ""}</div>
       </div>
       </details>
       ${keyWarn}
@@ -954,13 +1065,16 @@ const _readUpstreamEditor = () => {
     let name = (get("name").value || "").trim() || cardEl.dataset.name;
     const old = (state.config.upstreams || {})[cardEl.dataset.name] || {};
     const apiKey = get("apiKey").value;
-    const entry = {
-      protocol: get("protocol").value,
-      baseUrl: get("baseUrl").value.trim(),
-      models: parseModels(get("models").value),
-      default: get("default").checked,
-      autoModels: get("autoModels").checked,
-    };
+    // 保留所有未在表单里渲染的字段（cliVersion、modelCatalog、thinking…）：
+    // 以前这里重建对象，保存一次就会静默丢配置。
+    const entry = Object.assign({}, old);
+    delete entry._keyConfigured;
+    delete entry._keySource;
+    entry.protocol = get("protocol").value;
+    entry.baseUrl = get("baseUrl").value.trim();
+    entry.models = parseModels(get("models").value);
+    entry.default = get("default").checked;
+    entry.autoModels = get("autoModels").checked;
     if (apiKey) entry.apiKey = apiKey;
     else if (old.apiKey !== undefined) entry.apiKey = old.apiKey;
     const env = get("apiKeyEnv").value.trim();
@@ -975,8 +1089,144 @@ const _readUpstreamEditor = () => {
     if (zdr !== undefined) entry.cmdZdr = zdr;
     const sh = ccBox("sessionHeader");
     if (sh !== undefined) entry.sessionHeader = sh;
-    delete entry._keyConfigured;
-    delete entry._keySource;
+
+    // ── compat：provider 兼容能力（可留空的字段表示“跟随预设”） ──
+    const oldCompat = Object.assign({}, old.compat || {});
+    const compat = Object.assign({}, oldCompat);
+    state.compatErrors = state.compatErrors || [];
+    const text = (f) => {
+      const el = get(f);
+      return el ? el.value.trim() : null;
+    };
+    const select = (f) => {
+      const el = get(f);
+      return el ? el.value : null;
+    };
+
+    const profile = select("compatProfile");
+    if (profile !== null) {
+      if (!profile) delete compat.profile;
+      else compat.profile = profile;
+    }
+    const scheme = select("compatAuthScheme");
+    if (scheme !== null) {
+      if (!scheme) delete compat.auth;
+      else compat.auth = Object.assign({}, oldCompat.auth, { scheme });
+    }
+    const sessionHeader = text("compatSessionHeader");
+    if (sessionHeader !== null) {
+      if (!sessionHeader) {
+        // 留空 = 跟随 provider 预设（不会误关 opencode/commandcode 的会话头）
+        delete compat.session;
+      } else if (sessionHeader === "-" || sessionHeader.toLowerCase() === "off") {
+        compat.session = Object.assign({}, oldCompat.session, { enabled: false });
+      } else {
+        compat.session = Object.assign({}, oldCompat.session, { enabled: true, header: sessionHeader });
+      }
+    }
+    const chatPath = text("compatChatPath");
+    if (chatPath !== null) {
+      const endpoint = Object.assign({}, oldCompat.endpoint);
+      if (chatPath) endpoint.chat = chatPath; else delete endpoint.chat;
+      if (Object.keys(endpoint).length) compat.endpoint = endpoint; else delete compat.endpoint;
+    }
+    const headersText = text("compatHeaders");
+    if (headersText !== null) {
+      if (!headersText) {
+        delete compat.headers;
+      } else {
+        try {
+          const parsed = JSON.parse(headersText);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("必须是 JSON 对象");
+          }
+          compat.headers = parsed;
+        } catch (err) {
+          state.compatErrors.push(
+            `上游「${name}」的兼容请求头不是合法 JSON 对象：${err.message}`);
+        }
+      }
+    }
+    const maxOutRaw = text("compatMaxOutput");
+    if (maxOutRaw !== null) {
+      const limits = Object.assign({}, oldCompat.limits);
+      if (!maxOutRaw) delete limits.maxOutputTokens;
+      else {
+        const parsed = parseCount(maxOutRaw);
+        if (parsed) limits.maxOutputTokens = parsed;
+        else state.compatErrors.push(
+          `上游「${name}」的最大输出 token「${maxOutRaw}」无法识别`);
+      }
+      if (Object.keys(limits).length) compat.limits = limits; else delete compat.limits;
+    }
+    const thinking = select("compatThinking");
+    if (thinking !== null) {
+      if (thinking === "on") {
+        compat.thinking = Object.assign({}, oldCompat.thinking, { passthrough: true });
+      } else if (thinking === "off") {
+        compat.thinking = Object.assign({}, oldCompat.thinking, { passthrough: false });
+      } else {
+        delete compat.thinking;
+      }
+    }
+    const downgrade = select("compatDowngrade");
+    if (downgrade !== null) {
+      if (downgrade === "on") {
+        compat.toolChoice = Object.assign({}, oldCompat.toolChoice, { downgradeForced: true });
+      } else if (downgrade === "off") {
+        compat.toolChoice = Object.assign({}, oldCompat.toolChoice, { downgradeForced: false });
+      } else {
+        delete compat.toolChoice;
+      }
+    }
+    const zdrSelect = select("compatZdr");
+    if (zdrSelect !== null) {
+      if (zdrSelect === "on") compat.zdr = true;
+      else if (zdrSelect === "off") compat.zdr = false;
+      else delete compat.zdr;
+    }
+    const versionHeader = text("compatVersionHeader");
+    if (versionHeader !== null) {
+      if (versionHeader === "-") compat.versionHeader = "";
+      else if (versionHeader) compat.versionHeader = versionHeader;
+      else delete compat.versionHeader;
+    }
+    const environmentHeader = text("compatEnvironmentHeader");
+    if (environmentHeader !== null) {
+      if (environmentHeader === "-") compat.environmentHeader = "";
+      else if (environmentHeader) compat.environmentHeader = environmentHeader;
+      else delete compat.environmentHeader;
+    }
+
+    if (Object.keys(compat).length) entry.compat = compat; else delete entry.compat;
+
+    // ── 模型级覆盖：JSON 编辑；非法结构阻止保存（未编辑时原样保留） ──
+    const overridesText = text("modelOverrides");
+    if (overridesText !== null) {
+      if (!overridesText) {
+        delete entry.modelOverrides;
+      } else {
+        try {
+          const parsed = JSON.parse(overridesText);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("必须是 JSON 对象");
+          }
+          Object.entries(parsed).forEach(([key, value]) => {
+            if (String(key).split("*").length > 2) {
+              throw new Error(`键「${key}」包含多个 *，只支持一个通配符`);
+            }
+            if (!value || typeof value !== "object" || Array.isArray(value)
+                || !Object.keys(value).length) {
+              throw new Error(`「${key}」必须是非空对象（limits / capabilities）`);
+            }
+          });
+          entry.modelOverrides = parsed;
+        } catch (err) {
+          state.compatErrors.push(
+            `上游「${name}」的模型级覆盖不是合法配置：${err.message}`);
+        }
+      }
+    }
     ups[name] = entry;
   });
   return ups;
@@ -986,6 +1236,8 @@ async function loadConfig() {
   try {
     const data = await api("/api/config");
     state.config = data.config;
+    state.effective = data.effective || [];
+    state.profiles = data.profiles || [];
     const f = $("#config-form");
     f.host.value = state.config.host || "127.0.0.1";
     f.port.value = state.config.port ?? 8900;
@@ -1003,7 +1255,8 @@ async function loadConfig() {
     renderUpstreamEditor();
     setConfigDirty(false);
     state.autoFixNotes = [];
-    renderConfigIssues([]);
+    state.serverDiagnostics = data.diagnostics || [];
+    renderConfigIssues(serverIssues(state.serverDiagnostics));
     renderServiceFacts();
     $("#config-hint").textContent = "";
     $("#config-hint").classList.remove("err");
@@ -1041,6 +1294,7 @@ function collectConfig() {
     passthrough: f.thinkingPassthrough.checked,
   });
   // 上游地址先规范化再落库：缺协议就补 https://，并向用户说明补成了什么
+  state.compatErrors = [];
   const ups = _readUpstreamEditor();
   Object.keys(ups).forEach((name) => {
     const before = String(ups[name].baseUrl || "");
@@ -1113,8 +1367,7 @@ function renderServiceFacts() {
   updateRestartHint();
 }
 
-/* DeepSeek 官方：上下文 1M，最大输出 384K（= 393,216）—— 超过会被上游拒绝或截断 */
-const DEEPSEEK_MAX_OUTPUT = 384 * 1024;
+/* 每个上游的输出上限来自 compat.limits.maxOutputTokens；不再写死某一家厂商。 */
 
 function setConfigDirty(dirty) {
   state.configDirty = !!dirty;
@@ -1142,6 +1395,7 @@ function validateConfig(cfg) {
   // 采集阶段替用户兜住的输入（无法识别的数字、缺失协议的地址）先说明，
   // 这些不再拦保存——拦下来只会让人对着“有 1 处错误”发呆。
   (state.autoFixNotes || []).forEach((m) => add("warn", "", m));
+  (state.compatErrors || []).forEach((m) => add("error", "", m));
 
   const port = Number(cfg.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -1154,8 +1408,6 @@ function validateConfig(cfg) {
   const maxTok = Number(cfg.maxTokens);
   if (!isFinite(maxTok) || maxTok < 1) {
     add("warn", "maxTokens", `最大输出 token「${cfg.maxTokens}」无效，已按 8192 处理（支持 30万 / 3,000,000 / 384K 这种写法）`);
-  } else if (maxTok > DEEPSEEK_MAX_OUTPUT) {
-    add("warn", "maxTokens", `超过 DeepSeek 官方最大输出 384K（${fmtInt(DEEPSEEK_MAX_OUTPUT)}）：上游会拒绝或截断，建议不超过该值`);
   }
   if (Number(cfg.timeoutSeconds) < 1) {
     add("warn", "timeoutSeconds", `超时「${cfg.timeoutSeconds}」无效，已按 600 秒处理`);
@@ -1186,6 +1438,11 @@ function validateConfig(cfg) {
       add("warn", `upstream:${i}`,
         `${where} 没有模型清单：仍可用前缀路由 /${name}/v1/*（其 /models 会返回空），但不参与按模型名的自动路由`);
     }
+    const maxOut = up.compat && up.compat.limits && Number(up.compat.limits.maxOutputTokens);
+    if (maxOut && maxTok > maxOut) {
+      add("warn", `upstream:${i}`,
+        `${where} 的最大输出上限为 ${fmtInt(maxOut)}：全局 maxTokens 会被运行时收敛`);
+    }
   });
 
   const defaultModel = String(cfg.defaultModel || "").trim();
@@ -1199,6 +1456,15 @@ function validateConfig(cfg) {
     add("warn", "defaultModel", "未设置默认模型：客户端不指定模型时会回退到第一个可用上游");
   }
   return issues;
+}
+
+/* 服务端结构化诊断 → 与前端校验同一种展示格式（path 拼进正文，便于定位） */
+function serverIssues(diagnostics) {
+  return (diagnostics || []).map((d) => ({
+    level: d.level === "error" ? "error" : "warn",
+    field: "",
+    message: `${d.path ? `${d.path}：` : ""}${d.message}${d.hint ? `（${d.hint}）` : ""}`,
+  }));
 }
 
 function renderConfigIssues(issues) {
@@ -1273,11 +1539,13 @@ async function saveConfig(ev) {
     return;
   }
   try {
-    await postJson("/api/config", { config: cfg });
+    const data = await postJson("/api/config", { config: cfg });
     state.config = cfg;
     setConfigDirty(false);
-    hint.textContent = issues.length
-      ? `已保存（配置文件与数据库双写）；有 ${issues.length} 条提醒`
+    const diags = (data && data.diagnostics) || [];
+    renderConfigIssues(serverIssues(diags));
+    hint.textContent = diags.length
+      ? `已保存（配置文件与数据库双写）；有 ${diags.length} 条诊断提醒`
       : "已保存（配置文件与数据库双写）";
     hint.classList.remove("err");
     toast("配置已保存");

@@ -286,14 +286,256 @@ def command_code_catalog_entries(spec) -> list[dict]:
     return []
 
 
-def normalize_upstream(name: str, u: dict) -> dict:
+COMPAT_PROFILES = ("openai", "opencode", "anthropic", "commandcode", "deepseek")
+
+
+_profile_registry_warned = False
+
+
+def _compat_preset(profile: str, protocol: str, base_url: str) -> dict:
+    """按 provider 预设生成兼容能力；任何字段都可由 compat 覆盖。
+
+    数据源为共享注册表 `provider_profiles.json`（与 Rust 端一致）；
+    注册表缺失/损坏时退回内置实现，保证服务可用。
+    """
+    global _profile_registry_warned
+    try:
+        from .provider_profiles import resolve_compat
+        return resolve_compat(profile, protocol, base_url)
+    except Exception as exc:  # noqa: BLE001
+        if not _profile_registry_warned:
+            _profile_registry_warned = True
+            log(f"[model-gate] provider 注册表不可用（{exc}），退回内置预设")
+        return _compat_preset_builtin(profile, protocol, base_url)
+
+
+def _compat_preset_builtin(profile: str, protocol: str, base_url: str) -> dict:
+    """内置预设实现（兜底副本，行为冻结；注册表以 scripts/provider_profiles_check.py 对照）。"""
+    host = str(base_url or "").lower()
+    effective = str(profile or "").lower()
+    if not effective:
+        if protocol == "commandcode" or "commandcode.ai" in host:
+            effective = "commandcode"
+        elif "api.deepseek.com" in host:
+            effective = "deepseek"
+        elif "opencode.ai" in host:
+            effective = "opencode"
+        else:
+            effective = protocol
+    compat = {
+        "profile": effective or "openai",
+        "auth": {"scheme": "bearer", "header": "authorization", "prefix": "Bearer "},
+        "session": {"header": "", "idStyle": "hex32"},
+        "headers": {},
+        "endpoint": {"chat": "/v1/chat/completions", "models": "/v1/models"},
+        "thinking": {"passthrough": False, "field": "reasoning_content"},
+        "toolChoice": {"downgradeForced": False},
+        "limits": {},
+        "zdr": False,
+        "versionHeader": "",
+        "environmentHeader": "",
+    }
+    if effective == "opencode":
+        # opencode / zen：缺少会话头会被上游 400 拒绝；空 key 表示不鉴权。
+        compat["session"] = {"header": "x-opencode-session", "idStyle": "hex32"}
+    elif effective == "commandcode":
+        compat["auth"] = {"scheme": "bearer", "header": "authorization", "prefix": "Bearer "}
+        compat["session"] = {"header": "x-session-id", "idStyle": "sess16"}
+        compat["headers"] = {"user-agent": "cli"}
+        compat["endpoint"] = {"chat": "/alpha/generate", "models": "/v1/models"}
+        compat["toolChoice"] = {"downgradeForced": True}
+        compat["zdr"] = True
+        compat["versionHeader"] = "x-command-code-version"
+        compat["environmentHeader"] = "x-cli-environment"
+        compat["limits"] = {"maxOutputTokens": 64000}
+    elif effective == "anthropic":
+        compat["auth"] = {"scheme": "both", "header": "authorization", "prefix": "Bearer "}
+        compat["endpoint"] = {"chat": "/v1/messages", "models": "/v1/models"}
+        compat["thinking"] = {"passthrough": True, "field": "reasoning_content"}
+        compat["toolChoice"] = {"downgradeForced": True}
+        if "deepseek" in host:
+            compat["profile"] = "deepseek"
+            compat["limits"] = {"maxOutputTokens": 384 * 1024, "maxContextTokens": 1024 * 1024}
+    elif effective == "deepseek":
+        compat["thinking"] = {"passthrough": True, "field": "reasoning_content"}
+        compat["limits"] = {"maxOutputTokens": 384 * 1024, "maxContextTokens": 1024 * 1024}
+        if protocol == "anthropic":
+            compat["auth"] = {"scheme": "both", "header": "authorization", "prefix": "Bearer "}
+            compat["endpoint"] = {"chat": "/v1/messages", "models": "/v1/models"}
+            compat["toolChoice"] = {"downgradeForced": True}
+    return compat
+
+
+def compat_for(protocol: str, base_url: str, u: dict, config: dict | None = None) -> dict:
+    """解析上游兼容能力：预设 → 旧平铺字段 → 显式 compat → 全局开关。"""
+    raw_compat = u.get("compat") if isinstance(u.get("compat"), dict) else {}
+    profile = raw_compat.get("profile") or u.get("profile") or ""
+    compat = _compat_preset(str(profile), protocol, base_url)
+
+    # 旧版平铺字段：兼容输入，不覆盖显式 compat。
+    if isinstance(u.get("sessionHeader"), bool):
+        if u["sessionHeader"]:
+            compat["session"]["header"] = compat["session"].get("header") or "x-opencode-session"
+        else:
+            compat["session"]["header"] = ""
+    if isinstance(u.get("cmdZdr"), bool):
+        compat["zdr"] = u["cmdZdr"]
+    if isinstance(u.get("thinkingPassthrough"), bool):
+        compat["thinking"]["passthrough"] = u["thinkingPassthrough"]
+    if isinstance(u.get("downgradeForcedChoice"), bool):
+        compat["toolChoice"]["downgradeForced"] = u["downgradeForcedChoice"]
+
+    auth = raw_compat.get("auth")
+    if isinstance(auth, str):
+        compat["auth"]["scheme"] = auth.lower()
+    elif isinstance(auth, dict):
+        for key, target in (("scheme", "scheme"), ("header", "header"), ("prefix", "prefix")):
+            if isinstance(auth.get(key), str):
+                compat["auth"][target] = auth[key].lower() if key == "scheme" else auth[key]
+
+    session = raw_compat.get("session")
+    if isinstance(session, bool):
+        if session:
+            compat["session"]["header"] = compat["session"].get("header") or "x-opencode-session"
+        else:
+            compat["session"]["header"] = ""
+    elif isinstance(session, dict):
+        enabled = session.get("enabled", True)
+        if enabled:
+            if isinstance(session.get("header"), str):
+                compat["session"]["header"] = session["header"]
+            if not compat["session"].get("header"):
+                compat["session"]["header"] = "x-opencode-session"
+        else:
+            compat["session"]["header"] = ""
+        if isinstance(session.get("idStyle"), str):
+            compat["session"]["idStyle"] = session["idStyle"].lower()
+
+    thinking = raw_compat.get("thinking")
+    if isinstance(thinking, bool):
+        compat["thinking"]["passthrough"] = thinking
+    elif isinstance(thinking, dict):
+        if isinstance(thinking.get("passthrough"), bool):
+            compat["thinking"]["passthrough"] = thinking["passthrough"]
+        if isinstance(thinking.get("field"), str):
+            compat["thinking"]["field"] = thinking["field"]
+
+    choice = raw_compat.get("toolChoice")
+    if isinstance(choice, bool):
+        compat["toolChoice"]["downgradeForced"] = choice
+    elif isinstance(choice, dict) and isinstance(choice.get("downgradeForced"), bool):
+        compat["toolChoice"]["downgradeForced"] = choice["downgradeForced"]
+
+    headers = raw_compat.get("headers")
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if isinstance(value, (str, int, float, bool)):
+                compat["headers"][str(key).lower()] = str(value)
+
+    endpoint = raw_compat.get("endpoint")
+    if isinstance(endpoint, dict):
+        if isinstance(endpoint.get("chat"), str):
+            compat["endpoint"]["chat"] = endpoint["chat"]
+        if isinstance(endpoint.get("models"), str):
+            compat["endpoint"]["models"] = endpoint["models"]
+
+    limits = raw_compat.get("limits")
+    if isinstance(limits, dict):
+        for key in ("maxOutputTokens", "maxContextTokens"):
+            value = _to_int(limits.get(key))
+            if value and value > 0:
+                compat["limits"][key] = value
+
+    if isinstance(raw_compat.get("zdr"), bool):
+        compat["zdr"] = raw_compat["zdr"]
+    if "versionHeader" in raw_compat:
+        compat["versionHeader"] = str(raw_compat.get("versionHeader") or "")
+    if "environmentHeader" in raw_compat:
+        compat["environmentHeader"] = str(raw_compat.get("environmentHeader") or "")
+
+    # 能力元数据：注册表 profile → 上游 compat.capabilities（模型级在 modelOverrides 中另行合并）。
+    caps = raw_compat.get("capabilities")
+    if isinstance(caps, dict):
+        try:
+            from .provider_profiles import merge_capabilities
+            compat["capabilities"] = merge_capabilities(compat.get("profile"), compat.get("capabilities"), caps)
+        except Exception:  # noqa: BLE001 注册表不可用时保留已有能力层
+            pass
+
+    # 全局开关作为最终约束。
+    thinking_cfg = (config or {}).get("thinking")
+    if isinstance(thinking_cfg, dict) and thinking_cfg.get("passthrough") is False:
+        compat["thinking"]["passthrough"] = False
+    tools_cfg = (config or {}).get("tools")
+    if isinstance(tools_cfg, dict) and tools_cfg.get("downgradeForcedChoice") is False:
+        compat["toolChoice"]["downgradeForced"] = False
+    return compat
+
+
+def model_override_for(up: dict, model_id: str) -> tuple[str | None, dict | None]:
+    """命中模型级覆盖：精确 > 最长通配；只支持单个 `*`（多个视为非法不参与匹配）。"""
+    overrides = up.get("modelOverrides")
+    if not isinstance(overrides, dict) or not model_id:
+        return None, None
+    best = None
+    for order, (pattern, value) in enumerate(overrides.items()):
+        if not isinstance(pattern, str) or not isinstance(value, dict):
+            continue
+        stars = pattern.count("*")
+        if stars == 0:
+            if pattern != model_id:
+                continue
+            score = (1 << 30, -order)
+        elif stars == 1:
+            prefix, _, suffix = pattern.partition("*")
+            if not (model_id.startswith(prefix) and model_id.endswith(suffix)
+                    and len(model_id) >= len(prefix) + len(suffix)):
+                continue
+            score = (len(pattern) - 1, -order)
+        else:
+            continue
+        candidate = (score, pattern, value)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
+def resolve_model_limits(up: dict, model_id: str) -> dict:
+    """上游 compat.limits 叠加模型级覆盖后的生效 limits。"""
+    compat = up.get("compat") or {}
+    limits = dict(compat.get("limits") or {})
+    _, override = model_override_for(up, model_id)
+    if override and isinstance(override.get("limits"), dict):
+        for key in ("maxOutputTokens", "maxContextTokens"):
+            value = _to_int(override["limits"].get(key))
+            if value and value > 0:
+                limits[key] = value
+    return limits
+
+
+def resolve_model_capabilities(up: dict, model_id: str) -> dict:
+    """模型级能力：上游 compat.capabilities（已含 profile 层）→ 模型覆盖；只影响展示。"""
+    compat = up.get("compat") or {}
+    caps = dict(compat.get("capabilities") or {})
+    _, override = model_override_for(up, model_id)
+    if override and isinstance(override.get("capabilities"), dict):
+        for key, value in override["capabilities"].items():
+            if key in CAPABILITY_KEYS and isinstance(value, bool):
+                caps[key] = value
+    return caps
+
+
+def normalize_upstream(name: str, u: dict, config: dict | None = None) -> dict:
     if not isinstance(u, dict):
         u = {}
     protocol = infer_protocol(u)
     base_url = _normalize_base_url(u.get("baseUrl"))
     is_cc = protocol == "commandcode"
+    compat = compat_for(protocol, base_url, u, config)
     api_key, api_key_source = resolve_api_key(u)
-    declared = u.get("models") or []
+    declared = [m for m in (u.get("models") or []) if isinstance(m, str)]
     catalog = command_code_catalog_entries(u.get("modelCatalog", "auto" if is_cc else False))
     models_all: list[str] = []
     for mid in list(declared) + [e["id"] for e in catalog]:
@@ -310,7 +552,7 @@ def normalize_upstream(name: str, u: dict) -> dict:
         "modelsAll": list(models_all),
         "catalogEntries": catalog,
         "default": u.get("default") is True,
-        "sessionHeader": u.get("sessionHeader", not is_cc),
+        "sessionHeader": u.get("sessionHeader", bool(compat["session"].get("header"))),
         "fetchModels": u.get("fetchModels", not is_cc),
         "autoModels": u.get("autoModels") is True,
         "modelMap": dict(u.get("modelMap") or {}),
@@ -322,8 +564,10 @@ def normalize_upstream(name: str, u: dict) -> dict:
         "apiKeyEnv": u.get("apiKeyEnv"),
         "modelCatalog": u.get("modelCatalog", "auto" if is_cc else False),
         "modelCatalogPlan": u.get("modelCatalogPlan", "auto" if is_cc else False),
+        "modelOverrides": dict(u["modelOverrides"]) if isinstance(u.get("modelOverrides"), dict) else {},
         "pauseTurn": u.get("pauseTurn", is_cc),
-        "cmdZdr": u.get("cmdZdr", True),
+        "cmdZdr": u.get("cmdZdr", compat["zdr"]),
+        "compat": compat,
         "modelPlan": None,
         "modelPlanError": None,
     }
@@ -417,80 +661,468 @@ def upstreams_of(config: dict) -> list[dict]:
     else:
         legacy = (config or {}).get("upstream") if isinstance(config, dict) else None
         items = [("default", legacy if isinstance(legacy, dict) else {})]
-    return [normalize_upstream(name, u) for name, u in items]
+    return [normalize_upstream(name, u, config) for name, u in items]
+
+
+TOP_LEVEL_KEYS = {
+    "port", "host", "defaultModel", "models", "maxTokens", "timeoutSeconds",
+    "accessLog", "modelsCacheSeconds", "aliases", "thinking", "tools", "envFile",
+    "upstreams", "upstream", "retentionDays", "pricing",
+}
+
+UPSTREAM_KEYS = {
+    "protocol", "baseUrl", "apiKey", "apiKeyEnv", "apiKeyFile", "anthropicVersion",
+    "default", "fetchModels", "autoModels", "models", "modelMap", "sessionHeader",
+    "cliVersion", "cliEnvironment", "modelCatalog", "modelCatalogPlan", "pauseTurn",
+    "cmdZdr", "compat", "profile", "name", "thinkingPassthrough",
+    "downgradeForcedChoice", "modelOverrides",
+}
+
+COMPAT_KEYS = {
+    "profile", "auth", "session", "thinking", "toolChoice", "headers", "endpoint",
+    "limits", "zdr", "versionHeader", "environmentHeader", "catalog", "capabilities",
+}
+
+CAPABILITY_KEYS = ("stream", "tools", "vision", "thinking", "cache", "systemPrompt")
+
+_HEADER_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _diag(level: str, code: str, path: str, message: str, hint: str = "") -> dict:
+    return {"level": level, "code": code, "path": path, "message": message, "hint": hint}
+
+
+def validate_config(config: dict) -> list[dict]:
+    """结构化配置诊断：error 阻断保存，warn/info 只提示。
+
+    与 Rust 内核的 Config::diagnostics 对齐：同一份配置在两种运行时
+    得到同一组错误（字段名、严重级别一致）。
+    """
+    issues: list[dict] = []
+    if not isinstance(config, dict):
+        return [_diag("error", "invalid_config", "", "配置必须是 JSON 对象")]
+    add = lambda *args, **kwargs: issues.append(_diag(*args, **kwargs))
+
+    for key in config:
+        if str(key).startswith("_"):
+            continue  # `_doc` / `_keys` 等说明字段
+        if key not in TOP_LEVEL_KEYS:
+            add("warn", "unknown_field", key, f"未知顶层字段「{key}」，不会生效",
+                "检查拼写，或改用 compat / upstreams 下的字段")
+
+    host = config.get("host")
+    if host is not None and not isinstance(host, str):
+        add("error", "invalid_host", "host", "host 必须是字符串")
+    elif isinstance(host, str) and not host.strip():
+        add("error", "invalid_host", "host", "监听地址不能为空", "本机使用 127.0.0.1")
+
+    port = _to_int(config.get("port"))
+    if config.get("port") is not None and (port is None or not 0 <= port <= 65535):
+        add("error", "invalid_port", "port", f"端口「{config.get('port')}」需为 0–65535 的整数")
+
+    for key in ("maxTokens", "timeoutSeconds", "modelsCacheSeconds", "retentionDays"):
+        value = config.get(key)
+        if value is not None and _to_int(value) is None:
+            add("error", "invalid_number", key, f"{key} 必须是数字（当前 {value!r}）")
+    max_tokens = _to_int(config.get("maxTokens")) or 8192
+    if max_tokens <= 0:
+        add("error", "invalid_max_tokens", "maxTokens", "maxTokens 必须大于 0")
+    timeout = _to_int(config.get("timeoutSeconds"))
+    if timeout is not None and timeout < 1:
+        add("warn", "invalid_timeout", "timeoutSeconds", "超时小于 1 秒，将按 600 秒运行",
+            "建议 60–3600 秒")
+    if _to_int(config.get("modelsCacheSeconds")) is not None and _to_int(config.get("modelsCacheSeconds")) < 0:
+        add("error", "invalid_number", "modelsCacheSeconds", "缓存秒数不能为负")
+    if _to_int(config.get("retentionDays")) is not None and _to_int(config.get("retentionDays")) < 0:
+        add("error", "invalid_number", "retentionDays", "保留天数不能为负")
+
+    default_model = config.get("defaultModel")
+    if default_model is not None and not isinstance(default_model, str):
+        add("error", "invalid_default_model", "defaultModel", "defaultModel 必须是字符串")
+    models = config.get("models")
+    if models is not None:
+        if not isinstance(models, list):
+            add("error", "invalid_models", "models", "models 必须是数组")
+        elif any(not isinstance(m, str) for m in models):
+            add("error", "invalid_models", "models", "models 每一项都必须是字符串")
+    aliases = config.get("aliases")
+    if aliases is not None and not isinstance(aliases, dict):
+        add("error", "invalid_aliases", "aliases", "aliases 必须是对象（别名 = 真实模型）")
+    elif isinstance(aliases, dict):
+        for key, value in aliases.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                add("error", "invalid_aliases", "aliases",
+                    "aliases 的键与值都必须是字符串")
+                break
+    for key in ("thinking", "tools"):
+        if config.get(key) is not None and not isinstance(config.get(key), dict):
+            add("error", "invalid_object", key, f"{key} 必须是对象")
+
+    declared = config.get("upstreams")
+    if declared is not None and not isinstance(declared, dict):
+        add("error", "invalid_upstreams", "upstreams", "upstreams 必须是对象（上游名 → 上游配置）")
+        return issues
+    declared = declared if isinstance(declared, dict) else {}
+    if not declared and not isinstance(config.get("upstream"), dict):
+        add("error", "no_upstream", "upstreams", "至少要配置一个上游",
+            "在 upstreams 下添加一个对象")
+
+    try:
+        normalized = upstreams_of(config) if isinstance(config, dict) else []
+    except Exception:
+        normalized = []
+
+    model_owner: dict[str, str] = {}
+    for name, up in declared.items():
+        prefix = f"upstreams.{name}"
+        if not isinstance(up, dict):
+            add("error", "invalid_upstream", prefix, f"上游 {name!r} 的配置必须是对象")
+            continue
+        for key in up:
+            if key not in UPSTREAM_KEYS:
+                add("warn", "unknown_field", f"{prefix}.{key}",
+                    f"上游「{name}」的字段「{key}」未知，不会生效",
+                    "检查拼写；provider 差异请写在 compat 下")
+        base = up.get("baseUrl")
+        if not isinstance(base, str) or not base.strip():
+            add("error", "invalid_base_url", f"{prefix}.baseUrl",
+                f"上游「{name}」没有填 Base URL", "例如 https://api.deepseek.com/v1")
+        elif not re.match(r"^https?://", ensure_url_scheme(base), re.I):
+            add("error", "invalid_base_url", f"{prefix}.baseUrl",
+                f"上游「{name}」的 Base URL 无效：{base}", "例如 https://api.deepseek.com/v1")
+        protocol = infer_protocol(up)
+        if protocol not in ("openai", "anthropic", "commandcode"):
+            add("error", "unsupported_protocol", f"{prefix}.protocol",
+                f"上游「{name}」的协议「{protocol}」未实现",
+                "可用 openai / anthropic / commandcode")
+        if up.get("models") is not None and not isinstance(up["models"], list):
+            add("error", "invalid_models", f"{prefix}.models", f"上游 {name!r} 的 models 必须是数组")
+        if up.get("modelMap") is not None and not isinstance(up["modelMap"], dict):
+            add("error", "invalid_model_map", f"{prefix}.modelMap", f"上游 {name!r} 的 modelMap 必须是对象")
+
+        compat = up.get("compat")
+        if compat is not None and not isinstance(compat, dict):
+            add("error", "invalid_compat", f"{prefix}.compat", "compat 必须是对象",
+                '例如 {"auth":{"scheme":"bearer"}}')
+            compat = {}
+        compat = compat or {}
+        for key in compat:
+            if key not in COMPAT_KEYS:
+                add("warn", "unknown_compat_field", f"{prefix}.compat.{key}",
+                    f"compat 字段「{key}」未知，不会生效", "可用字段见 provider-compat.md")
+        for sub, allowed in (
+            ("auth", {"scheme", "header", "prefix"}),
+            ("session", {"enabled", "header", "idStyle"}),
+            ("thinking", {"passthrough", "field"}),
+            ("toolChoice", {"downgradeForced"}),
+            ("headers", None),
+            ("endpoint", {"chat", "models"}),
+            ("limits", {"maxOutputTokens", "maxContextTokens"}),
+            ("catalog", {"source", "path", "plan"}),
+            ("capabilities", set(CAPABILITY_KEYS)),
+        ):
+            value = compat.get(sub)
+            if value is None or allowed is None or not isinstance(value, dict):
+                continue
+            for key in value:
+                if key not in allowed:
+                    add("warn", "unknown_compat_field", f"{prefix}.compat.{sub}.{key}",
+                        f"{sub} 字段「{key}」未知，不会生效")
+
+        profile_hint = str(compat.get("profile") or up.get("profile") or "")
+        if profile_hint:
+            from .provider_profiles import is_known_profile, profile_ids
+            if not is_known_profile(profile_hint):
+                add("warn", "unknown_profile", f"{prefix}.compat.profile",
+                    f"profile「{profile_hint}」不在注册表，按协议/域名兜底",
+                    "可用：" + " / ".join(profile_ids()))
+
+        caps_cfg = compat.get("capabilities")
+        if caps_cfg is not None:
+            if not isinstance(caps_cfg, dict):
+                add("error", "invalid_capabilities", f"{prefix}.compat.capabilities",
+                    "capabilities 必须是对象")
+            else:
+                for key, value in caps_cfg.items():
+                    if key in CAPABILITY_KEYS and not isinstance(value, bool):
+                        add("error", "invalid_capabilities",
+                            f"{prefix}.compat.capabilities.{key}",
+                            "能力值必须是布尔（true/false）")
+
+        if protocol != "commandcode":
+            compat_cfg = compat if isinstance(compat, dict) else {}
+            for key in ("cliVersion", "cliEnvironment", "cmdZdr", "pauseTurn",
+                        "modelCatalog", "modelCatalogPlan"):
+                if key not in up:
+                    continue
+                generic = (
+                    (key == "cliVersion" and compat_cfg.get("versionHeader"))
+                    or (key == "cliEnvironment" and compat_cfg.get("environmentHeader"))
+                )
+                if not generic:
+                    add("warn", "field_not_applicable", f"{prefix}.{key}",
+                        f"字段「{key}」只对 commandcode 生效，上游「{name}」不会使用",
+                        "如需通用行为，请改用 compat.headers / compat.session")
+
+        # 解析后的能力检查
+        parsed = next((u for u in normalized if u["name"] == str(name)), None)
+        if parsed is None:
+            continue
+        c = parsed.get("compat") or {}
+        profile = str(c.get("profile") or "")
+        profile_ok = (
+            (profile == "commandcode" and protocol == "commandcode")
+            or (profile == "anthropic" and protocol == "anthropic")
+            or (profile == "opencode" and protocol == "openai")
+            or (profile == "deepseek" and protocol in ("openai", "anthropic"))
+            or (profile == "openai" and protocol == "openai")
+        )
+        if not profile_ok:
+            add("warn", "profile_protocol_mismatch", f"{prefix}.compat.profile",
+                f"compat.profile={profile} 与 protocol={protocol} 不匹配，wire 行为仍按 protocol 执行",
+                "检查 protocol；profile 只决定鉴权/会话/端点等默认能力")
+        auth = c.get("auth") or {}
+        scheme = str(auth.get("scheme") or "bearer")
+        if scheme not in ("bearer", "x-api-key", "both", "none", "header"):
+            add("error", "invalid_auth_scheme", f"{prefix}.compat.auth.scheme",
+                f"鉴权方式「{scheme}」无效", "可用 bearer / x-api-key / both / none / header")
+        session = c.get("session") or {}
+        header = str(session.get("header") or "")
+        if header and not _HEADER_TOKEN_RE.match(header):
+            add("error", "invalid_header_name", f"{prefix}.compat.session.header",
+                f"会话头名「{header}」不是合法的 HTTP 头名",
+                "头名只能包含字母、数字和 - _ .")
+        endpoint = c.get("endpoint") or {}
+        chat = str(endpoint.get("chat") or "")
+        if not chat.startswith("/"):
+            add("error", "invalid_endpoint", f"{prefix}.compat.endpoint.chat",
+                f"对话端点「{chat}」必须以 / 开头", "例如 /v1/chat/completions")
+        if not str(endpoint.get("models") or "").startswith("/"):
+            add("warn", "invalid_endpoint", f"{prefix}.compat.endpoint.models",
+                f"模型端点「{endpoint.get('models')}」必须以 / 开头", "例如 /v1/models")
+        limits = c.get("limits") or {}
+        max_out = _to_int(limits.get("maxOutputTokens"))
+        max_ctx = _to_int(limits.get("maxContextTokens"))
+        if max_out and max_ctx and max_out > max_ctx:
+            add("error", "invalid_limits", f"{prefix}.compat.limits",
+                f"最大输出 {max_out} 大于上下文窗口 {max_ctx}",
+                "输出上限应小于等于上下文窗口")
+        if max_out and max_tokens > max_out:
+            add("warn", "max_tokens_exceeds_upstream",
+                f"{prefix}.compat.limits.maxOutputTokens",
+                f"全局 maxTokens={max_tokens} 超过上游「{name}」上限 {max_out}，请求会被自动收敛",
+                "下调 maxTokens，或确认该上游上限")
+
+        overrides = up.get("modelOverrides")
+        if overrides is not None:
+            if not isinstance(overrides, dict):
+                add("error", "invalid_model_overrides", f"{prefix}.modelOverrides",
+                    f"上游「{name}」的 modelOverrides 必须是对象（模型 id → 覆盖项）")
+            else:
+                known_models = set(parsed.get("models") or [])
+                for key, value in overrides.items():
+                    path = f"{prefix}.modelOverrides.{key}"
+                    if not isinstance(key, str) or not key:
+                        add("error", "invalid_model_overrides", path,
+                            "模型覆盖键必须是非空字符串")
+                        continue
+                    if key.count("*") > 1:
+                        add("error", "multi_wildcard_override", path,
+                            f"模型覆盖键「{key}」包含多个 *，不参与匹配",
+                            "只支持一个 * 通配")
+                        continue
+                    if "*" not in key and known_models and key not in known_models:
+                        add("warn", "model_override_unknown_model", path,
+                            f"模型覆盖「{key}」不在上游「{name}」的模型清单里",
+                            "检查模型 id，或先在上游 models 中声明")
+                    if not isinstance(value, dict):
+                        add("error", "invalid_model_overrides", path,
+                            "模型覆盖值必须是对象（limits / capabilities）")
+                        continue
+                    if not value:
+                        add("error", "invalid_model_overrides", path,
+                            "模型覆盖值不能是空对象（至少包含 limits 或 capabilities）")
+                        continue
+                    for field in value:
+                        if field not in ("limits", "capabilities"):
+                            add("warn", "unknown_field", f"{path}.{field}",
+                                f"模型覆盖字段「{field}」未知，不会生效")
+                    limit_cfg = value.get("limits")
+                    if limit_cfg is not None:
+                        if not isinstance(limit_cfg, dict):
+                            add("error", "invalid_model_overrides", f"{path}.limits",
+                                "modelOverrides.limits 必须是对象")
+                        else:
+                            for field in limit_cfg:
+                                if field not in ("maxOutputTokens", "maxContextTokens"):
+                                    add("warn", "unknown_field", f"{path}.limits.{field}",
+                                        f"limits 字段「{field}」未知，不会生效")
+                            over_out = (_to_int(limit_cfg.get("maxOutputTokens"))
+                                        if "maxOutputTokens" in limit_cfg else None)
+                            over_ctx = (_to_int(limit_cfg.get("maxContextTokens"))
+                                        if "maxContextTokens" in limit_cfg else None)
+                            for field, number in (("maxOutputTokens", over_out),
+                                                  ("maxContextTokens", over_ctx)):
+                                if field in limit_cfg and (not number or number <= 0):
+                                    add("error", "invalid_model_overrides",
+                                        f"{path}.limits.{field}",
+                                        "limits 值必须是正整数")
+                            eff_out = over_out or max_out
+                            eff_ctx = over_ctx or max_ctx
+                            if eff_out and eff_ctx and eff_out > eff_ctx:
+                                add("error", "invalid_limit_relation", f"{path}.limits",
+                                    f"最大输出 {eff_out} 大于上下文窗口 {eff_ctx}",
+                                    "输出上限应小于等于上下文窗口")
+                    override_caps = value.get("capabilities")
+                    if override_caps is not None:
+                        if not isinstance(override_caps, dict):
+                            add("error", "invalid_capabilities", f"{path}.capabilities",
+                                "capabilities 必须是对象")
+                        else:
+                            for ck, cv in override_caps.items():
+                                if ck not in CAPABILITY_KEYS:
+                                    add("warn", "unknown_field",
+                                        f"{path}.capabilities.{ck}",
+                                        f"capabilities 字段「{ck}」未知，不会生效")
+                                elif not isinstance(cv, bool):
+                                    add("error", "invalid_capabilities",
+                                        f"{path}.capabilities.{ck}",
+                                        "能力值必须是布尔（true/false）")
+
+        if (parsed.get("apiKeySource") == "none" and protocol != "commandcode"
+                and scheme != "none" and not parsed.get("apiKeyEnv")
+                and not parsed.get("apiKeyFile")):
+            add("warn", "missing_credentials", f"{prefix}.apiKey",
+                f"上游「{name}」没有配置密钥（将以空鉴权请求）",
+                "设置 apiKeyEnv / apiKeyFile，或显式 apiKey 为空表示不鉴权")
+        if parsed.get("apiKeyEnv") and "apiKey" in up:
+            add("info", "key_precedence", f"{prefix}.apiKey",
+                f"上游「{name}」同时配置了 apiKeyEnv 与明文 apiKey，环境变量优先",
+                "只保留一种密钥来源更可控")
+        if up.get("autoModels") is True and up.get("fetchModels") is False:
+            add("warn", "ineffective_auto_models", f"{prefix}.autoModels",
+                "autoModels=true 但 fetchModels=false：不会向上游拉取模型",
+                "同时开启 fetchModels")
+        for model in parsed.get("models") or []:
+            if not isinstance(model, str):
+                continue
+            if model in model_owner and model_owner[model] != str(name):
+                add("info", "duplicate_model", f"{prefix}.models",
+                    f"模型「{model}」同时出现在「{model_owner[model]}」和「{name}」，按配置顺序取前者",
+                    "如需固定路由，使用 /<上游名>/v1 前缀")
+            else:
+                model_owner.setdefault(model, str(name))
+
+    if isinstance(default_model, str) and default_model.strip():
+        known = set(model_list(config, normalized))
+        if default_model not in known and default_model not in (aliases or {}):
+            add("warn", "default_model_unserved", "defaultModel",
+                f"默认模型「{default_model}」不在任何上游清单里",
+                "补齐上游 models，或改用已声明的模型名")
+    alias_map = aliases if isinstance(aliases, dict) else {}
+    for alias, target in alias_map.items():
+        if not isinstance(target, str):
+            continue
+        if target not in set(model_list(config, normalized)):
+            add("warn", "alias_target_missing", f"aliases.{alias}",
+                f"别名「{alias}」指向的模型「{target}」不在任何上游清单里",
+                "补齐上游 models，或修正别名目标")
+    return issues
+
+
+def effective_upstreams(upstreams: list[dict]) -> list[dict]:
+    """有效能力视图：面板展示“预设最终解析成了什么”，而不是猜。"""
+    rows = []
+    for up in upstreams:
+        compat = up.get("compat") or {}
+        rows.append({
+            "name": up.get("name"),
+            "protocol": up.get("protocol"),
+            "profile": compat.get("profile"),
+            "baseUrl": up.get("baseUrl"),
+            "chatPath": (compat.get("endpoint") or {}).get("chat"),
+            "modelsPath": (compat.get("endpoint") or {}).get("models"),
+            "authScheme": (compat.get("auth") or {}).get("scheme"),
+            "sessionHeader": (compat.get("session") or {}).get("header"),
+            "sessionIdStyle": (compat.get("session") or {}).get("idStyle"),
+            "thinkingPassthrough": (compat.get("thinking") or {}).get("passthrough"),
+            "thinkingField": (compat.get("thinking") or {}).get("field"),
+            "toolChoiceDowngrade": (compat.get("toolChoice") or {}).get("downgradeForced"),
+            "maxOutputTokens": (compat.get("limits") or {}).get("maxOutputTokens"),
+            "maxContextTokens": (compat.get("limits") or {}).get("maxContextTokens"),
+            "zdr": compat.get("zdr"),
+            "extraHeaders": compat.get("headers") or {},
+            "models": up.get("models") or [],
+            "default": bool(up.get("default")),
+            "keySource": up.get("apiKeySource"),
+            "keyConfigured": bool(up.get("apiKey")) and up.get("apiKeySource") != "none",
+            "capabilities": compat.get("capabilities") or {},
+            "modelOverrides": up.get("modelOverrides") or {},
+        })
+    return rows
+
+
+def compat_headers(up: dict, *, session_id: str = "", cli_version: str = "") -> dict:
+    """按 compat 生成出站请求头（探测与诊断复用，避免各协议各写一套）。
+
+    这是“配置可解释”的一部分：面板测活发什么头，必须和真实代理一致。
+    """
+    compat = up.get("compat") or {}
+    headers: dict = {}
+    for key, value in (compat.get("headers") or {}).items():
+        headers[str(key).lower()] = str(value)
+
+    key = up.get("apiKey") or ""
+    auth = compat.get("auth") or {}
+    scheme = str(auth.get("scheme") or "").lower()
+    if not scheme:
+        # 未归一化的旧上游（手工构造/测试）：按协议回退到历史行为。
+        scheme = "both" if up.get("protocol") == "anthropic" else "bearer"
+    if key and scheme != "none":
+        if scheme == "x-api-key":
+            headers["x-api-key"] = key
+        elif scheme == "both":
+            headers["authorization"] = f"Bearer {key}"
+            headers["x-api-key"] = key
+        elif scheme == "header":
+            headers[str(auth.get("header") or "authorization").lower()] = (
+                f"{auth.get('prefix') or ''}{key}")
+        else:
+            headers["authorization"] = f"{auth.get('prefix') or 'Bearer '}{key}"
+
+    session = compat.get("session") or {}
+    header = session.get("header")
+    if header is None:
+        # 旧字段回退：sessionHeader=true 时按 opencode 语义注入。
+        header = "x-opencode-session" if up.get("sessionHeader") else ""
+    if header and session_id:
+        value = session_id
+        if str(session.get("idStyle") or "hex32") == "sess16":
+            value = f"sess_{session_id[:16]}"
+        headers[str(header).lower()] = value
+
+    version_header = str(compat.get("versionHeader") or "")
+    if version_header and cli_version and cli_version != "auto":
+        headers[version_header] = cli_version
+    environment_header = str(compat.get("environmentHeader") or "")
+    if environment_header and up.get("cliEnvironment"):
+        headers[environment_header] = str(up["cliEnvironment"])
+    if compat.get("zdr", up.get("cmdZdr", False)):
+        headers["x-cmd-zdr"] = "1"
+    if up.get("protocol") == "anthropic":
+        headers.setdefault("anthropic-version",
+                           str(up.get("anthropicVersion") or "2023-06-01"))
+    return headers
 
 
 def validate_config_shape(config: dict) -> Optional[str]:
     """校验配置结构；合法返回 None，否则返回可读错误（HTTP 400 用）。
 
     目的：**先校验、后持久化**——避免把坏配置写进 bridge.config.json 后再崩溃，
-    导致下次启动直接失败。
+    导致下次启动直接失败。错误级诊断与 /api/config/validate 完全一致。
     """
-    if not isinstance(config, dict):
-        return "配置必须是 JSON 对象"
-
-    def _is_num(value) -> bool:
-        if isinstance(value, bool):
-            return False
-        return isinstance(value, (int, float)) or (
-            isinstance(value, str) and value.strip() != ""
-            and _to_int(value) is not None)
-
-    port = config.get("port")
-    if port is not None and not _is_num(port):
-        return f"port 必须是数字（当前 {port!r}）"
-    if _is_num(port) and not 0 <= int(_to_int(port)) <= 65535:
-        return "port 必须在 0-65535 之间"
-
-    for key in ("maxTokens", "timeoutSeconds", "modelsCacheSeconds"):
-        value = config.get(key)
-        if value is not None and not _is_num(value):
-            return f"{key} 必须是数字（当前 {value!r}）"
-
-    host = config.get("host")
-    if host is not None and not isinstance(host, str):
-        return "host 必须是字符串"
-
-    default_model = config.get("defaultModel")
-    if default_model is not None and not isinstance(default_model, str):
-        return "defaultModel 必须是字符串"
-
-    models = config.get("models")
-    if models is not None:
-        if not isinstance(models, list):
-            return "models 必须是数组"
-        if any(not isinstance(m, str) for m in models):
-            return "models 每一项都必须是字符串"
-
-    aliases = config.get("aliases")
-    if aliases is not None:
-        if not isinstance(aliases, dict):
-            return "aliases 必须是对象（别名 = 真实模型）"
-        if any(not isinstance(k, str) or not isinstance(v, str)
-               for k, v in aliases.items()):
-            return "aliases 的键与值都必须是字符串"
-
-    upstreams = config.get("upstreams")
-    if upstreams is not None:
-        if not isinstance(upstreams, dict):
-            return "upstreams 必须是对象（上游名 → 上游配置）"
-        for name, up in upstreams.items():
-            if not isinstance(name, str):
-                return f"上游名必须是字符串（当前 {name!r}）"
-            if not isinstance(up, dict):
-                return f"上游 {name!r} 的配置必须是对象"
-            if up.get("models") is not None and not isinstance(up["models"], list):
-                return f"上游 {name!r} 的 models 必须是数组"
-            if up.get("modelMap") is not None and not isinstance(up["modelMap"], dict):
-                return f"上游 {name!r} 的 modelMap 必须是对象"
-
-    thinking = config.get("thinking")
-    if thinking is not None and not isinstance(thinking, dict):
-        return "thinking 必须是对象"
-    tools = config.get("tools")
-    if tools is not None and not isinstance(tools, dict):
-        return "tools 必须是对象"
-    return None
+    errors = [item for item in validate_config(config) if item["level"] == "error"]
+    return errors[0]["message"] if errors else None
 
 
 def _to_int(value):
@@ -529,7 +1161,7 @@ def all_upstream_models(upstreams: list[dict]) -> list[str]:
     out: list[str] = []
     for u in upstreams:
         for m in u["models"]:
-            if m not in out:
+            if isinstance(m, str) and m not in out:
                 out.append(m)
     return out
 
@@ -537,15 +1169,15 @@ def all_upstream_models(upstreams: list[dict]) -> list[str]:
 def model_list(config: dict, upstreams: list[dict]) -> list[str]:
     """/v1/models 暴露的清单：顶层 models 是精确白名单，配了就只展示它。"""
     top = config.get("models") or []
-    ids: list[str] = list(top) if top else all_upstream_models(upstreams)
+    ids: list[str] = [m for m in top if isinstance(m, str)] if top else all_upstream_models(upstreams)
     for alias, target in (config.get("aliases") or {}).items():
         for value in (alias, target):
-            if value not in ids:
+            if isinstance(value, str) and value not in ids:
                 ids.append(value)
     for u in upstreams:
         for alias, target in (u.get("modelMap") or {}).items():
             for value in (alias, target):
-                if value not in ids:
+                if isinstance(value, str) and value not in ids:
                     ids.append(value)
     return ids
 

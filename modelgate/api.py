@@ -9,12 +9,23 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from urllib.parse import unquote_plus
 
-from . import __version__
-from .config import model_list, save_config, upstreams_of, validate_config_shape
+from . import __version__, provider_profiles
+from .config import (compat_headers, effective_upstreams, model_list, save_config,
+                     upstreams_of, validate_config, validate_config_shape)
 from .util import log
 
 TIME_RANGES = {"1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000, "all": None}
+
+
+def _profiles_meta() -> list[dict]:
+    """预设元数据；注册表不可用时返回空表，面板回退内置硬编码。"""
+    try:
+        return provider_profiles.profiles_meta()
+    except Exception as exc:  # noqa: BLE001
+        log(f"[model-gate] provider 注册表不可用：{exc}")
+        return []
 
 
 def _query(path: str) -> tuple[str, dict]:
@@ -26,12 +37,24 @@ def _query(path: str) -> tuple[str, dict]:
         if not pair:
             continue
         key, _, value = pair.partition("=")
-        params[key] = value
+        # 前端 URLSearchParams 会把 datetime-local 的 ":" 编成 %3A、空格编成 "+"；
+        # 这里必须解码，否则自定义时间会带着 %3A 进 _parse_ts 而报“无法识别的时间”。
+        params[unquote_plus(key)] = unquote_plus(value)
     return base, params
+
+
+def _today_start(now_ts: int | None = None) -> int:
+    """本机时区「今天 00:00:00」的时间戳。"""
+    from datetime import datetime
+
+    now = datetime.fromtimestamp(now_ts if now_ts is not None else time.time())
+    return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
 def _since_ts(params: dict) -> int | None:
     rng = params.get("range") or "24h"
+    if rng == "today":
+        return _today_start()
     seconds = TIME_RANGES.get(rng, 86400)
     if seconds is None:
         return None
@@ -101,6 +124,12 @@ def _previous_window(params: dict) -> tuple[int | None, int | None]:
         span = max(1, int(until) - int(since))
         return int(since) - span, int(since)
     rng = params.get("range") or "24h"
+    if rng == "today":
+        # 今天：对比区间为「今天 00:00 之前等长的上一段」，避免与 24h 混淆。
+        now_ts = int(time.time())
+        start = _today_start(now_ts)
+        span = max(1, now_ts - start)
+        return start - span, start
     seconds = TIME_RANGES.get(rng, 86400)
     if not seconds:
         return None, None
@@ -129,20 +158,19 @@ def _probe_one(bridge, up: dict, timeout: float = 6.0) -> dict:
         if candidate:
             model = candidate
             break
-    headers: dict = {"content-type": "application/json"}
-    key = up.get("apiKey") or ""
+    compat = up.get("compat") or {}
+    chat_path = str((compat.get("endpoint") or {}).get("chat") or "")
+    session_id = ""
+    cli_version = ""
 
     if proto == "anthropic":
-        url = f"{up['baseUrl']}/v1/messages"
+        url = f"{up['baseUrl']}{chat_path or '/v1/messages'}"
         payload = {"model": model, "max_tokens": 1,
                    "messages": [{"role": "user", "content": "ping"}]}
-        if key:
-            headers["x-api-key"] = key
-            headers["authorization"] = f"Bearer {key}"
-        headers["anthropic-version"] = up.get("anthropicVersion", "2023-06-01")
+        session_id = "probe_0000000000000000"
         streaming = False
     elif proto == "commandcode":
-        url = f"{up['baseUrl']}/alpha/generate"
+        url = f"{up['baseUrl']}{chat_path or '/alpha/generate'}"
         payload = {
             "config": {"workingDir": ".", "date": "2026-01-01",
                        "environment": "windows", "structure": [],
@@ -155,29 +183,21 @@ def _probe_one(bridge, up: dict, timeout: float = 6.0) -> dict:
                 {"role": "user", "content": [{"type": "text", "text": "ping"}]}],
                 "tools": [], "system": [], "max_tokens": 1, "stream": True},
         }
-        headers["user-agent"] = "cli"
-        if key:
-            headers["authorization"] = f"Bearer {key}"
-        if up.get("cliEnvironment"):
-            headers["x-cli-environment"] = up["cliEnvironment"]
-        headers["x-session-id"] = "sess_0000000000000000"
-        if up.get("cmdZdr", True):
-            headers["x-cmd-zdr"] = "1"
+        session_id = "0000000000000000"
+        streaming = True
         adapter = bridge.adapters.get("commandcode")
         if adapter is not None:
-            version = adapter.cli_version(up)
-            if version:
-                headers["x-command-code-version"] = version
-        streaming = True
+            cli_version = adapter.cli_version(up)
     else:
-        url = f"{up['baseUrl']}/v1/chat/completions"
+        url = f"{up['baseUrl']}{chat_path or '/v1/chat/completions'}"
         payload = {"model": model, "max_tokens": 1,
                    "messages": [{"role": "user", "content": "ping"}]}
-        if key:
-            headers["authorization"] = f"Bearer {key}"
-        if up.get("sessionHeader"):
-            headers["x-opencode-session"] = "probe_0000000000000000"
+        session_id = "probe_0000000000000000"
         streaming = False
+
+    # 探测请求头与真实代理保持一致：同一份 compat 解析结果。
+    headers = {"content-type": "application/json"}
+    headers.update(compat_headers(up, session_id=session_id, cli_version=cli_version))
 
     started = time.time()
     status = 0
@@ -423,9 +443,16 @@ def handle_get(handler, raw_path: str) -> None:
             if not isinstance(target, dict):
                 continue
             target.pop("apiKey", None)
-            target["_keyConfigured"] = bool(up.get("apiKey"))
+            target["_keyConfigured"] = bool(up.get("apiKey")) and up.get("apiKeySource") != "none"
             target["_keySource"] = up.get("apiKeySource")
-        handler.send_json(200, {"config": payload, "config_path": str(bridge.config_path or "")})
+        handler.send_json(200, {
+            "config": payload,
+            "config_path": str(bridge.config_path or ""),
+            "diagnostics": validate_config(bridge.config),
+            "effective": effective_upstreams(bridge.upstreams),
+            "profiles": _profiles_meta(),
+            "thinking": bridge.thinking_cache.stats(),
+        })
         return
 
     if path == "/api/usage/totals":
@@ -667,7 +694,13 @@ def handle_get(handler, raw_path: str) -> None:
                 "models": u["models"],
                 "modelsAll": u["modelsAll"],
                 "keySource": u["apiKeySource"],
-                "keyConfigured": bool(u.get("apiKey")),
+                "keyConfigured": bool(u.get("apiKey")) and u.get("apiKeySource") != "none",
+                "profile": (u.get("compat") or {}).get("profile"),
+                "chatPath": ((u.get("compat") or {}).get("endpoint") or {}).get("chat"),
+                "authScheme": ((u.get("compat") or {}).get("auth") or {}).get("scheme"),
+                "sessionHeader": ((u.get("compat") or {}).get("session") or {}).get("header"),
+                "thinkingPassthrough": ((u.get("compat") or {}).get("thinking") or {}).get("passthrough"),
+                "maxOutputTokens": ((u.get("compat") or {}).get("limits") or {}).get("maxOutputTokens"),
                 "apiKeyEnv": u.get("apiKeyEnv"),
                 "apiKeyFile": u.get("apiKeyFile"),
                 "plan": u.get("modelPlan"),
@@ -777,6 +810,25 @@ def handle_post(handler, raw_path: str) -> None:
         return
     if not isinstance(payload, dict):
         payload = {}
+
+    if path == "/api/config/validate":
+        incoming = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+        if not isinstance(incoming, dict):
+            handler.send_json(400, {"error": {"message": "配置必须是 JSON 对象",
+                                              "type": "invalid_request_error",
+                                              "code": "invalid_config"}})
+            return
+        diagnostics = validate_config(incoming)
+        errors = [d for d in diagnostics if d["level"] == "error"]
+        handler.send_json(200, {
+            "ok": not errors,
+            "errors": len(errors),
+            "warnings": len(diagnostics) - len(errors),
+            "diagnostics": diagnostics,
+            "effective": effective_upstreams(upstreams_of(incoming)),
+            "profiles": _profiles_meta(),
+        })
+        return
 
     if path == "/api/config":
         _save_config(handler, bridge, payload)
@@ -1007,7 +1059,17 @@ def _save_config(handler, bridge, payload: dict) -> None:
 
     # 客户端未回传密钥时保留既有引用（apiKeyEnv / apiKeyFile 原样保留即可）
     updated_upstreams = updated.get("upstreams") if isinstance(updated.get("upstreams"), dict) else {}
+    # 面板只渲染常用字段：未渲染的兼容字段（cliVersion、compat、modelCatalog…）
+    # 从当前配置补回，避免一次保存静默丢配置。
+    old_declared = bridge.config.get("upstreams") if isinstance(bridge.config.get("upstreams"), dict) else {}
     for name, new_up in updated_upstreams.items():
+        old_up = old_declared.get(name)
+        if isinstance(new_up, dict) and isinstance(old_up, dict):
+            for key, value in old_up.items():
+                if key != "apiKey" and key not in new_up:
+                    new_up[key] = value
+            for key in ("_keyConfigured", "_keySource"):
+                new_up.pop(key, None)
         if isinstance(new_up, dict) and not (new_up.get("apiKeyEnv") or new_up.get("apiKeyFile")):
             old = next((u for u in bridge.upstreams if u["name"] == name), None)
             if old:
@@ -1016,12 +1078,15 @@ def _save_config(handler, bridge, payload: dict) -> None:
                 elif old.get("apiKeyFile"):
                     new_up["apiKeyFile"] = old["apiKeyFile"]
 
-    # 先校验、后持久化：结构不合法直接 400，绝不把坏配置写进文件
-    problem = validate_config_shape(updated)
-    if problem:
+    # 先校验、后持久化：结构/能力不合法直接 400，绝不把坏配置写进文件
+    diagnostics = validate_config(updated)
+    errors = [item for item in diagnostics if item["level"] == "error"]
+    if errors:
         handler.send_json(400, {
-            "error": {"message": problem, "type": "invalid_request_error",
-                      "code": "invalid_config"},
+            "error": {"message": f"配置有 {len(errors)} 处错误，未保存：{errors[0]['message']}",
+                      "type": "invalid_request_error", "code": "invalid_config"},
+            "diagnostics": diagnostics,
+            "effective": effective_upstreams(upstreams_of(updated)),
         })
         return
 
@@ -1060,7 +1125,12 @@ def _save_config(handler, bridge, payload: dict) -> None:
     restored = set(literal_secrets) | set(prior)
     if restored:
         note += f"；{len(restored)} 个上游的明文密钥仅保留在内存，未写入配置文件"
-    handler.send_json(200, {"ok": True, "note": note})
+    handler.send_json(200, {
+        "ok": True,
+        "note": note,
+        "diagnostics": diagnostics,
+        "effective": effective_upstreams(bridge.upstreams),
+    })
 
 
 def _write_pricing_to_file(path: Path, table: dict) -> None:

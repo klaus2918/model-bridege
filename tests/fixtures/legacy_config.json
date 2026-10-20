@@ -1,0 +1,32 @@
+{
+  "_doc": "旧版配置夹具：面板出现前的旧简写字段（sessionHeader/cliVersion/pauseTurn/cmdZdr）+ 未知字段，用于双端「旧配置可加载」回归。请勿手改为新格式。",
+  "host": "127.0.0.1",
+  "port": 8900,
+  "defaultModel": "deepseek-chat",
+  "models": [],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "retentionDays": 0,
+  "accessLog": true,
+  "tools": { "downgradeForcedChoice": true },
+  "upstreams": {
+    "ds": {
+      "protocol": "anthropic",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "apiKey": "legacy-key",
+      "sessionHeader": true,
+      "cliVersion": "auto",
+      "pauseTurn": false,
+      "cmdZdr": true,
+      "mysteryField": { "keep": true },
+      "models": ["deepseek-chat"]
+    },
+    "zen": {
+      "protocol": "openai",
+      "baseUrl": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "ZEN_KEY",
+      "pauseTurn": true,
+      "models": ["kimi-k2"]
+    }
+  }
+}

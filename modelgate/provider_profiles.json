@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "_doc": "provider 预设注册表：Python 与 Rust 共用的唯一数据源。修改前请同步运行 scripts/provider_profiles_check.py 与 tests 下的 parity 校验。",
+  "profiles": {
+    "openai": {
+      "label": "OpenAI 兼容",
+      "description": "通用 OpenAI Chat Completions 端点；Bearer 鉴权、无会话头。",
+      "priority": 10,
+      "protocols": ["openai"],
+      "detect": { "baseUrlContains": [] },
+      "compat": {
+        "auth": { "scheme": "bearer", "header": "authorization", "prefix": "Bearer " },
+        "session": { "header": "", "idStyle": "hex32" },
+        "headers": {},
+        "endpoint": { "chat": "/v1/chat/completions", "models": "/v1/models" },
+        "thinking": { "passthrough": false, "field": "reasoning_content" },
+        "toolChoice": { "downgradeForced": false },
+        "limits": {},
+        "zdr": false,
+        "versionHeader": "",
+        "environmentHeader": "",
+        "catalog": { "source": "endpoint", "path": "/v1/models", "plan": false },
+        "capabilities": { "stream": true, "tools": true, "vision": false, "thinking": false, "cache": false, "systemPrompt": true }
+      },
+      "defaults": { "fetchModels": true, "autoModels": false, "pauseTurn": false }
+    },
+    "opencode": {
+      "label": "opencode / zen",
+      "description": "opencode 网关：缺少 x-opencode-session 会话头会被上游 400 拒绝；空 key 表示不鉴权。",
+      "priority": 80,
+      "protocols": ["openai"],
+      "detect": { "baseUrlContains": ["opencode.ai"] },
+      "compat": {
+        "session": { "header": "x-opencode-session", "idStyle": "hex32" }
+      },
+      "defaults": { "fetchModels": true, "autoModels": false, "pauseTurn": false }
+    },
+    "anthropic": {
+      "label": "Anthropic",
+      "description": "Anthropic Messages 端点：Bearer 与 x-api-key 双写；思考内容透传、强制 tool_choice 降级。",
+      "priority": 50,
+      "protocols": ["anthropic"],
+      "detect": { "baseUrlContains": [] },
+      "compat": {
+        "auth": { "scheme": "both", "header": "authorization", "prefix": "Bearer " },
+        "endpoint": { "chat": "/v1/messages", "models": "/v1/models" },
+        "thinking": { "passthrough": true, "field": "reasoning_content" },
+        "toolChoice": { "downgradeForced": true },
+        "capabilities": { "stream": true, "tools": true, "vision": true, "thinking": true, "cache": true, "systemPrompt": true }
+      },
+      "defaults": { "fetchModels": true, "autoModels": false, "pauseTurn": false }
+    },
+    "deepseek": {
+      "label": "DeepSeek",
+      "description": "DeepSeek OpenAI 兼容端点：思考回传，输出上限 384K、上下文 1M；提供 Anthropic 变体（供 CCH 等兼容层使用）。",
+      "priority": 90,
+      "protocols": ["openai", "anthropic"],
+      "detect": { "baseUrlContains": ["api.deepseek.com"] },
+      "compat": {
+        "thinking": { "passthrough": true, "field": "reasoning_content" },
+        "limits": { "maxOutputTokens": 393216, "maxContextTokens": 1048576 },
+        "capabilities": { "stream": true, "tools": true, "vision": false, "thinking": true, "cache": true, "systemPrompt": true }
+      },
+      "variants": {
+        "anthropic": {
+          "auth": { "scheme": "both", "header": "authorization", "prefix": "Bearer " },
+          "endpoint": { "chat": "/v1/messages", "models": "/v1/models" },
+          "toolChoice": { "downgradeForced": true }
+        }
+      },
+      "defaults": { "fetchModels": true, "autoModels": false, "pauseTurn": false }
+    },
+    "commandcode": {
+      "label": "CommandCode",
+      "description": "CommandCode NDJSON 端点：会话头、ZDR 安全头、CLI 版本/环境头、强制 tool_choice 降级；模型目录由专用协议拉取。",
+      "priority": 100,
+      "protocols": ["commandcode"],
+      "detect": { "baseUrlContains": ["commandcode.ai"] },
+      "compat": {
+        "session": { "header": "x-session-id", "idStyle": "sess16" },
+        "headers": { "user-agent": "cli" },
+        "endpoint": { "chat": "/alpha/generate", "models": "/v1/models" },
+        "toolChoice": { "downgradeForced": true },
+        "zdr": true,
+        "versionHeader": "x-command-code-version",
+        "environmentHeader": "x-cli-environment",
+        "limits": { "maxOutputTokens": 64000 },
+        "catalog": { "source": "commandcode", "path": "/v1/models", "plan": "auto" },
+        "capabilities": { "stream": true, "tools": true, "vision": false, "thinking": true, "cache": false, "systemPrompt": true }
+      },
+      "defaults": { "fetchModels": false, "autoModels": false, "pauseTurn": true }
+    }
+  }
+}

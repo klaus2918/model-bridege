@@ -1,12 +1,20 @@
 # Model-Gate — 使用说明
 
-> **桌面版（推荐，当前主线 2.19）**：`dist\Model-Gate.exe` 是 Windows 桌面代理：本地 HTTP 服务 + 模型配置面板
-> + token 用量统计（SQLite 落库）。启动后访问 `http://127.0.0.1:8900/ui/` 打开面板；
-> 无 GUI 环境可用 `Model-Gate.exe --no-gui --port 8911` 以纯代理模式运行。
+> **默认入口（2.19 起）：Rust 内核**。`dist\Model-Gate.exe`（约 4.3 MB）是
+> `rust/model-gate/` 的产物：配置格式、SQLite 表结构、HTTP 契约与面板
+> HTML/CSS/JS 与 Python 版完全一致；代理常驻内存约 7 MB（Python 版约 30 MB），
+> 三协议黑盒对等回归 `py scripts\parity_rust.py` 全部通过。
+> 构建/投放：`powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1 -Promote`；
+> 桌面壳为托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
+>
+> **Python 回退版（保留一个发布周期）**：`dist\Model-Gate-python.exe` 仍是完整可用的
+> 桌面代理（本地 HTTP 服务 + 模型配置面板 + token 用量统计 / SQLite 落库）；
+> 排查 Rust 版差异或需要旧行为时可直接运行。启动后访问 `http://127.0.0.1:8900/ui/`；
+> 无 GUI 环境可用 `--no-gui --port 8911` 以纯代理模式运行。
 >
 > **Legacy Node 版（冻结）**：`legacy/node-bridge/` 保留原始单文件实现（`node model-bridge.js`）。
-> 两者的代理路由与上游协议行为一致；桌面版另外提供面板、SQLite 用量、上游故障切换与配置热重载，
-> Node 版不再新增这些能力，仅做必要兼容修复。
+> 三者的代理路由与上游协议行为一致；Rust/Python 版另外提供面板、SQLite 用量、
+> 上游故障切换与配置热重载，Node 版不再新增这些能力，仅做必要兼容修复。
 >
 > **密钥安全**：桌面包会把**非空明文 `apiKey` 拦在内存里**，不写入 `bridge.config.json`
 > 与 SQLite。要长期使用请用 `apiKeyEnv`（读 `~/.jcode/.env`）或 `apiKeyFile`
@@ -451,8 +459,10 @@ curl http://127.0.0.1:8900/v1/models
 | `modelCatalogPlan` | `commandcode` 专用：按套餐过滤对外清单，`"auto"`（探测，默认）/ `go` / `goat` / `pro` / `max` / `false`（不过滤） |
 | `pauseTurn` | `commandcode` 专用：收到 `pause_turn` 时用同一请求体自动续跑（默认 `true`，最多续 5 次） |
 | `cmdZdr` | `commandcode` 专用：是否发送 `x-cmd-zdr: 1`（ZDR 安全头，零数据留存信号），默认 `true`；设 `false` 可关闭 |
+| `compat` | 通用兼容能力覆盖层：鉴权方式、会话头、额外请求头、端点、思考回传、输出上限、ZDR 等。见第六节「Provider 兼容能力」 |
+| `modelOverrides` | 模型级覆盖（精确/通配），只影响 `limits` 与 `capabilities`；见下文「预设注册表与模型级覆盖」 |
 
-**改完配置需重启才生效。**
+**面板保存后立即热重载；手工改文件后调用 `POST /api/config/reload` 或重启。**
 
 ### 密钥放哪：两种凭据模式
 
@@ -499,6 +509,80 @@ curl http://127.0.0.1:8900/v1/models
 
 `protocol` 可写 `anthropic` / `openai` / `commandcode`；省略时按 `baseUrl` 推断（opencode 系 → `openai`，
 commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议需在 `modelgate/protocols/` 增加适配器；Legacy Node 版对应改 `legacy/node-bridge/model-bridge.js`。
+
+### Provider 兼容能力（`compat`）
+
+不同厂商的差异不再写死在协议代码里，而是「预设 + 覆盖」：
+
+1. **预设**：按 `baseUrl` / `protocol` 自动识别 `opencode`、`commandcode`、`anthropic`、`deepseek`、`openai`；
+2. **旧字段**：`sessionHeader` / `cmdZdr` / `cliVersion` 等继续生效；
+3. **显式覆盖**：`upstreams.<name>.compat` 优先级最高，面板「兼容能力」区域可编辑。
+
+```json
+"commandcode": {
+  "protocol": "commandcode",
+  "baseUrl": "https://api.commandcode.ai",
+  "apiKeyEnv": "COMMAND_CODE_API_KEY",
+  "compat": {
+    "zdr": false,
+    "limits": { "maxOutputTokens": 64000 }
+  }
+}
+```
+
+常用覆盖：
+
+| 需求 | 写法 |
+|---|---|
+| 自定义鉴权头 | `"compat": {"auth": {"scheme": "header", "header": "x-api-key", "prefix": ""}}` |
+| 关闭会话头 | `"compat": {"session": false}` |
+| 换端点 | `"compat": {"endpoint": {"chat": "/v1/chat/completions"}}` |
+| 额外请求头 | `"compat": {"headers": {"x-client-name": "model-gate"}}` |
+| 关闭思考回传 | `"compat": {"thinking": {"passthrough": false}}` |
+| 收敛输出上限 | `"compat": {"limits": {"maxOutputTokens": 393216}}` |
+
+完整字段、预设矩阵与示例见 [`docs/architecture/provider-compat.md`](docs/architecture/provider-compat.md)。
+
+### 预设注册表与模型级覆盖
+
+五套预设（`openai` / `opencode` / `anthropic` / `deepseek` / `commandcode`）由
+`modelgate/provider_profiles.json` 单点定义，Python 与 Rust 共用；面板「预设」下拉与
+`/api/config` 的 `profiles` 字段都来自它，不再在代码里双写。
+
+**模型级覆盖**（`upstreams.<name>.modelOverrides`，可选）在 `compat` 之上声明单模型差异：
+
+| 规则 | 说明 |
+|------|------|
+| key | 路由解析后的模型 id；支持只含一个 `*` 的前缀/后缀通配 |
+| 优先级 | 精确匹配 > 最长通配 > 上游 `compat.limits` |
+| `limits.maxOutputTokens` | 参与请求 `max_tokens` 裁剪（与上游上限同一套逻辑） |
+| `capabilities` | 只读展示与配置诊断，不改变转发行为 |
+
+```json
+"deepseek": {
+  "protocol": "openai",
+  "baseUrl": "https://api.deepseek.com/v1",
+  "apiKeyEnv": "DEEPSEEK_API_KEY",
+  "models": ["deepseek-chat"],
+  "modelOverrides": {
+    "deepseek-chat": { "limits": { "maxOutputTokens": 8192 }, "capabilities": { "thinking": false } },
+    "deepseek-*": { "limits": { "maxOutputTokens": 65536 } }
+  }
+}
+```
+
+能力字段固定为 `stream / tools / vision / thinking / cache / systemPrompt`；合并顺序：
+模型覆盖 > 上游 `compat.capabilities` > profile 预设 > 内置默认（`stream/tools/systemPrompt` 为 true，
+其余 false）。`/api/config` 的 `effective` 回显解析结果，面板以徽标展示。
+
+新增诊断码：`unknown_profile`、`invalid_model_overrides`、`invalid_limit_relation`、
+`invalid_capabilities`、`model_override_unknown_model`、`multi_wildcard_override`
+（error 阻断保存，warn 仅提示；完整条件见 `docs/architecture/upstream-config-model.md`）。
+
+五套 provider 的完整示例配置见 [`docs/examples/providers/`](docs/examples/providers/)，均可直接加载。
+
+**配置诊断**：`POST /api/config/validate` 只校验不落盘，返回 `error / warn / info` 与解析后的
+`effective` 能力；`POST /api/config` 遇到 `error` 会返回 400 且不写文件。面板加载/保存后直接展示这些诊断。
 
 ---
 
@@ -660,16 +744,17 @@ KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示
 ```
 Model-Gate/
 ├─ README.md                      # 本说明
-├─ entry.py                       # 桌面版入口（pywebview/托盘/单实例）
-├─ modelgate/                     # 当前产品源码（Python）
-├─ tests/                         # pytest 测试
+├─ rust/model-gate/               # 默认产品源码（Rust：代理内核 + 托盘/系统浏览器桌面壳）
+├─ entry.py                       # Python 回退版入口（pywebview/托盘/单实例）
+├─ modelgate/                     # Python 回退版源码（对照与回退）
+├─ tests/                         # pytest 测试（Python 契约）
 ├─ assets/                        # 图标等构建资产
 ├─ docs/                          # 文档（architecture / integration / live-panel / maintenance）
-├─ scripts/                       # 活跃工具：构建、测试、安全扫描、发布
+├─ scripts/                       # 活跃工具：构建、测试、对等验证、安全扫描、发布
 │  └─ archive/                    # 过期的一次性版本验证/探测/文档脚本（只作历史证据）
 ├─ legacy/node-bridge/            # 冻结的 Node 单文件桥及其测试、changelog
-├─ ModelGate.spec / ModelGate.iss # PyInstaller / Inno Setup 打包定义
-├─ build.bat                      # 唯一构建入口
+├─ ModelGate.spec / ModelGate.iss # Python PyInstaller / Inno Setup 打包定义
+├─ build.bat                      # Python 回退版构建入口
 ├─ bridge.config.example.json     # 零密钥配置模板（唯一入库配置）
 └─ dist/ build/ data/ .op/        # 本地生成物/运行数据/变更工作区（均不在版本库）
 ```
@@ -684,12 +769,16 @@ Model-Gate/
 
 | 路径 | 作用 |
 |------|------|
-| `entry.py`、`modelgate/` | 桌面版入口与 Python 源码 |
+| `rust/model-gate/` | 默认产品源码：Rust 代理内核、托盘常驻 + 系统浏览器面板桌面壳、构建脚本 |
+| `entry.py`、`modelgate/` | Python 回退版入口与源码（对照/回退） |
 | `tests/` | 单元/接口测试（`python -m pytest`） |
-| `ModelGate.spec`、`ModelGate.iss`、`build.bat` | 打包定义与构建入口 |
+| `ModelGate.iss` | Inno Setup 打包定义（Rust/Python 通用，可 /D 覆盖源 exe） |
+| `ModelGate.spec`、`build.bat` | Python 回退版 PyInstaller 定义与构建入口 |
 | `assets/ModelGate.ico` | 应用图标（由 `scripts/make_icon.py` 生成） |
 | `docs/` | 架构图、集成记录、面板素材与维护规范 |
+| `docs/architecture/provider-compat.md` | Provider 兼容能力（compat）字段、预设与覆盖示例 |
 | `scripts/` | 活跃工具脚本；`scripts/archive/` 为历史一次性脚本 |
+| `scripts/compat_smoke.py` | compat 端到端冒烟：本地假上游验证请求头/端点由配置驱动 |
 | `legacy/node-bridge/` | 冻结的 Node 单文件桥、`package.json`、冒烟测试与 `changelog/` |
 | `bridge.config.example.json` | 配置模板（零密钥，可入库） |
 | `bridge.config.json` | 本机真实配置（**不入库**） |
@@ -700,34 +789,59 @@ Model-Gate/
 
 ## 十五、版本与打包
 
-版本号**唯一来源**：`modelgate/__init__.py` 的 `__version__`（面板资产戳、`/ui/` 注入的 `app.js?v=` 都读它）。
+版本号**唯一来源**：`rust/model-gate/Cargo.toml` 的 `version`（Rust 入口）；
+Python 回退版仍读 `modelgate/__init__.py` 的 `__version__`，两者保持同号。
 
-### 打包
+### 打包（Rust，默认）
+
+```bat
+powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1
+powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1 -Promote
+powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1
+```
+
+- `build-release.ps1` 产出 `dist\Model-Gate-rust.exe`（约 4.3 MB，单文件、内嵌前端）。
+- `-Promote` 额外把 Python 版备份为 `dist\Model-Gate-python.exe`，并用 Rust 覆盖
+  `dist\Model-Gate.exe`（正式入口切换）。
+- `build-installer.ps1` 产出 `dist\Model-Gate-v<ver>-rust-setup.exe`（约 3.8 MB，
+  Inno Setup 中文向导；自动查找 `ISCC.exe`，缺失时提示安装）。
+  安装包默认创建桌面图标与开始菜单项；exe 使用 Windows GUI 子系统，
+  双击不会弹出控制台窗口，日志仍写入 `data/modelgate.log`。
+  静默安装/卸载与安装后启动均已验证。
+
+也可以直接调用 ISCC：
+
+```bat
+iscc /DMyAppVersion=2.19.0 ^
+     /DMyAppSourceExe=dist\Model-Gate-rust.exe ^
+     /DMyOutputBaseFilename=Model-Gate-v2.19.0-rust-setup ^
+     ModelGate.iss
+```
+
+### 打包（Python，回退版）
 
 ```bat
 build.bat
 ```
 
-它按顺序做：探针解释器 → 生成图标 → **跑测试（失败即停）** → PyInstaller onefile → Inno Setup（本机无 `iscc` 时自动跳过）→ 汇总。
+探针解释器 → 生成图标 → **跑测试（失败即停）** → PyInstaller onefile →
+Inno Setup（本机无 `iscc` 时自动跳过）→ 汇总。产物 `dist\Model-Gate.exe`
+（会被 `-Promote` 改名为 `Model-Gate-python.exe`）。
 
-仓库里**只保留一份**打包定义 `ModelGate.spec`（产物 `dist\Model-Gate.exe`）。v2.3–v2.19 的逐版本 spec 已删除——它们只是同名的拷贝。
+Legacy Node 版不参与该打包流程；如需发布历史 Node 包，使用 `legacy-v<version>`
+tag 触发 `.github/workflows/release.yml`，产物为 `dist/model-bridge-v<version>.zip`。
 
-Legacy Node 版不参与该打包流程；如需发布历史 Node 包，使用 `legacy-v<version>` tag 触发 `.github/workflows/release.yml`，产物为 `dist/model-bridge-v<version>.zip`。
-
-### 产出带版本号的产物（升级时用）
-
-正在运行的 exe 文件被系统锁定，PyInstaller 无法覆盖。要与在跑实例并存：
+### 验证（切换前必跑）
 
 ```bat
-copy ModelGate.spec ModelGate.v2.19.spec
-:: 把 spec 里的 name="Model-Gate" 改成 name="Model-Gate-v2.19"
-py -3 -m PyInstaller --noconfirm --clean ModelGate.v2.19.spec
-:: 验证通过、切换完成后删掉这份临时 spec
+py scripts\parity_rust.py
+py scripts\panel_api_smoke.py --exe dist\Model-Gate-rust.exe
+node scripts\ui_smoke_cdp.mjs   :: 需以 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333 启动 GUI
 ```
 
 ### 升级（不停机）
 
-1. 新 exe 在**空闲端口 + 独立库**先跑一遍，或直接黑盒验证产物（可参考 `scripts/archive/versions/verify_v217_exe.py` 的历史形态，或使用 `scripts/upgrade_and_run.ps1`）
+1. 新 exe 在**空闲端口 + 独立库**先跑一遍（`--force-multi` 可跳过单实例守卫）
 2. 按 **PID** 停旧实例（端口占用者），**不要按进程名**
 3. 用同一 `--config` / `--db` 起新实例——`bridge.config.json` 与 `data/` 全程不动，客户端 `base_url` 无需修改
 4. 实测停机 2.6–3.6 秒
@@ -736,7 +850,10 @@ py -3 -m PyInstaller --noconfirm --clean ModelGate.v2.19.spec
 
 | 产物 | 说明 |
 |---|---|
-| `dist\Model-Gate.exe` | 绿色版单文件（GUI + `--no-gui` 两种模式） |
+| `dist\Model-Gate.exe` | **Rust** 绿色版单文件（GUI + `--no-gui` 两种模式） |
+| `dist\Model-Gate-v2.19.0-rust-setup.exe` | **Rust 安装包**（Inno Setup，中文向导） |
+| `dist\Model-Gate-rust.exe` | Rust 候选产物（切换前验证用） |
+| `dist\Model-Gate-python.exe` | Python 回退版（保留一个发布周期） |
 | `dist\Model-Gate-v*.exe` | 升级期间的并存实例（验证完可删） |
 | `dist\bridge.config.json` + `dist\data\` | 运行时配置与库（**不入库**） |
 

@@ -1,0 +1,35 @@
+{
+  "_doc": "Provider 示例：DeepSeek 官方（profile=deepseek，384K 输出 / 1M 上下文），模型级覆盖展示精确匹配与通配。复制为 bridge.config.json 使用。",
+  "port": 8900,
+  "host": "127.0.0.1",
+  "defaultModel": "deepseek-chat",
+  "models": ["deepseek-chat", "deepseek-reasoner"],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "accessLog": true,
+  "modelsCacheSeconds": 300,
+  "upstreams": {
+    "deepseek": {
+      "protocol": "openai",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "modelOverrides": {
+        "deepseek-chat": {
+          "limits": {
+            "maxOutputTokens": 8192
+          },
+          "capabilities": {
+            "thinking": false,
+            "cache": true
+          }
+        },
+        "deepseek-*": {
+          "limits": {
+            "maxContextTokens": 1048576
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "_doc": "Provider 示例：CommandCode（profile=commandcode，NDJSON + ZDR + 64K 输出上限）。复制为 bridge.config.json 使用；凭据优先读本地 CLI 登录态。",
+  "port": 8900,
+  "host": "127.0.0.1",
+  "defaultModel": "deepseek/deepseek-v4.1-flash",
+  "models": ["deepseek/deepseek-v4.1-flash"],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "accessLog": true,
+  "modelsCacheSeconds": 300,
+  "upstreams": {
+    "commandcode": {
+      "protocol": "commandcode",
+      "baseUrl": "https://api.commandcode.ai",
+      "apiKeyEnv": "COMMAND_CODE_API_KEY",
+      "apiKeyFile": "~/.commandcode/auth.json",
+      "cliVersion": "auto",
+      "cliEnvironment": "production",
+      "modelCatalog": "auto",
+      "modelCatalogPlan": "auto",
+      "pauseTurn": true,
+      "fetchModels": false,
+      "models": ["deepseek/deepseek-v4.1-flash"],
+      "compat": {
+        "limits": {
+          "maxOutputTokens": 64000
+        },
+        "zdr": true
+      }
+    }
+  }
+}

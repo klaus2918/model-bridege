@@ -52,6 +52,7 @@ ALLOW_SUFFIXES = (
     "npmjs.org", "github.com", "githubusercontent.com", "example.com",
     # 产品实际对接 / 文档引用的厂商域名
     "deepseek.com", "jrsoftware.org",
+    "anthropic.com", "openai.com", "microsoft.com",
     # 文档里 SVG 的 XML 命名空间（不是网络端点）
     "w3.org",
 )

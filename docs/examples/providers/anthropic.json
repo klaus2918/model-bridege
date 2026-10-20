@@ -1,0 +1,36 @@
+{
+  "_doc": "Provider 示例：Anthropic Messages（profile=anthropic），并用 modelOverrides 声明单模型输出上限与能力。复制为 bridge.config.json 使用。",
+  "port": 8900,
+  "host": "127.0.0.1",
+  "defaultModel": "claude-sonnet-4-5",
+  "models": ["claude-sonnet-4-5", "claude-haiku-4-5"],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "accessLog": true,
+  "modelsCacheSeconds": 300,
+  "upstreams": {
+    "anthropic": {
+      "protocol": "anthropic",
+      "baseUrl": "https://api.anthropic.com",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "anthropicVersion": "2023-06-01",
+      "models": ["claude-sonnet-4-5", "claude-haiku-4-5"],
+      "compat": {
+        "limits": {
+          "maxOutputTokens": 64000,
+          "maxContextTokens": 200000
+        }
+      },
+      "modelOverrides": {
+        "claude-haiku-4-5": {
+          "limits": {
+            "maxOutputTokens": 8192
+          },
+          "capabilities": {
+            "thinking": true
+          }
+        }
+      }
+    }
+  }
+}

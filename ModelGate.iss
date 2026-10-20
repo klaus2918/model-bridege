@@ -15,6 +15,15 @@
 #define MyAppExeName "Model-Gate.exe"
 #define MyAppURL "https://github.com/"
 
+; 打包源 exe 与输出名可由 ISCC /D 覆盖：正式打包默认 dist\Model-Gate.exe；
+; 验证版可指向独立文件名，避免覆盖正在使用的 exe。
+#ifndef MyAppSourceExe
+  #define MyAppSourceExe "dist\Model-Gate.exe"
+#endif
+#ifndef MyOutputBaseFilename
+  #define MyOutputBaseFilename "Model-Gate-v" + MyAppVersion + "-setup"
+#endif
+
 [Setup]
 AppId={{8F3C4A21-6D9E-4B7A-9C15-2B0E7D5F4A63}
 AppName={#MyAppName}
@@ -26,9 +35,11 @@ AppSupportURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+; 安装位置由用户自由指定（lowest 权限下 auto 会因 {autopf} 指向用户目录而隐藏该页）
+DisableDirPage=no
 LicenseFile=
 OutputDir=dist
-OutputBaseFilename=Model-Gate-v{#MyAppVersion}-setup
+OutputBaseFilename={#MyOutputBaseFilename}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -39,17 +50,15 @@ UninstallDisplayName={#MyAppName}
 CloseApplications=yes
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Default.isl"
-Name: "english"; MessagesFile: "compiler:Default.isl"
+; 默认且唯一的安装向导语言：简体中文。语言文件随仓库提供，避免依赖本机 Inno Setup 的额外语言包。
+Name: "chinesesimplified"; MessagesFile: "assets\inno\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
-  GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "quicklaunchicon"; Description: "{cm:CreateQuickLaunchIcon}"; \
-  GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked; OnlyBelowVersion: 6.1
+  GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [Files]
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; \
+Source: "{#MyAppSourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; \
   Flags: ignoreversion signonce
 
 [Icons]
@@ -57,8 +66,6 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\{#MyAppName} 数据目录"; Filename: "{app}\data"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; \
   Tasks: desktopicon
-Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#MyAppName}"; \
-  Filename: "{app}\{#MyAppExeName}"; Tasks: quicklaunchicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; \
