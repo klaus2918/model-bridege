@@ -5,11 +5,17 @@ mod anthropic;
 mod api_extra;
 mod commandcode;
 mod config;
+mod config_store;
 mod db;
+mod free_sources;
+mod free_sources_api;
 mod gui;
+mod opencode_transport;
 mod provider_profiles;
 mod proxy;
 mod thinking;
+mod ui_assets;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,7 +40,7 @@ struct Args {
     /// 覆盖监听地址
     #[arg(long)]
     host: Option<String>,
-    /// SQLite 数据库路径（默认 ./data/modelgate.db）
+    /// SQLite 数据库路径（默认与配置文件同目录的 data/modelgate.db）
     #[arg(long)]
     db: Option<PathBuf>,
     /// 纯代理模式：不创建托盘、不打开浏览器
@@ -60,10 +66,13 @@ struct Args {
 fn main() {
     let args = Args::parse();
     let config_path = args.config.clone().unwrap_or_else(default_config_path);
+    // 库路径跟随配置文件所在目录（与 Python 冻结版「exe 同目录 data/」同口径）。
+    // 为什么不用 CWD 相对：安装版从快捷方式启动时 CWD 可能是系统目录，
+    // 会读不到旧库（用量历史看似清零）并在别处新建空库，破坏升级衔接。
     let db_path = args
         .db
         .clone()
-        .unwrap_or_else(|| PathBuf::from("data").join("modelgate.db"));
+        .unwrap_or_else(|| default_db_path(&config_path));
     let data_dir = db_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -128,12 +137,17 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
     db.set_setting("lastPort", &actual_port.to_string());
     tracing::info!(
         "Model-Gate (rust) v{} 已启动 http://{}:{}/v1  db={}",
-        env!("CARGO_PKG_VERSION"), cfg.host, actual_port, db_path.display()
+        env!("CARGO_PKG_VERSION"),
+        cfg.host,
+        actual_port,
+        db_path.display()
     );
     for up in &cfg.upstreams {
         tracing::info!(
             "  上游 {:<10} {:<10} {}{}",
-            up.name, up.protocol, up.base_url,
+            up.name,
+            up.protocol,
+            up.base_url,
             if up.default { "  [默认]" } else { "" }
         );
     }
@@ -210,11 +224,17 @@ fn bind_with_fallback(host: &str, port: u16) -> anyhow::Result<(std::net::TcpLis
     anyhow::bail!("端口 {port} 起连续 20 个端口均不可用")
 }
 
-fn spawn_server(listener: std::net::TcpListener, app: axum::Router,
-                state: Arc<AppState>,
-                today_snapshot: Arc<std::sync::Mutex<serde_json::Value>>) -> std::thread::JoinHandle<()> {
+fn spawn_server(
+    listener: std::net::TcpListener,
+    app: axum::Router,
+    state: Arc<AppState>,
+    today_snapshot: Arc<std::sync::Mutex<serde_json::Value>>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(err) => {
                 tracing::error!("Tokio 运行时初始化失败：{err}");
@@ -239,6 +259,10 @@ fn spawn_server(listener: std::net::TcpListener, app: axum::Router,
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
+        });
+        let update = state.update.clone();
+        runtime.spawn(async move {
+            crate::update::auto_check(update).await;
         });
         runtime.block_on(async move {
             let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -270,7 +294,11 @@ fn init_logging(db_path: &std::path::Path) {
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking).with_ansi(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false),
+        )
         .try_init();
     // guard 必须活到进程结束，否则后台日志线程会被提前回收。
     std::mem::forget(guard);
@@ -452,7 +480,10 @@ fn write_fatal_log(data_dir: &std::path::Path, err: &anyhow::Error) -> PathBuf {
 }
 
 /// `--diagnose`：只读收集运行环境与配置状态，输出 `data/diagnose.txt`；不含 apiKey 等敏感值。
-fn run_diagnose(config_path: &std::path::Path, db_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+fn run_diagnose(
+    config_path: &std::path::Path,
+    db_path: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
     let mut out = String::new();
     out.push_str("Model-Gate 诊断报告\n");
     out.push_str(&format!("time={}\n", now_stamp()));
@@ -565,12 +596,41 @@ fn default_config_path() -> PathBuf {
         .join("bridge.config.json")
 }
 
+/// 默认数据库路径：与配置文件同目录的 `data\modelgate.db`。
+///
+/// 与 Python 冻结版（`Path(sys.executable).parent / "data" / "modelgate.db"`）同口径：
+/// 配置与数据同处一个目录，升级安装后旧库原地被接管，不随 CWD 漂移。
+fn default_db_path(config_path: &std::path::Path) -> PathBuf {
+    let base = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("data").join("modelgate.db")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("modelgate-test-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn default_db_path_follows_config_directory() {
+        // 升级衔接：库必须与配置同目录，不随 CWD 漂移。
+        let config = PathBuf::from(r"C:\Program Files\Model-Gate\bridge.config.json");
+        let db = default_db_path(&config);
+        assert_eq!(
+            db,
+            PathBuf::from(r"C:\Program Files\Model-Gate\data\modelgate.db")
+        );
+    }
+
+    #[test]
+    fn default_db_path_handles_relative_config() {
+        let db = default_db_path(std::path::Path::new("bridge.config.json"));
+        assert_eq!(db, PathBuf::from("data").join("modelgate.db"));
     }
 
     #[test]

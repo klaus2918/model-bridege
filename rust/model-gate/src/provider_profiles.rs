@@ -1,4 +1,4 @@
-//! provider 预设注册表（编译期嵌入 `modelgate/provider_profiles.json`，与 Python 端共用）。
+//! provider 预设注册表（编译期嵌入 crate 根目录的 `provider_profiles.json`）。
 //!
 //! 判定与合并规则见 docs/architecture/upstream-config-model.md：
 //! 显式 profile > 域名（按 priority）> 协议预设；显式 anthropic + 含 deepseek 的 host 走 DeepSeek 语义（兼容 shim）。
@@ -14,7 +14,7 @@ static REGISTRY: OnceLock<Option<Value>> = OnceLock::new();
 fn registry() -> Option<&'static Value> {
     REGISTRY
         .get_or_init(|| {
-            serde_json::from_str::<Value>(include_str!("../../../modelgate/provider_profiles.json")).ok()
+            serde_json::from_str::<Value>(include_str!("../provider_profiles.json")).ok()
         })
         .as_ref()
 }
@@ -54,7 +54,11 @@ pub fn detect_profile(profile_hint: &str, protocol: &str, base_url: &str) -> Str
                 effective = "openai".into();
             }
         } else {
-            effective = if protocol.is_empty() { "openai".into() } else { protocol.to_string() };
+            effective = if protocol.is_empty() {
+                "openai".into()
+            } else {
+                protocol.to_string()
+            };
         }
     }
     // 兼容 shim：显式 anthropic + 含 deepseek 的 host → DeepSeek 语义（历史行为，保留）。
@@ -70,7 +74,10 @@ pub fn resolve_compat(profile_hint: &str, base_url: &str, protocol: &str) -> Opt
     let base = profiles.get("openai")?.get("compat")?.clone();
     let effective = detect_profile(profile_hint, protocol, base_url);
     let known = profiles.get(&effective);
-    let mut merged = merge_values(&base, known.and_then(|e| e.get("compat")).unwrap_or(&Value::Null));
+    let mut merged = merge_values(
+        &base,
+        known.and_then(|e| e.get("compat")).unwrap_or(&Value::Null),
+    );
     if let Some(variant) = known
         .and_then(|e| e.get("variants"))
         .and_then(|v| v.get(protocol))
@@ -78,7 +85,16 @@ pub fn resolve_compat(profile_hint: &str, base_url: &str, protocol: &str) -> Opt
         merged = merge_values(&merged, variant);
     }
     let mut compat = compat_from_value(&merged);
-    compat.profile = effective;
+    compat.profile = effective.clone();
+    // profile 级「允许无密钥」声明在 compat 之外，不能被 compat 合并覆盖。
+    //
+    // 为什么需要它：opencode / zen 的免费层明确「空 key 表示不鉴权」，
+    // 但它的 auth.scheme 继承 openai 基线的 bearer。若只按 scheme 判定，
+    // 免鉴权上游会被误报「没有配置密钥」。
+    compat.auth_optional = known
+        .and_then(|e| e.get("authOptional"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Some(compat)
 }
 
@@ -172,7 +188,14 @@ fn compat_from_value(value: &Value) -> Compat {
     if let Some(headers) = get(&["headers"]).and_then(Value::as_object) {
         c.extra_headers = headers
             .iter()
-            .map(|(k, v)| (k.to_lowercase(), v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+            .map(|(k, v)| {
+                (
+                    k.to_lowercase(),
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string()),
+                )
+            })
             .collect();
     }
     c.chat_path = str_at(&["endpoint", "chat"]).to_string();
@@ -237,10 +260,13 @@ mod tests {
     fn golden_fixtures_match_rust_resolution() {
         // 与 Python（tests/test_provider_profiles.py）读取同一份 fixtures，不允许各自维护预期值。
         let golden: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/provider_profiles_golden.json"
+            "../tests/fixtures/provider_profiles_golden.json"
         ))
         .expect("golden fixtures 可解析");
-        let cases = golden.get("cases").and_then(Value::as_array).expect("cases");
+        let cases = golden
+            .get("cases")
+            .and_then(Value::as_array)
+            .expect("cases");
         assert!(!cases.is_empty(), "golden fixtures 为空");
         for case in cases {
             let name = case.get("name").and_then(Value::as_str).unwrap_or("?");
@@ -264,16 +290,66 @@ mod tests {
     }
 
     #[test]
-    fn profiles_meta_exposes_five_profiles_in_registry_order() {
+    fn profiles_meta_exposes_all_profiles_in_registry_order() {
         let meta = profiles_meta();
         let ids: Vec<&str> = meta.iter().filter_map(|v| v["id"].as_str()).collect();
-        assert_eq!(ids, ["openai", "opencode", "anthropic", "deepseek", "commandcode"]);
+        assert_eq!(
+            ids,
+            [
+                "openai",
+                "opencode",
+                "anthropic",
+                "deepseek",
+                "moonshot",
+                "zhipu",
+                "minimax",
+                "dashscope",
+                "ark",
+                "siliconflow",
+                "modelscope",
+                "hunyuan",
+                "commandcode",
+                "kilo",
+            ]
+        );
         for row in &meta {
-            for key in ["stream", "tools", "vision", "thinking", "cache", "systemPrompt"] {
+            for key in [
+                "stream",
+                "tools",
+                "vision",
+                "thinking",
+                "cache",
+                "systemPrompt",
+            ] {
                 assert!(row["capabilities"].get(key).is_some(), "缺少能力字段 {key}");
             }
         }
         assert!(is_known_profile("deepseek"));
         assert!(!is_known_profile("mystery"));
+    }
+
+    #[test]
+    fn kilo_profile_is_detected_and_no_auth() {
+        // Kilo 免密池：域名可识别，且声明不鉴权。
+        assert_eq!(
+            detect_profile("", "openai", "https://api.kilo.ai/api/openrouter"),
+            "kilo"
+        );
+        assert_eq!(
+            detect_profile("", "openai", "https://ai-gateway.kilo.ai/api/v1"),
+            "kilo"
+        );
+        let compat = resolve_compat("", "https://api.kilo.ai/api/openrouter", "openai")
+            .expect("kilo 预设可解析");
+        assert_eq!(compat.profile, "kilo");
+        assert_eq!(compat.auth_scheme, "none");
+        assert!(
+            compat.auth_optional,
+            "Kilo 免密池不应被误报「没有配置密钥」"
+        );
+        assert_eq!(compat.chat_path, "/v1/chat/completions");
+        assert_eq!(compat.models_path, "/v1/models");
+        // 免密池不注入会话头：Kilo 网关不校验会话头。
+        assert!(compat.session_header.is_empty());
     }
 }

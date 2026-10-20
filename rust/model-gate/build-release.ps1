@@ -3,7 +3,7 @@
 #   powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1
 #   powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1 -Promote
 # 参数：
-#   -Promote     额外覆盖 dist\Model-Gate.exe（正式入口切换；Python 版请先备份）
+#   -Promote     额外覆盖 dist\Model-Gate.exe（正式入口切换）
 #   -Acceptance  构建后运行黑盒验收 scripts\rust_shell_acceptance.ps1（指标 + 无 WebView2 + 二次启动）
 param(
     [switch]$Promote,
@@ -25,13 +25,6 @@ Write-Host "已生成 $dest ($size MB)"
 
 if ($Promote) {
     $official = Join-Path $dist "Model-Gate.exe"
-    $backup = Join-Path $dist "Model-Gate-python.exe"
-    if ((Test-Path $official) -and -not (Test-Path $backup)) {
-        Copy-Item $official $backup -Force
-        Write-Host "已备份 Python 入口到 $backup"
-    } elseif (Test-Path $backup) {
-        Write-Host "保留既有回退入口 $backup（不覆盖）"
-    }
     Copy-Item $exe $official -Force
     Write-Host "已切换正式入口：$official"
 }

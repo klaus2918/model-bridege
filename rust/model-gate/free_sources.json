@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "_doc": "免费来源注册表：免密（无需账号/Key）上游的定义与拒因字典。Rust 内核内嵌（include_str!）。判定只做筛选，最终可用性由探测决定。",
+  "states": {
+    "available": { "label": "可用", "order": 0, "tone": "ok" },
+    "transient": { "label": "暂时不可用", "order": 1, "tone": "warn" },
+    "suspect": { "label": "疑似可用", "order": 2, "tone": "warn" },
+    "region": { "label": "地区受限", "order": 3, "tone": "info" },
+    "unavailable": { "label": "明确不可用", "order": 4, "tone": "bad" }
+  },
+  "sources": {
+    "zen-free": {
+      "label": "OpenCode Zen 免密池",
+      "upstream": "zen",
+      "protocol": "openai",
+      "transport": "opencode",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "chatPath": "/v1/chat/completions",
+      "auth": "none",
+      "freeMatch": {
+        "suffixes": ["-free"],
+        "ids": ["big-pickle", "grok-code"]
+      },
+      "catalog": { "path": "/v1/models", "shape": "openai" },
+      "probe": {
+        "mode": "chat",
+        "minMaxTokens": 512,
+        "prompt": "ping"
+      },
+      "privacy": {
+        "level": "warn",
+        "note": "OpenCode 免密层：非官方公开契约，可能随时变更；请求需携带 OpenCode 客户端指纹。"
+      },
+      "docsUrl": "https://opencode.ai/docs"
+    },
+    "kilo-free": {
+      "label": "Kilo 免密免费池",
+      "upstream": "kilo",
+      "protocol": "openai",
+      "transport": "",
+      "baseUrl": "https://api.kilo.ai/api/openrouter",
+      "chatPath": "/v1/chat/completions",
+      "auth": "none",
+      "freeMatch": {
+        "suffixes": [":free"],
+        "flags": ["isFree"],
+        "zeroPrice": true
+      },
+      "catalog": { "path": "/v1/models", "shape": "openai" },
+      "probe": {
+        "mode": "chat",
+        "minMaxTokens": 512,
+        "prompt": "ping"
+      },
+      "privacy": {
+        "level": "danger",
+        "note": "Kilo 免密池：20 个免费模型中 19 个 mayTrainOnYourPrompts=true；NVIDIA 免费端点官方明示会记录会话用于改进产品。勿发送机密内容。"
+      },
+      "docsUrl": "https://kilo.ai/docs/gateway/models-and-providers"
+    }
+  },
+  "rejectReasons": {
+    "rate_limited_upstream": {
+      "label": "上游池限流",
+      "state": "transient",
+      "advice": "上游共享池已满，稍后重试；可换用其它免费模型"
+    },
+    "daily_quota_exhausted": {
+      "label": "日配额耗尽",
+      "state": "transient",
+      "advice": "该模型每日硬上限已用完（Credits 不影响此上限），次日恢复"
+    },
+    "upstream_timeout": {
+      "label": "上游超时",
+      "state": "transient",
+      "advice": "上游 5xx/504，属模型侧故障，可稍后重试或换模型"
+    },
+    "gateway_error": {
+      "label": "网关故障",
+      "state": "transient",
+      "advice": "网关自身异常，非模型问题；稍后重试"
+    },
+    "network_error": {
+      "label": "网络不可达",
+      "state": "transient",
+      "advice": "检查本机网络、代理与出口设置"
+    },
+    "budget_exhausted": {
+      "label": "输出预算不足",
+      "state": "suspect",
+      "advice": "上游返回 200 但正文为空，多为 reasoning 吃满预算；提高 max_tokens 或降低思考档位后再试"
+    },
+    "model_not_found": {
+      "label": "模型不存在",
+      "state": "unavailable",
+      "advice": "上游已下线或该 id 不存在，勿再使用"
+    },
+    "paid_model_auth_required": {
+      "label": "需登录(非免费)",
+      "state": "unavailable",
+      "advice": "零价不等于免鉴权；该模型需账号/Key，请改用同源免费模型"
+    },
+    "region_blocked": {
+      "label": "地区受限",
+      "state": "region",
+      "advice": "上游对当前出口 IP 不放行；更换出口或等待解除"
+    },
+    "free_tier_rejected": {
+      "label": "免费层拒绝",
+      "state": "unavailable",
+      "advice": "OpenCode 免费层契约可能已变更；确认 transport=opencode 指纹完整"
+    },
+    "cloudflare_blocked": {
+      "label": "边缘节点拦截",
+      "state": "unavailable",
+      "advice": "Cloudflare 1010；确认自定义头未覆盖客户端指纹"
+    },
+    "model_not_free": {
+      "label": "非免费模型",
+      "state": "unavailable",
+      "advice": "transport=opencode 只接受免费模型"
+    }
+  }
+}

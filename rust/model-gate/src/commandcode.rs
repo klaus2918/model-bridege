@@ -30,7 +30,10 @@ pub struct ToolCall {
 
 impl StreamState {
     pub fn new() -> Self {
-        Self { finish: "stop".into(), ..Default::default() }
+        Self {
+            finish: "stop".into(),
+            ..Default::default()
+        }
     }
 
     pub fn usage(&self) -> Value {
@@ -62,7 +65,11 @@ impl StreamState {
             }
         }
         let idx = self.calls.len();
-        self.calls.push(ToolCall { id: id.to_string(), name: name.to_string(), args: String::new() });
+        self.calls.push(ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            args: String::new(),
+        });
         if !id.is_empty() {
             self.by_id.insert(id.to_string(), idx);
         }
@@ -84,12 +91,22 @@ fn stop_reason(ev: &Value) -> &'static str {
 }
 
 fn usage_into(st: &mut StreamState, ev: &Value) {
-    let u = ev.get("totalUsage").or_else(|| ev.get("usage")).cloned().unwrap_or_else(|| json!({}));
+    let u = ev
+        .get("totalUsage")
+        .or_else(|| ev.get("usage"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     st.prompt += u.get("inputTokens").and_then(Value::as_i64).unwrap_or(0);
     st.completion += u.get("outputTokens").and_then(Value::as_i64).unwrap_or(0);
     if let Some(detail) = u.get("inputTokenDetails") {
-        st.cache_read += detail.get("cacheReadTokens").and_then(Value::as_i64).unwrap_or(0);
-        st.cache_write += detail.get("cacheWriteTokens").and_then(Value::as_i64).unwrap_or(0);
+        st.cache_read += detail
+            .get("cacheReadTokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        st.cache_write += detail
+            .get("cacheWriteTokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
     }
 }
 
@@ -104,7 +121,10 @@ pub fn chunk(model: &str, delta: Value, finish: Option<&str>, usage: Option<Valu
     if let Some(usage) = usage {
         obj["usage"] = usage;
     }
-    format!("data: {}\n\n", serde_json::to_string(&obj).unwrap_or_default())
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&obj).unwrap_or_default()
+    )
 }
 
 /// 处理一个 NDJSON 事件；返回需要写给下游的 SSE 文本（可能为空）。
@@ -125,10 +145,15 @@ pub fn handle_event(ev: &Value, st: &mut StreamState, model: &str) -> String {
             let id = str_of(ev.get("id").or_else(|| ev.get("toolCallId")));
             let name = str_of(ev.get("toolName"));
             let idx = st.tool_index(&id, &name);
-            chunk(model, json!({"tool_calls": [{
-                "index": idx, "id": id, "type": "function",
-                "function": {"name": name, "arguments": ""},
-            }]}), None, None)
+            chunk(
+                model,
+                json!({"tool_calls": [{
+                    "index": idx, "id": id, "type": "function",
+                    "function": {"name": name, "arguments": ""},
+                }]}),
+                None,
+                None,
+            )
         }
         "tool-input-delta" | "tool-delta" => {
             let id = str_of(ev.get("id").or_else(|| ev.get("toolCallId")));
@@ -138,16 +163,25 @@ pub fn handle_event(ev: &Value, st: &mut StreamState, model: &str) -> String {
             if let Some(call) = st.calls.get_mut(idx) {
                 call.args.push_str(&delta);
             }
-            chunk(model, json!({"tool_calls": [{
-                "index": idx, "function": {"arguments": delta},
-            }]}), None, None)
+            chunk(
+                model,
+                json!({"tool_calls": [{
+                    "index": idx, "function": {"arguments": delta},
+                }]}),
+                None,
+                None,
+            )
         }
         "tool-call" | "tool-use" => {
             let id = str_of(ev.get("toolCallId").or_else(|| ev.get("id")));
             let name = str_of(ev.get("toolName"));
             let known = st.by_id.contains_key(&id);
             let idx = st.tool_index(&id, &name);
-            let input = ev.get("input").or_else(|| ev.get("args")).cloned().unwrap_or_else(|| json!({}));
+            let input = ev
+                .get("input")
+                .or_else(|| ev.get("args"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let encoded = crate::anthropic::dumps_like_python(&input);
             if let Some(call) = st.calls.get_mut(idx) {
                 call.args = encoded.clone();
@@ -155,17 +189,23 @@ pub fn handle_event(ev: &Value, st: &mut StreamState, model: &str) -> String {
             if known {
                 String::new()
             } else {
-                chunk(model, json!({"tool_calls": [{
-                    "index": idx, "id": id, "type": "function",
-                    "function": {"name": name, "arguments": encoded},
-                }]}), None, None)
+                chunk(
+                    model,
+                    json!({"tool_calls": [{
+                        "index": idx, "id": id, "type": "function",
+                        "function": {"name": name, "arguments": encoded},
+                    }]}),
+                    None,
+                    None,
+                )
             }
         }
         "finish" => {
             st.finish = stop_reason(ev).to_string();
             usage_into(st, ev);
             st.saw_finish = true;
-            let raw = str_of(ev.get("rawFinishReason").or_else(|| ev.get("finishReason"))).to_lowercase();
+            let raw =
+                str_of(ev.get("rawFinishReason").or_else(|| ev.get("finishReason"))).to_lowercase();
             st.paused = raw == "pause_turn";
             String::new()
         }
@@ -173,7 +213,11 @@ pub fn handle_event(ev: &Value, st: &mut StreamState, model: &str) -> String {
             let err = ev.get("error").cloned().unwrap_or(Value::Null);
             st.error = match err {
                 Value::String(s) => s,
-                Value::Object(o) => o.get("message").and_then(Value::as_str).unwrap_or("上游返回错误").to_string(),
+                Value::Object(o) => o
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("上游返回错误")
+                    .to_string(),
                 _ => "上游返回未知错误".into(),
             };
             String::new()
@@ -205,7 +249,14 @@ pub fn consume_ndjson(raw: &str) -> StreamState {
 pub fn body_from_state(st: &StreamState, requested_model: &str) -> Value {
     let mut message = Map::new();
     message.insert("role".into(), json!("assistant"));
-    message.insert("content".into(), if st.text.is_empty() { Value::Null } else { json!(st.text) });
+    message.insert(
+        "content".into(),
+        if st.text.is_empty() {
+            Value::Null
+        } else {
+            json!(st.text)
+        },
+    );
     if !st.reasoning.is_empty() {
         message.insert("reasoning_content".into(), json!(st.reasoning));
     }
@@ -296,12 +347,18 @@ pub fn to_messages(messages: &[Value]) -> Vec<Value> {
                 if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
                     for tc in calls {
                         let function = tc.get("function").cloned().unwrap_or_else(|| json!({}));
-                        let name = function.get("name").and_then(Value::as_str).unwrap_or("unknown");
+                        let name = function
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
                         let id = str_of(tc.get("id"));
                         if !id.is_empty() {
                             name_by_id.insert(id.clone(), name.to_string());
                         }
-                        let args = function.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                        let args = function
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
                         let input: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
                         blocks.push(json!({
                             "type": "tool-call",
@@ -340,13 +397,21 @@ pub fn to_messages(messages: &[Value]) -> Vec<Value> {
                                     parts.push(json!({"type": "text", "text": s}));
                                 }
                             } else if p.get("type").and_then(Value::as_str) == Some("text") {
-                                if let Some(t) = p.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                if let Some(t) = p
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                {
                                     parts.push(json!({"type": "text", "text": t}));
                                 }
                             } else if p.get("type").and_then(Value::as_str) == Some("image_url") {
                                 let image = p.get("image_url").cloned().unwrap_or(Value::Null);
                                 let url = image.as_str().map(str::to_string).unwrap_or_else(|| {
-                                    image.get("url").and_then(Value::as_str).unwrap_or("").to_string()
+                                    image
+                                        .get("url")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string()
                                 });
                                 if let Some(rest) = url.strip_prefix("data:") {
                                     if let Some((mime, _)) = rest.split_once(';') {
@@ -368,21 +433,27 @@ pub fn to_messages(messages: &[Value]) -> Vec<Value> {
 }
 
 pub fn to_tools(tools: Option<&Vec<Value>>) -> Vec<Value> {
-    tools.map(|arr| {
-        arr.iter()
-            .filter(|t| t.get("type").and_then(Value::as_str) == Some("function")
-                && t.pointer("/function/name").and_then(Value::as_str).is_some())
-            .map(|t| {
-                let f = t.get("function").cloned().unwrap_or_else(|| json!({}));
-                json!({
-                    "name": f.get("name"),
-                    "description": f.get("description").cloned().unwrap_or_else(|| json!("")),
-                    "input_schema": f.get("parameters").cloned()
-                        .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+    tools
+        .map(|arr| {
+            arr.iter()
+                .filter(|t| {
+                    t.get("type").and_then(Value::as_str) == Some("function")
+                        && t.pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .is_some()
                 })
-            })
-            .collect()
-    }).unwrap_or_default()
+                .map(|t| {
+                    let f = t.get("function").cloned().unwrap_or_else(|| json!({}));
+                    json!({
+                        "name": f.get("name"),
+                        "description": f.get("description").cloned().unwrap_or_else(|| json!("")),
+                        "input_schema": f.get("parameters").cloned()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn to_system(parts: &[String]) -> Vec<Value> {
@@ -395,7 +466,10 @@ pub fn to_system(parts: &[String]) -> Vec<Value> {
 /// 构造 /alpha/generate 请求体（上游恒为流式）。
 pub fn build_payload(body: &Value, model: &str, max_tokens: u64) -> Value {
     let empty = Vec::new();
-    let messages = body.get("messages").and_then(Value::as_array).unwrap_or(&empty);
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
     let mut system_parts = Vec::new();
     let mut rest = Vec::new();
     for m in messages {
@@ -408,10 +482,16 @@ pub fn build_payload(body: &Value, model: &str, max_tokens: u64) -> Value {
     let mut params = Map::new();
     params.insert("model".into(), json!(model));
     params.insert("messages".into(), json!(to_messages(&rest)));
-    params.insert("tools".into(), json!(to_tools(body.get("tools").and_then(Value::as_array))));
+    params.insert(
+        "tools".into(),
+        json!(to_tools(body.get("tools").and_then(Value::as_array))),
+    );
     params.insert("system".into(), json!(to_system(&system_parts)));
-    let max_tokens = body.get("max_tokens").or_else(|| body.get("max_completion_tokens"))
-        .and_then(Value::as_u64).unwrap_or(max_tokens);
+    let max_tokens = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(max_tokens);
     params.insert("max_tokens".into(), json!(max_tokens));
     params.insert("stream".into(), json!(true));
     for key in ["temperature", "reasoning_effort"] {
@@ -445,14 +525,23 @@ fn thread_id(body: &Value) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let empty = Vec::new();
-    let seed = body.get("messages").and_then(Value::as_array).unwrap_or(&empty)
-        .first().map(|m| m.to_string()).unwrap_or_default();
+    let seed = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty)
+        .first()
+        .map(|m| m.to_string())
+        .unwrap_or_default();
     let mut hasher = DefaultHasher::new();
     seed.hash(&mut hasher);
     let n = hasher.finish();
     let hex = format!("{n:016x}{n:016x}");
     format!(
         "{}-{}-4{}-8{}-{}",
-        &hex[0..8], &hex[8..12], &hex[13..16], &hex[17..20], &hex[20..32]
+        &hex[0..8],
+        &hex[8..12],
+        &hex[13..16],
+        &hex[17..20],
+        &hex[20..32]
     )
 }

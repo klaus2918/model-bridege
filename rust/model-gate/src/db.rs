@@ -94,13 +94,19 @@ impl Db {
             std::fs::create_dir_all(parent).ok();
         }
         let write = connect(path)?;
-        write.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
+        write.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
         write.execute_batch(SCHEMA)?;
         migrate(&write);
         let readers = (0..2)
             .map(|_| connect(path).map(Mutex::new))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self { path: path.to_path_buf(), write: Mutex::new(write), readers })
+        Ok(Self {
+            path: path.to_path_buf(),
+            write: Mutex::new(write),
+            readers,
+        })
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -159,8 +165,10 @@ impl Db {
 
     pub fn get_setting(&self, key: &str) -> Option<String> {
         let conn = self.reader();
-        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0))
-            .ok()
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .ok()
     }
 
     pub fn set_setting(&self, key: &str, value: &str) {
@@ -184,15 +192,25 @@ impl Db {
         .unwrap_or(0)
     }
 
-    pub fn list_usage(&self, f: &Filters, limit: i64, offset: i64,
-                      sort: &str, order: &str) -> Vec<Value> {
+    pub fn list_usage(
+        &self,
+        f: &Filters,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+    ) -> Vec<Value> {
         let (where_sql, args) = where_clause(f, f.only.as_deref());
         let column = match sort {
             "duration_ms" | "ttft_ms" | "prompt_tokens" | "completion_tokens"
             | "cache_read_tokens" | "total_tokens" | "cost" | "status" => sort,
             _ => "ts",
         };
-        let direction = if order.eq_ignore_ascii_case("asc") { "ASC" } else { "DESC" };
+        let direction = if order.eq_ignore_ascii_case("asc") {
+            "ASC"
+        } else {
+            "DESC"
+        };
         let tie = if column == "ts" { "" } else { ", ts DESC" };
         let sql = format!(
             "SELECT * FROM usage_records{where_sql} ORDER BY {column} {direction}{tie} LIMIT ? OFFSET ?"
@@ -201,7 +219,10 @@ impl Db {
         all.push(SqlValue::Integer(limit));
         all.push(SqlValue::Integer(offset));
         let conn = self.reader();
-        let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return Vec::new() };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
         let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let rows = stmt.query_map(params_from_iter(all.iter()), |row| {
             let mut map = Map::new();
@@ -243,7 +264,10 @@ impl Db {
             percentile_cols()
         );
         let conn = self.reader();
-        let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return json!({}) };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return json!({}),
+        };
         let row = stmt.query_row(params_from_iter(args.iter()), |row| {
             let requests: i64 = row.get("requests")?;
             let ok: i64 = row.get("ok")?;
@@ -275,13 +299,15 @@ impl Db {
                 "max_duration_ms": max_d.unwrap_or(0) as f64,
             }))
         });
-        row.unwrap_or_else(|_| json!({
-            "requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-            "cache_read_tokens": 0, "cache_write_tokens": 0, "cost": 0.0, "errors": 0,
-            "ok": 0, "success_rate": 0.0, "cache_hit_rate": Value::Null,
-            "avg_duration_ms": 0.0, "avg_ttft_ms": 0.0, "ttft_samples": 0,
-            "p50_duration_ms": 0.0, "p95_duration_ms": 0.0, "max_duration_ms": 0.0
-        }))
+        row.unwrap_or_else(|_| {
+            json!({
+                "requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "cost": 0.0, "errors": 0,
+                "ok": 0, "success_rate": 0.0, "cache_hit_rate": Value::Null,
+                "avg_duration_ms": 0.0, "avg_ttft_ms": 0.0, "ttft_samples": 0,
+                "p50_duration_ms": 0.0, "p95_duration_ms": 0.0, "max_duration_ms": 0.0
+            })
+        })
     }
 
     /// 今日（本地日期）请求数与缓存命中率，供托盘轻量刷新。
@@ -310,10 +336,12 @@ impl Db {
                 }))
             },
         );
-        row.unwrap_or_else(|_| json!({
-            "requests": 0, "ok": 0, "success_rate": 0.0,
-            "cache_read_tokens": 0, "prompt_tokens": 0, "cache_hit_rate": Value::Null
-        }))
+        row.unwrap_or_else(|_| {
+            json!({
+                "requests": 0, "ok": 0, "success_rate": 0.0,
+                "cache_read_tokens": 0, "prompt_tokens": 0, "cache_hit_rate": Value::Null
+            })
+        })
     }
 
     pub fn summary(&self, f: &Filters, group_by: &str) -> Result<Vec<Value>, String> {
@@ -414,7 +442,10 @@ impl Db {
         let mut all = args;
         all.push(SqlValue::Integer(limit));
         let conn = self.reader();
-        let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return Vec::new() };
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
         let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let rows = stmt.query_map(params_from_iter(all.iter()), |row| {
             let mut map = Map::new();
@@ -438,9 +469,12 @@ impl Db {
     pub fn clear_usage(&self, f: &Filters) -> i64 {
         let (where_sql, args) = where_clause(f, f.only.as_deref());
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(&format!("DELETE FROM usage_records{where_sql}"), params_from_iter(args.iter()))
-            .map(|n| n as i64)
-            .unwrap_or(0)
+        conn.execute(
+            &format!("DELETE FROM usage_records{where_sql}"),
+            params_from_iter(args.iter()),
+        )
+        .map(|n| n as i64)
+        .unwrap_or(0)
     }
 
     pub fn delete_older_than(&self, days: i64) -> i64 {
@@ -457,7 +491,9 @@ impl Db {
     pub fn vacuum(&self) -> i64 {
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _ = conn.execute("VACUUM", []);
-        std::fs::metadata(&self.path).map(|m| m.len() as i64).unwrap_or(0)
+        std::fs::metadata(&self.path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0)
     }
 }
 
@@ -544,8 +580,11 @@ fn percentile_cols() -> String {
              MAX(CASE WHEN _rn = MIN(CAST((_n - 1) * {ratio} AS INTEGER) + 1, _n - 1) THEN duration_ms END) AS {alias}_hi"
         )
     };
-    format!("{}, {}, MAX(duration_ms) AS max_duration_ms",
-            pair("0.50", "p50"), pair("0.95", "p95"))
+    format!(
+        "{}, {}, MAX(duration_ms) AS max_duration_ms",
+        pair("0.50", "p50"),
+        pair("0.95", "p95")
+    )
 }
 
 pub fn percentile_from_edges(n: i64, lo: Option<i64>, hi: Option<i64>, ratio: f64) -> f64 {
@@ -586,35 +625,91 @@ fn finish_group_row(mut row: Value) -> Value {
     let p50_hi = obj.get("p50_hi").and_then(Value::as_i64);
     let p95_lo = obj.get("p95_lo").and_then(Value::as_i64);
     let p95_hi = obj.get("p95_hi").and_then(Value::as_i64);
-    for key in ["samples", "p50_lo", "p50_hi", "p95_lo", "p95_hi", "max_duration_ms"] {
+    for key in [
+        "samples",
+        "p50_lo",
+        "p50_hi",
+        "p95_lo",
+        "p95_hi",
+        "max_duration_ms",
+    ] {
         obj.remove(key);
     }
     let requests = obj.get("requests").and_then(Value::as_i64).unwrap_or(0);
     let errors = obj.get("errors").and_then(Value::as_i64).unwrap_or(0);
-    let prompt = obj.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let cache_read = obj.get("cache_read_tokens").and_then(Value::as_i64).unwrap_or(0);
-    obj.insert("success_rate".into(), json!(if requests > 0 {
-        round4((requests - errors) as f64 / requests as f64)
-    } else { 0.0 }));
-    obj.insert("cache_hit_rate".into(), match hit_rate(cache_read, prompt) {
-        Some(v) => json!(v),
-        None => Value::Null,
-    });
-    obj.insert("cost".into(), json!(round6(obj.get("cost").and_then(Value::as_f64).unwrap_or(0.0))));
-    obj.insert("avg_duration_ms".into(), json!(round1(obj.get("avg_duration_ms").and_then(Value::as_f64).unwrap_or(0.0))));
-    obj.insert("avg_ttft_ms".into(), json!(round1(obj.get("avg_ttft_ms").and_then(Value::as_f64).unwrap_or(0.0))));
-    obj.insert("p50_duration_ms".into(), json!(percentile_from_edges(samples, p50_lo, p50_hi, 0.50)));
-    obj.insert("p95_duration_ms".into(), json!(percentile_from_edges(samples, p95_lo, p95_hi, 0.95)));
+    let prompt = obj
+        .get("prompt_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_read = obj
+        .get("cache_read_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    obj.insert(
+        "success_rate".into(),
+        json!(if requests > 0 {
+            round4((requests - errors) as f64 / requests as f64)
+        } else {
+            0.0
+        }),
+    );
+    obj.insert(
+        "cache_hit_rate".into(),
+        match hit_rate(cache_read, prompt) {
+            Some(v) => json!(v),
+            None => Value::Null,
+        },
+    );
+    obj.insert(
+        "cost".into(),
+        json!(round6(
+            obj.get("cost").and_then(Value::as_f64).unwrap_or(0.0)
+        )),
+    );
+    obj.insert(
+        "avg_duration_ms".into(),
+        json!(round1(
+            obj.get("avg_duration_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        )),
+    );
+    obj.insert(
+        "avg_ttft_ms".into(),
+        json!(round1(
+            obj.get("avg_ttft_ms")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        )),
+    );
+    obj.insert(
+        "p50_duration_ms".into(),
+        json!(percentile_from_edges(samples, p50_lo, p50_hi, 0.50)),
+    );
+    obj.insert(
+        "p95_duration_ms".into(),
+        json!(percentile_from_edges(samples, p95_lo, p95_hi, 0.95)),
+    );
     row
 }
 
 fn hit_rate(cache_read: i64, prompt: i64) -> Option<f64> {
-    if prompt <= 0 { None } else { Some(round6(cache_read as f64 / prompt as f64)) }
+    if prompt <= 0 {
+        None
+    } else {
+        Some(round6(cache_read as f64 / prompt as f64))
+    }
 }
 
-fn round1(v: f64) -> f64 { (v * 10.0).round() / 10.0 }
-fn round4(v: f64) -> f64 { (v * 10_000.0).round() / 10_000.0 }
-fn round6(v: f64) -> f64 { (v * 1_000_000.0).round() / 1_000_000.0 }
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+fn round6(v: f64) -> f64 {
+    (v * 1_000_000.0).round() / 1_000_000.0
+}
 
 #[cfg(test)]
 mod tests {

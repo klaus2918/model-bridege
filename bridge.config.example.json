@@ -1,13 +1,16 @@
 {
   "_doc": "Model-Gate 配置模板。复制为 bridge.config.json 后按需修改；切勿把明文 apiKey 写进本文件——请用 apiKeyEnv 或 apiKeyFile 引用。",
   "_keys": "密钥三选一：apiKey（明文，不推荐）/ apiKeyEnv（环境变量名，密钥放 ~/.jcode/.env）/ apiKeyFile（本地 JSON 的 apiKey 字段，如 ~/.commandcode/auth.json）。工具只读不写这些文件。",
+  "_models": "各上游的 models 是该上游可用模型的声明（也是按名路由的依据）。可以在面板上点「查询清单」按上游拉取并勾选写入，不用手打：面板按 OpenAI 兼容约定拉 GET {baseUrl}/v1/models（路径可用 compat.endpoint.models 改）。",
+  "_freeSources": "免费来源：zen 与 kilo 两条免密通道，无需账号与 API Key（zen 用匿名 Bearer public + 客户端指纹，kilo 完全不发送鉴权头）。面板「免费来源」页可一键接入与实测可用性。注意：免费模型只登记在各自上游的 models 里，不会自动进入顶层 models（顶层 models 非空时全局清单只按白名单展示）——需要对外暴露时在模型卡上点「加入全局清单」。",
   "port": 8900,
   "host": "127.0.0.1",
   "defaultModel": "deepseek-flash",
   "models": [
     "deepseek-flash",
     "mimo-v2.5-pro",
-    "glm5.3"
+    "glm5.3",
+    "minimax/minimax-m3.1-flash:free"
   ],
   "maxTokens": 8192,
   "timeoutSeconds": 600,
@@ -29,6 +32,11 @@
       "default": true,
       "fetchModels": false,
       "autoModels": false,
+      "compat": {
+        "thinking": {
+          "passthrough": true
+        }
+      },
       "models": [
         "deepseek-flash",
         "mimo-v2.5-pro",
@@ -50,10 +58,14 @@
     },
     "zen": {
       "protocol": "openai",
+      "transport": "opencode",
       "baseUrl": "https://opencode.ai/zen/v1",
-      "sessionHeader": true,
+      "fetchModels": false,
+      "autoModels": false,
+      "sessionHeader": false,
       "models": [
-        "space-bunny-free"
+        "mimo-v2.6-flash-free",
+        "big-pickle"
       ]
     },
     "commandcode": {
@@ -68,6 +80,12 @@
       "pauseTurn": true,
       "cmdZdr": true,
       "fetchModels": false,
+      "compat": {
+        "limits": {
+          "maxOutputTokens": 64000
+        },
+        "zdr": true
+      },
       "models": [
         "deepseek/deepseek-v4.1-flash",
         "deepseek/deepseek-v4-pro",
@@ -76,6 +94,30 @@
         "zai-org/GLM-5.3",
         "MiniMaxAI/MiniMax-M3",
         "xiaomi/mimo-v2.5-pro"
+      ]
+    },
+    "kilo": {
+      "protocol": "openai",
+      "baseUrl": "https://api.kilo.ai/api/openrouter",
+      "fetchModels": true,
+      "autoModels": false,
+      "sessionHeader": false,
+      "default": false,
+      "compat": {
+        "auth": {
+          "scheme": "none"
+        },
+        "endpoint": {
+          "chat": "/v1/chat/completions",
+          "models": "/v1/models"
+        }
+      },
+      "models": [
+        "minimax/minimax-m3.1-flash:free",
+        "poolside/laguna-s-2.1:free",
+        "cohere/north-mini-code:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "openrouter/free"
       ]
     }
   }

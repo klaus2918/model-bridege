@@ -8,14 +8,15 @@ fn main() {
         return;
     }
     println!("cargo:rerun-if-changed={}", icon.display());
+    let version = windows_version(&std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
     let mut res = winres::WindowsResource::new();
     res.set_icon(icon.to_str().unwrap());
     res.set("ProductName", "Model-Gate");
     res.set("FileDescription", "Model-Gate local model gateway");
     res.set("CompanyName", "Model-Gate");
     res.set("LegalCopyright", "Model-Gate");
-    res.set("FileVersion", "2.19.0.0");
-    res.set("ProductVersion", "2.19.0.0");
+    res.set("FileVersion", &version);
+    res.set("ProductVersion", &version);
     if let Err(err) = res.compile() {
         println!("cargo:warning=Windows resource compile failed: {err}");
     }
@@ -23,10 +24,31 @@ fn main() {
     emit_tray_icon(icon);
 }
 
+fn windows_version(version: &str) -> String {
+    let mut parts: Vec<u32> = version
+        .split('.')
+        .take(3)
+        .map(|part| {
+            part.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect();
+    while parts.len() < 3 {
+        parts.push(0);
+    }
+    parts.push(0);
+    format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[3])
+}
+
 /// 从 ICO 中取 32x32 的 PNG 条目解出 RGBA，生成托盘图标常量。
 /// 解不出时退回纯色 16x16，保证托盘可用。
 fn emit_tray_icon(icon: &std::path::Path) {
-    let decoded = std::fs::read(icon).ok().and_then(|data| decode_ico_png(&data));
+    let decoded = std::fs::read(icon)
+        .ok()
+        .and_then(|data| decode_ico_png(&data));
     let (size, rgba) = match decoded {
         Some(pair) => pair,
         None => {

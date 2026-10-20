@@ -1,5 +1,5 @@
 ; ModelGate.iss — Inno Setup 安装脚本
-; 版本号不在此硬编码：由 build.bat 读取 modelgate/__init__.py（唯一版本源）后经
+; 版本号不在此硬编码：由 rust/model-gate/build-installer.ps1 读取 Cargo.toml（唯一版本源）后经
 ;   iscc /DMyAppVersion=<ver> ModelGate.iss
 ; 注入。单独编译而未注入时回落为 0.0.0-dev（明确标记非正式版本，避免假版本号）。
 ;
@@ -13,7 +13,7 @@
 #endif
 #define MyAppPublisher "Model-Gate"
 #define MyAppExeName "Model-Gate.exe"
-#define MyAppURL "https://github.com/"
+#define MyAppURL "https://github.com/klaus2918/model-bridege"
 
 ; 打包源 exe 与输出名可由 ISCC /D 覆盖：正式打包默认 dist\Model-Gate.exe；
 ; 验证版可指向独立文件名，避免覆盖正在使用的 exe。
@@ -48,6 +48,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 CloseApplications=yes
+RestartApplications=yes
+UsePreviousAppDir=yes
 
 [Languages]
 ; 默认且唯一的安装向导语言：简体中文。语言文件随仓库提供，避免依赖本机 Inno Setup 的额外语言包。

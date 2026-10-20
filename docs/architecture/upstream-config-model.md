@@ -1,8 +1,8 @@
 # 上游配置模型（注册表 + 模型级覆盖）
 
-> 目标：把「某类厂商的默认兼容行为」从双端硬编码抽成共享数据（`modelgate/provider_profiles.json`），
+> 目标：把「某类厂商的默认兼容行为」从代码硬编码抽成数据（`rust/model-gate/provider_profiles.json`），
 > 并在上游级 `compat` 之上增加模型级 `modelOverrides` 与只读 `capabilities`，
-> 让 Python 与 Rust 使用同一份判定与合并规则。
+> 由 Rust 内核使用唯一的判定与合并规则。
 
 关联文档：`docs/architecture/provider-compat.md`（现有 `compat` 字段契约，字段含义不变）。
 
@@ -39,7 +39,7 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 
 ## 3. 注册表结构
 
-`modelgate/provider_profiles.json` 顶层：`version`、`profiles`。
+`rust/model-gate/provider_profiles.json` 顶层：`version`、`profiles`。
 
 每个 profile：
 
@@ -87,7 +87,7 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 
 - key 为路由解析后的模型 id；支持只含一个 `*` 的前缀/后缀通配；
 - 优先级：精确匹配 > 最长通配 > 上游 `compat.limits`；
-- `limits.maxOutputTokens` 参与请求 `max_tokens` 裁剪（Python `protocols` 与 Rust `proxy.rs` 使用同一解析函数）；
+- `limits.maxOutputTokens` 参与请求 `max_tokens` 裁剪（Rust `proxy.rs` 统一解析）；
 - `capabilities` 仅用于展示与配置诊断，不改变转发行为（避免误判导致请求被错误拒绝）；
 - 未知模型 key：警告 `model_override_unknown_model`，不报错（模型目录可能动态变化）。
 
@@ -107,11 +107,11 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 - 旧 `compat` 简写（`auth: "bearer"`、`session: true`、`thinking: false`、`toolChoice: true`）继续支持；
 - 新增字段全部可选；未知字段不报错、面板保存不丢失；
 - 无数据库结构变更；`settings.lastPort` 为新增键；
-- 旧 Rust/Python exe 读取新配置时忽略新字段，可继续运行。
+- 旧版 exe 读取新配置时忽略新字段，可继续运行。
 
 ## 7. 校验与诊断
 
-新增诊断码（双端同码，级别一致）：
+新增诊断码：
 
 | 码 | 级别 | 条件 |
 |---|---|---|
@@ -129,8 +129,7 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 - `GET /api/config`：`config` / `effective` / `diagnostics` 保持；新增 `profiles: [{id, label, description, capabilities}]`；
 - `GET /api/config/validate`：同上新增 `profiles`；`effective` 每个上游新增 `profile`（生效 id）、
   `capabilities`（解析结果）、`modelOverrides`（原样回显）；
-- `effective.limits` 语义不变（上游级）；模型级通过 `modelOverrides` 回显，由面板展示；
-- Python 与 Rust 响应字段一致。
+- `effective.limits` 语义不变（上游级）；模型级通过 `modelOverrides` 回显，由面板展示。
 
 ## 9. 面板行为
 
@@ -141,19 +140,17 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 
 ## 10. 验证工具
 
-- `scripts/provider_profiles_check.py`：注册表结构校验 + 与当前 Python 预设逐字段对照 + golden fixtures 漂移检测；
-- `tests/fixtures/provider_profiles_golden.json`：由当前实现生成的黄金样例，覆盖显式 / 域名 / 协议 / 未知 profile；
-- `tests/fixtures/legacy_config.json`：旧简写与未知字段兼容夹具；
-- `tests/test_provider_profiles.py`：注册表结构、判定覆盖、预设/解析 vs golden、旧配置零 error；
-- `cargo test`（`provider_profiles.rs` / `config.rs`）：Rust 侧 golden 双端比对与 profiles 顺序；
-- `scripts/panel_api_smoke.py`：`/api/config` 的 profiles 顺序、`effective.modelOverrides`、保存往返、非法通配 400。
+- `cargo test`（`provider_profiles.rs` / `config.rs`）：注册表结构、判定覆盖、golden 样例、旧配置零 error；
+- `rust/model-gate/tests/fixtures/legacy_config.json`：旧简写与未知字段兼容夹具；
+- `scripts/panel_api_smoke.ps1`：启动 Rust 实例，检查 `/api/config` 的 profiles 顺序、
+  `effective.modelOverrides`、保存往返与非法通配 400。
 
 ## 11. 示例配置
 
 `docs/examples/providers/` 提供五套可直接加载的单上游完整配置（`openai.json` / `opencode.json` /
 `anthropic.json` / `deepseek.json` / `commandcode.json`）：
 
-- 每份均通过 `load_config` + `validate_config` 零 error，`detect_profile` 判定与文件名一致；
+- 每份均通过 Rust 配置加载与校验零 error，profile 判定与文件名一致；
 - `anthropic.json` 演示 `modelOverrides` 精确 key + 单模型 `capabilities`；
 - `deepseek.json` 演示精确 key 与 `deepseek-*` 通配叠加；
 - `commandcode.json` 演示旧扁平字段（`modelCatalog` / `modelCatalogPlan` / `pauseTurn` / `cmdZdr`）映射；

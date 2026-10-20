@@ -1,6 +1,6 @@
 //! 桌面壳：托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
 //!
-//! 面板仍是同一份 `modelgate/web/`，宿主从 pywebview/wry 换成系统默认浏览器；
+//! 面板由 Rust 内核直接嵌入并交给系统默认浏览器打开；
 //! 本进程只保留托盘、剪贴板、Shell 打开等轻量交互。
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -42,12 +42,16 @@ pub struct ShellOptions {
 /// 启动托盘壳并阻塞在主线程消息循环；`refresh_models` 由「刷新模型目录」菜单触发，
 /// `today_stats` 每分钟刷新托盘指标（tooltip + 只读菜单项）。
 #[cfg(windows)]
-pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>,
-           today_stats: Box<dyn Fn() -> serde_json::Value>) -> anyhow::Result<()> {
+pub fn run(
+    options: ShellOptions,
+    refresh_models: Box<dyn Fn()>,
+    today_stats: Box<dyn Fn() -> serde_json::Value>,
+) -> anyhow::Result<()> {
     let icon = tray_icon::Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), TRAY_ICON_SIZE, TRAY_ICON_SIZE)?;
 
     let menu = Menu::new();
     let open = MenuItem::new("打开面板", true, None);
+    let check_update = MenuItem::new("检查更新", true, None);
     let refresh = MenuItem::new("刷新模型目录", true, None);
     let copy = MenuItem::new("复制接入地址", true, None);
     let open_dir = MenuItem::new("打开数据目录", true, None);
@@ -56,6 +60,7 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>,
     let address = MenuItem::new(format!("服务地址 {}", options.endpoint), false, None);
     let quit = MenuItem::new("退出", true, None);
     let _ = menu.append(&open);
+    let _ = menu.append(&check_update);
     let _ = menu.append(&refresh);
     let _ = menu.append(&copy);
     let _ = menu.append(&open_dir);
@@ -111,6 +116,11 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>,
                 if !open_url(&options.url) {
                     tracing::warn!("打开面板失败：{}", options.url);
                 }
+            } else if event.id == check_update.id() {
+                let url = format!("{}?update=1", options.url);
+                if !open_url(&url) {
+                    tracing::warn!("打开更新面板失败：{}", url);
+                }
             } else if event.id == refresh.id() {
                 refresh_models();
             } else if event.id == copy.id() {
@@ -143,8 +153,7 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>,
 
 /// 把今日统计写入托盘 tooltip 与菜单只读项（命中率无样本时显示「—」）。
 #[cfg(windows)]
-fn apply_tray_stats(tray: &TrayIcon, today: &MenuItem, hit: &MenuItem,
-                    stats: &serde_json::Value) {
+fn apply_tray_stats(tray: &TrayIcon, today: &MenuItem, hit: &MenuItem, stats: &serde_json::Value) {
     let requests = stats
         .get("requests")
         .and_then(serde_json::Value::as_i64)
@@ -158,14 +167,15 @@ fn apply_tray_stats(tray: &TrayIcon, today: &MenuItem, hit: &MenuItem,
     };
     today.set_text(format!("今日请求 {requests}"));
     hit.set_text(format!("缓存命中率 {rate_text}"));
-    let _ = tray.set_tooltip(Some(format!(
-        "今日请求 {requests}\n缓存命中率 {rate_text}"
-    )));
+    let _ = tray.set_tooltip(Some(format!("今日请求 {requests}\n缓存命中率 {rate_text}")));
 }
 
 #[cfg(not(windows))]
-pub fn run(_options: ShellOptions, _refresh_models: Box<dyn Fn()>,
-           _today_stats: Box<dyn Fn() -> serde_json::Value>) -> anyhow::Result<()> {
+pub fn run(
+    _options: ShellOptions,
+    _refresh_models: Box<dyn Fn()>,
+    _today_stats: Box<dyn Fn() -> serde_json::Value>,
+) -> anyhow::Result<()> {
     anyhow::bail!("桌面壳仅支持 Windows")
 }
 

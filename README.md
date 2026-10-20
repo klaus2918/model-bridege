@@ -1,20 +1,13 @@
 # Model-Gate — 使用说明
 
-> **默认入口（2.19 起）：Rust 内核**。`dist\Model-Gate.exe`（约 4.3 MB）是
-> `rust/model-gate/` 的产物：配置格式、SQLite 表结构、HTTP 契约与面板
-> HTML/CSS/JS 与 Python 版完全一致；代理常驻内存约 7 MB（Python 版约 30 MB），
-> 三协议黑盒对等回归 `py scripts\parity_rust.py` 全部通过。
-> 构建/投放：`powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1 -Promote`；
-> 桌面壳为托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
+> **唯一实现：Rust 内核**。`dist\Model-Gate.exe`（约 4.3 MB）由 `rust/model-gate/`
+> 构建：本地 HTTP 代理 + 模型配置面板 + SQLite 用量统计，桌面壳为托盘常驻 +
+> 系统浏览器面板（无内嵌 WebView2），代理常驻内存约 7 MB。
+> 构建/投放：`powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1 -Promote`。
 >
-> **Python 回退版（保留一个发布周期）**：`dist\Model-Gate-python.exe` 仍是完整可用的
-> 桌面代理（本地 HTTP 服务 + 模型配置面板 + token 用量统计 / SQLite 落库）；
-> 排查 Rust 版差异或需要旧行为时可直接运行。启动后访问 `http://127.0.0.1:8900/ui/`；
-> 无 GUI 环境可用 `--no-gui --port 8911` 以纯代理模式运行。
->
-> **Legacy Node 版（冻结）**：`legacy/node-bridge/` 保留原始单文件实现（`node model-bridge.js`）。
-> 三者的代理路由与上游协议行为一致；Rust/Python 版另外提供面板、SQLite 用量、
-> 上游故障切换与配置热重载，Node 版不再新增这些能力，仅做必要兼容修复。
+> **应用内更新**：安装版可在面板顶栏「检查更新」或托盘菜单检查 GitHub Release，
+> 下载 `Model-Gate-v<版本>-rust-setup.exe` 并校验 `SHA256SUMS` 后静默覆盖升级；
+> 便携版只提示手动运行安装包。启动时后台检查每 24 小时最多一次，只提示、不自动下载。
 >
 > **密钥安全**：桌面包会把**非空明文 `apiKey` 拦在内存里**，不写入 `bridge.config.json`
 > 与 SQLite。要长期使用请用 `apiKeyEnv`（读 `~/.jcode/.env`）或 `apiKeyFile`
@@ -30,7 +23,7 @@ Agent（OpenAI 格式）
 model-bridge
    ├─ cch         (Anthropic 协议)   → 127.0.0.1:15721 → CCH → DeepSeek
    ├─ go          (OpenAI 协议)      → opencode.ai/zen/go/v1  ← Go 订阅套餐
-   ├─ zen         (OpenAI 协议)      → opencode.ai/zen/v1     ← 免费模型
+   ├─ zen         (OpenAI + opencode) → opencode.ai/zen/v1     ← 免费模型
    └─ commandcode (CommandCode 协议) → api.commandcode.ai/alpha/generate ← CommandCode 订阅
 ```
 
@@ -47,7 +40,7 @@ model-bridge
 ```
 model: deepseek-flash    → cch
 model: mimo-v2.6-flash    → go
-model: space-bunny-free   → zen
+model: mimo-v2.6-flash-free → zen
 model: (未声明的名字)     → 默认上游（cch）
 ```
 
@@ -128,8 +121,6 @@ model-bridge 把这些差异都收敛到一个进程里，Agent 只需指向一�
 ### 1. 启动
 
 桌面版（推荐）：双击 `dist\Model-Gate.exe`。托盘出现图标，面板自动打开 `http://127.0.0.1:8900/ui/`；**关窗不退出**，托盘菜单退出才停。
-
-Legacy Node 版（冻结）：`cd legacy\node-bridge` 后运行 `node model-bridge.js`（或 `start-bridge.cmd`）；无面板与用量统计，终端关闭即停。
 
 ### 两种运行模式（同一个 exe）
 
@@ -224,29 +215,90 @@ set OPENAI_API_KEY=any-key
 > ⚠️ **`mimo-v2.6-flash-free` 不在 go 上**（2026-10-08 实测 400 `Model is unavailable`）：它只存在于 zen 目录，
 > 而 zen 侧又被免费层限制挡住（见下一节）。配到 go 里只会稳定报 400，已移除。
 
-### zen（免费，无需密钥）
+### zen（OpenCode 免费层，`transport: opencode`）
 
-上游 `/zen/v1/models` 当前列 **87 个**（2026-10-08 快照），但能被外部客户端调用的仍然**只有 1 个**
-（2026-09-22 与 2026-10-08 两轮复测结论一致）：
+2026-10-20 实测：直接以普通 OpenAI 客户端请求 `-free` 模型仍会 403
+`FreeTierError: OpenCode's free tier can only be used from within OpenCode`，
+但按 OpenCode CLI 的指纹（匿名 `Bearer public`、UA、会话/请求 ID、强制流式、bash/read 工具）
+请求 `/inference/v1/chat/completions` 可以 200。本桥把这件事收敛为显式 `transport`：
 
-| 模型 | 说明 |
+```json
+"zen": {
+  "protocol": "openai",
+  "transport": "opencode",
+  "baseUrl": "https://opencode.ai/zen/v1",
+  "models": ["mimo-v2.6-flash-free", "big-pickle"],
+  "fetchModels": false,
+  "sessionHeader": false,
+  "autoModels": false
+}
+```
+
+| 行为 | 说明 |
 |------|------|
-| `space-bunny-free` | 免费、无需密钥，**有限流** |
+| 匿名鉴权 | 固定 `Authorization: Bearer public`，**不需要也不读取 apiKey** |
+| 指纹头 | `user-agent`、`x-opencode-client/project`、`x-opencode-session(-id)`、`x-opencode-request` 由桥生成 |
+| 路径 | `opencode.ai` 的 `/zen/...` 自动改写为 `/inference/...`；`/zen/go/...` 不改写 |
+| 流式 | 上游强制 `stream: true`；客户端要非流式时由桥聚合 SSE 成普通 `chat.completion` |
+| 工具 | 自动补/改名 `bash`、`read`（含 schema）；响应工具名映射回客户端原名；stub 调用会过滤并给出提示 |
+| 免费边界 | 只允许 `-free` / `big-pickle` / `grok-code`；其它模型本地 400 `model_not_free`，不会请求上游 |
+| 失败 | 免费层失败不自动切换到付费或其它上游，避免静默降级 |
 
-> **其余 86 个为什么没列**：
-> - 所有 `-free` 后缀的免费层模型 → 403 `FreeTierError: OpenCode's free tier can only be used from
->   within OpenCode`（**带上 API key 也一样**，只能在 OpenCode 客户端内部用，外部代理进不去）：
->   `mimo-v2.6-flash-free`、`longcat-2.5-preview-free`、`ling-3.1-flash-free`、`ling-3.0-flash-fin-free`、
->   `fledge-alpha-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、`exo-free`
-> - `muse-spark-1.2-contributor-free`、`muse-spark-1.3-contributor-free` → 403 `RegionError`（地区限制）
-> - `jev-1.13-free` → 500（上游自身故障）
-> - 付费档（`claude-*`、`gpt-*`、`grok-*`、`mistral-large-4`、`qwen3.8-max` 等）→ 不带 key 直接 401
->   `AuthError`；带 key 后 `claude-*` / `gpt-6*` / `grok-*` 又是 400 `ModelProtocolUnsupported`（需
->   `/v1/responses` 协议），而 `qwen3.8-max`、`deepseek-v4.1-flash` 虽可用，go 里已有同名、按名分发优先
->   命中 go，配进 zen 毫无意义
->
-> **旧清单已全部失效**：`mimo-v2.5-free`（401 `ModelError`）、`big-pickle`（403 `FreeTierError`）
-> 已从配置移除。
+- `grok-code` 是否仍免费尚未用本桥实测，默认不写进清单。
+- 这是 OpenCode 未公开的客户端契约，可能随上游升级失效；只用于免费层，不涉及 `go` 订阅、登录或付费。
+- 配置校验：`transport=opencode` 必须搭配 `protocol=openai`；面板可直接选择「opencode 免费层」。
+
+### 免费来源：免密免费模型（面板第 6 页「免费来源」）
+
+不登录、不注册、不填 API Key，就能用上免费模型——并且**看清此刻到底哪个模型真能用**。
+
+面板新增第 6 页「**免费来源**」，提供两条免密通道：
+
+| 来源 | 端点 | 鉴权 | 隐私级别 |
+|------|------|------|----------|
+| OpenCode Zen 免密池 | `https://opencode.ai/zen/v1` | 匿名 `Bearer public` + 客户端指纹 | warn |
+| Kilo 免密免费池 | `https://api.kilo.ai/api/openrouter` | **完全不发送鉴权头** | **danger** |
+
+一键接入后配置里**没有任何凭据**（不写 `apiKey` / `apiKeyEnv`）。
+
+```json
+"kilo": {
+  "protocol": "openai",
+  "baseUrl": "https://api.kilo.ai/api/openrouter",
+  "fetchModels": true,
+  "autoModels": false,
+  "sessionHeader": false,
+  "default": false,
+  "compat": { "auth": { "scheme": "none" } },
+  "models": ["minimax/minimax-m3.1-flash:free", "..."]
+}
+```
+
+页面上可以：
+
+- 看**鱼缸水位**（当前真可用模型占比）——2026-10-21 实测 Kilo 池为 **11/20（55%）**；
+- 逐个模型看**状态徽标**：可用 / 暂时不可用 / 疑似可用 / 地区受限 / 明确不可用，
+  外加**拒因原文**与**下一步该做什么**（不是只告诉你"失败了"）；
+- 点「全部探测」实测（会消耗免费额度，UI 明示）；限流中的模型自动退避跳过。
+
+**为什么"暂时不可用"和"明确不可用"要分开**：免费池的失败主因是**上游池限流**，
+不是模型下线。若把 429 判成"不可用"，模型会频繁从清单消失，用户会以为池子空了。
+只有上游**明确拒绝**（404 模型不存在 / 401 需登录 / 地区 403 / 免费层拒绝）才算"明确不可用"。
+
+> **零价 ≠ 免鉴权**：Kilo 的 `google/lyria-3-*` 零价却返回 401 `PAID_MODEL_AUTH_REQUIRED`，
+> 面板会如实标出并解释。
+
+> **免费模型默认不进对外的 `/v1/models`**。`/v1/models` 是客户端唯一认的通用清单接口，
+> 因此对外不暴露必须真的成立：一键接入固定 `autoModels: false`，且**不写顶层 `models`**；
+> 顶层 `models` 为空时连上游自己的声明也不写（否则会被自动并入全局）。
+> 实测：接入前后 `GET /v1/models` 都是 4 个（新增 0 个），而 `GET /kilo/v1/models` 有 19 个——
+> 内部可路由、对外不暴露。需要对外暴露时在模型卡上显式点「加入全局清单」。
+
+> **隐私红线**：Kilo 免密池 20 个模型中 **19 个 `mayTrainOnYourPrompts=true`**，NVIDIA 免费端点
+> 官方明示会记录会话用于改进产品。免费池**不适合承载机密或敏感内容**，面板会常驻警示。
+
+接口：`GET /api/free-sources`、`POST /api/free-sources/{catalog,probe,probe-all,attach}`。
+完整设计见 [`docs/architecture/free-sources.md`](docs/architecture/free-sources.md)。
 
 ### commandcode（CommandCode 订阅，复用你已登录的凭据）
 
@@ -353,6 +405,31 @@ curl http://127.0.0.1:8900/go/v1/chat/completions -H "Content-Type: application/
 
 ### 想自己核对上游到底有哪些模型
 
+**面板一键查询（推荐）**：配置页 → 上游 →「编辑」→ 模型清单旁点「**查询清单**」。
+
+- 后端按 OpenAI 兼容约定拉 `GET {baseUrl}/v1/models`（路径可用 `compat.endpoint.models` 改），
+  解析 `data` / `models` 数组里的 `id` / `slug` / `model`，**去重且保持上游顺序**。
+- 弹出的面板里**多选**即可，写入方式二选一：
+  - **替换**：用勾选结果整体覆盖该上游的 `models`；
+  - **追加**：把勾选结果并入现有 `models`（去重）。
+- 已配置的模型默认勾上，方便一眼看出「哪些已生效」；支持检索、全选、取消选择。
+- 写入只改面板表单，**不立即落盘**——点页面底部「保存配置」才写进 `bridge.config.json`。
+- 改了 `baseUrl` 但还没保存也能查：查询用**表单当前值**，打的是新地址。
+- 查询失败会说明原因（401 / 超时 / 返回体不是 JSON）与修复提示，不会伪装成「没有模型」。
+
+命令行同样可以查：
+
+```bat
+:: 查某个上游的可用模型（不写配置）
+curl "http://127.0.0.1:8900/api/upstreams/kilo/models"
+
+:: 带上未保存的 baseUrl（查改过地址的上游）
+curl "http://127.0.0.1:8900/api/upstreams/kilo/models?baseUrl=https://ai-gateway.kilo.ai/api/v1"
+```
+
+> 密钥不会出现在 URL 里（URL 会进访问日志与浏览器历史）；需要用未保存的密钥查询时走
+> `POST /api/upstreams/models`，密钥放请求体。
+
 ```bat
 :: 只看 go 声明了什么（不联网）
 curl http://127.0.0.1:8900/go/v1/models
@@ -401,10 +478,11 @@ curl http://127.0.0.1:8900/v1/models
     },
     "zen": {
       "protocol": "openai",
+      "transport": "opencode",
       "baseUrl": "https://opencode.ai/zen/v1",
-      "apiKey": "",
-      "sessionHeader": true,
-      "models": ["space-bunny-free"]
+      "fetchModels": false,
+      "sessionHeader": false,
+      "models": ["mimo-v2.6-flash-free", "big-pickle"]
     },
     "commandcode": {
       "protocol": "commandcode",
@@ -464,6 +542,42 @@ curl http://127.0.0.1:8900/v1/models
 
 **面板保存后立即热重载；手工改文件后调用 `POST /api/config/reload` 或重启。**
 
+### 配置即 JSON：唯一事实源与备份
+
+**`bridge.config.json` 是配置的唯一事实源。** 面板的每一次保存都会把配置写回这个文件；
+数据库里的 `settings.config` 只是运行态快照，**不能**成为第二条能独立演进的配置来源。
+
+| 行为 | 规则 |
+|------|------|
+| 面板新增上游 | 保存后 `upstreams` 里出现该条目，文件里同步可见 |
+| 面板删除上游 | 该条目从 `upstreams` 里**真正消失**（不会被任何旧数据顶回），重启后也不会复活 |
+| 局部保存 | 只改传入的字段，其余顶层键与上游保持原值；面板未渲染的兼容字段（`cliVersion` / `compat` / `modelCatalog`…）一并保留 |
+| 写入方式 | 临时文件 → 回读校验 JSON 合法 → 原子替换；不会留下半截配置 |
+
+**备份**（面板「配置落盘与备份」区可开关）：
+
+| 规则 | 说明 |
+|------|------|
+| 首次强制备份 | 配置目录里**没有任何备份**时，第一次保存强制生成一份 `bridge.config.json.bak`，**不受开关影响**（避免第一次保存就丢掉原始配置） |
+| 后续自主选择 | 「保存前备份」开关默认开启；关闭后保存不再生成新备份，但**已有备份不会被删除** |
+| 轮转 | 保留最近 **5 份**：`.bak` 为最近一次，`.bak.1`～`.bak.4` 为历史 |
+| 恢复 | 面板「恢复上一次备份」按钮，或 `POST /api/config/backups/restore`；恢复前会把当前内容另存一份 `.bak.pre-restore`，恢复动作本身可回退 |
+| 备份内容 | 存的是**保存前**的旧配置（写后备份存的是新内容，没有回滚价值） |
+
+接口：`GET /api/config/backups`（备份状态）、`POST /api/config/backups/restore`（恢复）。
+
+**「从文件重载」按钮**：手工编辑过 `bridge.config.json` 后，用它把磁盘内容重新读入并热重载，
+改动立即生效，不必重启进程。注意它与「放弃改动」方向相反：
+「从文件重载」读的是**磁盘**并覆盖运行态；「放弃改动」只是把表单恢复成**运行态**，不碰磁盘。
+面板上有未保存改动时，点「从文件重载」会先弹确认框（未保存的改动会丢失）。
+
+**从快照恢复不会复活已删除的上游**：SQLite 快照只补充顶层标量键与**文件中已有**的上游的缺失字段；
+用户从 `bridge.config.json` 里删掉的上游不会被补回，启动日志会点名说明「忽略了快照中已从配置删除的上游」。
+
+**升级安装不会清理旧数据**：安装脚本只覆盖 exe，`bridge.config.json` 与 `data\modelgate.db` 原地保留；
+Rust 版的数据库路径与配置文件同目录（`data\modelgate.db`），从快捷方式等任意目录启动都能读到旧库，
+不会因工作目录变化而「历史清零」或在别处生成空库。
+
 ### 密钥放哪：两种凭据模式
 
 | 模式 | 配置写法 | 密钥存放 | 适用 |
@@ -508,7 +622,7 @@ curl http://127.0.0.1:8900/v1/models
 ```
 
 `protocol` 可写 `anthropic` / `openai` / `commandcode`；省略时按 `baseUrl` 推断（opencode 系 → `openai`，
-commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议需在 `modelgate/protocols/` 增加适配器；Legacy Node 版对应改 `legacy/node-bridge/model-bridge.js`。
+commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议需在 `rust/model-gate/src/protocols/` 增加适配器。
 
 ### Provider 兼容能力（`compat`）
 
@@ -546,8 +660,8 @@ commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议�
 ### 预设注册表与模型级覆盖
 
 五套预设（`openai` / `opencode` / `anthropic` / `deepseek` / `commandcode`）由
-`modelgate/provider_profiles.json` 单点定义，Python 与 Rust 共用；面板「预设」下拉与
-`/api/config` 的 `profiles` 字段都来自它，不再在代码里双写。
+`rust/model-gate/provider_profiles.json` 单点定义并由 Rust 内核内嵌；面板「预设」下拉与
+`/api/config` 的 `profiles` 字段都来自它，不在代码里双写。
 
 **模型级覆盖**（`upstreams.<name>.modelOverrides`，可选）在 `compat` 之上声明单模型差异：
 
@@ -726,16 +840,14 @@ KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示
 
 ## 十二、运行前提
 
-- **桌面版**：Windows 10/11，直接运行 `dist\Model-Gate.exe`，无需安装 Python/Node
-- **源码运行/构建**：Python 3.11+（`entry.py`、`modelgate/`、`build.bat`）
-- **Legacy Node 版与 Node 冒烟测试**：Node.js 18+（无第三方依赖，不用 `npm install`）
-- **cch 上游**：需本地代理在 `127.0.0.1:15721` 运行
-- **go 上游**：配置里写的是 `apiKeyEnv: OPENCODE_API_KEY`。但 2026-10-08 实测本机 **Process / User / Machine
-  三处都没有这个变量**，go 的模型照样全部返回 200——即当前 Go 订阅的可用性并不依赖这个 key；
-  `/zen/go/v1/models` 更是公开可读。若哪天开始 401，再去 `~/.jcode/.env` 补 key 不迟
-- **zen 上游**：无需密钥
-- **commandcode 上游**：需本机登录过 command-code（凭据 `~/.commandcode/auth.json`）或设 `COMMAND_CODE_API_KEY`；`x-command-code-version` 默认自动探测，读不到时可显式配 `cliVersion`
-- **系统**：Windows（桌面 exe 与 `start-bridge.cmd`）；`legacy/node-bridge/model-bridge.js` 本身跨平台
+- **桌面版 / 安装版**：Windows 10/11，直接运行 `dist\Model-Gate.exe`，无需 Python/Node。
+- **应用内更新**：安装版需要能访问 `api.github.com` 与 `github.com`（下载 Release 资产）；企业代理/私有网络下检查会失败，可手动下载安装包。
+- **源码构建**：Rust stable + MSVC 工具链；生成安装包另需 Inno Setup 6（`build-installer.ps1` 会自动查找，缺失时可运行 `scripts\get_innosetup.ps1`）。
+- **cch 上游**：需本地代理在 `127.0.0.1:15721` 运行。
+- **go 上游**：配置里写的是 `apiKeyEnv: OPENCODE_API_KEY`。但 2026-10-08 实测本机 Process / User / Machine 三处都没有这个变量，go 的模型照样全部返回 200；若哪天开始 401，再去 `~/.jcode/.env` 补 key。
+- **zen 上游**：无需密钥。
+- **commandcode 上游**：需本机登录过 command-code（凭据 `~/.commandcode/auth.json`）或设 `COMMAND_CODE_API_KEY`；`x-command-code-version` 默认自动探测，读不到时可显式配 `cliVersion`。
+- **系统**：Windows（桌面 exe / 安装包）。
 
 ---
 
@@ -744,24 +856,26 @@ KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示
 ```
 Model-Gate/
 ├─ README.md                      # 本说明
-├─ rust/model-gate/               # 默认产品源码（Rust：代理内核 + 托盘/系统浏览器桌面壳）
-├─ entry.py                       # Python 回退版入口（pywebview/托盘/单实例）
-├─ modelgate/                     # Python 回退版源码（对照与回退）
-├─ tests/                         # pytest 测试（Python 契约）
+├─ rust/model-gate/               # 唯一产品源码（Rust 代理内核 + 托盘 + 系统浏览器面板）
+│  ├─ src/                        # 代理、协议适配、配置、SQLite、更新、托盘
+│  ├─ ui/                         # 内嵌面板（index.html / app.js / style.css）
+│  ├─ tests/fixtures/             # Rust 单测夹具（含 legacy 配置）
+│  ├─ provider_profiles.json      # Provider 预设注册表（编译期内嵌）
+│  ├─ Cargo.toml                  # 版本唯一源
+│  ├─ build-release.ps1           # 发布候选/正式入口
+│  ├─ build-installer.ps1         # Inno Setup 安装包
+│  └─ build.rs                    # Windows 版本资源 + 托盘图标
 ├─ assets/                        # 图标等构建资产
-├─ docs/                          # 文档（architecture / integration / live-panel / maintenance）
-├─ scripts/                       # 活跃工具：构建、测试、对等验证、安全扫描、发布
-│  └─ archive/                    # 过期的一次性版本验证/探测/文档脚本（只作历史证据）
-├─ legacy/node-bridge/            # 冻结的 Node 单文件桥及其测试、changelog
-├─ ModelGate.spec / ModelGate.iss # Python PyInstaller / Inno Setup 打包定义
-├─ build.bat                      # Python 回退版构建入口
+├─ docs/                          # 文档（architecture / integration / maintenance / examples）
+├─ scripts/                       # 4 个 PowerShell 运维/验收脚本 + README
+├─ ModelGate.iss                  # Inno Setup 打包定义
 ├─ bridge.config.example.json     # 零密钥配置模板（唯一入库配置）
-└─ dist/ build/ data/ .op/        # 本地生成物/运行数据/变更工作区（均不在版本库）
+└─ dist/ data/ target/ .op/       # 本地生成物/运行数据/构建缓存/变更工作区（均不入库）
 ```
 
 维护规则、清理节奏与敏感信息处理见 [`docs/maintenance/project-layout.md`](docs/maintenance/project-layout.md)；
-文档索引见 [`docs/README.md`](docs/README.md)。新增一次性排查脚本请放 `scripts/archive/`，不要继续堆积在 `scripts/` 根目录。
-日常排查先跑 `py -3 scripts/doctor.py all`（端口/配置/密钥/库/运行时一次看完），再用具体子命令深入。
+文档索引见 [`docs/README.md`](docs/README.md)。新增一次性排查脚本请放 `scripts/archive/`（该目录随
+Rust-only 迁移删除），不要继续堆积在 `scripts/` 根目录。
 
 ---
 
@@ -769,91 +883,104 @@ Model-Gate/
 
 | 路径 | 作用 |
 |------|------|
-| `rust/model-gate/` | 默认产品源码：Rust 代理内核、托盘常驻 + 系统浏览器面板桌面壳、构建脚本 |
-| `entry.py`、`modelgate/` | Python 回退版入口与源码（对照/回退） |
-| `tests/` | 单元/接口测试（`python -m pytest`） |
-| `ModelGate.iss` | Inno Setup 打包定义（Rust/Python 通用，可 /D 覆盖源 exe） |
-| `ModelGate.spec`、`build.bat` | Python 回退版 PyInstaller 定义与构建入口 |
-| `assets/ModelGate.ico` | 应用图标（由 `scripts/make_icon.py` 生成） |
-| `docs/` | 架构图、集成记录、面板素材与维护规范 |
-| `docs/architecture/provider-compat.md` | Provider 兼容能力（compat）字段、预设与覆盖示例 |
-| `scripts/` | 活跃工具脚本；`scripts/archive/` 为历史一次性脚本 |
-| `scripts/compat_smoke.py` | compat 端到端冒烟：本地假上游验证请求头/端点由配置驱动 |
-| `legacy/node-bridge/` | 冻结的 Node 单文件桥、`package.json`、冒烟测试与 `changelog/` |
+| `rust/model-gate/` | 唯一产品源码：Rust 代理内核、托盘常驻 + 系统浏览器面板、更新、构建脚本 |
+| `rust/model-gate/ui/` | 内嵌面板静态资源 |
+| `rust/model-gate/provider_profiles.json` | Provider 预设注册表 |
+| `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 |
+| `ModelGate.iss` | Inno Setup 打包定义（固定 AppId，支持静默覆盖升级） |
+| `assets/ModelGate.ico` | 应用与托盘图标 |
+| `docs/` | 架构、兼容性、维护规范与示例配置 |
+| `scripts/panel_api_smoke.ps1` | 面板接口与更新资源冒烟 |
+| `scripts/rust_shell_acceptance.ps1` | Rust 托盘壳黑盒验收 |
+| `scripts/upgrade_and_run.ps1` | 不停机升级辅助 |
+| `scripts/find_iscc.ps1` / `scripts/get_innosetup.ps1` | 查找/安装 Inno Setup |
 | `bridge.config.example.json` | 配置模板（零密钥，可入库） |
 | `bridge.config.json` | 本机真实配置（**不入库**） |
-| `dist/`、`build/`、`data/`、`.op/` | 打包产物、构建中间目录、运行数据、变更工作区（**均不入库**） |
-| `.github/workflows/release.yml` | Legacy Node 的 tag 驱动发布流水线（`legacy-v*`） |
+| `dist/`、`data/`、`target/`、`.op/` | 打包产物、运行数据、构建缓存、变更工作区（**均不入库**） |
+| `.github/workflows/release-rust.yml` | tag 驱动发布：构建、安装包、SHA256SUMS、GitHub Release |
 
 ---
 
-## 十五、版本与打包
+## 十五、版本、打包与发布
 
-版本号**唯一来源**：`rust/model-gate/Cargo.toml` 的 `version`（Rust 入口）；
-Python 回退版仍读 `modelgate/__init__.py` 的 `__version__`，两者保持同号。
+版本号**唯一来源**：`rust/model-gate/Cargo.toml` 的 `version`。`build.rs` 的 Windows 文件版本、
+面板静态资源的 `?v=` 缓存参数、安装包版本与 Release 资产名都从它派生。
 
-### 打包（Rust，默认）
+### 构建（Rust）
 
 ```bat
+cargo build --release
 powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1
 powershell -ExecutionPolicy Bypass -File rust\model-gate\build-release.ps1 -Promote
 powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1
 ```
 
-- `build-release.ps1` 产出 `dist\Model-Gate-rust.exe`（约 4.3 MB，单文件、内嵌前端）。
-- `-Promote` 额外把 Python 版备份为 `dist\Model-Gate-python.exe`，并用 Rust 覆盖
-  `dist\Model-Gate.exe`（正式入口切换）。
-- `build-installer.ps1` 产出 `dist\Model-Gate-v<ver>-rust-setup.exe`（约 3.8 MB，
-  Inno Setup 中文向导；自动查找 `ISCC.exe`，缺失时提示安装）。
-  安装包默认创建桌面图标与开始菜单项；exe 使用 Windows GUI 子系统，
-  双击不会弹出控制台窗口，日志仍写入 `data/modelgate.log`。
-  静默安装/卸载与安装后启动均已验证。
+- `build-release.ps1` 产出 `dist\Model-Gate-rust.exe`（单文件、内嵌前端）。
+- `-Promote` 额外覆盖 `dist\Model-Gate.exe`（正式入口）。
+- `build-installer.ps1` 产出 `dist\Model-Gate-v<ver>-rust-setup.exe`（Inno Setup 中文向导），
+  默认创建桌面图标与开始菜单项；静默安装/卸载与安装后启动已纳入验收。
 
 也可以直接调用 ISCC：
 
 ```bat
-iscc /DMyAppVersion=2.19.0 ^
+iscc /DMyAppVersion=2.21.0 ^
      /DMyAppSourceExe=dist\Model-Gate-rust.exe ^
-     /DMyOutputBaseFilename=Model-Gate-v2.19.0-rust-setup ^
+     /DMyOutputBaseFilename=Model-Gate-v2.21.0-rust-setup ^
      ModelGate.iss
 ```
 
-### 打包（Python，回退版）
+### 应用内更新
+
+| 场景 | 行为 |
+|------|------|
+| 启动自动检查 | 后台检查 GitHub `releases/latest`，24 小时内最多一次；只提示，不自动下载 |
+| 手动检查 | 面板顶栏「检查更新」或托盘菜单「检查更新」打开 `?update=1` |
+| 下载 | 精确选择 `Model-Gate-v<版本>-rust-setup.exe` 与 `SHA256SUMS`，流式下载并计算 SHA256 |
+| 安装 | 校验通过后启动安装包：`/SILENT /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /DIR=<当前exe目录>` |
+| 便携版 | 同目录没有 `unins*.exe` 时不自动覆盖，只提示手动运行安装包或打开 Release 页面 |
+| 失败 | 下载/校验/启动失败均保留原版本，不删除配置与用量库 |
+
+安装版升级会保留 `bridge.config.json`、`data\modelgate.db` 与旧安装包；安装器使用固定 `AppId`，
+不会产生第二份卸载项。
+
+### 发布
+
+1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `2.21.0`）。
+2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test` 与 `scripts\panel_api_smoke.ps1`。
+3. 打 tag 并推送：`git tag v2.21.0`、`git push origin v2.21.0`（Git 写操作需人工确认）。
+4. `.github/workflows/release-rust.yml` 构建并上传：
+   - `Model-Gate-v<版本>-rust-setup.exe`
+   - `Model-Gate-rust.exe`（便携版）
+   - `SHA256SUMS`
+5. 校验 Release 资产名与 `SHA256SUMS` 格式；应用内更新按精确文件名匹配。
+
+### 回滚
+
+- 保留上一版安装包与 Release；出现问题时手动重装上一版即可回滚，配置与用量库不动。
+- 已发布版本不删除 tag；修复后发布更高 patch 版本，让自动更新继续前进。
+- 便携版回滚只需换回旧 `Model-Gate-rust.exe`。
+
+### GitHub 限流
+
+未鉴权的 GitHub API 有速率限制。检查失败时面板显示错误原因并允许重试；不会影响代理转发。
+若频繁触发，可稍后重试，或直接打开 Release 页面手动下载。
+
+### 验证命令
 
 ```bat
-build.bat
+cargo fmt --check
+cargo check
+cargo test
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\rust_shell_acceptance.ps1 -Exe dist\Model-Gate-rust.exe
 ```
-
-探针解释器 → 生成图标 → **跑测试（失败即停）** → PyInstaller onefile →
-Inno Setup（本机无 `iscc` 时自动跳过）→ 汇总。产物 `dist\Model-Gate.exe`
-（会被 `-Promote` 改名为 `Model-Gate-python.exe`）。
-
-Legacy Node 版不参与该打包流程；如需发布历史 Node 包，使用 `legacy-v<version>`
-tag 触发 `.github/workflows/release.yml`，产物为 `dist/model-bridge-v<version>.zip`。
-
-### 验证（切换前必跑）
-
-```bat
-py scripts\parity_rust.py
-py scripts\panel_api_smoke.py --exe dist\Model-Gate-rust.exe
-node scripts\ui_smoke_cdp.mjs   :: 需以 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333 启动 GUI
-```
-
-### 升级（不停机）
-
-1. 新 exe 在**空闲端口 + 独立库**先跑一遍（`--force-multi` 可跳过单实例守卫）
-2. 按 **PID** 停旧实例（端口占用者），**不要按进程名**
-3. 用同一 `--config` / `--db` 起新实例——`bridge.config.json` 与 `data/` 全程不动，客户端 `base_url` 无需修改
-4. 实测停机 2.6–3.6 秒
 
 ### 产物
 
 | 产物 | 说明 |
 |---|---|
-| `dist\Model-Gate.exe` | **Rust** 绿色版单文件（GUI + `--no-gui` 两种模式） |
-| `dist\Model-Gate-v2.19.0-rust-setup.exe` | **Rust 安装包**（Inno Setup，中文向导） |
-| `dist\Model-Gate-rust.exe` | Rust 候选产物（切换前验证用） |
-| `dist\Model-Gate-python.exe` | Python 回退版（保留一个发布周期） |
-| `dist\Model-Gate-v*.exe` | 升级期间的并存实例（验证完可删） |
+| `dist\Model-Gate.exe` | 正式入口（Rust，GUI + `--no-gui`） |
+| `dist\Model-Gate-v<版本>-rust-setup.exe` | Rust 安装包（Inno Setup） |
+| `dist\Model-Gate-rust.exe` | Rust 候选/便携产物 |
+| `dist\SHA256SUMS` | 安装包 SHA256 校验清单 |
 | `dist\bridge.config.json` + `dist\data\` | 运行时配置与库（**不入库**） |
-

@@ -1,0 +1,497 @@
+{
+  "endpoint": "https://api.kilo.ai/api/openrouter",
+  "probedAt": "2026-10-21T07:11:55+0800",
+  "maxTokens": 512,
+  "count": 19,
+  "available": 13,
+  "results": [
+    {
+      "model": "kilo-auto/free",
+      "status": 200,
+      "elapsed_ms": 6135,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "pong",
+      "usage": {
+        "prompt_tokens": 126,
+        "completion_tokens": 178,
+        "total_tokens": 304,
+        "prompt_tokens_details": {
+          "cached_tokens": 124,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 170,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0,
+        "market_cost": 0
+      },
+      "provider": null,
+      "model_returned": "stealth/glyph-cluster"
+    },
+    {
+      "model": "minimax/minimax-m3.1-flash:free",
+      "status": 200,
+      "elapsed_ms": 1493,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "pong 🏓",
+      "usage": {
+        "prompt_tokens": 203,
+        "completion_tokens": 11,
+        "total_tokens": 214,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 201,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 7,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Minimax",
+      "model_returned": "minimax/minimax-m3.1-flash:free"
+    },
+    {
+      "model": "nvidia/nemotron-3.5-super-vl:free",
+      "status": 502,
+      "elapsed_ms": 800,
+      "ok": false,
+      "state": "unavailable",
+      "reason": "upstream_timeout",
+      "error": "{\"error\": {\"message\": \"Provider returned error\", \"code\": 502, \"metadata\": {\"raw\": \"{\\\"message\\\":\\\"Failed to generate completions\\\",\\\"type\\\":\\\"Internal Server Error\\\",\\\"code\\\":500}\", \"provider_name\": \"Nvidia\", \"is_byok\": false}}, \"user_id\": \"org_2uwFc1szZKyZweUX7pX97kXQf2O\"}"
+    },
+    {
+      "model": "reflection/beam-free",
+      "status": 200,
+      "elapsed_ms": 7282,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "pong",
+      "usage": {
+        "prompt_tokens": 47,
+        "completion_tokens": 43,
+        "total_tokens": 90,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 41,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0,
+        "market_cost": 0
+      },
+      "provider": null,
+      "model_returned": "reflection/beam"
+    },
+    {
+      "model": "stealth/glyph-cluster",
+      "status": 200,
+      "elapsed_ms": 5738,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "pong",
+      "usage": {
+        "prompt_tokens": 126,
+        "completion_tokens": 246,
+        "total_tokens": 372,
+        "prompt_tokens_details": {
+          "cached_tokens": 116,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 238,
+          "image_tokens": 0
+        },
+        "cache_creation_input_tokens": 0,
+        "market_cost": 0
+      },
+      "provider": null,
+      "model_returned": "stealth/glyph-cluster"
+    },
+    {
+      "model": "xingchen-agi/xing4.0-29b-a4b:free",
+      "status": 429,
+      "elapsed_ms": 830,
+      "ok": false,
+      "state": "unavailable",
+      "reason": "rate_limited_upstream",
+      "error": "{\"error\": {\"message\": \"Provider returned error\", \"code\": 429, \"metadata\": {\"raw\": \"xingchen-agi/xing4.0-29b-a4b:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations\", \"provider_name\": \"Phala\", \"is_byok\": false, \"limit_source\": \"upstream_provider_shared_pool\", \"remedy_hint\": \"Retry shortly, a"
+    },
+    {
+      "model": "dots-studio/dots-3-note-preview:free",
+      "status": 200,
+      "elapsed_ms": 2723,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "\n\nPong！😊 看到你在线啦，有什么想聊的或者需要帮忙的吗？",
+      "usage": {
+        "prompt_tokens": 14,
+        "completion_tokens": 117,
+        "total_tokens": 131,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 147,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "AtlasCloud",
+      "model_returned": "dots-studio/dots-3-note-preview:free"
+    },
+    {
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "status": 200,
+      "elapsed_ms": 4744,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "Pong!\n\nI'm here and ready to help. What can I do for you today?",
+      "usage": {
+        "prompt_tokens": 11,
+        "completion_tokens": 270,
+        "total_tokens": 281,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 4,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 249,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Liquid",
+      "model_returned": "liquid/lfm-2.5-2.6b:free"
+    },
+    {
+      "model": "nvidia/nemotron-3.5-lightning:free",
+      "status": 200,
+      "elapsed_ms": 2231,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "Pong! 🏓 How can I help you today?",
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 200,
+        "total_tokens": 217,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 185,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Nvidia",
+      "model_returned": "nvidia/nemotron-3.5-lightning:free"
+    },
+    {
+      "model": "poolside/laguna-s-2.1:free",
+      "status": 200,
+      "elapsed_ms": 4456,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "Pong! How can I help you today?",
+      "usage": {
+        "prompt_tokens": 45,
+        "completion_tokens": 11,
+        "total_tokens": 56,
+        "cost": 0,
+        "is_byok": true,
+        "prompt_tokens_details": {
+          "cached_tokens": 32,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Poolside",
+      "model_returned": "poolside/laguna-s-2.1:free"
+    },
+    {
+      "model": "poolside/laguna-xs-2.1:free",
+      "status": 429,
+      "elapsed_ms": 745,
+      "ok": false,
+      "state": "unavailable",
+      "reason": "rate_limited_upstream",
+      "error": "{\"error\": {\"message\": \"Provider returned error\", \"code\": 429, \"metadata\": {\"raw\": \"poolside/laguna-xs-2.1:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations\", \"provider_name\": \"Poolside\", \"is_byok\": false, \"limit_source\": \"upstream_provider_shared_pool\", \"remedy_hint\": \"Retry shortly, add "
+    },
+    {
+      "model": "cohere/north-mini-code:free",
+      "status": 200,
+      "elapsed_ms": 7187,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "Sure! `ping` is a command‑line utility used to test network connectivity to a specific host (by IP address or hostname).",
+      "usage": {
+        "prompt_tokens": 1,
+        "completion_tokens": 315,
+        "total_tokens": 316,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 112,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Cohere",
+      "model_returned": "cohere/north-mini-code:free"
+    },
+    {
+      "model": "nvidia/nemotron-3.5-content-safety:free",
+      "status": 200,
+      "elapsed_ms": 1803,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "User Safety: safe",
+      "usage": {
+        "prompt_tokens": 463,
+        "completion_tokens": 94,
+        "total_tokens": 557,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 92,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Nvidia",
+      "model_returned": "nvidia/nemotron-3.5-content-safety:free"
+    },
+    {
+      "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "status": 200,
+      "elapsed_ms": 1344,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "pong",
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 18,
+        "total_tokens": 35,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 14,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Nvidia",
+      "model_returned": "nvidia/nemotron-3-ultra-550b-a55b:free"
+    },
+    {
+      "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+      "status": 200,
+      "elapsed_ms": 1385,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "pong",
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 29,
+        "total_tokens": 46,
+        "cost": 0,
+        "is_byok": false,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 24,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Nvidia",
+      "model_returned": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    },
+    {
+      "model": "google/lyria-3-pro-preview",
+      "status": 401,
+      "elapsed_ms": 527,
+      "ok": false,
+      "state": "unavailable",
+      "reason": "paid_model_auth_required",
+      "error": "{\"error\": {\"code\": \"PAID_MODEL_AUTH_REQUIRED\", \"message\": \"You need to sign in to use this model.\"}, \"error_type\": \"paid_model_auth_required\"}"
+    },
+    {
+      "model": "google/lyria-3-clip-preview",
+      "status": 401,
+      "elapsed_ms": 476,
+      "ok": false,
+      "state": "unavailable",
+      "reason": "paid_model_auth_required",
+      "error": "{\"error\": {\"code\": \"PAID_MODEL_AUTH_REQUIRED\", \"message\": \"You need to sign in to use this model.\"}, \"error_type\": \"paid_model_auth_required\"}"
+    },
+    {
+      "model": "nvidia/nemotron-3-super-120b-a12b:free",
+      "status": 404,
+      "elapsed_ms": 707,
+      "ok": false,
+      "state": "unavailable",
+      "reason": "model_not_found",
+      "error": "{\"error\": {\"message\": \"Provider returned error\", \"code\": 404, \"metadata\": {\"raw\": \"{\\\"status\\\":404,\\\"title\\\":\\\"Not Found\\\",\\\"detail\\\":\\\"Function 'ac74040f-9fc9-4c5e-ac74-279ba5161d69': Not found for account 'sxpm0VR-knE2_K2__i14ZbzmXEludXpJbFGRvrvc08w'\\\"}\", \"provider_name\": \"Nvidia\", \"is_byok\": false}}, \"user_id\": \"org_2uwFc1szZKyZweUX7pX97kXQf2O\"}"
+    },
+    {
+      "model": "openrouter/free",
+      "status": 200,
+      "elapsed_ms": 1709,
+      "ok": true,
+      "state": "available",
+      "reason": null,
+      "error": null,
+      "text": "Pong! How can I assist you today?",
+      "usage": {
+        "prompt_tokens": 45,
+        "completion_tokens": 11,
+        "total_tokens": 56,
+        "cost": 0,
+        "is_byok": true,
+        "prompt_tokens_details": {
+          "cached_tokens": 32,
+          "cache_write_tokens": 0,
+          "audio_tokens": 0,
+          "video_tokens": 0
+        },
+        "cost_details": {
+          "upstream_inference_cost": 0,
+          "upstream_inference_prompt_cost": 0,
+          "upstream_inference_completions_cost": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "image_tokens": 0,
+          "audio_tokens": 0
+        }
+      },
+      "provider": "Poolside",
+      "model_returned": "poolside/laguna-s-2.1:free"
+    }
+  ]
+}

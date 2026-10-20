@@ -3,7 +3,7 @@ name: Rust Desktop Release
 # Model-Gate Rust 桌面版发布流水线：
 #   - 推送 v* tag（如 v2.19.0）触发构建并发布 GitHub Release；
 #   - 手动 workflow_dispatch 默认只构建产物（可勾选 publish 一并发布）。
-# 版本唯一源：modelgate/__init__.py；tag 触发时校验 tag == v<version>。
+# 版本唯一源：rust/model-gate/Cargo.toml；tag 触发时校验 tag == v<version>。
 on:
   push:
     tags: ['v*']
@@ -41,14 +41,20 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $text = Get-Content "modelgate\__init__.py" -Raw -Encoding UTF8
-          if ($text -notmatch '__version__\s*=\s*"([^"]+)"') { throw "version not found in modelgate/__init__.py" }
+          $text = Get-Content "rust\model-gate\Cargo.toml" -Raw -Encoding UTF8
+          if ($text -notmatch '(?m)^\s*version\s*=\s*"([^"]+)"') { throw "version not found in rust/model-gate/Cargo.toml" }
           $ver = $Matches[1]
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$ver") {
             throw "tag $($env:GITHUB_REF_NAME) does not match v$ver"
           }
           Write-Host "version: $ver"
           "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed: $LASTEXITCODE" }
 
       - name: cargo build --release
         shell: pwsh
@@ -66,11 +72,16 @@ jobs:
           .\rust\model-gate\build-installer.ps1 -Version "${{ steps.meta.outputs.version }}"
           $setup = "dist\Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe"
           if (-not (Test-Path $setup)) { throw "installer missing: $setup" }
+          if (-not (Test-Path "dist\Model-Gate-rust.exe")) { throw "portable exe missing" }
           $size = (Get-Item $setup).Length
           if ($size -gt 6MB) { throw ("installer exceeds 6MB: {0:N2} MB" -f ($size / 1MB)) }
           "installer_size_mb={0:N2}" -f ($size / 1MB) | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
-          "$hash  $(Split-Path $setup -Leaf)" | Out-File -FilePath "dist\SHA256SUMS" -Encoding ascii
+          $setupName = Split-Path $setup -Leaf
+          "$hash  $setupName" | Out-File -FilePath "dist\SHA256SUMS" -Encoding ascii
+          $manifest = Get-Content "dist\SHA256SUMS" -Raw -Encoding ASCII
+          $expected = "$hash  $setupName"
+          if ($manifest.Trim() -ne $expected.Trim()) { throw "SHA256SUMS mismatch: $manifest" }
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -95,6 +106,7 @@ jobs:
             - 安装包：`Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe`（安装时可选安装目录）
             - 便携版：`Model-Gate-rust.exe`（单文件，免安装）
             - 校验：`SHA256SUMS`
+            - 应用内更新会下载安装包并校验 `SHA256SUMS`；便携版请手动运行安装包。
           generate_release_notes: true
           draft: false
           files: |

@@ -189,6 +189,8 @@ mod tests {
     fn passthrough_off_skips_recall() {
         let cache = ThinkingCache::new(true, 10);
         cache.remember("chain", "", "answer", &[]);
-        assert!(cache.build_block(&json!({}), "answer", &[], false).is_none());
+        assert!(cache
+            .build_block(&json!({}), "answer", &[], false)
+            .is_none());
     }
 }

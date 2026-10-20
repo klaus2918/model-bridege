@@ -27,6 +27,10 @@
 > `protocol` 仍然只决定 **wire 形态**（OpenAI Chat / Anthropic Messages / CommandCode NDJSON），
 > 这是请求/响应结构差异，不能仅靠配置消除；其余厂商差异都走 `compat`。
 
+`transport` 是独立于 `protocol` 的传输适配器，优先级高于 `protocol` 推断，当前只有 `opencode`。
+它处理普通 compat 无法表达的部分：客户端指纹、每次请求重新生成的 ID、URL 重写、强制流式、
+工具注入/改名/过滤，以及 SSE 聚合。`transport=opencode` 只能搭配 `protocol=openai`。
+
 ## 2. `compat` 字段
 
 ```json
@@ -73,8 +77,8 @@
 
 ### 2.1 预设注册表与模型级覆盖
 
-预设不再硬编码在 `config.py` / `config.rs`，统一由 `modelgate/provider_profiles.json` 定义
-（Rust 编译期 `include_str!` 嵌入，Python 打包随 `datas` 分发）。判定优先级：
+预设不再硬编码在 `config.rs`，统一由 `rust/model-gate/provider_profiles.json` 定义
+（Rust 编译期 `include_str!` 嵌入，随 exe 分发）。判定优先级：
 
 1. 显式 `compat.profile`（或旧字段 `profile`）；
 2. 域名匹配，按注册表 `priority` 取最高（`commandcode.ai` 100 > `api.deepseek.com` 90 > `opencode.ai` 80）；
@@ -116,6 +120,35 @@
 ```json
 "compat": { "session": false }
 ```
+
+#### OpenCode Zen 免费层：`transport=opencode`
+
+```json
+"zen": {
+  "protocol": "openai",
+  "transport": "opencode",
+  "baseUrl": "https://opencode.ai/zen/v1",
+  "models": ["mimo-v2.6-flash-free", "big-pickle"],
+  "fetchModels": false,
+  "sessionHeader": false,
+  "autoModels": false
+}
+```
+
+该 transport 只服务免费层，不读取 apiKey，也不涉及 `go` 订阅：
+
+- 固定 `Authorization: Bearer public` 与 OpenCode CLI UA；生成 `ses_...` 会话 ID 和每请求新的 `msg_...` 请求 ID。
+- `opencode.ai` 的 `/zen/...` 改写为 `/inference/...`；`/zen/go/...` 不改写。
+- 上游强制 `stream: true`；客户端非流式时聚合 SSE。
+- 自动注入 `bash` / `read` 工具（含 schema），客户端同名工具转小写，响应工具名映射回原名；仅调用 stub 工具时返回提示并以 `stop` 结束。
+- 非免费模型（`-free` / `big-pickle` / `grok-code` 之外）本地 400 `model_not_free`，不请求上游。
+- 免费层失败不自动切换上游，避免静默降级到付费路径。
+- 诊断：`opencode_free_tier_rejected`、`opencode_cloudflare_blocked`、`opencode_rate_limited`。
+- `grok-code` 仍未用本桥实测，默认不启用。
+
+> 行为基线来自 magpie 的 `internal/provider/opencode_client.go` 与
+> `internal/gateway/zenfree.go`，并用 2026-10-20 真机请求复核。
+> 这是 OpenCode 未公开的客户端契约，可能随上游升级失效；不要把它用于付费/Go 上游。
 
 ### 3.2 CommandCode
 
@@ -193,4 +226,4 @@
 - `compat` 与旧字段冲突时，`compat` 优先。
 - 全局 `thinking.passthrough=false` 或 `tools.downgradeForcedChoice=false` 是最终约束，单上游无法绕过。
 - 面板保存时会保留所有未渲染的上游字段，避免“保存一次丢配置”。
-- 预设注册表随包分发：Python `ModelGate.spec` 的 `datas` 内置 `provider_profiles.json`，Rust 编译期嵌入；升级时只需同步该 JSON。
+- 预设注册表随包分发：`rust/model-gate/provider_profiles.json` 在 Rust 编译期嵌入；升级时只需修改该 JSON 并重新构建。

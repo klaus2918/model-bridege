@@ -1,61 +1,59 @@
 # 项目目录与维护规范
 
-适用 Model-Gate 2.x。最后核对：2026-10-19。
+适用 Model-Gate 2.21+（Rust-only）。最后核对：2026-10-21。
 
 ## 一、目录职责
 
 | 路径 | 职责 | 是否入库 |
 |---|---|---|
-| `modelgate/` | 当前产品源码：配置、SQLite、协议适配、代理、桌面壳、面板资产 | 是 |
-| `tests/` | pytest 测试；文件名与被测模块对应 | 是 |
-| `entry.py` | 桌面版入口（窗口/托盘/单实例） | 是 |
+| `rust/model-gate/` | 唯一产品源码：代理内核、协议适配、配置、SQLite、更新、托盘壳 | 是 |
+| `rust/model-gate/ui/` | 内嵌面板静态资源（`index.html` / `app.js` / `style.css` / `free_sources.js`）——**面板资源只有这一份** | 是 |
+| `rust/model-gate/tests/` | Rust 单测夹具（含 `legacy_config.json` 兼容样本） | 是 |
+| `rust/model-gate/provider_profiles.json` | Provider 预设注册表（编译期内嵌） | 是 |
+| `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 | 是 |
 | `assets/` | 构建资产（图标等） | 是 |
-| `docs/` | 长期文档：架构、集成记录、面板素材、维护规范 | 是 |
-| `scripts/` | 活跃工具：构建、测试、安全扫描、运行诊断、发布 | 是 |
-| `scripts/archive/` | 已过期的一次性版本验证、探测、文档补丁脚本 | 是（仅作历史证据） |
-| `legacy/node-bridge/` | 冻结的 Node 单文件桥、测试与历史 changelog | 是 |
-| `ModelGate.spec`、`ModelGate.iss`、`build.bat` | PyInstaller / Inno Setup 打包定义与唯一构建入口 | 是 |
+| `docs/` | 长期文档：架构、集成记录、维护规范 | 是 |
+| `scripts/` | 活跃 PowerShell 工具：验收、升级、Inno Setup 查找/安装、面板冒烟 | 是 |
+| `ModelGate.iss` | Inno Setup 打包定义（固定 AppId，支持覆盖升级） | 是 |
 | `bridge.config.example.json` | 零密钥配置模板 | 是 |
 | `bridge.config.json` | 本机真实配置（可能含路径与密钥引用） | **否** |
-| `dist/`、`build/` | 打包产物、构建中间目录 | **否** |
+| `dist/` | 安装包、便携 exe、正式入口 | **否** |
 | `data/`、`dist/data/` | 运行数据库与日志 | **否** |
+| `target/` | Cargo 构建缓存 | **否** |
 | `.op/` | 变更计划、验证证据、归档记录（含本机路径） | **否** |
+
+> **Python 旧实现已彻底移除**：`modelgate/`、根 `tests/`、`entry.py`、`ModelGate.spec`、
+> `build.bat`、`legacy/node-bridge/` 与 `scripts/` 下的 Python/Shell/MJS 脚本均已删除
+> （历史保留在 git 历史中）。仓库只剩 Rust 一条产品线，面板资源只有
+> `rust/model-gate/ui/` 一份。**不要**再引入第二份前端副本或 Python 回退实现。
 
 ## 二、新增文件的归属规则
 
-1. **产品代码**只进 `modelgate/`；跨模块共享逻辑放 `modelgate/` 顶层模块，不建新的根目录。
-2. **测试**只进 `tests/`，命名 `test_<主题>.py`；临时库写到 `tmp_path`，不写仓库根目录。
-3. **脚本**：
-   - 构建/测试/发布/安全扫描等会重复使用的，放 `scripts/` 根目录；
-   - 运行诊断统一走 `scripts/doctor.py`（`port` / `config` / `env` / `db` / `upstream` / `cli` / `runtime` / `gui`），不再新增 `check_*` / `diag_*` 单文件；
-   - 只服务于某次版本或某次排查的一次性脚本，放 `scripts/archive/<类别>/`，不再放根目录；
-   - 所有脚本默认从仓库根目录运行，路径以仓库根为基准。
+1. **产品代码**只进 `rust/model-gate/src/`；面板资源只进 `rust/model-gate/ui/`，**不要新增第二份前端副本**。
+2. **测试**只进 `rust/model-gate/src` 的 `#[cfg(test)]` 或 `rust/model-gate/tests/`；临时库写到系统临时目录，不写仓库根目录。
+3. **脚本**只保留 PowerShell，放在 `scripts/`：构建/验收/升级/打包辅助各一个入口；一次性排查脚本用完即删，不建 `archive/`。
 4. **文档**按主题进 `docs/`；使用说明只维护根 `README.md`，不在多处复制。
-5. **生成物**一律进 `dist/`、`build/`、`data/` 或系统临时目录，不回写源码目录。
-6. **Legacy Node 版**只做兼容修复，不新增面板、用量、故障切换等桌面版能力；新增 Node 相关文件放 `legacy/node-bridge/`。
+5. **生成物**一律进 `dist/`、`target/`、`data/` 或系统临时目录，不回写源码目录。
 
 ## 三、生成物与清理策略
 
 | 对象 | 生成方式 | 清理规则 |
 |---|---|---|
-| `build/` | PyInstaller | 可随时整目录删除；排查打包问题时再保留 |
-| `dist/Model-Gate.exe` | `build.bat` | 保留当前构建；运行中的 exe 被锁定，不要删 |
-| `dist/Model-Gate-v*.exe` | 升级时的并存实例 | 保留当前运行版与上一版用于回滚，其余可删 |
-| `dist/data/` | 桌面实例运行 | **活数据**，运行中禁止删除；备份用面板导出/备份功能 |
-| `dist/preview/` | 面板预览/测试 | 可删；下次预览会重建 |
-| `.pytest_cache/`、`__pycache__/` | pytest / Python | 可随时删除，已被 `.gitignore` 排除 |
-| `ModelGate.v*.spec` | 升级时临时复制 | 验证完成即删，已被 `.gitignore` 排除 |
-| `docs/live-panel/*.mp4` | `render.py --out` | 体积大，本地生成不入库；需要时按该目录 README 重生成 |
+| `target/` | `cargo build` | 可 `cargo clean`；排查构建问题时保留 |
+| `dist/Model-Gate.exe` | `build-release.ps1 -Promote` | 保留当前构建；运行中的 exe 被锁定，不要删 |
+| `dist/Model-Gate-rust.exe` | `build-release.ps1` | 可随时重建 |
+| `dist/Model-Gate-v*-rust-setup.exe` | `build-installer.ps1` / Release | 保留当前版与上一版用于回滚，其余可删 |
+| `dist/data/`、`data/` | 桌面实例运行 | **活数据**，运行中禁止删除；备份用面板导出/备份功能 |
+| `%TEMP%\model-gate-update-*` | 应用内更新下载 | 7 天后自动清理；失败残留可手动删除 |
+| `rust/model-gate/cargo_*.log` | 本地构建日志 | 验证完成即删，不入库 |
 
-建议在每次发布后或每季度执行一次（先确认没有正在运行的构建）：
+建议每次发布后清理（先确认没有正在运行的构建）：
 
 ```powershell
-Remove-Item -Recurse -Force build,.pytest_cache -ErrorAction SilentlyContinue
-Get-ChildItem -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
-Get-ChildItem -Filter 'ModelGate.v*.spec' | Remove-Item -Force
+cargo clean
+Remove-Item -Recurse -Force target -ErrorAction SilentlyContinue
+Remove-Item -Force rust\model-gate\cargo_*.log -ErrorAction SilentlyContinue
 ```
-
-`scripts/archive/` 是历史证据，不参与日常运行；确认某段历史不再需要时可整目录删除，但不要把它当作活跃工具目录继续加文件。
 
 ## 四、敏感信息边界
 
@@ -67,9 +65,8 @@ Get-ChildItem -Filter 'ModelGate.v*.spec' | Remove-Item -Force
 | `.env`、`.jcode/.env`、`*.env` | 环境变量密钥 | 不入库 |
 | `~/.jcode/.env`、`~/.commandcode/auth.json` | 用户级凭据 | 仓库外，不入库 |
 | `**/auth.json`、`**/credentials*.json`、`*.key`、`*.pem`、`*.token` | 凭据兜底规则 | 不入库 |
-| `dist/data/`、`data/` | SQLite 用量库、运行日志 | 不入库 |
+| `data/`、`dist/data/` | SQLite 用量库、运行日志 | 不入库 |
 | `.op/` | 变更记录，可能含本机绝对路径与源码片段 | 不入库 |
-| `.sensitive-terms` | 本地敏感词表 | 不入库 |
 
 原则：
 
@@ -82,24 +79,24 @@ Get-ChildItem -Filter 'ModelGate.v*.spec' | Remove-Item -Force
 
 ```powershell
 git ls-files | Select-String -Pattern 'bridge\.config\.json$|(^|/)\.env$|auth\.json$|credentials.*\.json$|\.(key|pem|token)$'
-git check-ignore -v bridge.config.json dist/data/modelgate.db .op/index.json
-python scripts/audit_secrets.py
-bash scripts/scan-sensitive.sh
+git check-ignore -v bridge.config.json data/modelgate.db .op/index.json
 ```
 
-第一条应无输出；`git check-ignore` 应命中忽略规则；扫描脚本发现真实密钥时应立即处理。
+第一条应无输出；`git check-ignore` 应命中忽略规则。
 
 ## 五、版本与发布
 
-- 当前产品版本唯一来源：`modelgate/__init__.py` 的 `__version__`。
-- 桌面 exe：Windows 本机运行 `build.bat`（测试门禁 → PyInstaller → Inno Setup）。
-- Legacy Node 版：版本在 `legacy/node-bridge/package.json`，发布 tag 形如 `legacy-v1.1.0`；不要用 `v2.x` tag 触发旧流水线。
+- 当前产品版本唯一来源：`rust/model-gate/Cargo.toml` 的 `version`。
+- 桌面 exe：`build-release.ps1`；安装包：`build-installer.ps1`（Inno Setup 6）。
+- 发布：推送 `v<version>` tag，由 `.github/workflows/release-rust.yml` 构建并上传
+  `Model-Gate-v<version>-rust-setup.exe`、`Model-Gate-rust.exe`、`SHA256SUMS`。
+- 应用内更新只接受与 tag 精确匹配的安装包名；版本号不一致时发布失败，不生成资产。
 
 ## 六、改动前检查清单
 
-1. `git status --short`：确认没有把 `dist/`、`build/`、`data/`、`.op/`、真实配置加入暂存区。
+1. `git status --short`：确认没有把 `dist/`、`target/`、`data/`、`.op/`、真实配置加入暂存区。
 2. 新增/移动文件后同步更新 `README.md`、`docs/README.md` 或本文件中的路径。
-3. 运行 `python -m pytest -q`；Node 相关改动运行 `node --check`。
-4. 环境/配置异常先运行 `py -3 scripts/doctor.py all`（只读，不修改配置或数据库）。
-5. 运行敏感扫描；确认 `bridge.config.example.json` 仍为零密钥模板。
+3. 验证：`cargo fmt --check`、`cargo check`、`cargo test`；面板改动加跑 `scripts/panel_api_smoke.ps1`。
+4. 更新相关改动加跑安装版双版本升级验收（见根 README「应用内更新」）。
+5. 环境/配置异常先看 `data/modelgate.log` 与 `/health`，再检查 `bridge.config.json` 是否合法 JSON。
 6. 不覆盖正在运行的实例：换端口、独立库、按 PID 停旧实例。

@@ -194,7 +194,7 @@ try {
     # 6) config save round-trip: profiles data + modelOverrides persist
     $live = Invoke-Json "GET" "/api/config"
     $profileIds = @($live.profiles | ForEach-Object { $_.id })
-    $expectedIds = @("openai", "opencode", "anthropic", "deepseek", "commandcode")
+    $expectedIds = @("openai", "opencode", "anthropic", "deepseek", "moonshot", "zhipu", "minimax", "dashscope", "ark", "siliconflow", "modelscope", "hunyuan", "commandcode")
     Add-Result "GET /api/config exposes profiles" `
         (($profileIds -join ",") -eq ($expectedIds -join ",")) ("profiles: " + ($profileIds -join ","))
 

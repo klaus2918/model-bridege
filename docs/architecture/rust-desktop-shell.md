@@ -15,15 +15,15 @@
 | 启动 ≤1s | 进程启动到 `GET /health` 返回 200 |
 | 无内嵌浏览器 | Model-Gate 进程树内 0 个 `msedgewebview2.exe` |
 
-边界：不做 WebView2 可选后端；不做内嵌窗口；不改面板前端（`modelgate/web/` 原样复用）；
-托盘动作不依赖页面加载成功。浏览器打开失败时弹窗给出可复制的 URL。
+边界：不做 WebView2 可选后端；不做内嵌窗口；面板前端统一放在 `rust/model-gate/ui/`
+并编译期内嵌；托盘动作不依赖页面加载成功。浏览器打开失败时弹窗给出可复制的 URL。
 
 ## 2. 进程与线程模型
 
 - **单进程**：axum 服务线程 + 主线程 Win32 消息循环；发布构建 `windows_subsystem = "windows"`，无控制台窗口。
 - **托盘**：`tray-icon`（Win32 后端），主线程 `GetMessageW` 循环消费菜单事件。
 - **面板**：`ShellExecuteW` 打开 `http://<host>:<实际端口>/ui/`，浏览器为独立进程，不计入 Model-Gate 进程树。
-- **前端资源**：`modelgate/web/` 通过 `include_str!` 编译进二进制，无外部资源文件。
+- **前端资源**：`rust/model-gate/ui/` 通过 `include_str!` 编译进二进制，无外部资源文件。
 
 ## 3. 启动流程
 
@@ -43,6 +43,7 @@
 | 菜单项 | 行为 |
 |---|---|
 | 打开面板 | Shell 打开 `http://<host>:<端口>/ui/` |
+| 检查更新 | Shell 打开 `http://<host>:<端口>/ui/?update=1`，由面板调用更新 API |
 | 刷新模型目录 | 触发 `autoModels` 上游目录拉取（失败保留旧缓存） |
 | 复制接入地址 | 剪贴板写入 `http://<host>:<端口>/v1` |
 | 打开数据目录 | Shell 打开 `data/`（配置、日志、SQLite） |
@@ -84,7 +85,8 @@
 ## 8. 回退
 
 - `--no-gui` 纯服务模式不受桌面壳影响；
-- 直接运行 `dist\Model-Gate-python.exe`（配置/DB 双向兼容，见 tech-stack-selection.md）；
+- 安装版回退：手动重装上一版 `Model-Gate-v<旧版本>-rust-setup.exe`，配置与 `data/` 原地保留；
+- 便携版回退：换回旧 `Model-Gate-rust.exe`；
 - 桌面壳异常时崩溃信息落在 `data/crash.log`，可用 `--diagnose` 收集环境信息。
 
 ## 9. 设计决策

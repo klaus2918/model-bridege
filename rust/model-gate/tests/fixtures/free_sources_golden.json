@@ -1,0 +1,106 @@
+{
+  "_doc": "免费来源 golden fixtures：目录样本 + 拒因样本。Rust 单测消费同一份，避免「判定逻辑」与「预期结果」各写一套。",
+  "version": 1,
+  "catalogCases": [
+    {
+      "name": "kilo 目录：三条免费判定路径都命中",
+      "source": "kilo-free",
+      "items": [
+        { "id": "minimax/minimax-m3.1-flash:free" },
+        { "id": "kilo-auto/free", "isFree": true },
+        { "id": "google/lyria-3-pro-preview", "pricing": { "prompt": "0", "completion": "0" } }
+      ],
+      "expectFree": [
+        "minimax/minimax-m3.1-flash:free",
+        "kilo-auto/free",
+        "google/lyria-3-pro-preview"
+      ]
+    },
+    {
+      "name": "kilo 目录：付费模型不算免费",
+      "source": "kilo-free",
+      "items": [
+        { "id": "anthropic/claude-haiku-5.5", "pricing": { "prompt": "1", "completion": "2" } },
+        { "id": "openai/gpt-6-luna", "isFree": false }
+      ],
+      "expectFree": []
+    },
+    {
+      "name": "kilo 目录：零价但未标 isFree 的仍算免费候选（探测后才知是否可用）",
+      "source": "kilo-free",
+      "items": [
+        { "id": "google/lyria-3-clip-preview", "pricing": { "prompt": 0, "completion": 0 } }
+      ],
+      "expectFree": ["google/lyria-3-clip-preview"]
+    },
+    {
+      "name": "zen 目录：只认 -free 与固定 id",
+      "source": "zen-free",
+      "items": [
+        { "id": "big-pickle" },
+        { "id": "mimo-v2.6-flash-free" },
+        { "id": "claude-haiku-4-5" },
+        { "id": "test" }
+      ],
+      "expectFree": ["big-pickle", "mimo-v2.6-flash-free"]
+    }
+  ],
+  "rejectCases": [
+    {
+      "name": "Kilo 401 需登录：零价不等于免鉴权",
+      "status": 401,
+      "body": "{\"code\":\"PAID_MODEL_AUTH_REQUIRED\",\"message\":\"You need to sign in to use this model.\"}",
+      "expectCode": "paid_model_auth_required",
+      "expectState": "unavailable"
+    },
+    {
+      "name": "Kilo 429 上游池限流：暂时不可用，不是模型下线",
+      "status": 429,
+      "body": "Provider returned error; code: 429; metadata={\"limit_source\":\"upstream_provider_shared_pool\"}",
+      "expectCode": "rate_limited_upstream",
+      "expectState": "transient"
+    },
+    {
+      "name": "Kilo 429 日配额耗尽：Credits 不影响此上限",
+      "status": 429,
+      "body": "Rate limit exceeded: limit_rpd/thinkingmachines/inkling-small-20260730/e27a9a6d. Daily limit reached for thinkingmachines/inkling-small:free via Thinking Machines. Credits don't affect this cap.",
+      "expectCode": "daily_quota_exhausted",
+      "expectState": "transient"
+    },
+    {
+      "name": "Kilo 404 上游函数不存在：模型已下线",
+      "status": 404,
+      "body": "Provider returned error; code: 404; metadata={\"raw\":\"{\\\"status\\\":404,\\\"title\\\":\\\"Not Found\\\"}\"}",
+      "expectCode": "model_not_found",
+      "expectState": "unavailable"
+    },
+    {
+      "name": "Kilo 504 上游超时：暂时不可用",
+      "status": 504,
+      "body": "Provider returned error; code: 504; metadata={\"provider_name\":\"Liquid\"}",
+      "expectCode": "upstream_timeout",
+      "expectState": "transient"
+    },
+    {
+      "name": "Zen 429 免密层额度耗尽（本机 IP 整体限流）",
+      "status": 429,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeUsageLimitError\",\"message\":\"Rate limit exceeded. Please try again later.\"}}",
+      "expectCode": "rate_limited_upstream",
+      "expectState": "transient"
+    },
+    {
+      "name": "Zen 403 免费层拒绝：契约可能已变更",
+      "status": 403,
+      "body": "{\"type\":\"error\",\"error\":{\"type\":\"FreeTierError\",\"message\":\"Free tier access denied\"}}",
+      "expectCode": "free_tier_rejected",
+      "expectState": "unavailable"
+    },
+    {
+      "name": "地区限制：单列状态，不与明确不可用混同",
+      "status": 403,
+      "body": "{\"error\":{\"message\":\"This model is not available in your country\"}}",
+      "expectCode": "region_blocked",
+      "expectState": "region"
+    }
+  ]
+}

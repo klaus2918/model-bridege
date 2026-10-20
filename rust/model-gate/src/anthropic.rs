@@ -90,7 +90,10 @@ pub fn to_anthropic(
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<Value> = Vec::new();
     let empty = Vec::new();
-    let source = body.get("messages").and_then(Value::as_array).unwrap_or(&empty);
+    let source = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
 
     for m in source {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -118,7 +121,9 @@ pub fn to_anthropic(
                     .map(|items| {
                         items
                             .iter()
-                            .filter_map(|tc| tc.get("id").and_then(Value::as_str).map(str::to_string))
+                            .filter_map(|tc| {
+                                tc.get("id").and_then(Value::as_str).map(str::to_string)
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
@@ -177,13 +182,20 @@ pub fn to_anthropic(
         }
     }
     if let Some(stop) = body.get("stop").filter(|v| !v.is_null()) {
-        out["stop_sequences"] = if stop.is_array() { stop.clone() } else { json!([stop]) };
+        out["stop_sequences"] = if stop.is_array() {
+            stop.clone()
+        } else {
+            json!([stop])
+        };
     }
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         out["stream"] = json!(true);
     }
 
-    let choice = body.get("tool_choice").and_then(Value::as_str).unwrap_or("");
+    let choice = body
+        .get("tool_choice")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let tools: Vec<Value> = if choice == "none" {
         Vec::new()
     } else {
@@ -193,7 +205,9 @@ pub fn to_anthropic(
                 arr.iter()
                     .filter(|t| {
                         t.get("type").and_then(Value::as_str) == Some("function")
-                            && t.pointer("/function/name").and_then(Value::as_str).is_some()
+                            && t.pointer("/function/name")
+                                .and_then(Value::as_str)
+                                .is_some()
                     })
                     .cloned()
                     .collect()
@@ -241,10 +255,16 @@ pub fn usage_of(raw: &Value) -> Value {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let mut out = Map::new();
-    out.insert("prompt_tokens".into(), json!(input + cache_read + cache_write));
+    out.insert(
+        "prompt_tokens".into(),
+        json!(input + cache_read + cache_write),
+    );
     out.insert(
         "completion_tokens".into(),
-        json!(raw.get("output_tokens").and_then(Value::as_i64).unwrap_or(0)),
+        json!(raw
+            .get("output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)),
     );
     if cache_read > 0 {
         out.insert("cacheReadTokens".into(), json!(cache_read));
@@ -258,7 +278,10 @@ pub fn usage_of(raw: &Value) -> Value {
 /// Anthropic 非流式响应 → OpenAI Chat Completion。
 pub fn to_openai(data: &Value, requested_model: &str, cache: &ThinkingCache) -> Value {
     let empty = Vec::new();
-    let blocks = data.get("content").and_then(Value::as_array).unwrap_or(&empty);
+    let blocks = data
+        .get("content")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
     let text: String = blocks
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
@@ -312,8 +335,14 @@ pub fn to_openai(data: &Value, requested_model: &str, cache: &ThinkingCache) -> 
     }
 
     let usage = usage_of(data.get("usage").unwrap_or(&Value::Null));
-    let prompt = usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0);
-    let completion = usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0);
+    let prompt = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion = usage
+        .get("completion_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let mut usage_out = json!({
         "prompt_tokens": prompt,
         "completion_tokens": completion,
@@ -352,7 +381,10 @@ pub fn chunk(model: &str, delta: Value, finish: Option<&str>, usage: Option<Valu
     if let Some(usage) = usage {
         obj["usage"] = usage;
     }
-    format!("data: {}\n\n", serde_json::to_string(&obj).unwrap_or_default())
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&obj).unwrap_or_default()
+    )
 }
 
 /// 把一段 Anthropic SSE（event + data）翻译成 OpenAI SSE 文本。
@@ -379,10 +411,18 @@ pub fn translate_sse_block(block: &str, model: &str, state: &mut StreamState) ->
             if let Some(usage) = data.pointer("/message/usage") {
                 state.apply_usage(usage);
             }
-            out.push_str(&chunk(model, json!({"role": "assistant", "content": ""}), None, None));
+            out.push_str(&chunk(
+                model,
+                json!({"role": "assistant", "content": ""}),
+                None,
+                None,
+            ));
         }
         "content_block_start" => {
-            let block = data.get("content_block").cloned().unwrap_or_else(|| json!({}));
+            let block = data
+                .get("content_block")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
                 state.tool_index += 1;
                 if let Some(id) = block.get("id").and_then(Value::as_str) {
@@ -415,7 +455,12 @@ pub fn translate_sse_block(block: &str, model: &str, state: &mut StreamState) ->
                     if let Some(text) = d.get("text").and_then(Value::as_str) {
                         state.text.push_str(text);
                     }
-                    out.push_str(&chunk(model, json!({"content": d.get("text").unwrap_or(&json!(""))}), None, None));
+                    out.push_str(&chunk(
+                        model,
+                        json!({"content": d.get("text").unwrap_or(&json!(""))}),
+                        None,
+                        None,
+                    ));
                 }
                 Some("thinking_delta") => {
                     if let Some(text) = d.get("thinking").and_then(Value::as_str) {
@@ -491,7 +536,11 @@ pub struct StreamState {
 
 impl StreamState {
     pub fn new() -> Self {
-        Self { finish: "stop".into(), tool_index: -1, ..Default::default() }
+        Self {
+            finish: "stop".into(),
+            tool_index: -1,
+            ..Default::default()
+        }
     }
 
     /// 流结束时把思考内容写入缓存，供下一轮补回。
@@ -502,7 +551,9 @@ impl StreamState {
     fn apply_usage(&mut self, usage: &Value) {
         let input = usage.get("input_tokens").and_then(Value::as_i64);
         let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
-        let cache_write = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
+        let cache_write = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_i64);
         if cache_read.is_some() {
             self.cache_read = cache_read.unwrap_or(0);
         }

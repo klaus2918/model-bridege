@@ -2,7 +2,7 @@
 name = "model-gate"
 version = "2.20.0"
 edition = "2021"
-description = "Model-Gate 代理内核（Rust 实现，保持与 Python 版一致的 HTTP/面板契约）"
+description = "Model-Gate 本地模型网关（Rust 实现）"
 license = "MIT"
 
 [[bin]]
@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "net", "sync"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -29,6 +29,8 @@ percent-encoding = "2"
 tokio-util = { version = "0.7", features = ["io"] }
 async-stream = "0.3"
 arc-swap = "1"
+semver = "1"
+sha2 = "0.10"
 tray-icon = "0.19"
 tracing-appender = "0.2"
 windows-sys = { version = "0.59", features = [
@@ -44,6 +46,11 @@ windows-sys = { version = "0.59", features = [
 [build-dependencies]
 winres = "0.1"
 png = "0.17"
+
+[dev-dependencies]
+# tower::util::ServiceExt::oneshot：接口层测试直接调用 router，不起真实端口。
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 opt-level = "z"

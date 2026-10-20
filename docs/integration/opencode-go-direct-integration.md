@@ -139,19 +139,22 @@ id = "mimo-v2.5"
 
 ---
 
-## 五、自检脚本
+## 五、自检方式
 
-`scripts/archive/one-off/opencode_go_direct_check.py`（一次性脚本，已归档）——对直连三要素做端到端自检：
+原一次性直连自检脚本已随 Rust-only 迁移删除；日常排查用 `curl` 对直连三要素做端到端检查：
 
 ```bat
-py -3.11 scripts\archive\one-off\opencode_go_direct_check.py
-:: 可选：--model glm-5.3-flash / --key-env OPENCODE_API_KEY / --env-file <path>
+curl -sS https://opencode.ai/zen/go/v1/models -H "Authorization: Bearer %OPENCODE_API_KEY%"
+curl -sS -X POST https://opencode.ai/zen/go/v1/chat/completions ^
+  -H "Authorization: Bearer %OPENCODE_API_KEY%" ^
+  -H "x-opencode-session: direct-check" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"glm-5.3-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
 ```
 
-日常排查优先用统一入口：`py -3 scripts/doctor.py env`（密钥就位）、
-`py -3 scripts/doctor.py upstream go`（端点连通与密钥有效性）。
+Model-Gate 侧的连通性/密钥诊断以 `data/modelgate.log`、`/health` 与面板「上游探测」为准。
 
-输出示例（2026-10-17 实测）：
+历史输出示例（2026-10-17 实测，原脚本）：
 
 ```
 凭据：len=67（不显示明文）  端点：https://opencode.ai/zen/go/v1
