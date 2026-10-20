@@ -819,6 +819,48 @@ fn record_ex(state: &AppState, up: &Upstream, requested: &str, target: &str, sta
         session: String::new(),
     };
     state.db.record_usage(&rec);
+    log_access(state, &rec, ttft_ms, truncated, paused);
+}
+
+/// 请求调用日志：受 `accessLog` 开关控制，格式对齐 Python 版（模型 -> 上游:目标 状态 耗时 tokens）。
+fn log_access(state: &AppState, rec: &UsageRecord, ttft_ms: i64, truncated: bool, paused: bool) {
+    if !state.cfg().access_log {
+        return;
+    }
+    let mut extra = String::new();
+    if rec.stream {
+        extra.push_str(&format!(" ttft={ttft_ms}ms stream"));
+    }
+    if truncated {
+        extra.push_str(" truncated");
+    }
+    if paused {
+        extra.push_str(" paused");
+    }
+    let route = format!("{} -> {}:{}", rec.requested_model, rec.upstream, rec.upstream_model);
+    match rec.error.as_deref().filter(|err| !err.is_empty()) {
+        Some(err) => tracing::warn!(
+            "{} {} {}ms 失败: {}{}",
+            route, rec.status, rec.duration_ms, brief_text(err, 200), extra
+        ),
+        None if rec.status >= 400 => tracing::warn!(
+            "{} {} {}ms{}",
+            route, rec.status, rec.duration_ms, extra
+        ),
+        None => tracing::info!(
+            "{} {} {}ms{} tokens={}+{}",
+            route, rec.status, rec.duration_ms, extra, rec.prompt_tokens, rec.completion_tokens
+        ),
+    }
+}
+
+/// 日志里的错误摘要：按字符截断，避免上游长 JSON 撑爆日志行。
+fn brief_text(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 pub fn session_id(payload: &Value) -> String {
@@ -1082,6 +1124,7 @@ async fn api_upstreams(State(state): State<Arc<AppState>>) -> impl IntoResponse 
                 "keyConfigured": u.key_configured(),
                 "apiKeyEnv": u.api_key_env,
                 "apiKeyFile": u.api_key_file,
+                "apiKeyAgent": u.api_key_agent,
                 "plan": Value::Null,
                 "planError": Value::Null,
             })
@@ -1219,6 +1262,13 @@ mod tests {
             let cache = rt.block_on(state.refresh_models_cache(false));
             assert!(cache.ids.is_empty());
         }
+    }
+
+    #[test]
+    fn brief_text_truncates_by_chars() {
+        assert_eq!(brief_text("abc", 5), "abc");
+        assert_eq!(brief_text("abcdef", 3), "abc…");
+        assert_eq!(brief_text("中文错误", 2), "中文…");
     }
 }
 

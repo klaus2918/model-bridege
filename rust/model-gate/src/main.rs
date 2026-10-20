@@ -142,13 +142,14 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
     let endpoint = format!("http://{}:{}/v1", cfg.host, actual_port);
     let state = Arc::new(AppState::new(cfg, db, config_path));
     let app = proxy::router(state.clone());
-    let server = spawn_server(listener, app, state.clone());
+    // 托盘指标快照：后台每 10 秒查库，主线程只读快照，避免阻塞消息循环。
+    let today_snapshot = Arc::new(std::sync::Mutex::new(state.db.today_stats()));
+    let server = spawn_server(listener, app, state.clone(), today_snapshot.clone());
 
     if args.no_gui {
         let _ = server.join();
         return Ok(());
     }
-    let title = format!("Model-Gate v{}", env!("CARGO_PKG_VERSION"));
     let data_dir = db_path
         .parent()
         .map(|p| p.display().to_string())
@@ -158,7 +159,6 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
         url: url.clone(),
         endpoint,
         data_dir,
-        title,
         open_on_start,
     };
     let tray_state = state.clone();
@@ -173,7 +173,14 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
             tracing::info!("模型目录已刷新（{} 个模型）", cache.ids.len());
         });
     });
-    match gui::run(options, refresh_models) {
+    let stats_slot = today_snapshot.clone();
+    let today_stats = Box::new(move || {
+        stats_slot
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or(serde_json::Value::Null)
+    });
+    match gui::run(options, refresh_models, today_stats) {
         Ok(()) => {
             // 托盘「退出」：关闭托盘后直接结束进程
             std::process::exit(0);
@@ -204,7 +211,8 @@ fn bind_with_fallback(host: &str, port: u16) -> anyhow::Result<(std::net::TcpLis
 }
 
 fn spawn_server(listener: std::net::TcpListener, app: axum::Router,
-                state: Arc<AppState>) -> std::thread::JoinHandle<()> {
+                state: Arc<AppState>,
+                today_snapshot: Arc<std::sync::Mutex<serde_json::Value>>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -215,6 +223,23 @@ fn spawn_server(listener: std::net::TcpListener, app: axum::Router,
         };
         // 托盘菜单需要跨线程触发异步刷新：把运行时句柄登记到共享状态。
         let _ = state.runtime.set(runtime.handle().clone());
+        // 今日指标：后台任务查库写快照，托盘定时器只读快照。
+        let stats_db = state.db.clone();
+        let stats_slot = today_snapshot.clone();
+        runtime.spawn(async move {
+            loop {
+                let db = stats_db.clone();
+                let value = tokio::task::spawn_blocking(move || db.today_stats())
+                    .await
+                    .unwrap_or(serde_json::Value::Null);
+                if !value.is_null() {
+                    if let Ok(mut slot) = stats_slot.lock() {
+                        *slot = value;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
         runtime.block_on(async move {
             let listener = match tokio::net::TcpListener::from_std(listener) {
                 Ok(l) => l,
@@ -238,6 +263,7 @@ fn init_logging(db_path: &std::path::Path) {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let _ = std::fs::create_dir_all(&dir);
+    rotate_log_if_needed(&dir);
     let appender = tracing_appender::rolling::never(&dir, "modelgate.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,hyper=warn".into());
@@ -248,6 +274,32 @@ fn init_logging(db_path: &std::path::Path) {
         .try_init();
     // guard 必须活到进程结束，否则后台日志线程会被提前回收。
     std::mem::forget(guard);
+}
+
+/// 单文件日志上限：超过即轮转，避免请求调用日志长期运行后无限增长。
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+/// 轮转保留的备份份数（modelgate.log.1 ~ .3）。
+const LOG_KEEP: u32 = 3;
+
+/// 启动时按大小轮转 `modelgate.log`：log → .1 → .2 → .3，超出保留份数的最旧文件丢弃。
+fn rotate_log_if_needed(dir: &std::path::Path) {
+    let path = dir.join("modelgate.log");
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    if meta.len() <= LOG_MAX_BYTES {
+        return;
+    }
+    for i in (1..LOG_KEEP).rev() {
+        let from = dir.join(format!("modelgate.log.{i}"));
+        let to = dir.join(format!("modelgate.log.{}", i + 1));
+        if from.is_file() {
+            let _ = std::fs::remove_file(&to);
+            let _ = std::fs::rename(&from, &to);
+        }
+    }
+    let _ = std::fs::remove_file(dir.join("modelgate.log.1"));
+    let _ = std::fs::rename(&path, dir.join("modelgate.log.1"));
 }
 
 /// 单实例：以数据库路径哈希命名互斥体（与 Python 版「同一数据目录只允许一个实例」一致）。

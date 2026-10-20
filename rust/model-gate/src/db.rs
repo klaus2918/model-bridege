@@ -284,6 +284,38 @@ impl Db {
         }))
     }
 
+    /// 今日（本地日期）请求数与缓存命中率，供托盘轻量刷新。
+    pub fn today_stats(&self) -> Value {
+        let conn = self.reader();
+        let row = conn.query_row(
+            "SELECT COUNT(*) AS requests,
+                    COALESCE(SUM(CASE WHEN status IS NULL OR status < 400 THEN 1 ELSE 0 END),0) AS ok,
+                    COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
+                    COALESCE(SUM(prompt_tokens),0) AS prompt_tokens
+             FROM usage_records
+             WHERE substr(created_at,1,10) = date('now','localtime')",
+            [],
+            |row| {
+                let requests: i64 = row.get(0)?;
+                let ok: i64 = row.get(1)?;
+                let cache_read: i64 = row.get(2)?;
+                let prompt: i64 = row.get(3)?;
+                Ok(json!({
+                    "requests": requests,
+                    "ok": ok,
+                    "success_rate": if requests > 0 { round4(ok as f64 / requests as f64) } else { 0.0 },
+                    "cache_read_tokens": cache_read,
+                    "prompt_tokens": prompt,
+                    "cache_hit_rate": hit_rate(cache_read, prompt),
+                }))
+            },
+        );
+        row.unwrap_or_else(|_| json!({
+            "requests": 0, "ok": 0, "success_rate": 0.0,
+            "cache_read_tokens": 0, "prompt_tokens": 0, "cache_hit_rate": Value::Null
+        }))
+    }
+
     pub fn summary(&self, f: &Filters, group_by: &str) -> Result<Vec<Value>, String> {
         let bucket = match group_by {
             "day" => "substr(created_at,1,10)",
@@ -583,3 +615,53 @@ fn hit_rate(cache_read: i64, prompt: i64) -> Option<f64> {
 fn round1(v: f64) -> f64 { (v * 10.0).round() / 10.0 }
 fn round4(v: f64) -> f64 { (v * 10_000.0).round() / 10_000.0 }
 fn round6(v: f64) -> f64 { (v * 1_000_000.0).round() / 1_000_000.0 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> Db {
+        let dir = std::env::temp_dir().join(format!("mg-db-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Db::open(&dir.join("modelgate.db")).unwrap()
+    }
+
+    #[test]
+    fn today_stats_counts_requests_and_cache_hit_rate() {
+        let db = temp_db();
+        db.record_usage(&UsageRecord {
+            upstream: "deepseek".into(),
+            requested_model: "m".into(),
+            upstream_model: "m".into(),
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cache_read_tokens: 40,
+            status: 200,
+            ..Default::default()
+        });
+        db.record_usage(&UsageRecord {
+            upstream: "deepseek".into(),
+            requested_model: "m".into(),
+            upstream_model: "m".into(),
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cache_read_tokens: 60,
+            status: 500,
+            ..Default::default()
+        });
+        let stats = db.today_stats();
+        assert_eq!(stats["requests"].as_i64(), Some(2));
+        assert_eq!(stats["ok"].as_i64(), Some(1));
+        assert_eq!(stats["cache_read_tokens"].as_i64(), Some(100));
+        assert_eq!(stats["prompt_tokens"].as_i64(), Some(200));
+        assert_eq!(stats["cache_hit_rate"].as_f64(), Some(0.5));
+    }
+
+    #[test]
+    fn today_stats_hit_rate_is_null_without_prompt_tokens() {
+        let db = temp_db();
+        let stats = db.today_stats();
+        assert_eq!(stats["requests"].as_i64(), Some(0));
+        assert!(stats["cache_hit_rate"].is_null());
+    }
+}

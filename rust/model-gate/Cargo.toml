@@ -1,6 +1,6 @@
 [package]
 name = "model-gate"
-version = "2.19.0"
+version = "2.20.0"
 edition = "2021"
 description = "Model-Gate 代理内核（Rust 实现，保持与 Python 版一致的 HTTP/面板契约）"
 license = "MIT"

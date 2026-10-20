@@ -841,7 +841,7 @@ function renderUpstreamEditor() {
     const keyConfigured = u._keyConfigured;
     const eff = ((state.effective || []).find((row) => row.name === name)) || null;
     const keyWarn = keyConfigured ? "" :
-      `<div class="hint" style="color:var(--warn)">未配置密钥：上游会返回 401，请在下方填写 apiKey（或设置 apiKeyEnv）</div>`;
+      `<div class="hint" style="color:var(--warn)">未配置密钥：上游会返回 401，请在下方填写 apiKey（或设置 apiKeyEnv / agent 来源）</div>`;
     return `
     <div class="up-card" data-name="${esc(name)}" data-index="${index}" data-key-configured="${keyConfigured ? 1 : 0}">
       <div class="up-head">
@@ -858,7 +858,8 @@ function renderUpstreamEditor() {
       <details class="up-fields" data-up-fields="${esc(name)}">
       <summary>
         <span class="up-preview">${esc(u.protocol || "anthropic")} · ${esc(u.baseUrl || "未填 Base URL")} · ${
-          (u.models || []).length} 个模型${u.apiKeyEnv ? ` · 密钥变量 ${esc(u.apiKeyEnv)}` : ""}</span>
+          (u.models || []).length} 个模型${u.apiKeyEnv ? ` · 密钥变量 ${esc(u.apiKeyEnv)}` : ""}${
+          u.apiKeyAgent ? ` · agent 来源 ${esc(u.apiKeyAgent)}` : ""}</span>
         <button type="button" class="ghost" data-act="edit">编辑</button>
       </summary>
       <div class="grid">
@@ -885,6 +886,20 @@ function renderUpstreamEditor() {
         <label>密钥环境变量（apiKeyEnv）
           <input type="text" data-field="apiKeyEnv" value="${esc(u.apiKeyEnv || "")}" placeholder="COMMAND_CODE_API_KEY">
         </label>
+        <label>密钥来源（agent 工具）
+          <select data-field="apiKeyAgent">
+            ${[["", "不启用"], ["opencode", "opencode (auth.json)"], ["jcode", "jcode (.env)"],
+               ["commandcode", "CommandCode (auth.json)"], ["custom", "自定义文件"]]
+              .map(([v, label]) => `<option value="${v}"${(u.apiKeyAgent || "") === v ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <label>agent Provider / 变量名
+          <input type="text" data-field="apiKeyAgentProvider" value="${esc(u.apiKeyAgentProvider || "")}" placeholder="opencode 填 provider；jcode/自定义填变量名">
+        </label>
+        <label class="span-2">agent 凭据路径（可选）
+          <input type="text" data-field="apiKeyAgentPath" value="${esc(u.apiKeyAgentPath || "")}" placeholder="留空使用默认路径；custom 时必填，如 ~/.codex/auth.json">
+        </label>
+        <div class="span-2 hint">只读本机客户端凭据；优先级低于 apiKeyEnv / apiKeyFile，高于明文 apiKey。</div>
         <label class="span-2">模型清单（每行一个，也是路由依据）
           <textarea data-field="models" rows="3">${esc((u.models || []).join("\n"))}</textarea>
         </label>
@@ -1079,6 +1094,14 @@ const _readUpstreamEditor = () => {
     else if (old.apiKey !== undefined) entry.apiKey = old.apiKey;
     const env = get("apiKeyEnv").value.trim();
     if (env) entry.apiKeyEnv = env; else delete entry.apiKeyEnv;
+    const agent = get("apiKeyAgent").value;
+    if (agent) entry.apiKeyAgent = agent; else delete entry.apiKeyAgent;
+    const agentProvider = get("apiKeyAgentProvider").value.trim();
+    if (agent && agentProvider) entry.apiKeyAgentProvider = agentProvider;
+    else delete entry.apiKeyAgentProvider;
+    const agentPath = get("apiKeyAgentPath").value.trim();
+    if (agent && agentPath) entry.apiKeyAgentPath = agentPath;
+    else delete entry.apiKeyAgentPath;
     const ccBox = (f) => {
       const el = cardEl.querySelector(`[data-field="${f}"]`);
       return el ? el.checked : undefined;

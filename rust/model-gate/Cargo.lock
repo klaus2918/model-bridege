@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "model-gate"
-version = "2.19.0"
+version = "2.20.0"
 dependencies = [
  "anyhow",
  "arc-swap",

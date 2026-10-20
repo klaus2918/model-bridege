@@ -3,7 +3,7 @@
 //! 面板仍是同一份 `modelgate/web/`，宿主从 pywebview/wry 换成系统默认浏览器；
 //! 本进程只保留托盘、剪贴板、Shell 打开等轻量交互。
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tray_icon::{TrayIconBuilder, TrayIconEvent};
+use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::GlobalFree;
@@ -17,8 +17,8 @@ use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, 
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MessageBoxW, PostQuitMessage, TranslateMessage, MB_ICONERROR,
-    MB_OK, MB_SETFOREGROUND, MSG, SW_SHOWNORMAL,
+    DispatchMessageW, GetMessageW, KillTimer, MessageBoxW, PostQuitMessage, SetTimer,
+    TranslateMessage, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG, SW_SHOWNORMAL, WM_TIMER,
 };
 
 #[cfg(windows)]
@@ -35,15 +35,15 @@ pub struct ShellOptions {
     pub endpoint: String,
     /// 数据目录（SQLite/日志所在目录）。
     pub data_dir: String,
-    /// 托盘 tooltip 标题。
-    pub title: String,
     /// 是否在托盘就绪后自动打开面板（首次运行或 --open）。
     pub open_on_start: bool,
 }
 
-/// 启动托盘壳并阻塞在主线程消息循环；`refresh_models` 由「刷新模型目录」菜单触发。
+/// 启动托盘壳并阻塞在主线程消息循环；`refresh_models` 由「刷新模型目录」菜单触发，
+/// `today_stats` 每分钟刷新托盘指标（tooltip + 只读菜单项）。
 #[cfg(windows)]
-pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>) -> anyhow::Result<()> {
+pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>,
+           today_stats: Box<dyn Fn() -> serde_json::Value>) -> anyhow::Result<()> {
     let icon = tray_icon::Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), TRAY_ICON_SIZE, TRAY_ICON_SIZE)?;
 
     let menu = Menu::new();
@@ -51,6 +51,8 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>) -> anyhow::Resu
     let refresh = MenuItem::new("刷新模型目录", true, None);
     let copy = MenuItem::new("复制接入地址", true, None);
     let open_dir = MenuItem::new("打开数据目录", true, None);
+    let today = MenuItem::new("今日请求 —", false, None);
+    let hit = MenuItem::new("缓存命中率 —", false, None);
     let address = MenuItem::new(format!("服务地址 {}", options.endpoint), false, None);
     let quit = MenuItem::new("退出", true, None);
     let _ = menu.append(&open);
@@ -58,13 +60,16 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>) -> anyhow::Resu
     let _ = menu.append(&copy);
     let _ = menu.append(&open_dir);
     let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&today);
+    let _ = menu.append(&hit);
+    let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&address);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&quit);
 
     let tray = match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(format!("{} {}", options.title, options.endpoint))
+        .with_tooltip("今日请求 —\n缓存命中率 —")
         .with_icon(icon)
         .build()
     {
@@ -79,6 +84,13 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>) -> anyhow::Resu
         tracing::warn!("打开面板失败：{}", options.url);
     }
 
+    // 启动即读一次快照，之后每 10 秒刷新（WM_TIMER 投递到本线程消息队列）。
+    apply_tray_stats(&tray, &today, &hit, &today_stats());
+    let timer = unsafe { SetTimer(std::ptr::null_mut(), 1, 10_000, None) };
+    if timer == 0 {
+        tracing::warn!("托盘指标定时器创建失败：只在启动时统计一次");
+    }
+
     let options = std::sync::Arc::new(options);
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     loop {
@@ -89,6 +101,9 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>) -> anyhow::Resu
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        if msg.message == WM_TIMER && msg.wParam == 1 {
+            apply_tray_stats(&tray, &today, &hit, &today_stats());
         }
         let mut should_quit = false;
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
@@ -119,12 +134,38 @@ pub fn run(options: ShellOptions, refresh_models: Box<dyn Fn()>) -> anyhow::Resu
             unsafe { PostQuitMessage(0) };
         }
     }
+    if timer != 0 {
+        unsafe { KillTimer(std::ptr::null_mut(), 1) };
+    }
     drop(tray);
     Ok(())
 }
 
+/// 把今日统计写入托盘 tooltip 与菜单只读项（命中率无样本时显示「—」）。
+#[cfg(windows)]
+fn apply_tray_stats(tray: &TrayIcon, today: &MenuItem, hit: &MenuItem,
+                    stats: &serde_json::Value) {
+    let requests = stats
+        .get("requests")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let rate = stats
+        .get("cache_hit_rate")
+        .and_then(serde_json::Value::as_f64);
+    let rate_text = match rate {
+        Some(rate) => format!("{:.1}%", rate * 100.0),
+        None => "—".to_string(),
+    };
+    today.set_text(format!("今日请求 {requests}"));
+    hit.set_text(format!("缓存命中率 {rate_text}"));
+    let _ = tray.set_tooltip(Some(format!(
+        "今日请求 {requests}\n缓存命中率 {rate_text}"
+    )));
+}
+
 #[cfg(not(windows))]
-pub fn run(_options: ShellOptions, _refresh_models: Box<dyn Fn()>) -> anyhow::Result<()> {
+pub fn run(_options: ShellOptions, _refresh_models: Box<dyn Fn()>,
+           _today_stats: Box<dyn Fn() -> serde_json::Value>) -> anyhow::Result<()> {
     anyhow::bail!("桌面壳仅支持 Windows")
 }
 

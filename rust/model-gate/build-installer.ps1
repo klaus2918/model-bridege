@@ -1,10 +1,10 @@
 # Build the Inno Setup installer (Rust kernel).
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1
-#   powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1 -Version 2.19.0
+#   powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1 -Version 2.20.0
 # Prerequisite: Inno Setup 6+ (ISCC.exe in PATH, or the default install dirs).
 param(
-    [string]$Version = "2.19.0",
+    [string]$Version = "2.20.0",
     [string]$SourceExe = "",
     [string]$OutputName = ""
 )
