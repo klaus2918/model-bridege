@@ -34,7 +34,10 @@ async fn report_release_and_runs() {
     let body: serde_json::Value = resp.json().await.expect("release json");
     println!("tag_name    = {}", body["tag_name"].as_str().unwrap_or("?"));
     println!("name        = {}", body["name"].as_str().unwrap_or("?"));
-    println!("published   = {}", body["published_at"].as_str().unwrap_or("?"));
+    println!(
+        "published   = {}",
+        body["published_at"].as_str().unwrap_or("?")
+    );
     println!("html_url    = {}", body["html_url"].as_str().unwrap_or("?"));
     println!("assets:");
     if let Some(assets) = body["assets"].as_array() {

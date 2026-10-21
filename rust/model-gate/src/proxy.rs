@@ -1943,7 +1943,9 @@ mod tests {
     fn query_upstream_models_dedupes_many_items_quickly() {
         // 全部重复的 id：若去重用 Vec::contains，这里会退化成 O(n²)。
         let count = 20_000;
-        let items: Vec<String> = (0..count).map(|_| "{\"id\":\"same\"}".to_string()).collect();
+        let items: Vec<String> = (0..count)
+            .map(|_| "{\"id\":\"same\"}".to_string())
+            .collect();
         let body = format!(r#"{{"data":[{}]}}"#, items.join(","));
         let url = spawn_models_server(Box::leak(body.into_boxed_str()), 1);
         let state = state_with_upstream(&url, false, true);

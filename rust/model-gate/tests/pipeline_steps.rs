@@ -74,7 +74,9 @@ async fn report_run_steps() {
                         "    step {} | {} | {}",
                         s["number"].as_u64().unwrap_or(0),
                         s["name"].as_str().unwrap_or("?"),
-                        s["conclusion"].as_str().unwrap_or(s["status"].as_str().unwrap_or("-"))
+                        s["conclusion"]
+                            .as_str()
+                            .unwrap_or(s["status"].as_str().unwrap_or("-"))
                     );
                 }
             }
