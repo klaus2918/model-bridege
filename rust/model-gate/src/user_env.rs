@@ -203,6 +203,7 @@ mod imp {
     }
 
     /// 删除用户变量（测试清理与显式撤销写入）。
+    #[allow(dead_code)] // 预留：面板「撤销写入」接入后才有生产调用方
     pub(super) fn delete_user_var_impl(name: &str) -> Result<(), String> {
         use windows_sys::Win32::System::Registry::RegDeleteValueW;
         let handle = open_environment_key(true)?;
@@ -251,6 +252,7 @@ mod imp {
         Err("当前平台不支持用户级环境变量写入".to_string())
     }
 
+    #[allow(dead_code)] // 预留：面板「撤销写入」接入后才有生产调用方
     pub(super) fn delete_user_var_impl(_name: &str) -> Result<(), String> {
         Err("当前平台不支持用户级环境变量删除".to_string())
     }
@@ -266,6 +268,7 @@ pub fn notify_environment_changed() {
 /// 删除用户级环境变量（供测试清理与「撤销写入」使用）。
 ///
 /// 不属于常规流程：密钥轮换场景下覆盖写即可，删除是显式动作。
+#[allow(dead_code)] // 预留：面板「撤销写入」接入后才有生产调用方
 pub fn delete_user_var(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("环境变量名不能为空".to_string());
