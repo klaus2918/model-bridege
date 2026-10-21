@@ -43,6 +43,12 @@ pub struct ModelQueryError {
     pub kind: &'static str,
 }
 
+/// 单次查询返回的模型条数上限。
+///
+/// 上游清单可达数百上千条（OpenRouter 级别过万），全量返回会让响应体
+/// 与内存无谓膨胀。超出部分截断，面板仍可看到足够多候选。
+pub const MODEL_QUERY_MAX_ITEMS: usize = 2000;
+
 pub struct AppState {
     pub cfg: ArcSwap<Config>,
     pub db: Arc<Db>,
@@ -273,6 +279,9 @@ impl AppState {
             .cloned()
             .unwrap_or_default();
         let mut out: Vec<String> = Vec::new();
+        // 去重用 HashSet：线性复杂度。上游清单可达数百上千条，
+        // 用 Vec::contains 做去重会退化成 O(n²) 次字符串比较。
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for item in &items {
             if !item.is_object() {
                 continue;
@@ -285,9 +294,13 @@ impl AppState {
                 .map(str::to_string);
             // 去重并保持上游返回顺序。
             if let Some(ident) = ident {
-                if !ident.is_empty() && !out.iter().any(|existing| existing == &ident) {
+                if !ident.is_empty() && seen.insert(ident.clone()) {
                     out.push(ident);
                 }
+            }
+            // 上限保护：超大清单不让内存与响应体无限膨胀。
+            if out.len() >= MODEL_QUERY_MAX_ITEMS {
+                break;
             }
         }
         Ok(out)
@@ -1906,6 +1919,45 @@ mod tests {
             .block_on(state.query_upstream_models(&upstream, 5.0))
             .unwrap();
         assert_eq!(models, vec!["a", "b", "c"]);
+    }
+
+    /// 超大清单会被截断到上限（防止响应体与内存无谓膨胀）。
+    #[test]
+    fn query_upstream_models_truncates_at_max_items() {
+        let count = MODEL_QUERY_MAX_ITEMS + 50;
+        let items: Vec<String> = (0..count).map(|i| format!("{{\"id\":\"m{i}\"}}")).collect();
+        let body = format!(r#"{{"data":[{}]}}"#, items.join(","));
+        let url = spawn_models_server(Box::leak(body.into_boxed_str()), 1);
+        let state = state_with_upstream(&url, false, true);
+        let upstream = state.cfg().upstream("u").cloned().unwrap();
+        let models = rt()
+            .block_on(state.query_upstream_models(&upstream, 10.0))
+            .unwrap();
+        assert_eq!(models.len(), MODEL_QUERY_MAX_ITEMS);
+        // 截断保留前 N 条（顺序不变），且首条仍是第一条
+        assert_eq!(models[0], "m0");
+    }
+
+    /// 去重是线性复杂度：清单很大时也不该退化成 O(n²)。
+    #[test]
+    fn query_upstream_models_dedupes_many_items_quickly() {
+        // 全部重复的 id：若去重用 Vec::contains，这里会退化成 O(n²)。
+        let count = 20_000;
+        let items: Vec<String> = (0..count).map(|_| "{\"id\":\"same\"}".to_string()).collect();
+        let body = format!(r#"{{"data":[{}]}}"#, items.join(","));
+        let url = spawn_models_server(Box::leak(body.into_boxed_str()), 1);
+        let state = state_with_upstream(&url, false, true);
+        let upstream = state.cfg().upstream("u").cloned().unwrap();
+        let started = std::time::Instant::now();
+        let models = rt()
+            .block_on(state.query_upstream_models(&upstream, 10.0))
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(models, vec!["same"], "重复 id 应只剩一条");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "去重应为线性复杂度，实际耗时 {elapsed:?}"
+        );
     }
 
     /// 上游返回空清单：这是**成功**，不是错误。
