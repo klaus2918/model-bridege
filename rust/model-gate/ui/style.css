@@ -274,6 +274,25 @@ th.sortable.desc::after { content: "▼"; color: var(--brand); }
 .bar-seg > i.out, .bar-stack > i.out { background: var(--out); }
 .bar-seg > i.cache, .bar-stack > i.cache { background: var(--cache); }
 .bars { display: flex; flex-direction: column; gap: 7px; margin-bottom: 12px; }
+/* 健康探测结果条：每行一张紧凑卡，头行左右分列 */
+.bar-row {
+  display: grid; gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.bar-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px;
+}
+.bar-head .label {
+  flex: 1 1 auto; min-width: 0;
+  font-family: var(--mono); font-size: 12px; color: var(--text);
+  overflow-wrap: anywhere;
+}
+.bar-head .val {
+  flex: none; display: inline-flex; align-items: center; gap: 6px;
+  color: var(--text-3); font-size: 11.5px;
+}
 .legend { display: flex; flex-direction: column; gap: 7px; }
 .legend-row { display: flex; flex-direction: column; gap: 4px; }
 .legend-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
@@ -318,6 +337,10 @@ code.ep { font-family: var(--mono); color: var(--data); }
 .up-card .up-name { font-family: var(--mono); font-weight: 600; font-size: 12.5px; }
 .up-card .up-sub { color: var(--text-3); font-size: 11.5px; }
 .up-card .row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.up-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.up-head .name { font-family: var(--mono); font-weight: 600; font-size: 12.5px; }
+.up-head .spacer { flex: 1 1 auto; }
+.up-actions { display: flex; align-items: center; gap: 6px; }
 .key-row { display: flex; gap: 6px; align-items: center; }
 .key-row input { flex: 1 1 auto; min-width: 0; }
 .key-row button { white-space: nowrap; }
@@ -397,6 +420,10 @@ tr.usage-row { cursor: pointer; }
 tr.usage-row:hover, tr.usage-row.open { background: var(--surface-2); }
 tr.usage-row.open td { border-bottom-color: transparent; }
 tr.usage-row.row-bad td:first-child { box-shadow: inset 2px 0 0 var(--danger); }
+/* 上游表格行内的「测试 / 重测」：跟行高一致的小号按钮
+   注意 button.ghost 的 padding/font-size 优先级更高，必须叠加同类选择器才生效 */
+button.ghost.btn-test-up { padding: 2px 8px; font-size: 11.5px; line-height: 1.6; white-space: nowrap; }
+.badge + .btn-test-up { margin-left: 4px; }
 .mono.slow { color: var(--warn); }
 
 tr.detail-row > td { padding: 0 12px 12px; background: var(--surface-2); }
@@ -732,6 +759,11 @@ details.fold > .actions.sticky-actions { padding: 10px 0 6px; }
   border-color: var(--brand-line);
   background: var(--brand-soft);
 }
+/* 更新弹窗正文容器：各段（meta/进度/说明/动作）等距纵排；
+   子元素原有 margin 会叠加到 gap 上，这里统一归零保证节奏一致 */
+.update-modal { display: grid; gap: 10px; }
+/* 提高一级权重：.update-status / .update-actions 定义在本规则之后且带 margin */
+.modal-body .update-modal > * { margin-top: 0; margin-bottom: 0; }
 .update-meta {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
