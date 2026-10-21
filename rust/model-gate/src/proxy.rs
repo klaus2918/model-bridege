@@ -139,6 +139,11 @@ impl AppState {
     ///
     /// 通用约定：`GET {baseUrl}{compat.endpoint.models}`（默认 `/v1/models`），
     /// 解析 `data` / `models` 数组里的 `id` / `slug` / `model`。
+    ///
+    /// **transport 感知**：`transport=opencode` 的上游（OpenCode Zen 免费层）
+    /// 目录端点同样只对官方客户端开放——裸请求会被拒（实测 401）。
+    /// 因此这类上游必须走与 chat 相同的两件事：路径重写（`/zen/...` → `/inference/...`）
+    /// 与客户端指纹头。缺任何一样，查询清单就会失败。
     pub async fn query_upstream_models(
         &self,
         up: &Upstream,
@@ -174,11 +179,26 @@ impl AppState {
                 _ => insert_header(&mut headers, "authorization", &bearer),
             }
         }
-        let url = format!(
+        let is_opencode = up.transport == "opencode";
+        if is_opencode {
+            // 与 chat 路径完全一致：客户端指纹（匿名 key + UA + 会话/请求 ID）。
+            let session = crate::opencode_transport::session_for(
+                &crate::opencode_transport::session_seed(&json!({
+                    "model": "",
+                    "messages": [],
+                })),
+            );
+            crate::opencode_transport::apply_headers(&mut headers, &session);
+        }
+        let mut url = format!(
             "{}{}",
             up.base_url.trim_end_matches('/'),
             up.compat.models_path
         );
+        if is_opencode {
+            // `/zen/...` → `/inference/...`（go 订阅路径不改写）。
+            url = crate::opencode_transport::rewrite_free_url(&url);
+        }
         let response = self
             .client
             .get(&url)
@@ -211,13 +231,27 @@ impl AppState {
         if !response.status().is_success() {
             return Err(ModelQueryError {
                 message: format!("上游返回 HTTP {status}"),
-                hint: match status {
-                    401 | 403 => "检查 apiKey / apiKeyEnv / agent 密钥来源".to_string(),
-                    404 => {
-                        "检查 compat.endpoint.models 路径是否正确（默认 /v1/models）".to_string()
+                hint: if is_opencode {
+                    // transport=opencode 的上游不需要 apiKey：401/403 通常是
+                    // 客户端指纹缺失或免费层契约变更，不是"没配密钥"。
+                    match status {
+                        401 | 403 => "该上游使用 transport=opencode（免密层）：不填 apiKey，\
+                             请确认客户端指纹头未被自定义头覆盖"
+                            .to_string(),
+                        404 => "该上游使用 transport=opencode：目录路径应自动改写为 \
+                             /inference/v1/models；请确认 compat.endpoint.models 路径"
+                            .to_string(),
+                        _ => "该上游使用 transport=opencode（免密层）：检查客户端指纹与网络"
+                            .to_string(),
                     }
-                    429 => "上游限流，请稍后重试".to_string(),
-                    _ => "检查 apiKey / baseUrl / 网络".to_string(),
+                } else {
+                    match status {
+                        401 | 403 => "检查 apiKey / apiKeyEnv / agent 密钥来源".to_string(),
+                        404 => "检查 compat.endpoint.models 路径是否正确（默认 /v1/models）"
+                            .to_string(),
+                        429 => "上游限流，请稍后重试".to_string(),
+                        _ => "检查 apiKey / baseUrl / 网络".to_string(),
+                    }
                 },
                 kind: "http",
             });

@@ -107,7 +107,15 @@ pub async fn free_sources(State(state): State<Arc<AppState>>) -> Response {
 /// Zen 免密层的 `/models` 同样需要客户端指纹与匿名 key（实测：裸请求拿不到可用目录），
 /// 因此走 `transport=opencode` 的来源必须带上同样的头，不能只对 chat 请求带。
 async fn fetch_catalog(source: &fs::FreeSource) -> Result<Vec<(String, Value)>, String> {
-    let url = format!("{}{}", source.normalized_base_url(), source.catalog_path);
+    let raw_url = format!("{}{}", source.normalized_base_url(), source.catalog_path);
+    // 与 chat 路径保持一致：`transport=opencode` 的来源要把 `/zen/...` 改写成
+    // `/inference/...`（OpenCode 免密层自 2026-10-14 起迁到新端点；
+    // 仍打旧端点会拿到 404）。
+    let url = if source.transport == "opencode" {
+        opencode::rewrite_free_url(&raw_url)
+    } else {
+        raw_url
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
