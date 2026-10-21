@@ -1,6 +1,6 @@
 {
-  "_doc": "Model-Gate 配置模板。复制为 bridge.config.json 后按需修改；切勿把明文 apiKey 写进本文件——请用 apiKeyEnv 或 apiKeyFile 引用。",
-  "_keys": "密钥三选一：apiKey（明文，不推荐）/ apiKeyEnv（环境变量名，密钥放 ~/.jcode/.env）/ apiKeyFile（本地 JSON 的 apiKey 字段，如 ~/.commandcode/auth.json）。工具只读不写这些文件。",
+  "_doc": "Model-Gate 配置模板。复制为 bridge.config.json 后按需修改；切勿把明文 apiKey 写进本文件——请用 apiKeyEnv 引用环境变量。",
+  "_keys": "密钥只从环境变量或你显式指定的凭据文件读取：apiKeyEnv 指定变量名，值由面板「写入密钥」写入（目标二选一：写入用户环境变量 → HKCU\\Environment；写入你手动指定的文件 → 该文件路径），也可由外部进程注入；JSON 里的明文 apiKey 会被忽略并给出迁移提示。apiKeyFile / apiKeyAgentPath 仅在你自己显式填写路径时读取（无内置默认路径），本文件只保存路径引用，不保存密钥。",
   "_models": "各上游的 models 是该上游可用模型的声明（也是按名路由的依据）。可以在面板上点「查询清单」按上游拉取并勾选写入，不用手打：面板按 OpenAI 兼容约定拉 GET {baseUrl}/v1/models（路径可用 compat.endpoint.models 改）。",
   "_freeSources": "免费来源：zen 与 kilo 两条免密通道，无需账号与 API Key（zen 用匿名 Bearer public + 客户端指纹，kilo 完全不发送鉴权头）。面板「免费来源」页可一键接入与实测可用性。注意：免费模型只登记在各自上游的 models 里，不会自动进入顶层 models（顶层 models 非空时全局清单只按白名单展示）——需要对外暴露时在模型卡上点「加入全局清单」。",
   "port": 8900,
@@ -72,7 +72,6 @@
       "protocol": "commandcode",
       "baseUrl": "https://api.commandcode.ai",
       "apiKeyEnv": "COMMAND_CODE_API_KEY",
-      "apiKeyFile": "~/.commandcode/auth.json",
       "cliVersion": "auto",
       "cliEnvironment": "production",
       "modelCatalog": "auto",
@@ -101,7 +100,6 @@
       "baseUrl": "https://api.kilo.ai/api/openrouter",
       "fetchModels": true,
       "autoModels": false,
-      "sessionHeader": false,
       "default": false,
       "compat": {
         "auth": {
@@ -110,6 +108,17 @@
         "endpoint": {
           "chat": "/v1/chat/completions",
           "models": "/v1/models"
+        },
+        "session": {
+          "header": "x-kilocode-taskid",
+          "idStyle": "sess16"
+        },
+        "headers": {
+          "HTTP-Referer": "https://kilocode.ai",
+          "X-Title": "Kilo Code",
+          "User-Agent": "opencode-kilo-provider/7.8.15",
+          "X-KILOCODE-EDITORNAME": "Kilo CLI 7.8.15",
+          "x-kilocode-mode": "code"
         }
       },
       "models": [

@@ -123,6 +123,38 @@ fn backup_endpoints_are_registered() {
     );
 }
 
+/// 「从文件重载」的后端语义：重读磁盘的 bridge.config.json 并覆盖运行态。
+///
+/// 这与「放弃改动」方向相反（后者只把表单恢复成运行态，不碰磁盘）。
+/// 面板靠这个差异给用户两个不同的出口，后端语义一旦被改成「读运行态」，
+/// 手工编辑配置文件后就没法让它立即生效（必须重启进程）。
+#[test]
+fn reload_from_file_reads_disk_not_runtime() {
+    let source = fs::read_to_string(crate_root().join("src/proxy.rs")).expect("read src/proxy.rs");
+    let start = source
+        .find("async fn api_config_reload")
+        .expect("找不到 api_config_reload");
+    let body = &source[start..];
+    let end = body
+        .find("\nasync fn ")
+        .or_else(|| body.find("\npub "))
+        .unwrap_or(body.len());
+    let fn_body = &body[..end];
+
+    assert!(
+        fn_body.contains("Config::load(&state.config_path)"),
+        "「从文件重载」必须从磁盘重读配置文件（Config::load(&state.config_path)）"
+    );
+    assert!(
+        fn_body.contains("replace_config"),
+        "「从文件重载」必须把磁盘内容应用到运行态（replace_config）"
+    );
+    assert!(
+        !fn_body.contains("state.cfg().clone()"),
+        "「从文件重载」不得只回显当前运行态 —— 那会与「放弃改动」无区别"
+    );
+}
+
 #[test]
 fn config_endpoints_are_registered() {
     let routes = rust_routes();
@@ -161,6 +193,33 @@ fn panel_backup_controls_exist_in_html() {
     assert!(
         html.contains("从文件重载"),
         "配置页底部按钮应为「从文件重载」（原名「重新载入」与其实际行为相反）"
+    );
+}
+
+/// 「从文件重载」必须先确认再覆盖，否则面板上未保存的改动会被静默丢弃。
+///
+/// 背景（config-as-json）：「从文件重载」= 重读磁盘的 bridge.config.json 并覆盖运行态。
+/// 面板上有未保存改动时点它，改动会**静默消失**且无任何提示 —— 实测确认过这个缺陷。
+/// 修复是加确认框；本守卫钉死它不被回退。
+#[test]
+fn reload_from_file_guards_unsaved_edits() {
+    let js = fs::read_to_string(ui_dir().join("app.js")).expect("read ui/app.js");
+    assert!(
+        js.contains("state.configDirty"),
+        "面板未跟踪未保存改动状态 —— 「从文件重载」无法判断是否要先确认"
+    );
+    assert!(
+        js.contains("放弃改动并重载"),
+        "「从文件重载」缺少确认文案 —— 未保存的改动会被静默覆盖"
+    );
+    assert!(
+        js.contains("这些未保存的改动会丢失"),
+        "确认框必须说明未保存改动会丢失，否则用户无法判断风险"
+    );
+    // 旧名不应复活：它与实际行为相反（听像重读面板，实为重读磁盘覆盖运行态）。
+    assert!(
+        !js.contains("已重新载入配置"),
+        "旧提示「已重新载入配置」不应存在（与「从文件重载」语义混淆）"
     );
 }
 

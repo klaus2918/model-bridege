@@ -9,10 +9,12 @@
 > 下载 `Model-Gate-v<版本>-rust-setup.exe` 并校验 `SHA256SUMS` 后静默覆盖升级；
 > 便携版只提示手动运行安装包。启动时后台检查每 24 小时最多一次，只提示、不自动下载。
 >
-> **密钥安全**：桌面包会把**非空明文 `apiKey` 拦在内存里**，不写入 `bridge.config.json`
-> 与 SQLite。要长期使用请用 `apiKeyEnv`（读 `~/.jcode/.env`）或 `apiKeyFile`
-> （读 `~/.commandcode/auth.json`）；分享配置用 `bridge.config.example.json`（零明文）。
-> `bridge.config.json` 已在 `.gitignore` 中，不会进版本库。
+> **密钥安全**：密钥只从环境变量或你显式指定的凭据文件读取；JSON 中的明文 `apiKey`
+> 会被忽略并给出迁移提示，不进入运行态、不写入 SQLite。推荐用 `apiKeyEnv` 引用环境变量：
+> 面板「写入密钥」可选**写入用户环境变量**（Windows 用户变量 `HKCU\Environment`，读取时进程环境优先）
+> 或**写入你手动指定的文件**（JSON / `.env`，只写你填的那个路径，配置文件里仅存路径引用）。
+> **不再内置**任何厂商客户端凭据路径。`apiKeyFile` / `apiKeyAgentPath` 仅在你自己显式填写路径时读取。
+> 分享配置用 `bridge.config.example.json`（零明文）。`bridge.config.json` 已在 `.gitignore` 中，不会进版本库。
 
 一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**四条上游**，并自动处理各上游的协议差异。
 
@@ -308,9 +310,10 @@ set OPENAI_API_KEY=any-key
 
 - **协议**：CommandCode 是私有接口（`POST /alpha/generate`），既不是 OpenAI 也不是 Anthropic。
   本桥在内部把 OpenAI 请求翻译过去、再把它的 **NDJSON 事件流**翻译回 OpenAI 流，**Agent 侧无感**。
-- **凭据**：桥按 CommandCode 自己的顺序取 key——先 `COMMAND_CODE_API_KEY` 环境变量，
-  再本机 `~/.commandcode/auth.json` 的 `apiKey`。所以**只要本机 `cmd` 登录过就能直接跑**，无需额外配置；
-  两处都没有时本地直接返回 401，不会把必然失败的请求打到上游。密钥只驻内存，不落盘、不进日志。
+- **凭据**：桥只从环境变量取 key——`COMMAND_CODE_API_KEY`（进程环境优先，其次面板写入的
+  Windows 用户变量 `HKCU\Environment`）。没有该变量时本地直接返回 401，不会把必然失败的请求打到上游。
+  旧配置里的 `apiKeyFile` 仍可在你**显式填写路径**时使用，但不再内置任何厂商客户端凭据路径。
+  密钥只驻内存，不落盘、不进日志。
 - **版本头**：`x-command-code-version` 是服务端硬门槛（缺失或过旧 → 403 `upgrade_required`）。
   桥默认读本机已安装的 command-code 版本，读不到则退回 npm registry（30 分钟缓存），
   也可用 `cliVersion` 固定一个值。
@@ -333,7 +336,6 @@ set OPENAI_API_KEY=any-key
   "protocol": "commandcode",
   "baseUrl": "https://api.commandcode.ai",
   "apiKeyEnv": "COMMAND_CODE_API_KEY",
-  "apiKeyFile": "~/.commandcode/auth.json",
   "cliVersion": "auto",
   "cliEnvironment": "production",
   "modelCatalog": "auto",
@@ -399,7 +401,7 @@ curl http://127.0.0.1:8900/go/v1/chat/completions -H "Content-Type: application/
 
 - **Zen 免费模型有限流**：用多了返回 `429 FreeUsageLimitError`，稍等恢复。上游配额策略，非本工具问题
 - **Go 的密钥**：配置里是 `apiKeyEnv: OPENCODE_API_KEY`，但 2026-10-08 实测没配也能调通（见第十二节）
-- **CommandCode 需要本机已登录**：凭据按 `COMMAND_CODE_API_KEY` → `~/.commandcode/auth.json` 的顺序取，两处都没有时**本地直接 401**（不打上游）
+- **CommandCode 需要环境变量里的密钥**：只读取 `COMMAND_CODE_API_KEY`（进程环境优先，其次面板写入的用户变量）；没有时**本地直接 401**（不打上游）
 - **CommandCode 版本头是硬门槛**：`x-command-code-version` 缺失或过旧会 `403 upgrade_required`；桥默认自动读本机 CLI 版本（见第五节）
 - **CommandCode 套餐外模型**：清单启动时按套餐过滤一次，超出套餐的模型仍可直呼，但会得到终态 `403 MODEL_NOT_IN_PLAN`（不重试）；换套餐后需重启桥刷新清单
 
@@ -462,7 +464,7 @@ curl http://127.0.0.1:8900/v1/models
     "cch": {
       "protocol": "anthropic",
       "baseUrl": "http://127.0.0.1:15721",
-      "apiKey": "",
+      "compat": { "auth": { "scheme": "none" } },
       "anthropicVersion": "2023-06-01",
       "default": true,
       "fetchModels": false,
@@ -488,7 +490,6 @@ curl http://127.0.0.1:8900/v1/models
       "protocol": "commandcode",
       "baseUrl": "https://api.commandcode.ai",
       "apiKeyEnv": "COMMAND_CODE_API_KEY",
-      "apiKeyFile": "~/.commandcode/auth.json",
       "cliVersion": "auto",
       "modelCatalog": "auto",
       "modelCatalogPlan": "auto",
@@ -513,7 +514,6 @@ curl http://127.0.0.1:8900/v1/models
 | `thinking.cacheSize` | 思考内容缓存条数上限，默认 `500` |
 | `tools.downgradeForcedChoice` | 上游 thinking 模式下把强制的 `tool_choice` 降级为 `auto`（默认 `true`） |
 | `models` | 顶层模型白名单，配了则 `/v1/models` 只返回这几个（见第七节） |
-| `envFile` | 密钥文件路径，默认 `~/.jcode/.env`；设 `false` 禁用 |
 
 ### 每个上游的字段
 
@@ -521,9 +521,10 @@ curl http://127.0.0.1:8900/v1/models
 |------|------|
 | `protocol` | `anthropic`（走 `/v1/messages`）、`openai`（走 `/v1/chat/completions`）或 `commandcode`（走 `/alpha/generate`）；不写则按 `baseUrl` 推断 |
 | `baseUrl` | 上游地址。**带不带 `/v1` 都行**，工具会自动规范化，不会拼出 `/v1/v1` |
-| `apiKey` | 直接写密钥；**写空字符串 `""` 表示不发送鉴权头**（Zen 免费模型就是这种） |
-| `apiKeyEnv` | 从环境变量/`.env` 文件读取密钥（推荐，避免密钥落盘） |
-| `apiKeyFile` | 从凭据文件读取密钥（如 `~/.commandcode/auth.json`），优先级在 `apiKeyEnv` 之后 |
+| `apiKey` | **已废弃**：JSON 中的明文 `apiKey` 不再作为凭据读取，只给迁移提示；请改用 `apiKeyEnv` |
+| `apiKeyEnv` | 要读取的环境变量名（推荐）：进程环境优先，其次本进程写入的用户变量 `HKCU\Environment` |
+| `apiKeyFile` | 兼容字段：仅当你**显式填写路径**时读取该 JSON 的 `apiKey` 字段；无内置默认路径。**路径可以写入本配置文件**（只存路径，不存密钥），建议优先用 `apiKeyEnv` |
+| `apiKeyAgentPath` | 兼容字段：显式指定凭据文件路径（JSON 点路径或 `.env` 变量名）；同样没有内置预设，路径可写入本配置文件 |
 | `anthropicVersion` | `anthropic` 协议的 `anthropic-version` 头，默认 `2023-06-01` |
 | `default` | 设为 `true` 的上游承接未匹配到任何模型的请求 |
 | `models` | 该上游负责的模型名清单，用于按名分发 |
@@ -578,32 +579,42 @@ curl http://127.0.0.1:8900/v1/models
 Rust 版的数据库路径与配置文件同目录（`data\modelgate.db`），从快捷方式等任意目录启动都能读到旧库，
 不会因工作目录变化而「历史清零」或在别处生成空库。
 
-### 密钥放哪：两种凭据模式
+### 密钥放哪：环境变量优先，文件可显式指定
 
 | 模式 | 配置写法 | 密钥存放 | 适用 |
 |---|---|---|---|
-| **环境变量**（推荐） | `"apiKeyEnv": "OPENCODE_API_KEY"` | 进程环境优先，其次 `~/.jcode/.env`（`envFile` 可改路径） | 长期使用、多上游共用、轮换方便 |
-| **本地凭据文件** | `"apiKeyFile": "~/.commandcode/auth.json"` | 该 JSON 的 `apiKey` 字段（厂商 CLI 已登录的凭据） | 复用已登录凭据，不复制明文 |
+| **用户环境变量**（推荐） | `"apiKeyEnv": "OPENCODE_API_KEY"` | 面板「写入密钥 → 写入用户环境变量」写入 `HKCU\Environment`；读取时进程环境优先，其次会话缓存，最后 `HKCU\Environment` | 长期使用、多上游共用、轮换方便 |
+| **自管凭据文件** | `"apiKeyFile": "D:\\secrets\\mykey.json"` 或 `apiKeyAgentPath` | 面板「写入密钥 → 写入指定文件」写进**你手填的路径**（JSON 根字段 `apiKey` / 点路径，或 `.env` 变量名）；也可由你自行维护该文件 | 已有自管凭据文件；路径必须自己填，**无内置默认路径** |
+| **不鉴权上游** | `"compat": { "auth": { "scheme": "none" } }` | 不保存、不发送密钥 | 本机回环服务、公开且无需鉴权的端点 |
 
 ```json
 "upstreams": {
   "go":  { "protocol": "openai", "baseUrl": "https://opencode.ai/zen/go", "apiKeyEnv": "OPENCODE_API_KEY", "models": ["deepseek-v4.1-flash"] },
-  "cc":  { "protocol": "commandcode", "baseUrl": "https://api.commandcode.ai", "apiKeyFile": "~/.commandcode/auth.json", "models": [] }
+  "cc":  { "protocol": "commandcode", "baseUrl": "https://api.commandcode.ai", "apiKeyEnv": "COMMAND_CODE_API_KEY", "models": [] }
 }
 ```
 
 **关系：同一上游按此顺序取第一个非空值**
 
-1. `apiKeyEnv` —— 进程环境 > `~/.jcode/.env`
-2. `apiKeyFile` —— 文件里的 `apiKey` 字段
-3. `apiKey` —— 面板里直接粘贴；**只驻内存**，不写 `bridge.config.json`、不写 SQLite，进程重启即丢
-4. 都没配 —— 用占位 `any-key`（本地不校验；上游会回 401）
+1. `apiKeyEnv` —— 进程环境 > 本进程写入的用户变量 > `HKCU\Environment`
+2. `apiKeyFile` —— 你显式填写的文件里的 `apiKey` 字段
+3. `apiKeyAgentPath` —— `apiKeyAgent` 启用时，你显式填写的路径（无内置预设）
+4. 都没有 —— 不发送鉴权头；不会生成占位密钥
 
-同一上游同时写 `apiKeyEnv` 与 `apiKeyFile` 时**前者生效**，后者被忽略；两个都写不算错，但配置页会以「实际生效来源」提示（`keySource` = env / file / literal / none）。
+> 面板里的密钥输入框配合「写入目标」下拉使用：「写入用户环境变量」写入 `HKCU\Environment`，
+> 「写入指定文件」写进你在「文件路径」里手填的那个文件（JSON 根字段 `apiKey` / 点路径，或 `.env` 变量名）。
+> 两种写法都**不会**把明文写进 `bridge.config.json`，配置文件里只保留路径引用。
+> 面板同时提供「密钥文件（apiKeyFile）」输入框，填入绝对路径即从该 JSON 的 `apiKey` 字段读取；
+> 其他格式（JSON 点路径 / `.env` 变量名）用「密钥来源（自定义文件）」+ 字段名 + 路径。
+> 手工在 JSON 中写入的 `apiKey` **不再作为凭据读取**：配置诊断会给出 `legacy_literal_api_key` 迁移提示，且不回显原值。
+
+同一上游同时写 `apiKeyEnv` 与 `apiKeyFile` 时**前者生效**，后者被忽略；两个都写不算错，但配置页会以「实际生效来源」提示（`keySource` = env / user-env / file / agent:* / none）。
+
+> 旧配置里的 `envFile`、内置 agent 预设（opencode / jcode / commandcode）已失效：启动时只在面板给出迁移提示，不阻断启动。`apiKeyFile` / `apiKeyAgentPath` 仍可用，但路径必须由你显式指定。
 
 **敏感隔离（不变式）**
 
-- `bridge.config.json` 里**永远不出现明文密钥**：面板保存时先剥离 `apiKey` 再落盘，明文只进内存。
+- `bridge.config.json` 里**永远不出现明文密钥**：面板保存时不携带 `apiKey`，后端落盘前还会再剥离一次；手工写入的非空 `apiKey` 在运行期被忽略。
 - `.gitignore` 已覆盖 `/bridge.config.json`、`/data/`、`*.env`、`**/auth.json`、`**/credentials*.json`、`*.key|*.pem|*.token`；对外分享只用 `bridge.config.example.json`（零明文）。
 - 只读接口不回显密钥：`/api/config` 与 `/api/upstreams` 仅给 `apiKeyEnv` / `apiKeyFile` 引用、`keySource` 与 `keyConfigured` 布尔值。
 - 日志只记上游名、状态码与耗时，不记请求头；用量导出（CSV/JSON）只含统计字段与模型名。
@@ -826,12 +837,12 @@ KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示
 | `EADDRINUSE` | 8900 被占用 | 换端口，或结束占用进程（提示里已给出命令） |
 | 请求 502 | 上游连不上 | cch：确认 15721 在监听；go/zen：确认能访问 opencode.ai；commandcode：确认能访问 api.commandcode.ai |
 | **429 限流** | Zen 免费模型配额用尽 | 稍后重试，或改用其他模型 |
-| **401 Invalid API key** | 该上游不该带 key 却带了，或 key 无效 | Zen 免费模型的 `apiKey` 必须是 `""`；Go 需要有效 `OPENCODE_API_KEY` |
-| 401 Missing API key | Go 没读到密钥 | 检查 `~/.jcode/.env` 里的 `OPENCODE_API_KEY` |
+| **401 Invalid API key** | 该上游不该带 key 却带了，或 key 无效 | Zen 免费模型用 `compat.auth.scheme=none`（不再依赖 `apiKey`）；Go 需要有效 `OPENCODE_API_KEY` |
+| 401 Missing API key | Go 没读到密钥 | 检查进程环境或用户变量里的 `OPENCODE_API_KEY`（面板「写入密钥 → 写入用户环境变量」） |
 | 400 `MissingSessionID` | 该上游未注入会话头 | 确认该上游 `sessionHeader` 不为 `false` |
 | 模型报不存在 | 该模型不在任何上游的 `models` 里，被送到默认上游 | 把模型名加到对应上游的 `models` |
 | 流式没有 `[DONE]` | 部分上游（如 minimax-m3）本身不发 | 上游行为，客户端按连接关闭结束即可 |
-| CommandCode 本地 401 | 没读到凭据（不打上游） | 先在本机登录 command-code，或设 `COMMAND_CODE_API_KEY` |
+| CommandCode 本地 401 | 没读到凭据（不打上游） | 在面板把 `COMMAND_CODE_API_KEY` 用「写入密钥」写入用户环境变量（或写入你指定的凭据文件），或由启动进程注入 |
 | 403 `upgrade_required` | `x-command-code-version` 缺失或过旧 | 装/升级本机 command-code CLI，或给该上游写死 `cliVersion` |
 | 403 `MODEL_NOT_IN_PLAN` | 模型超出当前套餐档位 | 改用套餐内模型；终态错误，桥不重试 |
 | CommandCode 报模型不存在 | 该上游按完整 id 匹配，不接受缩写 | 写全如 `deepseek/deepseek-v4.1-flash`，或给该上游配 `modelMap` 短名 |
@@ -844,9 +855,9 @@ KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示
 - **应用内更新**：安装版需要能访问 `api.github.com` 与 `github.com`（下载 Release 资产）；企业代理/私有网络下检查会失败，可手动下载安装包。
 - **源码构建**：Rust stable + MSVC 工具链；生成安装包另需 Inno Setup 6（`build-installer.ps1` 会自动查找，缺失时可运行 `scripts\get_innosetup.ps1`）。
 - **cch 上游**：需本地代理在 `127.0.0.1:15721` 运行。
-- **go 上游**：配置里写的是 `apiKeyEnv: OPENCODE_API_KEY`。但 2026-10-08 实测本机 Process / User / Machine 三处都没有这个变量，go 的模型照样全部返回 200；若哪天开始 401，再去 `~/.jcode/.env` 补 key。
+- **go 上游**：配置里写的是 `apiKeyEnv: OPENCODE_API_KEY`。但 2026-10-08 实测本机 Process / User / Machine 三处都没有这个变量，go 的模型照样全部返回 200；若哪天开始 401，在面板把 `OPENCODE_API_KEY` 用「写入密钥」写入用户环境变量（或写入你指定的凭据文件），或由启动进程注入。
 - **zen 上游**：无需密钥。
-- **commandcode 上游**：需本机登录过 command-code（凭据 `~/.commandcode/auth.json`）或设 `COMMAND_CODE_API_KEY`；`x-command-code-version` 默认自动探测，读不到时可显式配 `cliVersion`。
+- **commandcode 上游**：需设置 `COMMAND_CODE_API_KEY`（面板「写入密钥 → 写入用户环境变量」，或写入你指定的凭据文件，或由启动进程注入）；`x-command-code-version` 默认自动探测，读不到时可显式配 `cliVersion`。
 - **系统**：Windows（桌面 exe / 安装包）。
 
 ---

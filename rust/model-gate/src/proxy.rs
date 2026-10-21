@@ -171,7 +171,7 @@ impl AppState {
                 headers.insert(n, v);
             }
         }
-        // Python 侧用归一化后的 apiKey（未配置时为占位 any-key）发请求，这里保持一致。
+        // 未配置凭据时 apiKey 为空：不伪造占位密钥，也不发送鉴权头。
         if !up.api_key.is_empty() && up.compat.auth_scheme != "none" {
             let key = up.api_key.clone();
             let bearer = key_with_prefix(&up.compat.auth_prefix, &key);
@@ -709,7 +709,7 @@ async fn chat_inner(
                 && upstream.compat.auth_scheme != "none"
             {
                 return error_json(StatusCode::UNAUTHORIZED,
-                                  "未配置 CommandCode 凭据：请设置 COMMAND_CODE_API_KEY，或先在本机登录 CommandCode（~/.commandcode/auth.json）",
+                                  "未配置 CommandCode 凭据：请设置 COMMAND_CODE_API_KEY 环境变量，或在面板「写入密钥」保存",
                                   "authentication_error", "missing_api_key");
             }
             outbound = commandcode::build_payload(&payload, &target_model, fallback_max);

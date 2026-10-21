@@ -11,12 +11,14 @@ mod db;
 mod free_sources;
 mod free_sources_api;
 mod gui;
+mod key_file;
 mod opencode_transport;
 mod provider_profiles;
 mod proxy;
 mod thinking;
 mod ui_assets;
 mod update;
+mod user_env;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,6 +131,17 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
     }
     if let Some(host) = args.host.clone() {
         cfg.host = host;
+    }
+    // 旧凭据来源迁移提示：只提示，不阻断启动。
+    for diag in cfg.diagnostics() {
+        if diag.code.starts_with("legacy_") {
+            tracing::warn!(
+                "配置迁移提示 [{}] {}（{}）",
+                diag.path,
+                diag.message,
+                diag.hint
+            );
+        }
     }
 
     let (listener, actual_port) = bind_with_fallback(&cfg.host, cfg.port)?;
@@ -671,6 +684,10 @@ mod tests {
             .as_object_mut()
             .expect("默认配置应包含 upstreams 对象");
         let (_, first_upstream) = upstreams.iter_mut().next().expect("至少一个上游");
+        let env_name = "MODEL_GATE_DIAG_TEST_KEY";
+        std::env::set_var(env_name, "env-secret-should-not-appear");
+        first_upstream["apiKeyEnv"] = serde_json::json!(env_name);
+        // 旧版明文写法：必须被忽略，也不能出现在诊断报告里。
         first_upstream["apiKey"] = serde_json::json!("leaky-secret-should-not-appear");
         first_upstream["modelOverrides"] = serde_json::json!({
             "model-*": {"limits": {"maxOutputTokens": 1234}}
@@ -688,6 +705,8 @@ mod tests {
         assert!(text.contains("model_overrides=1"));
         assert!(text.contains("override=model-* limits=") && text.contains("1234"));
         assert!(!text.contains("leaky-secret-should-not-appear"));
+        assert!(!text.contains("env-secret-should-not-appear"));
+        std::env::remove_var(env_name);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

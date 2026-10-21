@@ -114,6 +114,45 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 - 无数据库结构变更；`settings.lastPort` 为新增键；
 - 旧版 exe 读取新配置时忽略新字段，可继续运行。
 
+### 6.1 密钥来源契约（`env-only-secrets`）
+
+密钥**只有一个来源方向**：环境变量优先，其次是用户显式指定的凭据文件。
+代码与模板中**没有任何内置厂商凭据路径**（opencode / jcode / commandcode 的默认路径一律移除）。
+
+**读取优先级**（`config.rs::resolve_api_key`，同一上游取第一个非空值）：
+
+| 顺序 | 来源 | `keySource` | 说明 |
+|---|---|---|---|
+| 1 | `apiKeyEnv` 指定的变量 | `env` / `user-env` | 取值顺序：进程环境 → 本进程会话缓存 → `HKCU\Environment` |
+| 2 | `apiKeyFile` 指定的文件 | `file` | 读该 JSON 的 `apiKey` 字段（路径由用户手填） |
+| 3 | `apiKeyAgentPath` 指定的文件 | `agent:file/<名>` / `agent:env-file/<名>` | JSON 点路径或 `.env` 变量名（`apiKeyAgent` 内置预设已移除） |
+| 4 | 都没有 | `none` | **不发送鉴权头**，不生成占位密钥 |
+
+**JSON 里的明文 `apiKey` 永不作为凭据**：历史配置中的非空值被忽略，
+由 `diagnostics()` 给出 `legacy_literal_api_key` 迁移提示，且**不回显原值**。
+
+**失效字段**（只给迁移提示，不阻断启动）：
+
+| 字段 | 诊断码 | 级别 | 失效原因 | 替代 |
+|---|---|---|---|---|
+| `envFile` | `legacy_env_file` | warn | 内置 `.env` 兜底路径已移除 | `apiKeyEnv` |
+| `apiKeyAgent` 内置预设（opencode / jcode / commandcode） | `legacy_agent_preset` | warn | 内置路径已移除 | `apiKeyEnv`，或 `apiKeyAgent=custom` + `apiKeyAgentPath` |
+| `apiKeyFile` | `legacy_api_key_file` | warn | 不再内置默认路径 | 仍可用，但路径必须显式填写；建议改用 `apiKeyEnv` |
+| `apiKeyAgent`（自定义路径） | `legacy_api_key_agent` | info | 旧凭据来源（仍可用） | 推荐改用 `apiKeyEnv` |
+| JSON 明文 `apiKey` | `legacy_literal_api_key` | warn | 明文不再作为凭据 | `apiKeyEnv` + 面板「写入密钥」 |
+
+> 上述诊断**都不阻断启动**，也**不回显原值**；warn 级别的会在面板提示区与启动日志点名。
+
+**写入目标**（`POST /api/upstreams/secret`，见 §8.1）：
+
+| 目标 | 落点 | 语义 |
+|---|---|---|
+| `env`（默认） | `HKCU\Environment` | 写 `apiKeyEnv` 指定的变量名，写后广播 `WM_SETTINGCHANGE`；当前进程靠会话缓存立即生效，新进程由系统继承 |
+| `file` | 用户手填的绝对路径 | JSON（根字段 `apiKey` 或点路径）或 `.env`（变量名）；读-改-写保留其它字段，同目录临时文件 + `rename` 原子替换，**不生成 `.bak`**；写完用运行时同一套读取语义回读校验 |
+
+写入 Model-Gate 自己的 `bridge.config.json` 会被拒绝；密钥含换行/控制字符会被拒绝；
+错误信息只含路径与原因，**不含密钥**。配置文件里只保存路径引用，不保存密钥本体。
+
 ## 7. 校验与诊断
 
 新增诊断码：
@@ -162,12 +201,55 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
   `capabilities`（解析结果）、`modelOverrides`（原样回显）；
 - `effective.limits` 语义不变（上游级）；模型级通过 `modelOverrides` 回显，由面板展示。
 
+### 8.1 写入上游密钥 `POST /api/upstreams/secret`
+
+入参：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `name` | 是 | 上游名 |
+| `apiKey` | 是 | 明文密钥；为空 → 400 `empty_key`；含换行/控制字符 → 400 `invalid_key` |
+| `target` | 否 | `env`（默认，写用户变量）/ `file`（写用户指定文件）；其它值 → 400 `invalid_target` |
+| `envName` | 否 | 变量名；缺省时用该上游已配置的 `apiKeyEnv`；都没有 → 400 `missing_env_name`；含 `=` → 400 `invalid_env_name` |
+| `filePath` | 否 | 凭据文件路径；缺省时回退该上游的 `apiKeyFile` / `apiKeyAgentPath`；都没有 → 400 `missing_file_path`；非绝对路径 → 400 `invalid_file_path` |
+| `fileFormat` | 否 | `json`（默认）/ `env`；其它值 → 400 `invalid_file_format` |
+| `field` | 否 | JSON 点路径（缺省 `apiKey`）/ `.env` 变量名（`.env` 必填） |
+
+成功响应（**不含明文**）：
+
+| 目标 | 响应字段 |
+|---|---|
+| `env` | `ok` / `name` / `target=env` / `envName` / `scope=user` / `keySource=user-env` / `note` |
+| `file` | `ok` / `name` / `target=file` / `scope=file` / `filePath` / `fileFormat` / `field` / `created` / `keySource` / `warning` / `note` |
+
+- `file` 目标下 `warning`：该上游已配置 `apiKeyEnv` 时提示「环境变量优先于文件，文件里的密钥暂不生效」；
+- `keySource` 取值：`user-env` / `file` / `agent:file/<名>` / `agent:env-file/<名>`；
+- 写入失败**不降级为「只进内存」**：注册表写入失败 → 500 `write_user_var_failed`；
+  文件写入失败 → 400 `write_key_file_failed`（参数不合法：路径/字段/密钥内容）或 500 `write_key_file_failed`（IO 失败）；
+  文件写后回读校验失败 → 500 `verify_key_file_failed`；
+- 写入成功后运行态立即更新（`key_source`），**路径引用需用户另存配置**才落盘到 `bridge.config.json`。
+
 ## 9. 面板行为
 
 - 预设下拉改读 `config.profiles`（缺失时回退现有硬编码，兼容旧后端）；当前 `compat.profile` 不在列表时追加显示；
 - 高级区新增「模型级覆盖（JSON）」文本域，保存前 `JSON.parse` 校验对象结构；非法时阻止保存并提示；
 - 新增只读「能力」徽标与「生效值」摘要（profile、上游 limits、模型覆盖条数）；
 - 保存沿用未知字段保留策略；`modelOverrides` 与既有字段一样参与 `collectConfig`。
+
+### 9.2 密钥写入区（`env-only-secrets`）
+
+上游编辑器的 API Key 行有「写入目标」下拉，两档都**没有内置默认路径**：
+
+| 目标 | 面板字段 | 行为 |
+|---|---|---|
+| 写入用户环境变量 | 「密钥环境变量（apiKeyEnv）」 | 变量名为空时**拒绝写入**并提示先填变量名；确认框写明落点为 `HKCU\Environment → <变量名>` |
+| 写入指定文件 | 「凭据文件路径」+「文件格式」+「字段 / 变量名」 | 路径为空 → 拒绝并提示；选 `.env` 文本但字段名为空 → 拒绝并提示；确认框写明落点路径、格式与字段名 |
+
+- 密钥输入框的值**只用于本次写入**，不进入 `bridge.config.json`（保存时主动剔除 `apiKey`）；
+- 面板与编辑弹窗共用同一组「写入目标」字段，切换目标时显隐对应输入；
+- 写文件成功后，面板把**路径引用回填到表单字段**（JSON 根字段 `apiKey` → `apiKeyFile`；
+  自定义字段 / `.env` 变量名 → `apiKeyAgent=custom` + `apiKeyAgentPath` + `apiKeyAgentProvider`），
+  并标记「有未保存的改动」：**路径要落盘仍需用户点「保存配置」**，配置文件里只有路径引用。
 
 ### 9.1 提醒区（诊断展示）
 
@@ -189,7 +271,12 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 - `cargo test`（`provider_profiles.rs` / `config.rs`）：注册表结构、判定覆盖、golden 样例、旧配置零 error；
 - `rust/model-gate/tests/fixtures/legacy_config.json`：旧简写与未知字段兼容夹具；
 - `scripts/panel_api_smoke.ps1`：启动 Rust 实例，检查 `/api/config` 的 profiles 顺序、
-  `effective.modelOverrides`、保存往返与非法通配 400。
+  `effective.modelOverrides`、保存往返与非法通配 400；
+- `rust/model-gate/tests/user_env_contracts.rs` / `key_file_contracts.rs`：密钥写入的静态守卫
+  （源码与模板中无内置凭据路径、配置无明文密钥、拒写自身配置文件、`.env` 变量名校验）；
+- `.op/changes/env-only-secrets/secret_api_smoke.ps1`：`POST /api/upstreams/secret` 的 env / file
+  双目标端到端冒烟（写后注册表可读、文件保留其它字段、响应不含明文、非法 target/空 key 400、
+  拒写自身 `bridge.config.json`）。
 
 ## 11. 示例配置
 

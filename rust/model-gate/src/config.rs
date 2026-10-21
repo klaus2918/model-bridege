@@ -347,7 +347,7 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    /// 是否真正拿到可用凭据（占位 any-key 不算已配置）。
+    /// 是否真正拿到可用凭据（未配置时为空值，不算已配置）。
     pub fn key_configured(&self) -> bool {
         !self.api_key.is_empty() && self.key_source != "none"
     }
@@ -630,6 +630,18 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "pricing",
 ];
 
+/// 已移除的内置 agent 凭据预设名。
+///
+/// 这些值仍会被 `apiKeyAgent` 接受，但**不再提供内置默认路径**：
+/// 只用于诊断给出迁移提示，不代表还能自动找到凭据。
+const LEGACY_AGENT_PRESETS: &[&str] = &["opencode", "jcode", "commandcode"];
+
+fn is_builtin_agent_preset(name: &str) -> bool {
+    LEGACY_AGENT_PRESETS
+        .iter()
+        .any(|preset| name.eq_ignore_ascii_case(preset))
+}
+
 const UPSTREAM_KEYS: &[&str] = &[
     "protocol",
     "transport",
@@ -761,6 +773,15 @@ impl Config {
                     );
                 }
             }
+            if obj.contains_key("envFile") {
+                push(
+                    "warn",
+                    "legacy_env_file",
+                    "envFile",
+                    "envFile 已失效：Model-Gate 不读取任何 .env 文件，密钥只从环境变量读取".into(),
+                    "删除该字段，改用上游的 apiKeyEnv 引用环境变量",
+                );
+            }
         }
         if self.host.trim().is_empty() {
             push(
@@ -889,6 +910,44 @@ impl Config {
                             &format!("{prefix}.{key}"),
                             format!("上游「{}」的字段「{key}」未知，不会生效", up.name),
                             "检查拼写；provider 差异请写在 compat 下",
+                        );
+                    }
+                }
+                let legacy_agent = raw_up
+                    .get("apiKeyAgent")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if raw_up
+                    .get("apiKeyFile")
+                    .and_then(Value::as_str)
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    push(
+                        "warn",
+                        "legacy_api_key_file",
+                        &format!("{prefix}.apiKeyFile"),
+                        format!("上游「{}」仍使用 apiKeyFile 凭据来源", up.name),
+                        "建议改用 apiKeyEnv；继续用文件时，路径必须由你手动指定（不再有内置默认路径）",
+                    );
+                }
+                if let Some(tool) = legacy_agent {
+                    if is_builtin_agent_preset(tool) {
+                        push(
+                            "warn",
+                            "legacy_agent_preset",
+                            &format!("{prefix}.apiKeyAgent"),
+                            format!("上游「{}」使用已移除的内置预设「{tool}」", up.name),
+                            "内置 opencode / jcode / commandcode 预设已删除：请填写 apiKeyAgentPath，或改用 apiKeyEnv",
+                        );
+                    } else {
+                        push(
+                            "info",
+                            "legacy_api_key_agent",
+                            &format!("{prefix}.apiKeyAgent"),
+                            format!("上游「{}」仍使用 apiKeyAgent 凭据来源", up.name),
+                            "可继续使用自定义路径；推荐改用 apiKeyEnv 统一从环境变量读取",
                         );
                     }
                 }
@@ -1350,7 +1409,7 @@ impl Config {
                     "missing_credentials",
                     &format!("{prefix}.apiKey"),
                     format!("上游「{}」没有配置密钥（将以空鉴权请求）", up.name),
-                    "设置 apiKeyEnv / apiKeyFile / apiKeyAgent，或显式 apiKey 为空表示不鉴权",
+                    "设置 apiKeyEnv / apiKeyFile / apiKeyAgent；无需鉴权的上游请设置 compat.auth.scheme=none",
                 );
             }
             if up.api_key_agent.is_some() && !up.key_configured() {
@@ -1365,37 +1424,22 @@ impl Config {
                     "检查 apiKeyAgentProvider / apiKeyAgentPath，或确认对应客户端已登录",
                 );
             }
-            if up.key_source.starts_with("agent:")
-                && raw_up
-                    .and_then(|r| r.get("apiKey"))
-                    .and_then(Value::as_str)
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false)
+            // JSON 里的明文 apiKey 不再作为凭据来源；只给迁移提示，不回显原值。
+            if raw_up
+                .and_then(|r| r.get("apiKey"))
+                .and_then(Value::as_str)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
             {
                 push(
-                    "info",
-                    "key_precedence",
+                    "warn",
+                    "legacy_literal_api_key",
                     &format!("{prefix}.apiKey"),
                     format!(
-                        "上游「{}」同时配置了 agent 密钥来源与明文 apiKey，agent 来源优先",
+                        "上游「{}」在 JSON 中写有 apiKey，运行期已忽略：密钥只从环境变量或显式凭据文件读取",
                         up.name
                     ),
-                    "只保留一种密钥来源更可控",
-                );
-            }
-            if let (Some(env), true) = (
-                up.api_key_env.as_ref(),
-                raw_up.map(|r| r.contains_key("apiKey")).unwrap_or(false),
-            ) {
-                push(
-                    "info",
-                    "key_precedence",
-                    &format!("{prefix}.apiKey"),
-                    format!(
-                        "上游「{}」同时配置了 apiKeyEnv={env} 与明文 apiKey，环境变量优先",
-                        up.name
-                    ),
-                    "只保留一种密钥来源更可控",
+                    "删除 apiKey，改用 apiKeyEnv 并通过面板「写入密钥」保存；无需鉴权的上游请设置 compat.auth.scheme=none",
                 );
             }
             if up.fetch_models == false
@@ -1815,7 +1859,7 @@ pub fn normalize_base_url(raw: &str) -> String {
     url
 }
 
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -1825,16 +1869,35 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// 密钥优先级：apiKeyEnv → apiKeyFile → agent 客户端工具 → 字面 apiKey → any-key。
+/// 密钥优先级：apiKeyEnv → apiKeyFile → agent 自定义路径 → 无凭据。
+///
+/// `apiKeyEnv` 的取值顺序（**只认环境变量**）：
+/// 1. 进程环境 `std::env::var`；
+/// 2. 本进程写过的会话缓存（Windows 环境块是启动时快照，运行中读不到新写入的值）；
+/// 3. Windows 用户级环境变量 `HKCU\Environment`。
+///
+/// 没有任何内置 `.env` 兜底路径：凭据位置一律由用户显式指定。
+/// JSON 里的 `apiKey` 字段**永不作为凭据来源**：历史配置中的非空值会被忽略，
+/// 并由 `diagnostics()` 给出 `legacy_literal_api_key` 迁移提示。
 fn resolve_api_key(u: &Map<String, Value>, _root: &Map<String, Value>) -> (String, String) {
     if let Some(env_name) = u.get("apiKeyEnv").and_then(Value::as_str) {
-        if let Ok(value) = std::env::var(env_name) {
-            if !value.is_empty() {
-                return (value, "env".into());
+        let env_name = env_name.trim();
+        if !env_name.is_empty() {
+            if let Ok(value) = std::env::var(env_name) {
+                if !value.is_empty() {
+                    return (value, "env".into());
+                }
             }
-        }
-        if let Some(value) = read_env_file(env_name) {
-            return (value, "env-file".into());
+            if let Some(value) = crate::user_env::session_var(env_name) {
+                if !value.is_empty() {
+                    return (value, "user-env".into());
+                }
+            }
+            if let Some(value) = crate::user_env::read_user_var(env_name) {
+                if !value.is_empty() {
+                    return (value, "user-env".into());
+                }
+            }
         }
     }
     if let Some(file) = u.get("apiKeyFile").and_then(Value::as_str) {
@@ -1862,16 +1925,8 @@ fn resolve_api_key(u: &Map<String, Value>, _root: &Map<String, Value>) -> (Strin
             return (value, format!("agent:{label}"));
         }
     }
-    if let Some(value) = u.get("apiKey").and_then(Value::as_str) {
-        // 注意：空字符串是合法值（Zen 免费模型要求不带鉴权），不能回落到 any-key。
-        return (value.to_string(), "literal".into());
-    }
-    ("any-key".into(), "none".into())
-}
-
-fn read_env_file(name: &str) -> Option<String> {
-    let text = std::fs::read_to_string(expand_home("~/.jcode/.env")).ok()?;
-    parse_env_value(&text, name)
+    // 未配置任何来源时不伪造占位密钥：空 key 表示不发送鉴权头。
+    (String::new(), "none".into())
 }
 
 /// 从 .env 文本中读取指定变量（跳过注释与空行，去掉首尾引号）。
@@ -1906,83 +1961,31 @@ fn read_key_file(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 从 agent 客户端工具读取密钥（只读，不修改对方文件）。
-/// 预设：opencode（auth.json 的 provider.key）、jcode（.env 变量）、
-/// commandcode（auth.json 的 apiKey）；custom 按路径 + 字段/变量名读取。
+/// 从用户显式指定的凭据文件读取密钥（只读，不修改对方文件）。
+///
+/// **没有内置预设**：opencode / jcode / commandcode 等客户端的默认路径一律内置在
+/// 代码里会让「密钥从哪来」不可控，因此全部移除 —— 路径必须由用户手填。
+/// `apiKeyAgentPath` 缺省时直接返回 None（不猜路径）。
 fn read_agent_key(
-    tool: &str,
+    _tool: &str,
     provider: &str,
     custom_path: Option<&str>,
 ) -> Option<(String, String)> {
-    match tool.to_ascii_lowercase().as_str() {
-        "opencode" => {
-            if provider.is_empty() {
-                return None;
-            }
-            let paths: Vec<PathBuf> = match custom_path {
-                Some(path) => vec![expand_home(path)],
-                None => vec![
-                    expand_home("~/.local/share/opencode/auth.json"),
-                    expand_home("~/.config/opencode/auth.json"),
-                ],
-            };
-            for path in paths {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                    continue;
-                };
-                if let Some(key) = value
-                    .get(provider)
-                    .and_then(|entry| entry.get("key"))
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some((key.to_string(), format!("opencode/{provider}")));
-                }
-            }
-            None
-        }
-        "jcode" => {
-            if provider.is_empty() {
-                return None;
-            }
-            let path = custom_path
-                .map(expand_home)
-                .unwrap_or_else(|| expand_home("~/.jcode/.env"));
-            let text = std::fs::read_to_string(path).ok()?;
-            let value = parse_env_value(&text, provider)?;
-            Some((value, format!("jcode/{provider}")))
-        }
-        "commandcode" => {
-            let path = custom_path
-                .map(expand_home)
-                .unwrap_or_else(|| expand_home("~/.commandcode/auth.json"));
-            let text = std::fs::read_to_string(path).ok()?;
-            let value: Value = serde_json::from_str(&text).ok()?;
-            let key = value
-                .get("apiKey")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())?;
-            Some((key.to_string(), "commandcode".into()))
-        }
-        "custom" | "file" => {
-            let path = custom_path.map(expand_home)?;
-            read_key_from_path(&path, provider)
-        }
-        _ => None,
-    }
-}
-
-/// 自定义 key 文件：JSON 按点路径/顶层 apiKey，非 JSON 按 .env 变量读取。
-fn read_key_from_path(path: &Path, provider: &str) -> Option<(String, String)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let file_label = path
+    let path = custom_path.map(expand_home)?;
+    let label = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("file")
         .to_string();
+    let (value, kind) = read_key_from_path(&path, provider)?;
+    Some((value, format!("{kind}/{label}")))
+}
+
+/// 自定义 key 文件：JSON 按点路径/顶层 apiKey，非 JSON 按 .env 变量读取。
+///
+/// 返回 `(值, 来源种类)`：种类是 `file`（JSON 凭据）或 `env-file`（.env 文本）。
+pub(crate) fn read_key_from_path(path: &Path, provider: &str) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
     if let Ok(value) = serde_json::from_str::<Value>(&text) {
         let key = if provider.is_empty() {
             value.get("apiKey").or_else(|| value.get("key"))
@@ -1991,16 +1994,24 @@ fn read_key_from_path(path: &Path, provider: &str) -> Option<(String, String)> {
             for part in provider.split('.') {
                 current = current.get(part)?;
             }
+            // 点路径命中的是对象时（如 `{"deepseek":{"key":"sk-..."}}`），
+            // 再往里取一层 `key` / `apiKey`。
+            if let Some(obj) = current.as_object() {
+                current = obj
+                    .get("key")
+                    .or_else(|| obj.get("apiKey"))
+                    .or_else(|| obj.get("token"))?;
+            }
             Some(current)
         };
         if let Some(key) = key.and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            return Some((key.to_string(), format!("file/{file_label}")));
+            return Some((key.to_string(), "file".to_string()));
         }
     }
     if provider.is_empty() {
         return None;
     }
-    parse_env_value(&text, provider).map(|value| (value, format!("env-file/{provider}")))
+    parse_env_value(&text, provider).map(|value| (value, "env-file".to_string()))
 }
 
 /// 生成默认配置（首次启动写盘用），字段与 Python 版默认模板对齐。
@@ -2019,7 +2030,7 @@ pub fn default_config_value() -> Value {
             "cch": {
                 "protocol": "anthropic",
                 "baseUrl": "http://127.0.0.1:15721",
-                "apiKey": "",
+                "compat": {"auth": {"scheme": "none"}},
                 "default": true,
                 "fetchModels": false,
                 "models": ["deepseek-flash", "mimo-v2.5-pro", "glm5.3"]
@@ -2165,6 +2176,44 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_reports_legacy_credential_sources() {
+        let cfg = Config::from_value(json!({
+            "host": "127.0.0.1",
+            "maxTokens": 8192,
+            "envFile": "D:/legacy-placeholder.env",
+            "upstreams": {
+                "legacy-file": {
+                    "protocol": "openai",
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "apiKeyFile": "D:/secrets/legacy.json"
+                },
+                "legacy-agent": {
+                    "protocol": "openai",
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "apiKeyAgent": "jcode",
+                    "apiKeyAgentProvider": "MY_KEY"
+                }
+            }
+        }));
+        let diags = cfg.diagnostics();
+        let legacy: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code.starts_with("legacy_"))
+            .collect();
+        assert!(legacy.iter().any(|d| d.code == "legacy_env_file"));
+        assert!(legacy
+            .iter()
+            .any(|d| d.code == "legacy_api_key_file" && d.path.ends_with(".apiKeyFile")));
+        assert!(legacy
+            .iter()
+            .any(|d| d.code == "legacy_agent_preset" && d.path.ends_with(".apiKeyAgent")));
+        // 迁移提示只提示、不阻断启动。
+        assert!(legacy
+            .iter()
+            .all(|d| d.level == "warn" || d.level == "info"));
+    }
+
+    #[test]
     fn placeholder_key_is_not_configured() {
         let up = normalize_upstream(
             "go",
@@ -2187,9 +2236,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_key_reads_opencode_auth_json() {
+    fn agent_key_reads_user_specified_json_path() {
+        // 用户手填路径的 JSON 凭据：provider 走点路径。
         let path = temp_key_file(
-            "opencode-auth.json",
+            "user-auth.json",
             r#"{"deepseek":{"type":"api","key":"sk-open"}}"#,
         );
         let up = normalize_upstream(
@@ -2204,13 +2254,14 @@ mod tests {
             &empty_root(),
         );
         assert_eq!(up.api_key, "sk-open");
-        assert_eq!(up.key_source, "agent:opencode/deepseek");
+        assert_eq!(up.key_source, "agent:file/user-auth.json");
         assert!(up.key_configured());
     }
 
     #[test]
-    fn agent_key_reads_jcode_env() {
-        let path = temp_key_file("jcode.env", "# comment\nMY_KEY = \"sk-jcode\"\n");
+    fn agent_key_reads_user_specified_env_file() {
+        // 用户手填路径的 .env 文本：按变量名取值。
+        let path = temp_key_file("user.env", "# comment\nMY_KEY = \"sk-custom\"\n");
         let up = normalize_upstream(
             "ds",
             &json!({
@@ -2222,13 +2273,13 @@ mod tests {
             }),
             &empty_root(),
         );
-        assert_eq!(up.api_key, "sk-jcode");
-        assert_eq!(up.key_source, "agent:jcode/MY_KEY");
+        assert_eq!(up.api_key, "sk-custom");
+        assert_eq!(up.key_source, "agent:env-file/user.env");
     }
 
     #[test]
-    fn agent_key_reads_commandcode_auth_json() {
-        let path = temp_key_file("commandcode-auth.json", r#"{"apiKey":"sk-cc"}"#);
+    fn agent_key_reads_user_specified_auth_json() {
+        let path = temp_key_file("cc-auth.json", r#"{"apiKey":"sk-cc"}"#);
         let up = normalize_upstream(
             "cc",
             &json!({
@@ -2239,11 +2290,82 @@ mod tests {
             &empty_root(),
         );
         assert_eq!(up.api_key, "sk-cc");
-        assert_eq!(up.key_source, "agent:commandcode");
+        assert_eq!(up.key_source, "agent:file/cc-auth.json");
     }
 
     #[test]
-    fn agent_key_falls_back_to_literal_when_missing() {
+    fn agent_key_without_explicit_path_is_not_resolved() {
+        // 内置预设已移除：不填 apiKeyAgentPath 就不猜路径。
+        let up = normalize_upstream(
+            "ds",
+            &json!({
+                "protocol": "openai",
+                "baseUrl": "https://api.deepseek.com/v1",
+                "apiKeyAgent": "jcode",
+                "apiKeyAgentProvider": "MY_KEY"
+            }),
+            &empty_root(),
+        );
+        assert_eq!(up.key_source, "none");
+        assert!(!up.key_configured());
+    }
+
+    #[test]
+    fn api_key_env_reads_process_environment() {
+        let name = "MODEL_GATE_TEST_PROCESS_ENV";
+        std::env::set_var(name, "sk-process");
+        let up = normalize_upstream(
+            "ds",
+            &json!({
+                "protocol": "openai",
+                "baseUrl": "https://api.deepseek.com/v1",
+                "apiKeyEnv": name
+            }),
+            &empty_root(),
+        );
+        std::env::remove_var(name);
+        assert_eq!(up.api_key, "sk-process");
+        assert_eq!(up.key_source, "env");
+    }
+
+    #[test]
+    fn api_key_env_reads_session_cache_when_process_env_missing() {
+        // 进程环境没有时，回落到本进程写过的会话缓存。
+        let name = "MODEL_GATE_TEST_SESSION_ENV";
+        std::env::remove_var(name);
+        crate::user_env::remember_session_var(name, "sk-session");
+        let up = normalize_upstream(
+            "ds",
+            &json!({
+                "protocol": "openai",
+                "baseUrl": "https://api.deepseek.com/v1",
+                "apiKeyEnv": name
+            }),
+            &empty_root(),
+        );
+        assert_eq!(up.api_key, "sk-session");
+        assert_eq!(up.key_source, "user-env");
+    }
+
+    #[test]
+    fn api_key_env_missing_yields_no_key() {
+        // 不存在任何来源时不得回落到明文或内置 .env。
+        let up = normalize_upstream(
+            "ds",
+            &json!({
+                "protocol": "openai",
+                "baseUrl": "https://api.deepseek.com/v1",
+                "apiKeyEnv": "MODEL_GATE_TEST_ABSENT_ENV_VAR"
+            }),
+            &empty_root(),
+        );
+        assert_eq!(up.key_source, "none");
+        assert!(!up.key_configured());
+    }
+
+    #[test]
+    fn agent_key_missing_does_not_fall_back_to_literal() {
+        // 旧配置可能同时保留 apiKey；它已不是凭据来源，读取失败时不得“捡回来”。
         let up = normalize_upstream(
             "ds",
             &json!({
@@ -2256,8 +2378,38 @@ mod tests {
             }),
             &empty_root(),
         );
-        assert_eq!(up.api_key, "sk-literal");
-        assert_eq!(up.key_source, "literal");
+        assert!(up.api_key.is_empty());
+        assert_eq!(up.key_source, "none");
+        assert!(!up.key_configured());
+    }
+
+    #[test]
+    fn legacy_literal_api_key_is_ignored_and_diagnosed() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "ds": {
+                    "protocol": "openai",
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "apiKey": "sk-legacy-literal"
+                }
+            }
+        }));
+        let up = cfg.upstream("ds").expect("ds upstream");
+        assert!(up.api_key.is_empty(), "JSON 中的 apiKey 不得作为凭据");
+        assert_eq!(up.key_source, "none");
+        assert!(!up.key_configured());
+
+        let diag = cfg
+            .diagnostics()
+            .into_iter()
+            .find(|d| d.code == "legacy_literal_api_key")
+            .expect("应给出明文 apiKey 迁移提示");
+        assert_eq!(diag.level, "warn");
+        assert_eq!(diag.path, "upstreams.ds.apiKey");
+        assert!(
+            !diag.message.contains("sk-legacy-literal"),
+            "诊断信息不得回显密钥"
+        );
     }
 
     #[test]

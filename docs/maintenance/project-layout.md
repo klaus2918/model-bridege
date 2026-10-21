@@ -8,7 +8,7 @@
 |---|---|---|
 | `rust/model-gate/` | 唯一产品源码：代理内核、协议适配、配置、SQLite、更新、托盘壳 | 是 |
 | `rust/model-gate/ui/` | 内嵌面板静态资源（`index.html` / `app.js` / `style.css` / `free_sources.js`）——**面板资源只有这一份** | 是 |
-| `rust/model-gate/tests/` | Rust 单测夹具（含 `legacy_config.json` 兼容样本） | 是 |
+| `rust/model-gate/tests/` | 集成测试：契约守卫（`user_env_contracts.rs` / `key_file_contracts.rs`）与夹具（含 `legacy_config.json` 兼容样本） | 是 |
 | `rust/model-gate/provider_profiles.json` | Provider 预设注册表（编译期内嵌） | 是 |
 | `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 | 是 |
 | `assets/` | 构建资产（图标等） | 是 |
@@ -62,8 +62,8 @@ Remove-Item -Force rust\model-gate\cargo_*.log -ErrorAction SilentlyContinue
 | 路径/模式 | 内容 | 处理方式 |
 |---|---|---|
 | `bridge.config.json` | 真实上游地址、`apiKeyEnv`/`apiKeyFile` 引用，可能含本机路径 | 不入库；分享用 `bridge.config.example.json` |
-| `.env`、`.jcode/.env`、`*.env` | 环境变量密钥 | 不入库 |
-| `~/.jcode/.env`、`~/.commandcode/auth.json` | 用户级凭据 | 仓库外，不入库 |
+| `.env`、`*.env` | 用户自管的环境变量文件（程序不再内置读取） | 不入库 |
+| 用户显式指定的凭据文件（JSON / `.env`） | 用户自管凭据 | 仓库外；程序只在配置显式给出路径时读取，**无内置默认路径**；面板「写入指定文件」也只写用户手填的那个路径 |
 | `**/auth.json`、`**/credentials*.json`、`*.key`、`*.pem`、`*.token` | 凭据兜底规则 | 不入库 |
 | `data/`、`dist/data/` | SQLite 用量库、运行日志 | 不入库 |
 | `.op/` | 变更记录，可能含本机绝对路径与源码片段 | 不入库 |
@@ -71,7 +71,7 @@ Remove-Item -Force rust\model-gate\cargo_*.log -ErrorAction SilentlyContinue
 原则：
 
 - **不会被提交的敏感文件不需要脱敏**；但必须确认它确实未被跟踪，且忽略规则有效。
-- 需要入库的示例只能使用占位符：`apiKeyEnv`、`apiKeyFile`、`example.com`，不写真实密钥、账号、Cookie、请求头。
+- 需要入库的示例只能使用占位符：`apiKeyEnv`、空路径的 `apiKeyFile`/`apiKeyAgentPath`、`example.com`，不写真实密钥、账号、Cookie、请求头，也不写死具体厂商凭据路径。
 - 日志只记录上游名、状态码、耗时与用量字段，不记录请求头与正文。
 - 若敏感文件曾被提交：先 `git rm --cached` 并补忽略规则，再**轮换对应密钥**；仅删除文件不等于从历史移除。
 

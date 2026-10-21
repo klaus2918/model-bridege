@@ -702,23 +702,98 @@ function addUpstream() {
   renderUpstreamEditor();
 }
 
-async function saveUpstreamSecret(name, secret, input) {
+/* 密钥写入目标二选一（用户确认口径）：
+ * - env：Windows 用户级环境变量（HKCU\Environment）
+ * - file：用户手动指定的凭据文件（JSON / .env），代码里没有任何内置默认路径
+ * 两条路径都只写「密钥本体」；配置文件里只保存路径引用，绝不保存明文。 */
+async function saveUpstreamSecret(name, secret, input, opts) {
+  const o = opts || {};
+  const isFile = o.target === "file";
+  const envName = (o.envName || "").trim();
+  const filePath = (o.filePath || "").trim();
+  const fileFormat = (o.fileFormat || "json").trim();
+  const field = (o.field || "").trim();
+  const where = isFile
+    ? `${filePath}\n格式：${fileFormat === "env" ? ".env 文本" : "JSON"}${field ? ` · 字段/变量名：${field}` : ""}`
+    : `Windows 用户变量 HKCU\\Environment → ${envName}`;
   const ok = await confirmModal({
-    title: "写入密钥文件",
-    text: `对象：${name}\n写入位置：配置里 apiKeyEnv 指向的变量（默认 ~/.jcode/.env）\n说明：只写密钥文件、不写 bridge.config.json；不重启、不回显。`,
+    title: isFile ? "写入指定文件" : "写入用户环境变量",
+    text: `对象：${name}\n写入位置：${where}\n说明：${isFile
+      ? "只写你手动指定的这个文件；配置文件里只保存路径引用，不保存密钥；不回显密钥。"
+      : "只写用户环境变量、不写 bridge.config.json；当前进程立即生效，新进程自动继承；不回显密钥。"}`,
     confirmLabel: "写入",
     danger: false,
   });
   if (!ok) return;
   try {
-    const data = await postJson("/api/upstreams/secret", { name, apiKey: secret });
-    toast(`已写入 ${data.envName || "密钥文件"} 并热更新`);
+    const body = { name, apiKey: secret, target: isFile ? "file" : "env" };
+    if (isFile) {
+      body.filePath = filePath;
+      body.fileFormat = fileFormat;
+      if (field) body.field = field;
+    } else {
+      body.envName = envName;
+    }
+    const data = await postJson("/api/upstreams/secret", body);
+    if (isFile) {
+      toast(`已写入 ${data.filePath || filePath} 并立即生效`);
+      if (o.onWritten) o.onWritten(data);
+    } else {
+      toast(`已写入用户变量 ${data.envName || envName} 并立即生效`);
+    }
     if (input) input.value = "";
-    await loadConfig();
-    await loadOverview();
+    if (isFile) {
+      // 写文件后只刷新概览：不重载配置（会冲掉用户还没保存的其它改动）。
+      await loadOverview();
+    } else {
+      await loadConfig();
+      await loadOverview();
+    }
+    if (data.warning) toast(data.warning, true);
   } catch (err) {
     toast(`写入失败：${err.message}`, true);
   }
+}
+
+/* 写入文件成功后，把「路径引用」回填到卡片的配置字段：
+ * - JSON 根字段 apiKey → apiKeyFile（运行时优先级高于 agent 自定义路径）
+ * - 自定义字段 / .env 变量名 → apiKeyAgent=custom + apiKeyAgentPath + apiKeyAgentProvider
+ * 配置文件里只落路径，密钥本体永远不进 JSON。 */
+function applyKeyFileReference(cardEl, data) {
+  if (!cardEl) return;
+  const path = String((data && data.filePath) || "").trim();
+  if (!path) return;
+  const format = String((data && data.fileFormat) || "json").trim();
+  const field = String((data && data.field) || "").trim();
+  const setVal = (f, v) => {
+    const el = cardEl.querySelector(`[data-field="${f}"]`);
+    if (el) el.value = v;
+  };
+  if (format === "json" && (!field || field === "apiKey")) {
+    setVal("apiKeyFile", path);
+    setVal("apiKeyAgent", "");
+    setVal("apiKeyAgentPath", "");
+    setVal("apiKeyAgentProvider", "");
+  } else {
+    setVal("apiKeyAgent", "custom");
+    setVal("apiKeyAgentPath", path);
+    setVal("apiKeyAgentProvider", field);
+    setVal("apiKeyFile", "");
+  }
+  cardEl.dataset.keyConfigured = "1";
+  cardEl.dataset.keySource = String((data && data.keySource) || "");
+  setConfigDirty(true);
+  renderUpstreamCfgTable();
+}
+
+/* 密钥写入目标切换：只有选「写入指定文件」才显示路径/格式/字段输入。 */
+function syncKeyTargetFields(scope) {
+  if (!scope) return;
+  const sel = scope.querySelector('[data-field="keyWriteTarget"]');
+  const isFile = !!sel && sel.value === "file";
+  $$('[data-role="key-file-field"]', scope).forEach((el) => {
+    el.style.display = isFile ? "" : "none";
+  });
 }
 
 /* 上游「列表 + 详情」：表格负责浏览与操作，隐藏的卡片仍是唯一表单源 */
@@ -731,8 +806,11 @@ function upstreamDetailRowCfg(card) {
   const models = val("models").split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   const items = [
     ["模型清单", models.slice(0, 12).join(", ") + (models.length > 12 ? ` …共 ${models.length} 个` : "")],
-    ["密钥环境变量", val("apiKeyEnv") || "未设置（直接用配置文件里的密钥）"],
-    ["密钥状态", card.dataset.keyConfigured === "1" ? "已配置" : "未配置（上游会返回 401）"],
+    ["密钥环境变量", val("apiKeyEnv") || "未设置（仅用自定义凭据文件）"],
+    ["凭据文件", val("apiKeyFile") || val("apiKeyAgentPath") || "未设置"],
+    ["密钥状态", card.dataset.keyConfigured === "1"
+      ? `已配置${card.dataset.keySource ? `（${card.dataset.keySource}）` : ""}`
+      : "未配置（上游会返回 401）"],
     ["自动拉取模型", val("autoModels")],
     ["鉴权方式", val("compatAuthScheme") || "跟随 provider 预设"],
     ["会话头", val("compatSessionHeader") || "跟随预设 / 不注入"],
@@ -818,8 +896,11 @@ function renderUpstreamCfgTable() {
   const hint = $("#upstream-cfg-hint");
   if (hint) {
     const bad = cards.filter((c) => c.dataset.keyConfigured !== "1").length;
+    const envFileDead = state.config
+      && Object.prototype.hasOwnProperty.call(state.config, "envFile");
     hint.textContent = `共 ${fmtInt(cards.length)} 个上游`
       + (bad ? ` · ${bad} 个未配置密钥（会返回 401）` : "")
+      + (envFileDead ? " · 顶层 envFile 已失效（密钥只从环境变量读取）" : "")
       + " · 点击任意行展开详情 ·「编辑」在弹窗里改字段";
   }
 }
@@ -857,9 +938,22 @@ function renderUpstreamEditor() {
     const keyConfigured = u._keyConfigured;
     const eff = ((state.effective || []).find((row) => row.name === name)) || null;
     const keyWarn = keyConfigured ? "" :
-      `<div class="hint" style="color:var(--warn)">未配置密钥：上游会返回 401，请在下方填写 apiKey（或设置 apiKeyEnv / agent 来源）</div>`;
+      `<div class="hint" style="color:var(--warn)">未配置密钥：上游会返回 401，请填写 apiKeyEnv 并点「写入密钥」（可选写入用户环境变量或你手动指定的文件），或设置自定义凭据路径</div>`;
+    const legacyHints = [];
+    if (u.apiKeyFile) {
+      legacyHints.push("apiKeyFile 为旧凭据来源：仍可用；路径可保存在 bridge.config.json，但必须由你手动指定，且文件内只应放密钥");
+    }
+    const agentName = String(u.apiKeyAgent || "").trim();
+    if (agentName && ["opencode", "jcode", "commandcode"].includes(agentName.toLowerCase())) {
+      legacyHints.push(`内置预设「${agentName}」已移除：请填写自定义凭据路径，或改用 apiKeyEnv`);
+    } else if (agentName) {
+      legacyHints.push("apiKeyAgent 为旧凭据来源：自定义路径仍可用，推荐改用 apiKeyEnv");
+    }
+    const legacyHint = legacyHints.length
+      ? `<div class="hint" style="color:var(--warn)">迁移提示：${legacyHints.map(esc).join("；")}</div>`
+      : "";
     return `
-    <div class="up-card" data-name="${esc(name)}" data-index="${index}" data-key-configured="${keyConfigured ? 1 : 0}">
+    <div class="up-card" data-name="${esc(name)}" data-index="${index}" data-key-configured="${keyConfigured ? 1 : 0}" data-key-source="${esc(eff ? eff.keySource : "")}">
       <div class="up-head">
         <span class="name">${esc(name)}</span>
         ${u.default ? '<span class="badge brand">默认上游</span>' : ""}
@@ -902,27 +996,47 @@ function renderUpstreamEditor() {
         <label>API Key
           <div class="key-row">
             <input type="password" data-field="apiKey" value="" placeholder="${keyConfigured ? "已配置 · 留空保持不变" : "未配置"}">
+            <select data-field="keyWriteTarget" title="密钥写到哪里：Windows 用户环境变量，或你手动指定的文件">
+              <option value="env">写入用户环境变量</option>
+              <option value="file">写入指定文件</option>
+            </select>
             <button type="button" class="ghost" data-act="save-env"
-              title="把上面填的密钥写入密钥文件（apiKeyEnv 指向的变量）并立即生效，无需重启">写入 .env</button>
+              title="把上面填的密钥写入所选目标（用户环境变量 / 你指定的文件）并立即生效，无需重启">写入密钥</button>
           </div>
         </label>
+        <label class="span-2" data-role="key-file-field">凭据文件路径（写入指定文件时必填）
+          <input type="text" data-field="keyWritePath" value="${esc(u.apiKeyFile || u.apiKeyAgentPath || "")}" placeholder="如 D:\\secrets\\mykey.json 或 D:\\secrets\\app.env">
+        </label>
+        <label data-role="key-file-field">文件格式
+          <select data-field="keyWriteFormat">
+            <option value="json">JSON</option>
+            <option value="env">.env 文本</option>
+          </select>
+        </label>
+        <label data-role="key-file-field">字段 / 变量名
+          <input type="text" data-field="keyWriteField" value="${esc(u.apiKeyAgentProvider || "")}" placeholder="JSON 点路径（留空=根字段 apiKey）/ .env 变量名（必填）">
+        </label>
+        <div class="span-2 hint" data-role="key-file-field">凭据文件没有内置默认路径：只能写你手动指定的这个文件。写入后配置文件里只保存路径引用，不保存密钥。</div>
         <label>密钥环境变量（apiKeyEnv）
           <input type="text" data-field="apiKeyEnv" value="${esc(u.apiKeyEnv || "")}" placeholder="COMMAND_CODE_API_KEY">
         </label>
-        <label>密钥来源（agent 工具）
+        <label class="span-2">密钥文件（apiKeyFile，可选）
+          <input type="text" data-field="apiKeyFile" value="${esc(u.apiKeyFile || "")}" placeholder="如 D:\\secrets\\mykey.json（读取 JSON 根字段 apiKey）">
+        </label>
+        <div class="span-2 hint">只读你手填的文件路径，没有内置默认位置；该路径会保存到 bridge.config.json（仅路径，不含密钥）。优先级低于 apiKeyEnv、高于下方自定义凭据文件。</div>
+        <label>密钥来源（自定义文件）
           <select data-field="apiKeyAgent">
-            ${[["", "不启用"], ["opencode", "opencode (auth.json)"], ["jcode", "jcode (.env)"],
-               ["commandcode", "CommandCode (auth.json)"], ["custom", "自定义文件"]]
+            ${[["", "不启用"], ["custom", "自定义文件"]]
               .map(([v, label]) => `<option value="${v}"${(u.apiKeyAgent || "") === v ? " selected" : ""}>${label}</option>`).join("")}
           </select>
         </label>
-        <label>agent Provider / 变量名
-          <input type="text" data-field="apiKeyAgentProvider" value="${esc(u.apiKeyAgentProvider || "")}" placeholder="opencode 填 provider；jcode/自定义填变量名">
+        <label>自定义文件字段 / 变量名
+          <input type="text" data-field="apiKeyAgentProvider" value="${esc(u.apiKeyAgentProvider || "")}" placeholder="JSON 点路径或 .env 变量名（可留空）">
         </label>
-        <label class="span-2">agent 凭据路径（可选）
-          <input type="text" data-field="apiKeyAgentPath" value="${esc(u.apiKeyAgentPath || "")}" placeholder="留空使用默认路径；custom 时必填，如 ~/.codex/auth.json">
+        <label class="span-2">自定义凭据路径（必填）
+          <input type="text" data-field="apiKeyAgentPath" value="${esc(u.apiKeyAgentPath || "")}" placeholder="必填，如 D:\\secrets\\mykey.json">
         </label>
-        <div class="span-2 hint">只读本机客户端凭据；优先级低于 apiKeyEnv / apiKeyFile，高于明文 apiKey。</div>
+        <div class="span-2 hint">只读你手动指定的凭据文件；没有内置默认路径。优先级低于 apiKeyEnv / apiKeyFile；JSON 中的 apiKey 已不再作为凭据。</div>
         <label class="span-2">模型清单（每行一个，也是路由依据）
           <div class="models-field-row">
             <textarea data-field="models" rows="3">${esc((u.models || []).join("\n"))}</textarea>
@@ -1005,8 +1119,17 @@ function renderUpstreamEditor() {
       </div>
       </details>
       ${keyWarn}
+      ${legacyHint}
     </div>`;
   }).join("") || '<div class="empty">还没有上游，点「＋ 新增上游」创建</div>';
+
+  // 密钥写入目标：默认写用户环境变量；选「写入指定文件」才显示文件相关字段。
+  $$(".up-card", host).forEach((card) => syncKeyTargetFields(card));
+  $$('[data-field="keyWriteTarget"]', host).forEach((sel) => {
+    sel.addEventListener("change", () => {
+      syncKeyTargetFields(sel.closest(".up-card") || host);
+    });
+  });
 
   $$("[data-act]", host).forEach((btn) => {
     btn.addEventListener("click", async (ev) => {
@@ -1021,7 +1144,39 @@ function renderUpstreamEditor() {
           toast("请先在上面填入新的 API Key", true);
           return;
         }
-        saveUpstreamSecret(key, secret, input);
+        const targetSel = cardEl.querySelector('[data-field="keyWriteTarget"]');
+        const target = (targetSel && targetSel.value === "file") ? "file" : "env";
+        if (target === "file") {
+          const pathEl = cardEl.querySelector('[data-field="keyWritePath"]');
+          const filePath = ((pathEl && pathEl.value) || "").trim();
+          if (!filePath) {
+            toast("请先填写「凭据文件路径」，再写入文件", true);
+            return;
+          }
+          const fmtEl = cardEl.querySelector('[data-field="keyWriteFormat"]');
+          const fileFormat = (fmtEl && fmtEl.value) || "json";
+          const fieldEl = cardEl.querySelector('[data-field="keyWriteField"]');
+          const field = ((fieldEl && fieldEl.value) || "").trim();
+          if (fileFormat === "env" && !field) {
+            toast(".env 格式必须填变量名（字段/变量名输入框）", true);
+            return;
+          }
+          saveUpstreamSecret(key, secret, input, {
+            target: "file",
+            filePath,
+            fileFormat,
+            field,
+            onWritten: (data) => applyKeyFileReference(cardEl, data),
+          });
+          return;
+        }
+        const envInput = cardEl.querySelector('[data-field="apiKeyEnv"]');
+        const envName = ((envInput && envInput.value) || "").trim();
+        if (!envName) {
+          toast("请先填写「密钥环境变量」名，再写入用户变量", true);
+          return;
+        }
+        saveUpstreamSecret(key, secret, input, { target: "env", envName });
         return;
       }
       if (btn.dataset.act === "edit") {
@@ -1275,6 +1430,12 @@ function openUpstreamEditor(cardEl) {
   });
   const host = root && root.querySelector(".modal-grid-host");
   if (host) host.appendChild(clone);
+  // 弹窗里的「写入目标」也要能切换文件字段（cloneNode 不带事件监听器）。
+  const targetSel = clone.querySelector('[data-field="keyWriteTarget"]');
+  if (targetSel) {
+    syncKeyTargetFields(clone);
+    targetSel.addEventListener("change", () => syncKeyTargetFields(clone));
+  }
   // cloneNode 不复制事件监听器：编辑弹窗里的「查询清单」要单独接上。
   // 面板内嵌在弹窗内（不另开弹窗），否则会把正在编辑的字段冲掉。
   const queryBtn = clone.querySelector('[data-act="query-models"]');
@@ -1294,12 +1455,13 @@ const _readUpstreamEditor = () => {
     const get = (f) => cardEl.querySelector(`[data-field="${f}"]`);
     let name = (get("name").value || "").trim() || cardEl.dataset.name;
     const old = (state.config.upstreams || {})[cardEl.dataset.name] || {};
-    const apiKey = get("apiKey").value;
     // 保留所有未在表单里渲染的字段（cliVersion、modelCatalog、thinking…）：
     // 以前这里重建对象，保存一次就会静默丢配置。
     const entry = Object.assign({}, old);
     delete entry._keyConfigured;
     delete entry._keySource;
+    // 表单里的密钥输入只用于「写入密钥」（写入用户环境变量 / 写入指定文件）；保存配置时不携带任何密钥本体。
+    delete entry.apiKey;
     entry.protocol = get("protocol").value;
     const transport = get("transport") ? get("transport").value : "";
     if (transport) entry.transport = transport; else delete entry.transport;
@@ -1307,10 +1469,11 @@ const _readUpstreamEditor = () => {
     entry.models = parseModels(get("models").value);
     entry.default = get("default").checked;
     entry.autoModels = get("autoModels").checked;
-    if (apiKey) entry.apiKey = apiKey;
-    else if (old.apiKey !== undefined) entry.apiKey = old.apiKey;
     const env = get("apiKeyEnv").value.trim();
     if (env) entry.apiKeyEnv = env; else delete entry.apiKeyEnv;
+    const keyFileEl = get("apiKeyFile");
+    const keyFile = keyFileEl ? keyFileEl.value.trim() : "";
+    if (keyFile) entry.apiKeyFile = keyFile; else delete entry.apiKeyFile;
     const agent = get("apiKeyAgent").value;
     if (agent) entry.apiKeyAgent = agent; else delete entry.apiKeyAgent;
     const agentProvider = get("apiKeyAgentProvider").value.trim();

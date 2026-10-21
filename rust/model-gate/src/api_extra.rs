@@ -1021,7 +1021,7 @@ async fn probe(state: &AppState, up: &crate::config::Upstream, timeout: f64) -> 
                 "message": if resp.status().is_success() { "模型列表可访问".to_string() }
                            else { format!("HTTP {status}") },
                 "hint": if resp.status().is_success() { "" }
-                        else { "检查 apiKey / baseUrl / 网络；CommandCode 无 /v1/models，属正常" },
+                        else { "检查 apiKeyEnv / 凭据文件路径 / baseUrl / 网络；CommandCode 无 /v1/models，属正常" },
             })
         }
         Err(err) => json!({
@@ -1034,6 +1034,19 @@ async fn probe(state: &AppState, up: &crate::config::Upstream, timeout: f64) -> 
     }
 }
 
+/// 写入上游密钥：**只写 Windows 用户级环境变量**（`HKCU\Environment`）或**用户指定文件**。
+///
+/// 入参：
+/// - `name` / `apiKey`：必填。
+/// - `target`：`env`（默认，写用户变量）或 `file`（写用户手填的凭据文件）。
+/// - `envName`：变量名，缺省时用该上游配置的 `apiKeyEnv`。
+/// - `filePath`：文件路径，缺省时用该上游配置的 `apiKeyFile` / `apiKeyAgentPath`。
+/// - `fileFormat`：`json`（默认）或 `env`。
+/// - `field`：JSON 点路径（缺省 `apiKey`）或 `.env` 变量名。
+///
+/// 约定：
+/// - 写入成功 → 更新运行态并热重载，响应只回变量名/路径与来源，**不回显明文**。
+/// - 写入失败 → 返回可诊断错误，**不**静默降级为「只进内存」。
 pub async fn upstream_secret(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -1048,23 +1061,291 @@ pub async fn upstream_secret(
             "empty_key",
         );
     }
-    let mut cfg: crate::config::Config = (**state.cfg()).clone();
-    let mut found = false;
-    for up in cfg.upstreams.iter_mut() {
-        if up.name == name {
-            up.api_key = key.to_string();
-            up.key_source = "literal".into();
-            found = true;
-        }
-    }
-    if !found {
+    if let Err(err) = crate::key_file::validate_key(key) {
         return error_json(
-            StatusCode::NOT_FOUND,
-            format!("未知上游 {name}"),
+            StatusCode::BAD_REQUEST,
+            err.to_string(),
             "invalid_request_error",
-            "unknown_upstream",
+            "invalid_key",
         );
     }
+    let target = body
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("env")
+        .to_ascii_lowercase();
+    if target != "env" && target != "file" {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("未知写入目标 {target}：只支持 env（用户变量）/ file（指定文件）"),
+            "invalid_request_error",
+            "invalid_target",
+        );
+    }
+
+    let cfg: crate::config::Config = (**state.cfg()).clone();
+    let upstream = match cfg.upstreams.iter().find(|u| u.name == name) {
+        Some(up) => up.clone(),
+        None => {
+            return error_json(
+                StatusCode::NOT_FOUND,
+                format!("未知上游 {name}"),
+                "invalid_request_error",
+                "unknown_upstream",
+            )
+        }
+    };
+    // 原始配置条目：agent 路径与 provider 只存在于 raw 里。
+    let raw_up = cfg
+        .raw
+        .get("upstreams")
+        .and_then(Value::as_object)
+        .and_then(|m| m.get(name))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    if target == "file" {
+        return write_secret_to_file(&state, cfg, &upstream, &raw_up, &body, key);
+    }
+    write_secret_to_user_env(&state, cfg, &upstream, &body, key)
+}
+
+/// 写入 Windows 用户级环境变量（`HKCU\Environment`）。
+fn write_secret_to_user_env(
+    state: &AppState,
+    mut cfg: crate::config::Config,
+    upstream: &crate::config::Upstream,
+    body: &Value,
+    key: &str,
+) -> Response {
+    let env_name = body
+        .get("envName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            upstream
+                .api_key_env
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
+    if env_name.is_empty() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "缺少密钥环境变量名：请填写「密钥环境变量」或指定 envName",
+            "invalid_request_error",
+            "missing_env_name",
+        );
+    }
+    if !is_valid_env_name(&env_name) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("环境变量名不合法：{env_name}"),
+            "invalid_request_error",
+            "invalid_env_name",
+        );
+    }
+
+    // 真正写入用户级环境变量。
+    if let Err(err) = crate::user_env::write_user_var(&env_name, key) {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("写入用户变量 {env_name} 失败：{err}"),
+            "internal_error",
+            "write_user_var_failed",
+        );
+    }
+    // Windows 环境块是启动时快照：当前进程要靠会话缓存才能立刻读到新值。
+    crate::user_env::remember_session_var(&env_name, key);
+    crate::user_env::notify_environment_changed();
+
+    // 热更新运行态：让本次会话立即按新密钥工作。
+    for up in cfg.upstreams.iter_mut() {
+        if up.name == upstream.name {
+            up.api_key = key.to_string();
+            up.key_source = "user-env".into();
+        }
+    }
     state.cfg.store(Arc::new(cfg));
-    Json(json!({"ok": true, "name": name, "note": "密钥仅驻内存，不落盘"})).into_response()
+    Json(json!({
+        "ok": true,
+        "name": upstream.name,
+        "target": "env",
+        "envName": env_name,
+        "scope": "user",
+        "keySource": "user-env",
+        "note": "已写入 Windows 用户环境变量（HKCU\\Environment）；新进程自动继承",
+    }))
+    .into_response()
+}
+
+/// 写入**用户手动指定**的凭据文件（JSON / `.env`）。
+///
+/// 路径没有内置默认值：入参 `filePath` 优先，缺省时回退该上游已配置的
+/// `apiKeyFile` / `apiKeyAgentPath`（都是用户自己填的路径）。
+fn write_secret_to_file(
+    state: &AppState,
+    mut cfg: crate::config::Config,
+    upstream: &crate::config::Upstream,
+    raw_up: &Value,
+    body: &Value,
+    key: &str,
+) -> Response {
+    let file_path_raw = body
+        .get("filePath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            upstream
+                .api_key_file
+                .clone()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            raw_up
+                .get("apiKeyAgentPath")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if file_path_raw.is_empty() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "缺少凭据文件路径：请填写「凭据文件路径」或先在配置里指定 apiKeyFile",
+            "invalid_request_error",
+            "missing_file_path",
+        );
+    }
+    let format_raw = body
+        .get("fileFormat")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("json")
+        .to_string();
+    let format = match crate::key_file::KeyFileFormat::parse(&format_raw) {
+        Some(f) => f,
+        None => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("未知凭据文件格式 {format_raw}：只支持 json / env"),
+                "invalid_request_error",
+                "invalid_file_format",
+            )
+        }
+    };
+    // `.env` 必须有变量名：沿用上游已配置的 provider（`apiKeyAgentProvider`）。
+    // JSON 缺省写根字段 `apiKey`。
+    let field = body
+        .get("field")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| match format {
+            crate::key_file::KeyFileFormat::Env => raw_up
+                .get("apiKeyAgentProvider")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            crate::key_file::KeyFileFormat::Json => None,
+        })
+        .unwrap_or_default();
+
+    let path = crate::config::expand_home(&file_path_raw);
+    if !path.is_absolute() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            format!("凭据文件路径必须是绝对路径：{file_path_raw}"),
+            "invalid_request_error",
+            "invalid_file_path",
+        );
+    }
+    // 禁止把密钥写进 Model-Gate 自己的配置文件。
+    let protected = vec![state.config_path.clone()];
+    let written = match crate::key_file::write_key_file(&path, format, &field, key, &protected) {
+        Ok(w) => w,
+        Err(err) => {
+            let status = match err {
+                crate::key_file::KeyFileError::Invalid(_) => StatusCode::BAD_REQUEST,
+                crate::key_file::KeyFileError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return error_json(
+                status,
+                err.to_string(),
+                "invalid_request_error",
+                "write_key_file_failed",
+            );
+        }
+    };
+    // 回读校验：用与运行时相同的读取语义确认密钥真的落到了文件里。
+    if !crate::key_file::verify_key_file(&written.path, &written.field) {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "写入 {} 后回读校验失败，请检查文件格式与字段名",
+                written.path.display()
+            ),
+            "internal_error",
+            "verify_key_file_failed",
+        );
+    }
+
+    let label = written
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    // 与配置里保存的引用保持一致：根字段 `apiKey` 走 `apiKeyFile`，其余走 agent 自定义路径。
+    let key_source = match format {
+        crate::key_file::KeyFileFormat::Json if written.field == "apiKey" => "file".to_string(),
+        crate::key_file::KeyFileFormat::Json => format!("agent:file/{label}"),
+        crate::key_file::KeyFileFormat::Env => format!("agent:env-file/{label}"),
+    };
+    for up in cfg.upstreams.iter_mut() {
+        if up.name == upstream.name {
+            up.api_key = key.to_string();
+            up.key_source = key_source.clone();
+        }
+    }
+    state.cfg.store(Arc::new(cfg));
+
+    // 环境变量优先级高于文件：已配置 apiKeyEnv 时给出明确提示。
+    let warning = match upstream.api_key_env.as_ref().map(|s| s.trim()) {
+        Some(env_name) if !env_name.is_empty() => {
+            format!("该上游配置了 apiKeyEnv={env_name}：环境变量优先于文件，文件里的密钥暂不生效")
+        }
+        _ => String::new(),
+    };
+    Json(json!({
+        "ok": true,
+        "name": upstream.name,
+        "target": "file",
+        "scope": "file",
+        "filePath": written.path.display().to_string(),
+        "fileFormat": written.format,
+        "field": written.field,
+        "created": written.created,
+        "keySource": key_source,
+        "warning": warning,
+        "note": "已写入用户指定文件；请点「保存配置」把路径引用写入配置文件（配置文件里只存路径，不存密钥）",
+    }))
+    .into_response()
+}
+
+/// Windows 环境变量名合法性：不能含 `=`，不能为空，不能以 `=` 开头。
+fn is_valid_env_name(name: &str) -> bool {
+    crate::key_file::is_valid_env_name(name)
 }

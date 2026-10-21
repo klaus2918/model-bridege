@@ -21,7 +21,7 @@ powershell -ExecutionPolicy Bypass -File build-installer.ps1
 
 | 能力 | 验证 |
 |---|---|
-| 配置解析 / 密钥解析（env → file → agent → 字面值，空 key 保留） | `config.rs` 单元测试 |
+| 配置解析 / 密钥解析（env → file → agent；**无字面量凭据、无内置预设路径**） | `config.rs` 单元测试 |
 | SQLite 同构（迁移、索引、读写分库） | `db.rs` 单元测试 |
 | 统计口径（totals/summary/list/models/upstreams，SQL 窗口分位） | `db.rs` 单元测试 |
 | 面板全量 `/api/*`（config 保存/热重载、pricing、catalog、logs、export、清空、保留策略、健康探测、密钥写入） | `scripts\panel_api_smoke.ps1` |
@@ -29,7 +29,7 @@ powershell -ExecutionPolicy Bypass -File build-installer.ps1
 | 面板静态资源（自有副本 `rust/model-gate/ui/`，编译期内嵌） | `/ui/` 正常 |
 | 桌面壳：托盘常驻 + 系统浏览器面板（打开面板、复制地址、数据目录、退出、今日指标） | `scripts\rust_shell_acceptance.ps1` |
 | 单实例（签名互斥）/ 端口降级 / 请求调用日志（5 MB×3 轮转）、崩溃落盘 | 启动路径验证 |
-| 从 agent 工具读取密钥（opencode / jcode / commandcode / 自定义） | `config.rs` 单元测试 |
+| 从 agent 工具读取密钥（**仅自定义路径**，无内置 opencode / jcode / commandcode 预设） | `config.rs` 单元测试 |
 | **应用内更新**：GitHub Release 检查、SHA256 校验、Inno 静默覆盖升级 | `cargo test` + `tests\update_probe.rs` |
 
 ## 对等回归
@@ -74,17 +74,34 @@ deepseek-flash -> deepseek:deepseek-chat 502 120ms 失败: 无法连接上游 ..
 日志文件为 `data/modelgate.log`，启动时超过 5 MB 自动轮转，保留 `modelgate.log.1` ~ `.3`。
 面板「日志」页签保持 4 秒自动刷新。
 
-## 从 agent 工具读取密钥
+## 密钥来源
 
-上游新增 `apiKeyAgent` 预设（`opencode` / `jcode` / `commandcode` / `custom`），
-只读本机客户端凭据。优先级：`apiKeyEnv` → `apiKeyFile` → `apiKeyAgent` → `apiKey`。
+密钥只从环境变量或你显式指定的凭据文件读取。`apiKeyEnv` 指定变量名，取值顺序：
 
-| 预设 | 默认路径 | Provider 语义 |
+1. 进程环境变量；
+2. 本进程写入的会话缓存（Windows 环境块是启动时快照，运行中读不到新写入的注册表值）；
+3. Windows 用户变量 `HKCU\Environment`。
+
+面板 API Key 行的「写入密钥」有两个目标，**都没有内置默认路径**：
+
+| 写入目标 | 落点 | 说明 |
 |---|---|---|
-| opencode | `~/.local/share/opencode/auth.json`（或 `~/.config/opencode/auth.json`） | provider 名，读取 `provider.key` |
-| jcode | `~/.jcode/.env` | 变量名 |
-| commandcode | `~/.commandcode/auth.json` | 无需填写，读取 `apiKey` |
-| custom | 用 `apiKeyAgentPath` 指定 | JSON 路径（`a.b`）或 .env 变量名 |
+| 写入用户环境变量 | `HKCU\Environment` | 写 `apiKeyEnv` 指定的变量名（缺省用该上游已配置的 `apiKeyEnv`）；写完广播 `WM_SETTINGCHANGE`，当前进程靠会话缓存立即生效，新进程由系统继承 |
+| 写入指定文件 | 你手填的绝对路径 | JSON（根字段 `apiKey` 或点路径，如 `deepseek.key`）或 `.env`（变量名）；读-改-写保留其它字段，同目录临时文件 + `rename` 原子替换，**不生成 `.bak`**；写完用运行时同一套读取语义回读校验 |
+
+写入成功后运行态立即生效（`keySource` = `user-env` / `file` / `agent:file/<名>` / `agent:env-file/<名>`）；
+配置文件里只保存**路径引用**（`apiKeyFile` / `apiKeyAgentPath`），不保存密钥本体。
+若该上游同时配置了 `apiKeyEnv`，环境变量优先级更高，界面会提示「文件里的密钥暂不生效」。
+写入 Model-Gate 自己的 `bridge.config.json` 会被拒绝。
+
+旧字段 `apiKeyFile` / `apiKeyAgent` 仍兼容，但**没有任何内置预设路径**：
+
+| 字段 | 行为 |
+|---|---|
+| `apiKey` | 已废弃：JSON 中的明文值不再作为凭据读取，只给 `legacy_literal_api_key` 迁移提示，不回显原值 |
+| `apiKeyFile` | 仅当你显式填写路径时，读取该 JSON 的 `apiKey` 字段；**路径本身可以写入 `bridge.config.json`**（只保存路径，不保存密钥） |
+| `apiKeyAgentPath` | 仅当你显式填写路径时读取；支持 JSON 点路径或 `.env` 变量名；路径同样可写入 `bridge.config.json` |
+| `envFile` | 已失效：启动时给迁移提示，不阻断启动 |
 
 ```json
 {
@@ -92,14 +109,13 @@ deepseek-flash -> deepseek:deepseek-chat 502 120ms 失败: 无法连接上游 ..
     "deepseek": {
       "protocol": "openai",
       "baseUrl": "https://api.deepseek.com/v1",
-      "apiKeyAgent": "opencode",
-      "apiKeyAgentProvider": "deepseek"
+      "apiKeyEnv": "DEEPSEEK_API_KEY"
     }
   }
 }
 ```
 
-面板「上游」页签可直接选择预设、填 Provider / 变量名与路径。
+面板「上游」页签可直接填环境变量名，在 API Key 行选「写入用户环境变量」或「写入指定文件」（后者需填路径、格式、字段名）后点「写入密钥」；也可以在「密钥文件（apiKeyFile）」里填绝对路径，从该 JSON 的 `apiKey` 字段读取；其他格式用「自定义凭据文件」填字段名/变量名与路径。凭据文件路径必须由你手动填写。
 
 ## 托盘今日指标
 
@@ -119,7 +135,7 @@ Windows 托盘不支持常驻鼠标正文字，
 | 新增 / 删除上游 | 保存时按 `upstreams` 同步增删（删除是真的，不会被顶回），重启后不复活 |
 | 局部保存 | 只改传入的字段（如 `{"defaultModel": ...}`），其余顶层键与上游保持原样 |
 | 未展示字段 | 面板不展示的兼容字段（`cliVersion` / `compat` / `modelCatalog`…）逐字段保留 |
-| 写入方式 | 临时文件 → 回读校验 → 原子替换；明文 `apiKey` 永不落盘 |
+| 写入方式 | 临时文件 → 回读校验 → 原子替换；面板保存永不携带 `apiKey`，后端落盘前再剥离 |
 
 **备份**（面板配置落盘与备份区）：
 
@@ -140,6 +156,8 @@ src/
   main.rs        CLI / 启动 / 单实例 / 日志
   config.rs      配置、上游归一化、密钥解析
   config_store.rs 配置落盘：合并语义 + 原子写 + 备份策略
+  key_file.rs    凭据文件写入：JSON / .env 读-改-写 + 原子替换 + 安全护栏
+  user_env.rs    Windows 用户级环境变量写入（HKCU\Environment）
   db.rs          SQLite（读写分库 + SQL 窗口分位）
   proxy.rs       HTTP 路由、代理、流式、面板 API
   api_extra.rs   面板扩展接口（catalog/logs/export/pricing/retention/backups 等）

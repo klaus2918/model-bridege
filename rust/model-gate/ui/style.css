@@ -343,6 +343,7 @@ code.ep { font-family: var(--mono); color: var(--data); }
 .up-actions { display: flex; align-items: center; gap: 6px; }
 .key-row { display: flex; gap: 6px; align-items: center; }
 .key-row input { flex: 1 1 auto; min-width: 0; }
+.key-row select { flex: 0 0 auto; max-width: 170px; }
 .key-row button { white-space: nowrap; }
 
 /* ══ 日志查看器 ══ */

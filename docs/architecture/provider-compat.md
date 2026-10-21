@@ -157,7 +157,6 @@
   "protocol": "commandcode",
   "baseUrl": "https://api.commandcode.ai",
   "apiKeyEnv": "COMMAND_CODE_API_KEY",
-  "apiKeyFile": "~/.commandcode/auth.json",
   "compat": {
     "zdr": false,
     "versionHeader": "x-command-code-version",

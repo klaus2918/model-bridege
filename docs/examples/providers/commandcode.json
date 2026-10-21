@@ -1,5 +1,5 @@
 {
-  "_doc": "Provider 示例：CommandCode（profile=commandcode，NDJSON + ZDR + 64K 输出上限）。复制为 bridge.config.json 使用；凭据优先读本地 CLI 登录态。",
+  "_doc": "Provider 示例：CommandCode（profile=commandcode，NDJSON + ZDR + 64K 输出上限）。复制为 bridge.config.json 使用；凭据只从环境变量 COMMAND_CODE_API_KEY 读取（进程环境或 Windows 用户变量），不再内置厂商凭据路径。",
   "port": 8900,
   "host": "127.0.0.1",
   "defaultModel": "deepseek/deepseek-v4.1-flash",
@@ -13,7 +13,6 @@
       "protocol": "commandcode",
       "baseUrl": "https://api.commandcode.ai",
       "apiKeyEnv": "COMMAND_CODE_API_KEY",
-      "apiKeyFile": "~/.commandcode/auth.json",
       "cliVersion": "auto",
       "cliEnvironment": "production",
       "modelCatalog": "auto",
