@@ -805,7 +805,7 @@ details.fold > .actions.sticky-actions { padding: 10px 0 6px; }
   font-size: 12px;
 }
 .update-notes {
-  max-height: 180px;
+  max-height: 320px;
   overflow: auto;
   margin: 8px 0 0;
   padding: 10px 12px;
@@ -818,6 +818,68 @@ details.fold > .actions.sticky-actions { padding: 10px 0 6px; }
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+/* 更新弹窗：位置区（安装包下载到哪 / 会装到哪）——路径必须一眼可见 */
+.update-paths { display: grid; gap: 6px; }
+.update-path-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.update-path-row .hint { white-space: nowrap; }
+.update-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+/* 更新弹窗：下载目录编辑器（可指定安装包下载位置） */
+.update-dir-editor {
+  display: grid;
+  gap: 6px;
+  margin: 2px 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.update-dir-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+}
+.update-dir-input {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.update-dir-editor code { font-family: var(--mono); }
+@media (max-width: 720px) {
+  .update-dir-row { grid-template-columns: minmax(0, 1fr); }
+}
+/* 更新弹窗：分步说明（下载 → 校验 → 安装 → 覆盖 → 重启） */
+.update-steps {
+  margin: 2px 0;
+  padding-left: 20px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.update-steps code { font-family: var(--mono); }
+/* 更新弹窗：安装前的二次确认块（放在弹窗内部，不另开弹窗） */
+.update-confirm {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--brand-line);
+  border-radius: var(--radius-sm);
+  background: var(--brand-soft);
 }
 .update-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
 

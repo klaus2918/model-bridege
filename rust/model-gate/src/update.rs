@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::db::Db;
 use crate::proxy::{error_json, AppState};
+use crate::update_paths;
 
 const REPO_OWNER: &str = "klaus2918";
 const REPO_NAME: &str = "model-bridege";
@@ -306,19 +307,52 @@ pub struct UpdateService {
     state: Mutex<UpdateState>,
     db: Arc<Db>,
     install_dir: PathBuf,
+    /// 当前运行的 exe 路径（取不到时为 None）。
+    exe_path: Option<PathBuf>,
+    /// Inno 卸载项记录的安装目录（取不到时为 None）。
+    ///
+    /// 已安装状态下 Inno 会忽略 `/DIR=`，改用这个值——它才是「实际装到哪」的答案。
+    registered_install_dir: Option<PathBuf>,
 }
 
 impl UpdateService {
     pub fn new(current: Version, db: Arc<Db>, install_dir: PathBuf) -> Self {
         cleanup_stale_temp();
         let client = build_client();
+        let exe_path = std::env::current_exe().ok();
+        let registered_install_dir = update_paths::registered_install_dir();
         Self {
             current,
             client,
             state: Mutex::new(UpdateState::default()),
             db,
             install_dir,
+            exe_path,
+            registered_install_dir,
         }
+    }
+
+    /// 生效安装目录：注册表记录优先，回退当前 exe 所在目录。
+    fn effective_install_dir(&self) -> PathBuf {
+        update_paths::effective_install_dir_with(
+            self.registered_install_dir.as_deref(),
+            &self.install_dir,
+        )
+    }
+
+    /// 生效安装目标：生效安装目录下的 `Model-Gate.exe`（升级时被覆盖的那个文件）。
+    fn effective_install_target(&self) -> PathBuf {
+        update_paths::effective_install_target_with(
+            self.registered_install_dir.as_deref(),
+            &self.install_dir,
+        )
+    }
+
+    /// 生效下载目录：`update.download_dir` 设置优先，缺失/空值用默认目录
+    /// （`%LOCALAPPDATA%\Model-Gate\updates`）。
+    fn download_dir(&self) -> PathBuf {
+        let custom = self.db.get_setting(update_paths::DOWNLOAD_DIR_SETTING);
+        update_paths::resolve_download_dir(custom.as_deref())
     }
 
     pub async fn status(&self) -> Value {
@@ -459,11 +493,16 @@ impl UpdateService {
         // 用 cmd 包一层，先等本进程退出释放 exe 句柄，再让安装器真正执行。
         // `ping -n N 127.0.0.1` 是一个不依赖本进程存活的一次性延时器
         // （N = 等待秒数 + 1），退出码固定为 0，因此不会中断后续命令。
+        //
+        // 安装目录取「生效安装目录」：已安装过时 Inno 会忽略 /DIR=，改用注册表
+        // 里记录的 InstallLocation；这里显式传入同一个值，保证「面板显示的安装
+        // 位置」与「安装器实际写入的位置」一致。
         let wait_secs = INSTALL_EXIT_DELAY_MS / 1000 + 1;
+        let install_dir = update_paths::effective_install_dir(&self.install_dir);
         let installer_args = format!(
             "\"{}\" /SILENT /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /SUPPRESSMSGBOXES \"/DIR={}\"",
             path.display(),
-            self.install_dir.display()
+            install_dir.display()
         );
         let cmd_line = format!("ping -n {} 127.0.0.1 >nul & {}", wait_secs, installer_args);
         std::process::Command::new("cmd")
@@ -495,10 +534,12 @@ impl UpdateService {
         let sums_text = self.fetch_text(&sums.url, MAX_SUMS_BYTES).await?;
         let expected_sha = parse_sha256sums(&sums_text, &setup.name)?;
 
-        let dir = std::env::temp_dir().join(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4()));
+        // 下载目录可配置（默认 %LOCALAPPDATA%\Model-Gate\updates）：
+        // 用户要能自己找到安装包，随机临时目录做不到这一点。
+        let dir = self.download_dir();
         tokio::fs::create_dir_all(&dir)
             .await
-            .map_err(|err| UpdateError::download_failed(format!("创建临时目录失败：{err}")))?;
+            .map_err(|err| UpdateError::download_failed(format!("创建下载目录失败：{err}")))?;
         let file_name = Path::new(&setup.name)
             .file_name()
             .and_then(|name| name.to_str())
@@ -685,6 +726,9 @@ impl UpdateService {
                 .map(|release| release.setup.is_some() && release.sums.is_some())
                 .unwrap_or(false);
         let release = state.latest.as_ref();
+        // 下载目录可被用户指定；面板要能区分「自定义」与「默认」。
+        let download_dir = self.download_dir();
+        let download_dir_custom = download_dir != update_paths::download_dir();
         json!({
             "current": self.current.to_string(),
             "phase": phase_name(state.phase),
@@ -708,6 +752,24 @@ impl UpdateService {
             "install_supported": self.install_supported(),
             "installer_ready": state.installer_path.is_some(),
             "installer_size": state.installer_size,
+            // ── 路径事实：让用户看得见「下到哪」「装到哪」 ──
+            "installer_path": state.installer_path.as_ref().map(|path| path.display().to_string()),
+            "installer_dir": state
+                .installer_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|dir| dir.display().to_string()),
+            "download_dir": download_dir.display().to_string(),
+            "download_dir_custom": download_dir_custom,
+            "exe_path": self.exe_path.as_ref().map(|path| path.display().to_string()),
+            "install_dir": self.install_dir.display().to_string(),
+            "registered_install_dir": self
+                .registered_install_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string()),
+            "effective_install_dir": self.effective_install_dir().display().to_string(),
+            "install_target": self.effective_install_target().display().to_string(),
+            "install_dir_matches_exe": self.effective_install_dir() == self.install_dir,
             "error": state.error.as_ref().map(|error| json!({
                 "code": error.code.clone(),
                 "message": error.message.clone(),
@@ -780,6 +842,121 @@ pub async fn api_update_install(State(state): State<Arc<AppState>>) -> Response 
         Ok(status) => Json(status).into_response(),
         Err(err) => error_response(err),
     }
+}
+
+/// 「打开位置」支持的目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenLocationTarget {
+    /// 下载目录（已下载时定位并选中安装包）。
+    Download,
+    /// 生效安装目录。
+    Install,
+}
+
+/// 解析「打开位置」的目标枚举。
+///
+/// **只接受 `download` / `install` 两种固定取值**，其余一律拒绝——
+/// 这个接口绝不能变成任意路径打开器。
+fn parse_open_location_target(target: &str) -> Option<OpenLocationTarget> {
+    match target.trim() {
+        "download" => Some(OpenLocationTarget::Download),
+        "install" => Some(OpenLocationTarget::Install),
+        _ => None,
+    }
+}
+
+/// 打开更新相关位置（下载目录 / 生效安装目录）。
+///
+/// 安全约定：**只接受 `download` / `install` 两种枚举**，路径一律由服务端推导，
+/// 不接受调用方传入的任意路径——否则这个接口会变成任意文件打开器。
+pub async fn api_update_open_location(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let raw = body
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(target) = parse_open_location_target(raw) else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "不支持的位置类型（只允许 download / install）",
+            "bad_request",
+            "update_open_location_target",
+        );
+    };
+    let update = state.update.clone();
+    let (path, select) = match target {
+        OpenLocationTarget::Download => {
+            let state = update.state.lock().await;
+            match state.installer_path.clone() {
+                // 已下载：在资源管理器里定位并选中安装包文件。
+                Some(installer) => (installer, true),
+                // 未下载：打开下载目录本身（目录可能还不存在，先建出来）。
+                None => {
+                    let dir = update.download_dir();
+                    let _ = std::fs::create_dir_all(&dir);
+                    (dir, false)
+                }
+            }
+        }
+        OpenLocationTarget::Install => (update.effective_install_dir(), false),
+    };
+    match update_paths::open_in_explorer(&path, select) {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "target": raw.trim(),
+            "path": path.display().to_string(),
+            "selected": select,
+        }))
+        .into_response(),
+        Err(err) => error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            err,
+            "update_open_location_failed",
+            "update_open_location_failed",
+        ),
+    }
+}
+
+/// 保存下载目录设置。请求体 `{ "dir": "<绝对路径>" }`；空字符串表示恢复默认。
+///
+/// 只接受校验通过的目录（绝对路径、可创建、可写），其余一律拒绝并给出中文原因。
+pub async fn api_update_download_dir(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let raw = body
+        .get("dir")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        // 空值 = 恢复默认：清掉设置（读回空串时按默认目录处理）。
+        state
+            .update
+            .db
+            .set_setting(update_paths::DOWNLOAD_DIR_SETTING, "");
+    } else {
+        match update_paths::validate_download_dir(&raw) {
+            Ok(dir) => {
+                state.update.db.set_setting(
+                    update_paths::DOWNLOAD_DIR_SETTING,
+                    &dir.display().to_string(),
+                );
+            }
+            Err(message) => {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    message,
+                    "bad_request",
+                    "update_download_dir_invalid",
+                )
+            }
+        }
+    }
+    Json(state.update.status().await).into_response()
 }
 
 fn error_response(err: UpdateError) -> Response {
@@ -1048,5 +1225,21 @@ mod tests {
         // 会出现「无法连接 GitHub」，这条断言配合真实探针守住回归。
         let client = build_client();
         assert!(client.get(API_LATEST).build().is_ok());
+    }
+
+    #[test]
+    fn open_location_accepts_only_known_targets() {
+        assert_eq!(
+            parse_open_location_target("download"),
+            Some(OpenLocationTarget::Download)
+        );
+        assert_eq!(
+            parse_open_location_target(" install "),
+            Some(OpenLocationTarget::Install)
+        );
+        // 任意路径必须被拒掉：这个接口不能变成任意文件打开器。
+        assert_eq!(parse_open_location_target(r"C:\Windows\System32"), None);
+        assert_eq!(parse_open_location_target(""), None);
+        assert_eq!(parse_open_location_target("file"), None);
     }
 }

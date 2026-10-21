@@ -417,6 +417,14 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/update/install",
             post(crate::update::api_update_install),
         )
+        .route(
+            "/api/update/open-location",
+            post(crate::update::api_update_open_location),
+        )
+        .route(
+            "/api/update/download-dir",
+            post(crate::update::api_update_download_dir),
+        )
         .route("/api/proxy/status", get(api_proxy_status))
         .route("/api/upstreams", get(api_upstreams))
         .route("/api/config", get(api_config).post(api_config_save))

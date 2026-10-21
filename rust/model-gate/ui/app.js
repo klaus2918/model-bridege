@@ -62,7 +62,10 @@ const state = {
   modal: null,
   theme: "dark",
   logs: { level: "all", q: "", timer: null, lines: 400, autoSeconds: 4, lastUpdated: null, rows: [] },
-  update: { status: null, busy: false, timer: null },
+  // 更新：status 为后端状态；notesOpen 记住「Release 说明」的展开态
+  // （轮询会整块重渲染弹窗，不记住就会被收起来，用户根本看不到内容）；
+  // confirmInstall 为「安装并重启」的弹窗内二次确认态。
+  update: { status: null, busy: false, timer: null, notesOpen: false, confirmInstall: false },
   // 免费来源页：来源清单、当前来源、候选模型、探测结果、各来源水位
   free: { sources: [], states: [], source: "", models: [], results: {}, level: {} },
 };
@@ -3817,6 +3820,14 @@ function updateModalHtml(status) {
     ? `${esc(s.asset.name)} · ${fmtBytes(s.asset.size)}`
     : "—";
 
+  // 路径事实：「下到哪」「装到哪」必须直接可见，不能让用户猜
+  const downloadDir = s.installer_dir || s.download_dir || "";
+  const installDir = s.effective_install_dir || s.install_dir || "";
+  const downloadLabel = s.installer_ready ? "安装包已下载到" : "安装包将下载到";
+  const installLabel = s.install_dir_matches_exe === false
+    ? "本次将安装到（与当前运行位置不同）"
+    : "本次将安装到";
+
   let body = "";
   if (phase === "checking") {
     body = `<p class="update-status">正在检查 GitHub 上的最新版本…</p>`;
@@ -3833,7 +3844,7 @@ function updateModalHtml(status) {
         percent == null ? "" : ` · ${Math.round(percent)}%`}</div>`;
   } else if (phase === "installing") {
     body = `<p class="update-status">安装程序已启动，应用即将退出…</p>
-      <p class="hint">安装完成后会自动重启；若未自动打开，请手动启动 Model-Gate。</p>`;
+      <p class="hint">安装位置：<code>${esc(installDir || "—")}</code>。安装完成后会自动重启；若未自动打开，请手动启动 Model-Gate。</p>`;
   } else if (phase === "error") {
     const message = s.error && s.error.message ? s.error.message : "检查更新失败";
     body = `<p class="update-error">${esc(message)}</p>`;
@@ -3857,17 +3868,69 @@ function updateModalHtml(status) {
       s.checked_at ? "重新检查" : "检查更新"}</button>`);
   }
   if (phase === "available" && s.installable && !s.installer_ready) {
-    actions.push(`<button type="button" class="primary" data-update-action="download">下载并安装</button>`);
+    // 按钮文案必须与实际动作一致：这个按钮只下载，不安装。
+    actions.push(`<button type="button" class="primary" data-update-action="download">下载安装包</button>`);
   }
   if (phase === "ready" && !portable) {
-    actions.push(`<button type="button" class="primary" data-update-action="install">立即安装并重启</button>`);
+    actions.push(`<button type="button" class="primary" data-update-action="install">安装并重启</button>`);
   }
   if (s.release_url) {
     actions.push(`<button type="button" class="ghost" data-update-action="release">打开 Release 页面</button>`);
   }
 
+  // 「Release 说明」：展开态存在 state 里，重渲染后依然保持展开
   const notes = s.notes
-    ? `<details class="update-notes-wrap"><summary>Release 说明</summary><pre class="update-notes">${esc(s.notes)}</pre></details>`
+    ? `<details class="update-notes-wrap" data-update-notes${
+        state.update.notesOpen ? " open" : ""}><summary>Release 说明（点开查看完整更新内容）</summary><pre class="update-notes">${esc(s.notes)}</pre></details>`
+    : "";
+
+  // 位置区：两个位置各配一个「打开」按钮，直接把资源管理器窗口开到那儿
+  const paths = `<div class="update-paths">
+      <div class="update-path-row">
+        <span class="hint">${esc(downloadLabel)}</span>
+        <code class="update-path">${esc(downloadDir || "—")}</code>
+        <button type="button" class="ghost tiny" data-update-action="open-download">打开下载位置</button>
+      </div>
+      <div class="update-path-row">
+        <span class="hint">${esc(installLabel)}</span>
+        <code class="update-path">${esc(installDir || "—")}</code>
+        <button type="button" class="ghost tiny" data-update-action="open-install">打开安装位置</button>
+      </div>
+    </div>`;
+
+  // 下载位置可改：默认目录之外允许用户指定（存 DB setting `update.download_dir`）
+  const downloadCustom = Boolean(s.download_dir_custom);
+  const dirEditor = phase === "downloading" || phase === "installing"
+    ? ""
+    : `<div class="update-dir-editor">
+        <label class="hint" for="update-dir-input">下载目录${downloadCustom ? "（自定义）" : "（默认）"}</label>
+        <div class="update-dir-row">
+          <input type="text" id="update-dir-input" class="update-dir-input" spellcheck="false"
+                 value="${esc(s.download_dir || "")}" placeholder="留空并保存 = 恢复默认目录">
+          <button type="button" class="ghost tiny" data-update-action="save-download-dir">保存目录</button>
+          <button type="button" class="ghost tiny" data-update-action="reset-download-dir">恢复默认</button>
+        </div>
+        <p class="hint">填绝对路径（例如 <code>D:\\Model-Gate\\updates</code>）；目录不存在会自动创建，不可写时会提示原因。</p>
+      </div>`;
+
+  // 分步说明：把「下载 → 安装 → 覆盖 → 重启」讲清楚
+  const steps = `<ol class="update-steps">
+      <li>点「下载安装包」：安装包保存到上面的下载目录（点「打开下载位置」可直接查看）。</li>
+      <li>下载完成并通过 SHA256 校验后，点「安装并重启」。</li>
+      <li>安装器把新版本写入上面的安装位置，覆盖旧的 <code>Model-Gate.exe</code>，然后自动重启应用。</li>
+    </ol>`;
+
+  // 安装二次确认：放在更新弹窗内部，不能用 confirmModal
+  // （confirmModal 会重建整个弹窗根节点，取消后更新弹窗会被清空）
+  const confirmPanel = state.update.confirmInstall
+    ? `<div class="update-confirm">
+        <p class="update-status">确认现在安装并重启？</p>
+        <p class="hint">应用将先退出，安装器会覆盖 <code>${esc(installDir || "—")}</code> 下的 Model-Gate.exe，安装完成后自动重启。</p>
+        <div class="update-actions">
+          <button type="button" class="primary" data-update-action="install-confirm">确认安装并重启</button>
+          <button type="button" class="ghost" data-update-action="install-cancel">取消</button>
+        </div>
+      </div>`
     : "";
 
   return `<div class="update-meta">
@@ -3877,14 +3940,38 @@ function updateModalHtml(status) {
       <div><span class="hint">安装包</span><strong>${asset}</strong></div>
     </div>
     ${body}
+    ${paths}
+    ${dirEditor}
+    ${steps}
     ${notes}
-    <div class="update-actions">${actions.join("")}</div>`;
+    ${confirmPanel || `<div class="update-actions">${actions.join("")}</div>`}`;
 }
+
+/* 记录更新弹窗最后一次渲染的内容：内容没变就不重建 DOM。
+   为什么：轮询每秒重渲染会把用户正在读的说明重新折起来、滚动位置也清零，
+   用户反馈就是「点开就关闭，根本看不了」。 */
+let updateRenderState = { host: null, html: "" };
 
 function renderUpdateModal(status) {
   const host = $("#update-modal");
   if (!host) return;
-  host.innerHTML = updateModalHtml(status);
+  const html = updateModalHtml(status);
+  if (updateRenderState.host === host && updateRenderState.html === html) return;
+  updateRenderState = { host, html };
+  host.innerHTML = html;
+  // details 的 toggle 事件不冒泡，只能用捕获阶段监听。
+  // 这里把展开态同步回 state：轮询每秒整块重渲染，否则用户刚展开的说明立刻被收起。
+  if (!host.dataset.notesBound) {
+    host.dataset.notesBound = "1";
+    host.addEventListener("toggle", (ev) => {
+      const target = ev.target;
+      if (target && target.matches && target.matches("details[data-update-notes]")) {
+        state.update.notesOpen = Boolean(target.open);
+        // 展开态变了就同步缓存，保证下一次轮询不会重建 DOM（重建会清掉滚动位置）。
+        updateRenderState = { host, html: updateModalHtml(state.update.status) };
+      }
+    }, true);
+  }
 }
 
 function stopUpdatePolling() {
@@ -3938,10 +4025,12 @@ async function runUpdateCheck() {
 async function handleUpdateAction(action) {
   try {
     if (action === "check") {
+      state.update.confirmInstall = false;
       await runUpdateCheck();
       return;
     }
     if (action === "download") {
+      state.update.confirmInstall = false;
       const status = await postJson("/api/update/download", {});
       state.update.status = status;
       refreshUpdateButton(status);
@@ -3949,14 +4038,42 @@ async function handleUpdateAction(action) {
       startUpdatePolling();
       return;
     }
+    if (action === "save-download-dir" || action === "reset-download-dir") {
+      // 下载目录可指定：空串 = 恢复默认目录（服务端按默认目录处理）
+      const input = document.querySelector("#update-dir-input");
+      const dir = action === "reset-download-dir" ? "" : (input ? input.value.trim() : "");
+      const status = await postJson("/api/update/download-dir", { dir });
+      state.update.status = status;
+      refreshUpdateButton(status);
+      renderUpdateModal(status);
+      toast(
+        action === "reset-download-dir"
+          ? "已恢复默认下载目录"
+          : `下载目录已保存：${status.download_dir || "—"}`
+      );
+      return;
+    }
+    if (action === "open-download" || action === "open-install") {
+      // 服务端只接受 download / install 两种枚举，路径由服务端推导
+      const target = action === "open-download" ? "download" : "install";
+      const result = await postJson("/api/update/open-location", { target });
+      toast(result.path ? `已打开：${result.path}` : "已打开");
+      return;
+    }
     if (action === "install") {
-      const ok = await confirmModal({
-        title: "安装并重启",
-        text: "应用将退出并启动安装程序。安装完成后会自动重启；若未自动打开，请手动启动 Model-Gate。",
-        confirmLabel: "安装并重启",
-        danger: false,
-      });
-      if (!ok) return;
+      // 二次确认放在更新弹窗内部：confirmModal 会重建整个弹窗根节点，
+      // 取消后更新弹窗会被清空——这正是「点一下就关闭、什么也看不到」的成因。
+      state.update.confirmInstall = true;
+      renderUpdateModal(state.update.status);
+      return;
+    }
+    if (action === "install-cancel") {
+      state.update.confirmInstall = false;
+      renderUpdateModal(state.update.status);
+      return;
+    }
+    if (action === "install-confirm") {
+      state.update.confirmInstall = false;
       const status = await postJson("/api/update/install", {});
       state.update.status = status;
       renderUpdateModal(status);
