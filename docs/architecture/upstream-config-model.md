@@ -188,6 +188,7 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 | 诊断 | 级别 | 理由 |
 |---|---|---|
 | `max_tokens_exceeds_upstream` | **info** | 运行时已在请求侧自动收敛，**不阻断保存** —— 属「知会」而非「待修」 |
+| `thinking_not_used` | **info** | 只有 anthropic 协议才回传 thinking 块；openai 协议下 `thinking.passthrough` 不参与请求改写，同属「知会」 |
 
 属实但等级不当的诊断（此例）与纯属误报的诊断（免鉴权上游）要分开处理：
 前者降级并改中性样式，后者直接不产生。
@@ -283,8 +284,9 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 `docs/examples/providers/` 提供五套可直接加载的单上游完整配置（`openai.json` / `opencode.json` /
 `anthropic.json` / `deepseek.json` / `commandcode.json`）：
 
-- 每份均通过 Rust 配置加载与校验零 error，profile 判定与文件名一致；
+- 每份均能通过 Rust 配置加载与校验（`config_load=ok`、**无 error 级诊断**），profile 判定与文件名一致；
 - `anthropic.json` 演示 `modelOverrides` 精确 key + 单模型 `capabilities`；
-- `deepseek.json` 演示精确 key 与 `deepseek-*` 通配叠加；
+- `deepseek.json` 演示精确 key 与 `deepseek-*` 通配叠加；该示例会带出 1 条 **info 级** `thinking_not_used`
+  （deepseek profile 默认 `thinking.passthrough=true`，而 openai 协议本就不回传 thinking 块）——属「知会」，不阻断加载与启动；
 - `commandcode.json` 演示旧扁平字段（`modelCatalog` / `modelCatalogPlan` / `pauseTurn` / `cmdZdr`）映射；
 - 复制任意一份为 `bridge.config.json` 即可使用，密钥统一走 `apiKeyEnv` / `apiKeyFile`。
