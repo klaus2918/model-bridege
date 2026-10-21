@@ -27,6 +27,10 @@ include!(concat!(env!("OUT_DIR"), "/tray_icon.rs"));
 #[cfg(windows)]
 const CF_UNICODETEXT: u32 = 13;
 
+/// 托盘指标刷新周期。
+#[cfg(windows)]
+const TRAY_STATS_INTERVAL_MS: u32 = 10_000;
+
 /// 桌面壳启动参数。
 pub struct ShellOptions {
     /// 面板地址，形如 `http://127.0.0.1:8900/ui/`。
@@ -40,7 +44,7 @@ pub struct ShellOptions {
 }
 
 /// 启动托盘壳并阻塞在主线程消息循环；`refresh_models` 由「刷新模型目录」菜单触发，
-/// `today_stats` 每分钟刷新托盘指标（tooltip + 只读菜单项）。
+/// `today_stats` 每 10 秒刷新托盘指标（tooltip + 只读菜单项）。
 #[cfg(windows)]
 pub fn run(
     options: ShellOptions,
@@ -91,9 +95,12 @@ pub fn run(
 
     // 启动即读一次快照，之后每 10 秒刷新（WM_TIMER 投递到本线程消息队列）。
     apply_tray_stats(&tray, &today, &hit, &today_stats());
-    let timer = unsafe { SetTimer(std::ptr::null_mut(), 1, 10_000, None) };
-    if timer == 0 {
-        tracing::warn!("托盘指标定时器创建失败：只在启动时统计一次");
+    // SAFETY: SetTimer 只登记本线程的定时器；窗口句柄为空时 WM_TIMER 进入线程队列。
+    // hWnd 为 NULL 时 nIDEvent 会被系统忽略，WM_TIMER 的 wParam 是系统分配的返回值，
+    // 因此后续必须按 timer_id 判定，不能再用传入值 1。
+    let timer_id = unsafe { SetTimer(std::ptr::null_mut(), 1, TRAY_STATS_INTERVAL_MS, None) };
+    if timer_id == 0 {
+        tracing::warn!("托盘指标定时器创建失败：仅显示启动时快照");
     }
 
     let options = std::sync::Arc::new(options);
@@ -107,7 +114,7 @@ pub fn run(
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if msg.message == WM_TIMER && msg.wParam == 1 {
+        if is_stats_timer_message(msg.message, msg.wParam, timer_id) {
             apply_tray_stats(&tray, &today, &hit, &today_stats());
         }
         let mut should_quit = false;
@@ -144,11 +151,21 @@ pub fn run(
             unsafe { PostQuitMessage(0) };
         }
     }
-    if timer != 0 {
-        unsafe { KillTimer(std::ptr::null_mut(), 1) };
+    if timer_id != 0 {
+        unsafe { KillTimer(std::ptr::null_mut(), timer_id) };
     }
     drop(tray);
     Ok(())
+}
+
+/// 判断消息是否为托盘指标定时器触发。
+///
+/// `SetTimer(NULL, nIDEvent, ...)` 会忽略传入的 `nIDEvent`，返回系统分配的
+/// 定时器 ID；`WM_TIMER` 的 `wParam` 携带该返回值。`timer_id == 0` 表示创建失败，
+/// 此时不匹配任何消息，避免误刷。
+#[cfg(windows)]
+fn is_stats_timer_message(message: u32, wparam: usize, timer_id: usize) -> bool {
+    timer_id != 0 && message == WM_TIMER && wparam == timer_id
 }
 
 /// 把今日统计写入托盘 tooltip 与菜单只读项（命中率无样本时显示「—」）。
@@ -257,5 +274,29 @@ pub fn show_error(message: &str) {
     #[cfg(not(windows))]
     {
         let _ = message;
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{is_stats_timer_message, WM_TIMER};
+
+    #[test]
+    fn stats_timer_matches_returned_id_only() {
+        assert!(is_stats_timer_message(WM_TIMER, 28_617, 28_617));
+    }
+
+    #[test]
+    fn stats_timer_rejects_old_nidevent_check() {
+        // 回归：SetTimer(NULL, 1, ..) 返回非 1 时，旧写法 `wParam == 1` 永不命中。
+        assert!(!is_stats_timer_message(WM_TIMER, 1, 28_617));
+        assert!(!is_stats_timer_message(WM_TIMER, 28_617, 1));
+    }
+
+    #[test]
+    fn stats_timer_ignores_other_messages_and_zero_id() {
+        assert!(!is_stats_timer_message(0x0100, 28_617, 28_617)); // WM_KEYDOWN
+        assert!(!is_stats_timer_message(WM_TIMER, 0, 0)); // 创建失败：不匹配任何 tick
+        assert!(!is_stats_timer_message(WM_TIMER, 28_617, 0));
     }
 }
