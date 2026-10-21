@@ -575,17 +575,35 @@ async fn query_upstream_models(
     match result {
         Ok(models) => {
             let declared: Vec<String> = saved.models.clone();
+            // 目录来源：CommandCode 没有 HTTP 端点，目录来自本机 CLI 包内 models.md。
+            let local_catalog = upstream.compat.catalog_source == "commandcode";
+            let (source, path, hint) = if local_catalog {
+                let hint = if models.is_empty() {
+                    "未找到 CommandCode 本地模型目录（需安装 command-code CLI，或手动填写 models）"
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                ("local-catalog", "models.md".to_string(), hint)
+            } else {
+                (
+                    "endpoint",
+                    upstream.compat.models_path.clone(),
+                    String::new(),
+                )
+            };
             Json(json!({
                 "ok": true,
                 "upstream": name,
                 "models": models,
                 "count": models.len(),
-                "source": "endpoint",
-                "path": upstream.compat.models_path,
+                "source": source,
+                "path": path,
                 "declared": declared,
                 "baseUrl": upstream.base_url,
                 "usedOverride": used_override,
                 "elapsedMs": elapsed_ms,
+                "hint": hint,
             }))
             .into_response()
         }
@@ -700,6 +718,89 @@ mod tests {
         } else {
             format!("{path}?{query}").parse().unwrap()
         }
+    }
+
+    /// 构造一个 `catalog.source = commandcode` 的上游。
+    ///
+    /// `baseUrl` 指向不可达地址：这类上游**不该**发 HTTP 请求，
+    /// 断言 200 即证明走的是本地目录分支。
+    fn state_with_commandcode(catalog_plan: Value) -> Arc<AppState> {
+        let cfg = Config::from_value(json!({
+            "modelsCacheSeconds": 300,
+            "upstreams": {
+                "cc": {
+                    "protocol": "commandcode",
+                    "baseUrl": "http://127.0.0.1:1",
+                    "apiKey": "k",
+                    "models": ["m"],
+                    "fetchModels": true,
+                    "autoModels": false,
+                    "compat": {
+                        "catalog": { "source": "commandcode", "path": "/v1/models", "plan": catalog_plan }
+                    }
+                }
+            }
+        }));
+        let dir = temp_dir("cc-state");
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        Arc::new(AppState::new(cfg, db, dir.join("c.json")))
+    }
+
+    #[tokio::test]
+    async fn commandcode_reads_local_catalog_instead_of_http_endpoint() {
+        // 造一个 models.md，写明模型 id 与 Min plan。
+        let dir = temp_dir("cc-catalog");
+        let models_md = dir.join("models.md");
+        std::fs::write(
+            &models_md,
+            "| Model | Name | Ctx | Think | Price | Min plan | Scope |\n\
+             | --- | --- | --- | --- | --- | --- | --- |\n\
+             | `deepseek/deepseek-v4-pro` | DeepSeek | 128K | yes | 3 | GOAT | all |\n\
+             | `moonshotai/Kimi-K3` | Kimi | 256K | no | 2 | Max | all |\n",
+        )
+        .unwrap();
+
+        let state = state_with_commandcode(json!(models_md.to_str().unwrap()));
+        let resp = upstream_models(
+            State(state),
+            Path("cc".to_string()),
+            uri_with("/api/upstreams/cc/models", ""),
+        )
+        .await;
+        let (status, body) = body_json(resp).await;
+
+        assert_eq!(status, StatusCode::OK, "本地目录分支不应返回 404");
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["source"], json!("local-catalog"));
+        assert_eq!(
+            body["models"],
+            json!(["deepseek/deepseek-v4-pro", "moonshotai/Kimi-K3"])
+        );
+        assert_eq!(body["count"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn commandcode_without_local_catalog_returns_empty_with_hint() {
+        // 本机没装 CLI → 200 + 空清单 + 明确提示，**不是 404**
+        // （404 会把用户引向「改 compat.endpoint.models 路径」的错误方向）。
+        let state = state_with_commandcode(json!("definitely/not/here/models.md"));
+        let resp = upstream_models(
+            State(state),
+            Path("cc".to_string()),
+            uri_with("/api/upstreams/cc/models", ""),
+        )
+        .await;
+        let (status, body) = body_json(resp).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["models"], json!([]));
+        assert_eq!(body["count"], json!(0));
+        let hint = body["hint"].as_str().unwrap_or("");
+        assert!(
+            hint.contains("CommandCode") && hint.contains("目录"),
+            "空清单必须给出「未找到本地目录」的可读提示，实际：{hint}"
+        );
     }
 
     #[tokio::test]

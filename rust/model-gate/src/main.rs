@@ -4,6 +4,7 @@
 mod anthropic;
 mod api_extra;
 mod commandcode;
+mod commandcode_catalog;
 mod config;
 mod config_store;
 mod db;

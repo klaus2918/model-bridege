@@ -150,11 +150,18 @@ impl AppState {
     /// 目录端点同样只对官方客户端开放——裸请求会被拒（实测 401）。
     /// 因此这类上游必须走与 chat 相同的两件事：路径重写（`/zen/...` → `/inference/...`）
     /// 与客户端指纹头。缺任何一样，查询清单就会失败。
+    ///
+    /// **目录来源感知**：`compat.catalog_source == "commandcode"` 的上游
+    /// （CommandCode）**没有** `/v1/models` 端点，模型目录来自本机 CLI 包内的
+    /// `models.md`。这类上游改走本地目录解析，绝不请求 HTTP 端点。
     pub async fn query_upstream_models(
         &self,
         up: &Upstream,
         timeout_secs: f64,
     ) -> Result<Vec<String>, ModelQueryError> {
+        if up.compat.catalog_source == "commandcode" {
+            return self.query_commandcode_catalog(up);
+        }
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in &up.compat.extra_headers {
             if let (Ok(n), Ok(v)) = (
@@ -304,6 +311,37 @@ impl AppState {
             }
         }
         Ok(out)
+    }
+
+    /// 读取 CommandCode 的**本地**模型目录（本机 CLI 包内 `models.md`）。
+    ///
+    /// CommandCode 没有 `/v1/models` 端点，请求 HTTP 只会得到 404，
+    /// 而 404 提示会把用户引向「改端点路径」这个错误方向。因此这类上游
+    /// 改走本地目录解析；本机没装 CLI 时返回空清单，**不报 404**。
+    ///
+    /// 目录来源由 `compat.catalog_source == "commandcode"` 判定；
+    /// 具体文件路径取自 `compat.catalog_plan`（`auto` 表示自动探测 CLI 安装根）。
+    fn query_commandcode_catalog(&self, up: &Upstream) -> Result<Vec<String>, ModelQueryError> {
+        let spec = match &up.compat.catalog_plan {
+            serde_json::Value::String(text) if !text.is_empty() => Some(text.as_str()),
+            serde_json::Value::Bool(false) => {
+                return Ok(Vec::new());
+            }
+            _ => None,
+        };
+        let entries = crate::commandcode_catalog::read_catalog(spec);
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 按套餐过滤：只有当 catalog_plan 是具体档位名时才过滤。
+        // "auto" 表示套餐未知（探测失败），此时不过滤，避免误伤用户。
+        let plan = match &up.compat.catalog_plan {
+            serde_json::Value::String(text) => text.clone(),
+            _ => String::new(),
+        };
+        let rank = crate::commandcode_catalog::plan_rank(&plan);
+        let entries = crate::commandcode_catalog::filter_by_plan(entries, &plan, rank);
+        Ok(entries.into_iter().map(|entry| entry.id).collect())
     }
 
     /// 刷新模型目录缓存；`force=true` 时失败不清空旧缓存（对齐 `proxy.py:refresh_models_cache`）。
