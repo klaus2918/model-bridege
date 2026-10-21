@@ -52,6 +52,11 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 | `compat` | object | 预设值；只需声明与「openai 基线」不同的字段 |
 | `variants.<protocol>` | object | 按协议的差异覆盖（如 `deepseek.variants.anthropic`） |
 | `defaults` | object | `fetchModels` / `autoModels` / `pauseTurn` 三键，必须齐全 |
+| `authOptional` | boolean | 该 provider **允许空密钥调用**（默认 `false`）。声明在 `compat` **之外**，不参与 compat 合并 |
+
+`authOptional` 独立于 `compat` 的原因：`compat` 会被「openai 基线 → profile → variants」三层合并覆盖，
+而「是否需要鉴权」是 **profile 级**语义（`opencode` 允许空 key，但它的 `auth.scheme` 继承基线的 `bearer`）。
+放在 `compat` 内会被基线 `bearer` 覆盖掉。
 
 `compat` 内除现有字段外新增：
 
@@ -122,6 +127,32 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 | `model_override_unknown_model` | warn | key 既非精确模型也不含 `*`，且不在本置 `models` / 目录中 |
 | `multi_wildcard_override` | error | key 含一个以上 `*` |
 
+### 7.1 免鉴权判定口径（`missing_credentials` 的前提）
+
+诊断「没有配置密钥」必须与**运行时的实际行为**一致：不需要鉴权的上游不该被提醒。
+判定为「需要鉴权」需**同时**满足下列三条，缺一即视为免鉴权、不产生该诊断：
+
+| # | 条件 | 覆盖场景 |
+|---|---|---|
+| 1 | `compat.auth.scheme != "none"` | 显式声明不鉴权（`scheme=none`）即免鉴权 |
+| 2 | profile 未声明 `authOptional: true` | 如 `opencode` / `zen`：注册表 description 明写「空 key 表示不鉴权」 |
+| 3 | 上游地址不是本机 | 回环 / 局域网段（`127.0.0.0/8`、`localhost`、`::1`、`10/8`、`172.16/12`、`192.168/16`）上的本机桥接（如 CCH）通常不校验密钥 |
+
+**本机地址判定必须按完整 IPv4 四段精确匹配**，不能按前缀 —— 否则
+`127.0.0.1.example.com` 这类公网域名会被误判为本机而**漏报**真实缺密钥的上游。
+
+反例（必须仍然产生 `missing_credentials`）：普通公网 bearer 上游无密钥。
+判定放宽到「所有上游」等于把检查关掉，正例须有用例钉住。
+
+### 7.2 等级口径
+
+| 诊断 | 级别 | 理由 |
+|---|---|---|
+| `max_tokens_exceeds_upstream` | **info** | 运行时已在请求侧自动收敛，**不阻断保存** —— 属「知会」而非「待修」 |
+
+属实但等级不当的诊断（此例）与纯属误报的诊断（免鉴权上游）要分开处理：
+前者降级并改中性样式，后者直接不产生。
+
 现有诊断码与行为不变。
 
 ## 8. API 契约（只增不删）
@@ -137,6 +168,21 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 - 高级区新增「模型级覆盖（JSON）」文本域，保存前 `JSON.parse` 校验对象结构；非法时阻止保存并提示；
 - 新增只读「能力」徽标与「生效值」摘要（profile、上游 limits、模型覆盖条数）；
 - 保存沿用未知字段保留策略；`modelOverrides` 与既有字段一样参与 `collectConfig`。
+
+### 9.1 提醒区（诊断展示）
+
+诊断的**位置与呈现**遵循「不干扰配置填写」：
+
+| 规则 | 说明 |
+|---|---|
+| 位置 | 提醒区位于**保存按钮行正上方**，不在表单顶部 —— 主展示区（服务与全局、上游列表）回到第一屏 |
+| 默认折叠 | 折叠为一行摘要，按 `error` / `warn` / `info` 显示计数；有 `error` 时**自动展开** |
+| 单条关闭 | 每条可单独关闭，**仅本次页面会话内生效**（刷新恢复） |
+| 全局静音 | 「不再提示」持久化到 `localStorage`；**只压制展示，不压制 error** —— error 仍自动展开、仍阻断保存 |
+| 按需检查 | 「检查」按钮主动触发一次完整诊断并强制展开 |
+
+「检查」**不得重置表单**：只重拉服务端诊断并合并前端本地校验，
+不能覆盖用户尚未保存的改动。
 
 ## 10. 验证工具
 
