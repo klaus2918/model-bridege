@@ -1,6 +1,6 @@
 {
-  "_doc": "Model-Gate 配置模板。复制为 bridge.config.json 后按需修改；切勿把明文 apiKey 写进本文件——请用 apiKeyEnv 引用环境变量。",
-  "_keys": "密钥只从环境变量或你显式指定的凭据文件读取：apiKeyEnv 指定变量名，值由面板「写入密钥」写入（目标二选一：写入用户环境变量 → HKCU\\Environment；写入你手动指定的文件 → 该文件路径），也可由外部进程注入；JSON 里的明文 apiKey 会被忽略并给出迁移提示。apiKeyFile / apiKeyAgentPath 仅在你自己显式填写路径时读取（无内置默认路径），本文件只保存路径引用，不保存密钥。",
+  "_doc": "Model-Gate 进阶配置模板（本文件已随安装包放在安装目录）。当前生效的配置是同目录的 bridge.config.json；本文件只作参考：想接入更多上游（付费 / 免密 / 本机代理）时，照抄这里的条目到 bridge.config.json 里再改，改前先备份。安装器不会覆盖已存在的 bridge.config.json，升级与静默更新同样不覆盖。切勿把明文 apiKey 写进配置——请用 apiKeyEnv 引用环境变量。",
+  "_keys": "密钥只从环境变量或你显式指定的凭据文件读取：apiKeyEnv 指定变量名，值由面板「写入密钥」写入（目标二选一：写入用户环境变量 → HKCU\\Environment；写入你手动指定的文件 → 该文件路径），也可由外部进程注入；JSON 里的明文 apiKey 会被忽略并给出迁移提示。apiKeyFile / apiKeyAgentPath 仅在你自己显式填写路径时读取（无内置默认路径），配置文件里只保存路径引用，不保存密钥。",
   "_models": "各上游的 models 是该上游可用模型的声明（也是按名路由的依据）。可以在面板上点「查询清单」按上游拉取并勾选写入，不用手打：面板按 OpenAI 兼容约定拉 GET {baseUrl}/v1/models（路径可用 compat.endpoint.models 改）。",
   "_freeSources": "免费来源：zen 与 kilo 两条免密通道，无需账号与 API Key（zen 用匿名 Bearer public + 客户端指纹，kilo 完全不发送鉴权头）。面板「免费来源」页可一键接入与实测可用性。注意：免费模型只登记在各自上游的 models 里，不会自动进入顶层 models（顶层 models 非空时全局清单只按白名单展示）——需要对外暴露时在模型卡上点「加入全局清单」。",
   "port": 8900,

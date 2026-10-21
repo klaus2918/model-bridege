@@ -1,0 +1,37 @@
+{
+  "_doc": "Model-Gate 默认配置（安装包随附，首次启动自动生成同一份）。bridge.config.json 是运行期唯一事实源：面板里保存配置即回写本文件。改完保存后需重启 Model-Gate 生效。切勿把明文 apiKey 写进本文件——密钥请用 apiKeyEnv 引用环境变量。安装器不会覆盖已存在的本文件（升级/静默更新同样不覆盖），你改过的内容会一直保留。",
+  "_keys": "密钥只从环境变量或你显式指定的凭据文件读取：apiKeyEnv 指定变量名，值可在面板「密钥」页写入（目标二选一：写入用户环境变量 → HKCU\\Environment；写入你手动指定的文件 → 该文件路径），也可由外部进程注入。JSON 里的明文 apiKey 会被忽略并给出迁移提示。apiKeyFile / apiKeyAgentPath 仅在你自己显式填写路径时读取（无内置默认路径），本文件只保存路径引用，不保存密钥。",
+  "_models": "各上游的 models 是该上游可用模型的声明（也是按名路由的依据）。可以在面板上点「查询清单」按上游拉取并勾选写入，不用手打。顶层 models 是对外暴露的模型白名单（非空时只按白名单展示）：需要把上游里的模型暴露出去时，把它加进顶层 models，或在模型卡上点「加入全局清单」。",
+  "_upstreams": "upstreams 里的每个键是一条上游；配置顺序即优先级，标了 default:true 的是兜底上游。本默认配置只含一条免密上游 zen（OpenCode Zen 免费层，无需账号与 API Key）。要接入自己的服务，按面板顶部「配置说明」弹窗里的 JSON 示例加一条并填 apiKeyEnv。",
+  "port": 8900,
+  "host": "127.0.0.1",
+  "defaultModel": "mimo-v2.6-flash-free",
+  "models": [
+    "mimo-v2.6-flash-free",
+    "big-pickle"
+  ],
+  "maxTokens": 8192,
+  "timeoutSeconds": 600,
+  "accessLog": true,
+  "modelsCacheSeconds": 300,
+  "aliases": {},
+  "thinking": {
+    "passthrough": true,
+    "cacheSize": 500
+  },
+  "upstreams": {
+    "zen": {
+      "protocol": "openai",
+      "transport": "opencode",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "fetchModels": false,
+      "autoModels": false,
+      "sessionHeader": false,
+      "default": true,
+      "models": [
+        "mimo-v2.6-flash-free",
+        "big-pickle"
+      ]
+    }
+  }
+}

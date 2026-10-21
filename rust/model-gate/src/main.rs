@@ -18,6 +18,7 @@ mod proxy;
 mod thinking;
 mod ui_assets;
 mod update;
+mod update_paths;
 mod user_env;
 
 use std::path::PathBuf;

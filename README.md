@@ -872,13 +872,14 @@ Model-Gate/
 │  ├─ ui/                         # 内嵌面板（index.html / app.js / style.css）
 │  ├─ tests/fixtures/             # Rust 单测夹具（含 legacy 配置）
 │  ├─ provider_profiles.json      # Provider 预设注册表（编译期内嵌）
+│  ├─ default_config.json         # 默认配置唯一来源（代码内嵌 + 安装包随附）
 │  ├─ Cargo.toml                  # 版本唯一源
 │  ├─ build-release.ps1           # 发布候选/正式入口
 │  ├─ build-installer.ps1         # Inno Setup 安装包
 │  └─ build.rs                    # Windows 版本资源 + 托盘图标
 ├─ assets/                        # 图标等构建资产
 ├─ docs/                          # 文档（architecture / integration / maintenance / examples）
-├─ scripts/                       # 4 个 PowerShell 运维/验收脚本 + README
+├─ scripts/                       # 5 个 PowerShell 运维/验收脚本 + README
 ├─ ModelGate.iss                  # Inno Setup 打包定义
 ├─ bridge.config.example.json     # 零密钥配置模板（唯一入库配置）
 └─ dist/ data/ target/ .op/       # 本地生成物/运行数据/构建缓存/变更工作区（均不入库）
@@ -897,6 +898,8 @@ Rust-only 迁移删除），不要继续堆积在 `scripts/` 根目录。
 | `rust/model-gate/` | 唯一产品源码：Rust 代理内核、托盘常驻 + 系统浏览器面板、更新、构建脚本 |
 | `rust/model-gate/ui/` | 内嵌面板静态资源 |
 | `rust/model-gate/provider_profiles.json` | Provider 预设注册表 |
+| `rust/model-gate/default_config.json` | 默认配置唯一来源（代码内嵌 + 安装包随附为 `bridge.config.json`） |
+| `rust/model-gate/ui/app.js` | 内嵌面板逻辑（含「配置说明」弹窗：JSON 格式 + 常用字段用途与用法） |
 | `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 |
 | `ModelGate.iss` | Inno Setup 打包定义（固定 AppId，支持静默覆盖升级） |
 | `assets/ModelGate.ico` | 应用与托盘图标 |
@@ -905,6 +908,7 @@ Rust-only 迁移删除），不要继续堆积在 `scripts/` 根目录。
 | `scripts/rust_shell_acceptance.ps1` | Rust 托盘壳黑盒验收 |
 | `scripts/upgrade_and_run.ps1` | 不停机升级辅助 |
 | `scripts/find_iscc.ps1` / `scripts/get_innosetup.ps1` | 查找/安装 Inno Setup |
+| `scripts/install_config_guard.ps1` | 安装包默认配置回归（五场景：落地 / 不覆盖 / 升级 / 卸载 / 便携首启） |
 | `bridge.config.example.json` | 配置模板（零密钥，可入库） |
 | `bridge.config.json` | 本机真实配置（**不入库**） |
 | `dist/`、`data/`、`target/`、`.op/` | 打包产物、运行数据、构建缓存、变更工作区（**均不入库**） |
@@ -940,6 +944,24 @@ iscc /DMyAppVersion=2.21.0 ^
      ModelGate.iss
 ```
 
+### 安装后目录里有什么
+
+安装完成后 `{app}`（默认 `{autopf}\Model-Gate`，未提权时为 `%LOCALAPPDATA%\Programs\Model-Gate`）下：
+
+| 文件 | 说明 |
+|------|------|
+| `Model-Gate.exe` | 主程序 |
+| `bridge.config.json` | **当前生效的配置**：默认配置已随包落地，开箱即用 |
+| `data\` | 运行数据：`modelgate.db` 用量库与日志（卸载也保留） |
+
+配置怎么改：
+
+- 用文本编辑器改 `bridge.config.json`（JSON），保存后回面板点「从文件重载」即生效；也可以直接在面板里改，面板保存回写的是同一个文件。
+- 不知道格式？点面板顶栏「配置说明」：**软件内弹窗**里写清了 JSON 格式、常用字段（`host`/`port`/`defaultModel`/`models`/`upstreams`/`apiKeyEnv` 等）的用途与用法、密钥怎么写、改完怎么生效。
+- 密钥不要写进配置：用 `apiKeyEnv`（环境变量名）或 `apiKeyFile`（密钥文件路径）引用，明文密钥落盘会随文件扩散。
+- 随包的 `bridge.config.json` 是「存在即跳过」：**安装 / 升级 / 应用内静默更新都不会覆盖你已有的 `bridge.config.json`**；安装包本身不含 `data\modelgate.db`，升级与卸载都不会动你的用量库。
+- 便携版（`Model-Gate-rust.exe`）目录里没有配置时，首次启动会生成一份与安装包完全相同的默认配置。
+
 ### 应用内更新
 
 | 场景 | 行为 |
@@ -947,7 +969,10 @@ iscc /DMyAppVersion=2.21.0 ^
 | 启动自动检查 | 后台检查 GitHub `releases/latest`，24 小时内最多一次；只提示，不自动下载 |
 | 手动检查 | 面板顶栏「检查更新」或托盘菜单「检查更新」打开 `?update=1` |
 | 下载 | 精确选择 `Model-Gate-v<版本>-rust-setup.exe` 与 `SHA256SUMS`，流式下载并计算 SHA256 |
-| 安装 | 校验通过后启动安装包：`/SILENT /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /DIR=<当前exe目录>` |
+| 下载位置 | 默认 `%LOCALAPPDATA%\Model-Gate\updates`；更新弹窗里可直接指定绝对路径（自动创建、不可写会报错），并有「打开下载位置」按钮 |
+| 安装位置 | 读取注册表里安装器记录的 `InstallLocation`（即「已安装位置」）作为安装目标，弹窗内显示并可「打开安装位置」；与当前运行位置不同会明确标注 |
+| 安装 | 校验通过后在弹窗内二次确认，再启动安装包：`/SILENT /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /DIR=<安装位置>` |
+| 更新说明 | Release notes 以可展开区域展示（点开不会被弹窗重建而关掉），展开状态在重渲染后保持 |
 | 便携版 | 同目录没有 `unins*.exe` 时不自动覆盖，只提示手动运行安装包或打开 Release 页面 |
 | 失败 | 下载/校验/启动失败均保留原版本，不删除配置与用量库 |
 

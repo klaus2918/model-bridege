@@ -11,6 +11,7 @@
 | `panel_api_smoke.ps1` | 启动 `--no-gui` 实例，检查 `/api/info`、`/api/update/status`、`/ui/` 与更新资源 |
 | `rust_shell_acceptance.ps1` | 托盘壳黑盒验收：启动耗时、内存、无 WebView2、二次启动、配置保存 |
 | `upgrade_and_run.ps1` | 按 PID 停旧实例、启动版本化 exe 并等待 `/api/info` 就绪 |
+| `install_config_guard.ps1` | 安装包随包文件回归：默认配置落地 / 不随包发独立说明页（说明在面板弹窗里） / 已有配置与 `modelgate.db` 不被覆盖 / 升级 / 卸载 / 便携首启 五场景断言 |
 | `find_iscc.ps1` | 查找本机 `ISCC.exe`（Inno Setup 6） |
 | `get_innosetup.ps1` | 下载并安装 Inno Setup 到 `tools/`（或提示手动安装） |
 

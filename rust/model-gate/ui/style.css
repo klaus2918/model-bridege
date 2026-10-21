@@ -593,6 +593,33 @@ div.issue.static { cursor: default; }
 .modal-text { margin: 0; color: var(--text-2); font-size: 13px; line-height: 1.6; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .modal-body .grid { padding: 0; }
+.modal-card.modal-wide { width: min(980px, 96vw); }
+
+/* ══ 配置说明弹窗：JSON 格式 + 常用字段速查（长在面板里，不另发文件） ══ */
+.cfg-help { display: grid; gap: 12px; }
+.cfg-help section {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2); padding: 10px 12px;
+}
+.cfg-help h4 {
+  margin: 0 0 6px; font-family: var(--display); font-size: 13px;
+  letter-spacing: .02em; color: var(--text);
+}
+.cfg-help p { margin: 4px 0; color: var(--text-2); font-size: 12.5px; line-height: 1.7; }
+.cfg-help ul { margin: 4px 0; padding-left: 18px; color: var(--text-2); font-size: 12.5px; line-height: 1.75; }
+.cfg-help li { margin: 2px 0; }
+.cfg-help b { color: var(--text); }
+.cfg-help code { color: var(--brand); }
+.cfg-help-code {
+  margin: 6px 0 0; padding: 10px 12px; overflow-x: auto;
+  background: var(--surface-3); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-2); font-size: 12px; line-height: 1.65; white-space: pre;
+}
+.cfg-help .table-wrap { margin-top: 6px; max-height: 260px; }
+.cfg-help table { font-size: 12px; }
+.cfg-help tbody td { vertical-align: top; }
+.cfg-help td:nth-child(1) { font-family: var(--mono); color: var(--brand); white-space: nowrap; }
+.cfg-help td:nth-child(2), .cfg-help td:nth-child(3) { font-family: var(--mono); color: var(--text-3); white-space: nowrap; }
 .primary.danger-primary {
   background: color-mix(in srgb, var(--danger) 86%, black);
   border-color: color-mix(in srgb, var(--danger) 70%, black);

@@ -62,6 +62,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ..\..\scripts\panel_api_smok
 | `update_asset_missing` | 该 Release 缺少安装包或 `SHA256SUMS` |
 | `update_checksum_mismatch` | SHA256 不匹配，已拒绝安装 |
 
+## 更新过程可见性与安装落点
+
+应用内更新把「下载到哪 / 装到哪 / 装了什么」显式化，路径全部来自运行时真实状态，不做假文案：
+
+| 能力 | 落点 |
+|---|---|
+| 下载位置可指定 | 更新弹窗输入绝对路径 → `POST /api/update/download-dir`；存 DB setting `update.download_dir`，传空串恢复默认 `%LOCALAPPDATA%\Model-Gate\updates`；非法路径返回 400 `update_download_dir_invalid`（非绝对路径 / 是文件 / 不可写） |
+| 下载位置回显 | `GET /api/update/status` 回传 `download_dir`（实际落点）与 `download_dir_custom`（是否被用户改过） |
+| 打开下载位置 | 面板「打开下载位置」→ `POST /api/update/open-location` |
+| 安装位置 | 读注册表里安装器写入的 `InstallLocation` 作为安装目标；状态回传 `installer_path` / `effective_install_dir` / `install_target` / `install_dir_matches_exe`（与当前运行位置不同会明确标注） |
+| 安装不覆盖用户数据 | 静默安装参数 `/SILENT /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /DIR=<安装位置>`；安装器只装 exe，`data\modelgate.db` 与已有 `bridge.config.json` 永不被覆盖，默认配置与说明页仅在缺失时才落盘 |
+| 更新说明可读 | Release notes 以可展开区域展示，展开状态在重渲染后保持（不再点开即关） |
+
 ## 请求调用日志
 
 每个请求完成后写一行 access log（受 `accessLog` 控制，默认开启）：
@@ -148,6 +161,14 @@ Windows 托盘不支持常驻鼠标正文字，
 **升级衔接**：安装脚本只覆盖 exe，`bridge.config.json` 与 `data\modelgate.db` 原地保留；
 默认库路径与配置文件同目录（`data/modelgate.db`），从任意目录启动都能读同一份旧库，
 不会因工作目录变化而丢历史或清理升级时在别处生成空库。
+
+**随包默认配置与说明弹窗**：默认配置收敛为单一来源 `default_config.json`——代码用 `include_str!` 内嵌
+（`config::default_config_value()`），安装包把它落为 `{app}\bridge.config.json`；配置说明则**长在面板里**：
+顶栏「配置说明」按钮打开软件内弹窗（`ui/app.js` 的 `openConfigHelp()`），内容讲清 JSON 格式、常用字段
+（顶层与 `upstreams` 两条）的用途与用法、密钥怎么写、改完怎么生效，不再随包发独立说明页。随包文件在安装包里是
+`onlyifdoesntexist` + `uninsneveruninstall`：**安装 / 升级 / 静默更新都不覆盖已有配置，
+卸载也不删用户配置与用量库**；便携版目录里没有配置时，首启自动生成与 `default_config.json`
+内容一致的那一份。仓库根的 `bridge.config.example.json` 保留为进阶模板，但不再随包投放。
 
 ## 代码结构
 

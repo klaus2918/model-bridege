@@ -62,6 +62,12 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
 [Files]
 Source: "{#MyAppSourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; \
   Flags: ignoreversion signonce
+; 随包文件：默认配置（安装后落在程序目录，改过就永远保留）。
+; onlyifdoesntexist：目标已存在就跳过，绝不覆盖用户已有配置（升级与静默更新同样不覆盖）。
+; uninsneveruninstall：卸载时不删除这些文件（用户配置与数据不随卸载消失）。
+; 配置说明不再随包发独立页面：面板顶部「配置说明」按钮打开软件内弹窗（同一套样式与主题）。
+Source: "rust\model-gate\default_config.json"; DestDir: "{app}"; DestName: "bridge.config.json"; \
+  Flags: onlyifdoesntexist uninsneveruninstall
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

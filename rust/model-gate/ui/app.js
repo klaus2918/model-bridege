@@ -85,7 +85,7 @@ function openModal(opts) {
   const root = $("#modal-root");
   if (!root) return null;
   root.hidden = false;
-  root.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true">
+  root.innerHTML = `<div class="modal-card${opts.wide ? " modal-wide" : ""}" role="dialog" aria-modal="true">
       <div class="modal-head">
         <h3>${esc(opts.title || "")}</h3>
         <button type="button" class="ghost tiny" data-modal-close>关闭</button>
@@ -4128,9 +4128,128 @@ function initUpdate() {
   });
 }
 
+/* ── 配置说明：软件内弹窗（讲清 JSON 格式与常用字段） ─────────
+   说明不再随包发一个独立 HTML，而是长在面板里：跟软件同一套样式、
+   同一套弹窗与主题，改配置说明不用再单独维护一份文件。 */
+
+/* 字段表：[字段, 类型, 默认值, 用途]；字段名与 src/config.rs 实际解析的键一一对应 */
+const CONFIG_HELP_TOP_FIELDS = [
+  ["host", "string", "127.0.0.1", "监听地址；只在本机用就别改，要让局域网访问填 0.0.0.0"],
+  ["port", "number", "8900", "监听端口；被占用会自动顺延，实际端口看面板顶部"],
+  ["defaultModel", "string", "—", "默认模型；客户端没指定模型时走它"],
+  ["models", "string[]", "上游合并", "对外模型白名单；填了就只暴露这些模型"],
+  ["maxTokens", "number", "8192", "单次请求的默认输出上限"],
+  ["timeoutSeconds", "number", "600", "转发上游的超时秒数"],
+  ["modelsCacheSeconds", "number", "300", "模型清单缓存秒数"],
+  ["accessLog", "boolean", "true", "是否写访问日志（data/modelgate.log）"],
+  ["aliases", "object", "{}", "模型别名：对外名 → 上游真实名"],
+  ["thinking", "object", "—", "思考链回传：{\"passthrough\": true, \"cacheSize\": 500}"],
+  ["upstreams", "object", "—", "上游清单：键是上游名，值见下一张表"],
+];
+
+const CONFIG_HELP_UPSTREAM_FIELDS = [
+  ["protocol", "string", "openai", "上游协议：openai / anthropic / deepseek / opencode / commandcode 等"],
+  ["baseUrl", "string", "—", "上游地址（一般带 /v1 后缀）"],
+  ["apiKeyEnv", "string", "—", "密钥的环境变量名（推荐；不要写明文密钥）"],
+  ["apiKeyFile", "string", "—", "从文件读密钥的路径（自己指定才有默认值）"],
+  ["apiKeyAgent", "string", "—", "从 agent 客户端取密钥：opencode / jcode / commandcode / custom"],
+  ["default", "boolean", "false", "是否兜底上游；都没标时取第一条"],
+  ["models", "string[]", "—", "该上游提供的模型清单（面板可「查询清单」自动写入）"],
+  ["modelMap", "object", "{}", "模型映射：对外名 → 上游真实名"],
+  ["fetchModels", "boolean", "true", "是否按上游拉取模型清单（commandcode 除外）"],
+  ["sessionHeader", "boolean", "按协议", "是否注入会话头（x-opencode-session 等）"],
+  ["modelOverrides", "object", "{}", "模型级覆盖：键是模型名（支持单个 * 通配），值覆盖该模型的能力与参数"],
+  ["compat", "object", "预设", "兼容能力预设：profile、capabilities 等"],
+];
+
+const CONFIG_HELP_EXAMPLE = `{
+  "host": "127.0.0.1",
+  "port": 8900,
+  "defaultModel": "mimo-v2.6-flash-free",
+  "models": ["mimo-v2.6-flash-free"],
+  "accessLog": true,
+  "upstreams": {
+    "zen": {
+      "protocol": "openai",
+      "baseUrl": "https://opencode.ai/zen/v1",
+      "default": true,
+      "models": ["mimo-v2.6-flash-free"]
+    },
+    "my-api": {
+      "protocol": "openai",
+      "baseUrl": "https://api.example.com/v1",
+      "apiKeyEnv": "MY_API_KEY",
+      "models": ["gpt-4o-mini"]
+    }
+  }
+}`;
+
+function configHelpTable(rows) {
+  return `<div class="table-wrap"><table>
+      <thead><tr><th>字段</th><th>类型</th><th>默认</th><th>用途</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><td>${esc(r[0])}</td><td>${esc(r[1])}</td><td>${esc(r[2])}</td><td>${esc(r[3])}</td></tr>`).join("")}</tbody>
+    </table></div>`;
+}
+
+function openConfigHelp() {
+  openModal({
+    title: "配置说明",
+    wide: true,
+    hint: "配置文件是程序目录下的 bridge.config.json；面板「配置」页保存即回写该文件",
+    body: `<div class="cfg-help">
+      <section>
+        <h4>配置文件在哪</h4>
+        <p>固定名 <code>bridge.config.json</code>，放在 <code>Model-Gate.exe</code> 同一个目录。面板「配置」页底部「配置落盘与备份」里显示的就是真实绝对路径。</p>
+        <p>用量记录在同目录 <code>data/modelgate.db</code>（SQLite），与配置文件彼此独立，互不影响。</p>
+      </section>
+      <section>
+        <h4>格式：整个文件就是一个 JSON 对象</h4>
+        <pre class="cfg-help-code">${esc(CONFIG_HELP_EXAMPLE)}</pre>
+        <p>顶层放通用字段；<code>upstreams</code> 里每一项是一条上游，键是上游名，值是上面那张表的字段。</p>
+      </section>
+      <section>
+        <h4>常用字段（顶层）</h4>
+        ${configHelpTable(CONFIG_HELP_TOP_FIELDS)}
+      </section>
+      <section>
+        <h4>常用字段（upstreams 里的一条）</h4>
+        ${configHelpTable(CONFIG_HELP_UPSTREAM_FIELDS)}
+      </section>
+      <section>
+        <h4>密钥怎么写</h4>
+        <p>配置文件里只写<b>环境变量名</b>，不要写明文密钥：<code>"apiKeyEnv": "MY_API_KEY"</code>。明文 <code>apiKey</code> 会被忽略并给出迁移提示。</p>
+        <p>变量值可以在面板「配置」页展开对应上游 → 填好密钥 → 点<b>「写入密钥」</b>（写用户环境变量或你指定的文件，当前进程立即生效）；也可以自己设置：<code>setx MY_API_KEY "sk-xxxx"</code>。</p>
+      </section>
+      <section>
+        <h4>改完怎么生效 / 会不会被覆盖</h4>
+        <ul>
+          <li>面板「配置」页改完点<b>「保存配置」</b>，立即回写 bridge.config.json。</li>
+          <li>手工改完文件点<b>「从文件重载」</b>即刻生效，不必重启。</li>
+          <li>安装、升级、静默更新时若已存在 bridge.config.json 一律<b>跳过</b>，只在缺失时写入默认配置；data/modelgate.db 不进安装包，卸载也不删除。</li>
+        </ul>
+      </section>
+      <section>
+        <h4>常见问题</h4>
+        <ul>
+          <li>改了没生效：点一次「从文件重载」；还不行看日志 data/modelgate.log。</li>
+          <li>面板打不开：端口被占用会自动顺延；命令行加 --diagnose 可打印实际端口与配置路径。</li>
+          <li>便携版：exe 所在目录必须可写，否则配置与数据库无法落盘。</li>
+        </ul>
+      </section>
+    </div>`,
+    actions: [{ label: "关闭", className: "ghost" }],
+  });
+}
+
+function initConfigHelp() {
+  const button = $("#config-help-btn");
+  if (button) button.addEventListener("click", openConfigHelp);
+}
+
 /* ── 启动 ──────────────────────────────────────────────── */
 function boot() {
   initTheme();
+  initConfigHelp();
   initUpdate();
   initTabs();
   initUsageControls();

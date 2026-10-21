@@ -2014,29 +2014,218 @@ pub(crate) fn read_key_from_path(path: &Path, provider: &str) -> Option<(String,
     parse_env_value(&text, provider).map(|value| (value, "env-file".to_string()))
 }
 
-/// 生成默认配置（首次启动写盘用），字段与 Python 版默认模板对齐。
+/// 默认配置唯一来源：`rust/model-gate/default_config.json`。
+/// 安装包把它随附为 `{app}\bridge.config.json`，应用首启自动生成的也是同一份内容
+/// （同一来源，避免「安装包里的默认配置」与「首启生成的默认配置」两份模板各自漂移）。
+const DEFAULT_CONFIG_JSON: &str = include_str!("../default_config.json");
+
+/// 生成默认配置（首次启动写盘用）。
+/// 优先使用内嵌的 `default_config.json`；解析失败时回落到内置兜底模板，保证首启仍能写出合法配置。
 pub fn default_config_value() -> Value {
+    default_config_value_from(DEFAULT_CONFIG_JSON)
+}
+
+/// 解析给定的默认配置文本；解析失败或不是对象时回落到内置兜底模板。
+/// 抽成独立函数是为了让兜底分支可被单测直接覆盖（内嵌常量正常情况下永远解析成功）。
+pub fn default_config_value_from(text: &str) -> Value {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(|value| value.is_object())
+        .unwrap_or_else(fallback_default_config_value)
+}
+
+/// 内置兜底模板：仅在内嵌默认配置解析失败时使用（正常路径不会命中）。
+/// 内容与 `default_config.json` 的可用口径保持一致：一条免密上游，无明文密钥。
+fn fallback_default_config_value() -> Value {
     json!({
         "port": 8900,
         "host": "127.0.0.1",
-        "defaultModel": "deepseek-flash",
-        "models": ["deepseek-flash", "mimo-v2.5-pro", "glm5.3"],
+        "defaultModel": "mimo-v2.6-flash-free",
+        "models": ["mimo-v2.6-flash-free", "big-pickle"],
         "maxTokens": 8192,
         "timeoutSeconds": 600,
         "accessLog": true,
         "modelsCacheSeconds": 300,
+        "aliases": {},
         "thinking": {"passthrough": true, "cacheSize": 500},
         "upstreams": {
-            "cch": {
-                "protocol": "anthropic",
-                "baseUrl": "http://127.0.0.1:15721",
-                "compat": {"auth": {"scheme": "none"}},
-                "default": true,
+            "zen": {
+                "protocol": "openai",
+                "transport": "opencode",
+                "baseUrl": "https://opencode.ai/zen/v1",
                 "fetchModels": false,
-                "models": ["deepseek-flash", "mimo-v2.5-pro", "glm5.3"]
+                "autoModels": false,
+                "sessionHeader": false,
+                "default": true,
+                "models": ["mimo-v2.6-flash-free", "big-pickle"]
             }
         }
     })
+}
+
+/// 默认配置唯一来源的内嵌与兜底行为。
+///
+/// 覆盖三件事：① 安装包随附的 `default_config.json` 与首启自动生成的内容同源；
+/// ② 内嵌文本非法时兜底分支可达（首启仍能写出合法配置）；③ 默认配置不含明文密钥。
+#[cfg(test)]
+mod default_config_tests {
+    use super::*;
+
+    #[test]
+    fn default_config_is_parsable_object() {
+        let value = default_config_value();
+        assert!(value.is_object(), "默认配置必须是 JSON 对象");
+        assert_eq!(value.get("port").and_then(Value::as_u64), Some(8900));
+    }
+
+    #[test]
+    fn default_config_contains_doc_fields() {
+        let value = default_config_value();
+        for key in ["_doc", "_keys", "_models"] {
+            let text = value.get(key).and_then(Value::as_str).unwrap_or_default();
+            assert!(!text.is_empty(), "默认配置缺少说明字段 {key}");
+        }
+    }
+
+    #[test]
+    fn default_config_has_zen_without_plaintext_key() {
+        let value = default_config_value();
+        let upstreams = value
+            .get("upstreams")
+            .and_then(Value::as_object)
+            .expect("默认配置应含 upstreams");
+        let zen = upstreams
+            .get("zen")
+            .and_then(Value::as_object)
+            .expect("默认配置应含免密 zen 上游");
+        assert_eq!(
+            zen.get("transport").and_then(Value::as_str),
+            Some("opencode")
+        );
+        assert_eq!(zen.get("fetchModels").and_then(Value::as_bool), Some(false));
+        assert!(zen.get("apiKey").is_none(), "默认配置不得写明文 apiKey");
+        assert!(zen.get("apiKeyEnv").is_none(), "免密上游不需要密钥来源");
+        // 不含依赖本机服务或需要密钥的上游
+        assert!(
+            !upstreams.contains_key("cch"),
+            "默认配置不应依赖本机 CCH 服务"
+        );
+        assert!(!upstreams.contains_key("go"), "默认配置不应含需密钥上游 go");
+        assert!(!upstreams.contains_key("commandcode"));
+    }
+
+    #[test]
+    fn default_config_falls_back_when_text_invalid() {
+        let value = default_config_value_from("{ not json");
+        assert!(value.is_object());
+        assert_eq!(value.get("port").and_then(Value::as_u64), Some(8900));
+        assert!(
+            value
+                .get("upstreams")
+                .and_then(Value::as_object)
+                .map(|m| m.contains_key("zen"))
+                .unwrap_or(false),
+            "兜底模板仍应提供可用上游"
+        );
+    }
+
+    #[test]
+    fn default_config_falls_back_when_not_object() {
+        let value = default_config_value_from("[1,2,3]");
+        assert!(value.is_object(), "非对象文本必须回落到兜底模板");
+        assert!(value.get("upstreams").is_some());
+    }
+
+    /// 单一来源：内嵌内容与磁盘上的 `default_config.json` 完全一致
+    /// （安装包随附的默认配置 = 首启自动生成的默认配置）。
+    #[test]
+    fn default_config_matches_source_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("default_config.json");
+        let text = std::fs::read_to_string(&path).expect("应能读到 default_config.json");
+        let from_disk: Value =
+            serde_json::from_str(&text).expect("default_config.json 应是合法 JSON");
+        assert_eq!(from_disk, default_config_value());
+    }
+}
+
+/// 面板内「配置说明」弹窗的内容契约。
+///
+/// 说明长在面板里（`ui/app.js` 的 `openConfigHelp`），不再随包发一份独立 HTML。
+/// 这里守住三件事：① 弹窗确实存在、由顶栏按钮触发；② 讲清了「配置文件格式」
+/// 与「常用字段的用途/用法」；③ 说明里出现的字段名都是后端真正解析的键，
+/// 避免说明与实现各自漂移。
+#[cfg(test)]
+mod config_help_doc_tests {
+    use super::*;
+
+    const PANEL_APP_JS: &str = include_str!("../ui/app.js");
+
+    #[test]
+    fn config_help_dialog_lives_in_panel() {
+        assert!(
+            PANEL_APP_JS.contains("function openConfigHelp()"),
+            "面板里应有配置说明弹窗"
+        );
+        assert!(
+            PANEL_APP_JS.contains("config-help-btn"),
+            "顶栏应保留「配置说明」按钮"
+        );
+        assert!(
+            !PANEL_APP_JS.contains("/api/config/help"),
+            "不应再依赖脱离软件的独立说明页接口"
+        );
+    }
+
+    /// 说明里出现的字段名必须是后端真正解析的键（防止写出不存在的字段）。
+    #[test]
+    fn config_help_only_documents_real_fields() {
+        for key in [
+            "host",
+            "port",
+            "defaultModel",
+            "models",
+            "maxTokens",
+            "timeoutSeconds",
+            "modelsCacheSeconds",
+            "accessLog",
+            "aliases",
+            "thinking",
+            "upstreams",
+            "protocol",
+            "baseUrl",
+            "apiKeyEnv",
+            "apiKeyFile",
+            "apiKeyAgent",
+            "default",
+            "modelMap",
+            "fetchModels",
+            "sessionHeader",
+            "modelOverrides",
+            "compat",
+        ] {
+            assert!(
+                PANEL_APP_JS.contains(&format!("\"{key}\"")),
+                "配置说明弹窗缺少字段：{key}"
+            );
+        }
+    }
+
+    /// 关键主题不能丢：配置文件名、数据库位置、密钥写环境变量、改完怎么生效。
+    #[test]
+    fn config_help_covers_key_topics() {
+        for needle in [
+            "bridge.config.json",
+            "apiKeyEnv",
+            "modelgate.db",
+            "从文件重载",
+            "保存配置",
+        ] {
+            assert!(
+                PANEL_APP_JS.contains(needle),
+                "配置说明弹窗缺少关键内容：{needle}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
