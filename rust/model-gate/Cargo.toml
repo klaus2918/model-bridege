@@ -1,6 +1,6 @@
 [package]
 name = "model-gate"
-version = "2.21.0"
+version = "2.22.0"
 edition = "2021"
 description = "Model-Gate 本地模型网关（Rust 实现）"
 license = "MIT"
