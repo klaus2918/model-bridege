@@ -29,6 +29,23 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TEMP_PREFIX: &str = "model-gate-update-";
 
+/// 启动安装器后，本进程延迟多久退出。
+///
+/// 时序依据（实测，见 verify-log「运行中升级实测」）：
+///
+/// 1. Inno Setup 的 Restart Manager 通过向目标窗口发 `WM_CLOSE` 来关闭占用
+///    exe 的进程。但 Model-Gate 是托盘常驻应用——它的窗口只用于消息循环，
+///    **不处理 `WM_CLOSE`**；`--no-gui` 模式更是根本没有窗口。
+///    因此 `/CLOSEAPPLICATIONS` 对本产品无效，Inno 会一直等它关闭而卡住。
+/// 2. 结论：必须由本进程**自己退出**来释放 exe 句柄。
+/// 3. 但若安装器在退出前就开始写文件，覆盖会因文件占用失败。
+///
+/// 解决办法：用 `cmd` 包装一层，让安装器在包装进程里**等本进程退出后**才启动：
+/// `cmd /c "ping -n <n+1> 127.0.0.1 >nul & <installer> <args>"`。
+/// `ping` 的等待不依赖本进程是否还活着，只依赖时间；本进程在窗口内退出后，
+/// 安装器才真正开始执行，此时 exe 句柄已释放。
+const INSTALL_EXIT_DELAY_MS: u64 = 3_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
@@ -438,15 +455,19 @@ impl UpdateService {
             return Err(UpdateError::checksum_mismatch());
         }
 
-        let mut command = std::process::Command::new(&path);
-        command
-            .arg("/SILENT")
-            .arg("/NORESTART")
-            .arg("/CLOSEAPPLICATIONS")
-            .arg("/RESTARTAPPLICATIONS")
-            .arg("/SP-")
-            .arg(format!("/DIR={}", self.install_dir.display()));
-        command
+        // 启动安装器（见 INSTALL_EXIT_DELAY_MS 的说明）：
+        // 用 cmd 包一层，先等本进程退出释放 exe 句柄，再让安装器真正执行。
+        // `ping -n N 127.0.0.1` 是一个不依赖本进程存活的一次性延时器
+        // （N = 等待秒数 + 1），退出码固定为 0，因此不会中断后续命令。
+        let wait_secs = INSTALL_EXIT_DELAY_MS / 1000 + 1;
+        let installer_args = format!(
+            "\"{}\" /SILENT /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /SUPPRESSMSGBOXES \"/DIR={}\"",
+            path.display(),
+            self.install_dir.display()
+        );
+        let cmd_line = format!("ping -n {} 127.0.0.1 >nul & {}", wait_secs, installer_args);
+        std::process::Command::new("cmd")
+            .args(["/C", &cmd_line])
             .spawn()
             .map_err(|err| UpdateError::install_failed(format!("安装程序启动失败：{err}")))?;
 
@@ -460,8 +481,10 @@ impl UpdateService {
             self.status_json(&state)
         };
 
+        // 退出节奏：先给安装器一点时间确认已接手（避免它还没起来我们就退了，
+        // 造成窗口内没人执行安装），再退出释放 exe 句柄。
         tokio::spawn(async {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio::time::sleep(Duration::from_millis(INSTALL_EXIT_DELAY_MS)).await;
             std::process::exit(0);
         });
 
