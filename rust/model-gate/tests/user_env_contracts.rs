@@ -132,16 +132,16 @@ fn example_config_has_no_embedded_secret_or_env_file() {
 fn panel_exposes_explicit_key_file_path() {
     let text = fs::read_to_string(crate_root().join("ui/app.js")).expect("read ui/app.js");
     assert!(
-        text.contains("data-field=\"apiKeyFile\""),
-        "面板必须提供「密钥文件（apiKeyFile）」输入框，允许用户手动指定文件"
+        text.contains("data-field=\"apiKeyAgentPath\""),
+        "面板必须提供「凭据文件路径（apiKeyAgentPath）」输入框，允许用户手动指定文件"
     );
     assert!(
-        text.contains("entry.apiKeyFile = keyFile"),
-        "保存配置时必须把 apiKeyFile 路径写回，否则面板输入不生效"
+        text.contains("entry.apiKeyAgentPath = path"),
+        "保存配置时必须把凭据文件路径写回，否则面板输入不生效"
     );
     assert!(
-        text.contains("else delete entry.apiKeyFile"),
-        "清空路径时必须删除旧 apiKeyFile，避免沿用已失效的文件"
+        text.contains("delete entry.apiKeyFile"),
+        "保存时必须清理旧 apiKeyFile 字段，避免旧路径继续生效"
     );
 }
 

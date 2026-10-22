@@ -61,6 +61,15 @@ fn scan_token_end(input: &str, start: usize) -> usize {
     i
 }
 
+/// 从 `index`（必须是字符边界）前进一个完整字符；用于扫描无匹配时避免落入 UTF-8 多字节中间。
+fn next_char_boundary(input: &str, index: usize) -> usize {
+    input[index..]
+        .chars()
+        .next()
+        .map(|c| index + c.len_utf8())
+        .unwrap_or(index)
+}
+
 fn redact_private_keys(input: &str, count: &mut usize) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -111,7 +120,11 @@ fn redact_bearer(input: &str, count: &mut usize) -> String {
             last = token_end;
             *count += 1;
         }
-        search = token_end.max(token_start + 1);
+        search = if token_end > token_start {
+            token_end
+        } else {
+            next_char_boundary(input, token_start)
+        };
     }
     out.push_str(&input[last..]);
     out
@@ -142,7 +155,11 @@ fn redact_authorization(input: &str, count: &mut usize) -> String {
             last = token_end;
             *count += 1;
         }
-        search = token_end.max(token_start + 1);
+        search = if token_end > token_start {
+            token_end
+        } else {
+            next_char_boundary(input, token_start)
+        };
     }
     out.push_str(&input[last..]);
     out
@@ -180,7 +197,11 @@ fn redact_query_param(input: &str, name: &str, marker: &str, count: &mut usize) 
             last = value_end;
             *count += 1;
         }
-        search = value_end.max(value_start + 1);
+        search = if value_end > value_start {
+            value_end
+        } else {
+            next_char_boundary(input, value_start)
+        };
     }
     out.push_str(&input[last..]);
     out
@@ -852,6 +873,28 @@ mod tests {
         let (text, _) = redact_text(jwt);
         assert!(text.contains(REDACTED_KEY));
         assert!(!text.contains("eyJhbGciOiJIUzI1NiJ9"));
+    }
+
+    #[test]
+    fn redaction_handles_chinese_after_markers_without_panic() {
+        // 回归：`bearer ` 后直接跟中文时，旧实现按 +1 字节前进会落入 UTF-8 中间并 panic。
+        let (text, count) = redact_text("请检查 bearer 鉴权说明与 Authorization: 中文");
+        assert_eq!(count, 0);
+        assert_eq!(text, "请检查 bearer 鉴权说明与 Authorization: 中文");
+
+        let (text, _) = redact_text("https://example.test/?token=中文");
+        assert!(text.contains("token=[REDACTED:url]"), "{text}");
+        assert!(!text.contains("中文"));
+
+        // 其他“标记后直接跟中文”的路径也不能 panic。
+        for sample in [
+            "sk-中文",
+            "api_key=中文",
+            "-----BEGIN 中文",
+            "Bearer 鉴权 / bearer 说明 / Authorization: 中文",
+        ] {
+            let _ = redact_text(sample);
+        }
     }
 
     #[test]
