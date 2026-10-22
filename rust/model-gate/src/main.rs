@@ -12,7 +12,9 @@ mod free_sources;
 mod free_sources_api;
 mod gui;
 mod key_file;
+mod lifecycle;
 mod opencode_transport;
+mod prompt;
 mod provider_profiles;
 mod proxy;
 mod thinking;
@@ -173,10 +175,20 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
     let app = proxy::router(state.clone());
     // 托盘指标快照：后台每 10 秒查库，主线程只读快照，避免阻塞消息循环。
     let today_snapshot = Arc::new(std::sync::Mutex::new(state.db.today_stats()));
-    let server = spawn_server(listener, app, state.clone(), today_snapshot.clone());
+    let shutdown = state.shutdown.clone();
+    let server = spawn_server(
+        listener,
+        app,
+        state.clone(),
+        today_snapshot.clone(),
+        shutdown.clone(),
+    );
 
     if args.no_gui {
+        // 纯代理模式：没有托盘，关闭请求只能来自 HTTP 服务自身的优雅退出
+        // （Ctrl+C 或更新流程）。服务停下来后落盘数据库再退出。
         let _ = server.join();
+        state.db.checkpoint();
         return Ok(());
     }
     let data_dir = db_path
@@ -209,10 +221,11 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
             .map(|value| value.clone())
             .unwrap_or(serde_json::Value::Null)
     });
-    match gui::run(options, refresh_models, today_stats) {
+    match gui::run(options, refresh_models, today_stats, shutdown.clone()) {
         Ok(()) => {
-            // 托盘「退出」：关闭托盘后直接结束进程
-            std::process::exit(0);
+            // 托盘退出 / 更新流程要求关闭：统一走优雅关闭
+            // （停 HTTP 服务释放端口 → 数据库落盘 → 结束进程）。
+            graceful_exit(&state, &shutdown);
         }
         Err(err) => {
             tracing::warn!("桌面壳不可用（{err}），降级为纯代理模式：{url}");
@@ -220,6 +233,28 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+/// 优雅退出：停 HTTP 服务 → 数据库落盘 → 结束进程。
+///
+/// 顺序很关键：
+/// 1. 先请求服务停止（`axum` 优雅退出：不再接受新连接，等在途请求做完）；
+/// 2. 等端口真正释放——新版本起来后要能立刻绑定同一个端口；
+/// 3. 再把数据库 WAL 落盘，最后才结束进程（exe 句柄随之释放，
+///    安装器这时才能覆盖 `Model-Gate.exe`）。
+fn graceful_exit(state: &Arc<AppState>, shutdown: &Arc<crate::lifecycle::Shutdown>) {
+    shutdown.request();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !shutdown.server_stopped() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !shutdown.server_stopped() {
+        tracing::warn!("HTTP 服务未在 10 秒内停止，仍继续退出流程");
+    }
+    state.db.checkpoint();
+    // 通知安装看护脚本：资源已释放，可以开始安装。
+    shutdown.signal_exit();
+    std::process::exit(0);
 }
 
 /// 端口被占用时顺序尝试后续端口（与 Python 版「不中断接入」的降级策略一致）。
@@ -244,6 +279,7 @@ fn spawn_server(
     app: axum::Router,
     state: Arc<AppState>,
     today_snapshot: Arc<std::sync::Mutex<serde_json::Value>>,
+    shutdown: Arc<crate::lifecycle::Shutdown>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -279,6 +315,9 @@ fn spawn_server(
         runtime.spawn(async move {
             crate::update::auto_check(update).await;
         });
+        // 优雅退出：Ctrl+C 或关闭请求（更新流程 / 外部 WM_CLOSE）。
+        // 服务停下来 = 监听套接字释放 = 端口可被新版本立刻绑定。
+        let mut server_signal = shutdown.server_signal();
         runtime.block_on(async move {
             let listener = match tokio::net::TcpListener::from_std(listener) {
                 Ok(l) => l,
@@ -288,11 +327,16 @@ fn spawn_server(
                 }
             };
             let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
+                .with_graceful_shutdown(async move {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = server_signal.changed() => {}
+                    }
                 })
                 .await;
         });
+        // 服务已停止：端口释放完成。
+        shutdown.mark_server_stopped();
     })
 }
 

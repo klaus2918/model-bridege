@@ -16,8 +16,9 @@ use serde_json::{json, Value};
 use crate::anthropic;
 use crate::commandcode;
 use crate::config::{Config, Upstream};
-use crate::db::{Db, Filters, UsageRecord};
+use crate::db::{Db, Filters, PromptRecord, UsageRecord};
 use crate::opencode_transport as opencode;
+use crate::prompt;
 
 use arc_swap::ArcSwap;
 
@@ -66,6 +67,8 @@ pub struct AppState {
     pub free_probe_cache: std::sync::Mutex<crate::free_sources::ProbeCache>,
     /// 服务线程的 Tokio 句柄；托盘「刷新模型目录」用它触发异步刷新。
     pub runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    /// 关闭协调器：更新流程用它触发「停服务 → 落盘 → 退出」。
+    pub shutdown: std::sync::Arc<crate::lifecycle::Shutdown>,
 }
 
 impl AppState {
@@ -98,11 +101,17 @@ impl AppState {
             .ok()
             .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // 关闭协调器：HTTP 服务、托盘、更新流程共用同一个「请退出」信号。
+        let shutdown = crate::lifecycle::Shutdown::new();
         let update = Arc::new(crate::update::UpdateService::new(
             env!("CARGO_PKG_VERSION").parse().expect("crate version"),
             db.clone(),
             install_dir,
+            shutdown.clone(),
         ));
+        // 启动即执行一次提示词保留策略：即使本次未开启记录，也清理上次遗留的超期数据。
+        db.delete_prompts_older_than(cfg.prompt_retention_days as i64);
+        db.trim_prompts(cfg.prompt_max_records as i64);
         Self {
             cfg: ArcSwap::from_pointee(cfg),
             db,
@@ -114,6 +123,7 @@ impl AppState {
             update,
             free_probe_cache: std::sync::Mutex::new(crate::free_sources::ProbeCache::default()),
             runtime: std::sync::OnceLock::new(),
+            shutdown,
         }
     }
 
@@ -446,6 +456,24 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             post(crate::api_extra::retention_apply),
         )
         .route("/api/usage/export", get(crate::api_extra::usage_export))
+        .route("/api/usage/sessions", get(crate::api_extra::usage_sessions))
+        .route("/api/prompts", get(crate::api_extra::prompts_list))
+        .route("/api/prompts/export", get(crate::api_extra::prompts_export))
+        .route(
+            "/api/prompts/evolution",
+            get(crate::api_extra::prompts_evolution),
+        )
+        .route("/api/prompts/diff", get(crate::api_extra::prompts_diff))
+        .route(
+            "/api/prompts/diff/download",
+            get(crate::api_extra::prompts_diff_download),
+        )
+        .route("/api/prompts/clear", post(crate::api_extra::prompts_clear))
+        .route(
+            "/api/prompts/{id}/download",
+            get(crate::api_extra::prompt_download),
+        )
+        .route("/api/prompts/{id}", get(crate::api_extra::prompt_detail))
         .route("/api/logs", get(crate::api_extra::logs_get))
         .route("/api/logs/clear", post(crate::api_extra::logs_clear))
         .route(
@@ -598,7 +626,7 @@ async fn chat_forced(
 async fn chat_inner(
     state: Arc<AppState>,
     forced: Option<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let started = Instant::now();
@@ -619,6 +647,11 @@ async fn chat_inner(
         .map(str::to_string)
         .or_else(|| state.cfg().default_model.clone())
         .unwrap_or_default();
+    let ctx = prompt::RequestCtx {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        session: resolve_session(&headers, &payload),
+    };
+    capture_prompt(&state, &ctx, &requested_model, &payload);
     if requested_model.is_empty() {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -859,6 +892,7 @@ async fn chat_inner(
                 &upstream,
                 &requested_model,
                 &target_model,
+                &ctx,
                 started,
                 502,
                 false,
@@ -889,6 +923,7 @@ async fn chat_inner(
             &upstream,
             &requested_model,
             &target_model,
+            &ctx,
             started,
             status.as_u16(),
             stream,
@@ -910,6 +945,7 @@ async fn chat_inner(
             &upstream,
             &requested_model,
             &target_model,
+            &ctx,
             started,
             200,
             false,
@@ -982,6 +1018,7 @@ async fn chat_inner(
             &upstream,
             &requested_model,
             &target_model,
+            &ctx,
             started,
             200,
             false,
@@ -1004,7 +1041,15 @@ async fn chat_inner(
     let pause_turn = upstream.pause_turn;
     match upstream.protocol.as_str() {
         "anthropic" => {
-            stream_anthropic(state, upstream, requested_model, target_model, response).await
+            stream_anthropic(
+                state,
+                upstream,
+                requested_model,
+                target_model,
+                response,
+                ctx,
+            )
+            .await
         }
         "commandcode" => {
             stream_commandcode(
@@ -1017,6 +1062,7 @@ async fn chat_inner(
                 retry_headers,
                 retry_payload,
                 pause_turn,
+                ctx,
             )
             .await
         }
@@ -1028,10 +1074,21 @@ async fn chat_inner(
                 target_model,
                 response,
                 tool_state,
+                ctx,
             )
             .await
         }
-        _ => stream_response(state, upstream, requested_model, target_model, response).await,
+        _ => {
+            stream_response(
+                state,
+                upstream,
+                requested_model,
+                target_model,
+                response,
+                ctx,
+            )
+            .await
+        }
     }
 }
 
@@ -1041,6 +1098,7 @@ async fn stream_response(
     requested_model: String,
     target_model: String,
     response: reqwest::Response,
+    ctx: prompt::RequestCtx,
 ) -> Response {
     let started = Instant::now();
     let name = upstream.name.clone();
@@ -1077,7 +1135,7 @@ async fn stream_response(
                 }
             }
         }
-        record_ex(&state, &upstream, &requested_model, &target_model, started, 200, true,
+        record_ex(&state, &upstream, &requested_model, &target_model, &ctx, started, 200, true,
                   usage.as_ref(), None, ttft_ms, false, false);
     };
     let mut out = Response::new(Body::from_stream(stream));
@@ -1101,6 +1159,7 @@ async fn stream_opencode(
     target_model: String,
     response: reqwest::Response,
     tool_state: opencode::ToolState,
+    ctx: prompt::RequestCtx,
 ) -> Response {
     let started = Instant::now();
     let name = upstream.name.clone();
@@ -1165,7 +1224,7 @@ async fn stream_opencode(
             }
             yield Ok(Bytes::from("data: [DONE]\n\n"));
         }
-        record_ex(&state, &upstream, &requested_model, &target_model, started, 200, true,
+        record_ex(&state, &upstream, &requested_model, &target_model, &ctx, started, 200, true,
                   usage.as_ref(), None, ttft_ms, false, false);
     };
     let mut out = Response::new(Body::from_stream(stream));
@@ -1192,6 +1251,7 @@ async fn stream_commandcode(
     headers: reqwest::header::HeaderMap,
     payload: Value,
     pause_turn: bool,
+    ctx: prompt::RequestCtx,
 ) -> Response {
     let started = Instant::now();
     let name = upstream.name.clone();
@@ -1246,7 +1306,7 @@ async fn stream_commandcode(
             &requested_model, json!({}), Some(&st.finish), Some(st.openai_usage()))));
         yield Ok(Bytes::from("data: [DONE]\n\n"));
         let err = if st.error.is_empty() { None } else { Some(st.error.clone()) };
-        record_ex(&state, &upstream, &requested_model, &target_model, started, 200, true,
+        record_ex(&state, &upstream, &requested_model, &target_model, &ctx, started, 200, true,
                   Some(&st.usage()), err, ttft_ms, !st.saw_finish, st.paused);
     };
     let mut out = Response::new(Body::from_stream(stream));
@@ -1269,6 +1329,7 @@ async fn stream_anthropic(
     requested_model: String,
     target_model: String,
     response: reqwest::Response,
+    ctx: prompt::RequestCtx,
 ) -> Response {
     let started = Instant::now();
     let name = upstream.name.clone();
@@ -1310,7 +1371,7 @@ async fn stream_anthropic(
             "cacheReadTokens": st.cache_read,
             "cacheWriteTokens": st.cache_write,
         });
-        record_ex(&state, &upstream, &requested_model, &target_model, started, 200, true,
+        record_ex(&state, &upstream, &requested_model, &target_model, &ctx, started, 200, true,
                   Some(&usage), None, ttft_ms, false, false);
     };
     let mut out = Response::new(Body::from_stream(stream));
@@ -1332,6 +1393,7 @@ fn record(
     up: &Upstream,
     requested: &str,
     target: &str,
+    ctx: &prompt::RequestCtx,
     started: Instant,
     status: u16,
     stream: bool,
@@ -1339,7 +1401,7 @@ fn record(
     error: Option<String>,
 ) {
     record_ex(
-        state, up, requested, target, started, status, stream, usage, error, 0, false, false,
+        state, up, requested, target, ctx, started, status, stream, usage, error, 0, false, false,
     );
 }
 
@@ -1348,6 +1410,7 @@ fn record_ex(
     up: &Upstream,
     requested: &str,
     target: &str,
+    ctx: &prompt::RequestCtx,
     started: Instant,
     status: u16,
     stream: bool,
@@ -1359,6 +1422,7 @@ fn record_ex(
 ) {
     let usage = usage.cloned().unwrap_or(Value::Null);
     let rec = UsageRecord {
+        id: ctx.id.clone(),
         upstream: up.name.clone(),
         protocol: up.protocol.clone(),
         requested_model: requested.to_string(),
@@ -1388,7 +1452,7 @@ fn record_ex(
         paused,
         error,
         cost: 0.0,
-        session: String::new(),
+        session: ctx.session.clone(),
     };
     state.db.record_usage(&rec);
     log_access(state, &rec, ttft_ms, truncated, paused);
@@ -1444,6 +1508,64 @@ fn brief_text(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// 读取入站会话标识：优先客户端显式头，缺失时回退「模型 + 首条 user」哈希。
+fn resolve_session(headers: &HeaderMap, payload: &Value) -> String {
+    const NAMES: [&str; 3] = ["x-session-id", "x-opencode-session", "x-conversation-id"];
+    for name in NAMES {
+        let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) else {
+            continue;
+        };
+        let cleaned: String = value
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect();
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    session_id(payload)
+}
+
+/// 记录入站提示词；开关关闭或没有 messages 时不产生任何序列化与写库开销。
+fn capture_prompt(
+    state: &AppState,
+    ctx: &prompt::RequestCtx,
+    requested_model: &str,
+    payload: &Value,
+) {
+    let cfg = state.cfg();
+    if !cfg.prompt_capture {
+        return;
+    }
+    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+    let encoded = prompt::prepare_messages(messages, cfg.prompt_max_chars as usize);
+    let record = PromptRecord {
+        id: ctx.id.clone(),
+        ts: 0,
+        session: ctx.session.clone(),
+        requested_model: requested_model.to_string(),
+        message_count: encoded.message_count,
+        size_bytes: encoded.size_bytes,
+        truncated: encoded.truncated,
+        preview: encoded.preview,
+        messages: encoded.messages,
+    };
+    if state.db.record_prompt(&record).is_empty() {
+        return;
+    }
+    state
+        .db
+        .delete_prompts_older_than(cfg.prompt_retention_days as i64);
+    state.db.trim_prompts(cfg.prompt_max_records as i64);
 }
 
 pub fn session_id(payload: &Value) -> String {
@@ -1563,6 +1685,7 @@ async fn api_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "db_path": state.db.path.display().to_string(),
         "thinking": state.thinking.stats(),
         "server_time": chrono::Utc::now().timestamp(),
+        "prompt_capture": state.cfg().prompt_capture,
         "runtime": "rust",
     }))
 }
@@ -2158,6 +2281,35 @@ mod tests {
         assert_eq!(until, today_start(), "右边界是今天 00:00");
         assert_eq!(since, until - (now - until), "左边界是等长的一段");
         assert!(since < until);
+    }
+
+    #[test]
+    fn resolve_session_prefers_client_header_and_falls_back_to_hash() {
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "  client-session  ".parse().unwrap());
+        assert_eq!(resolve_session(&headers, &payload), "client-session");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-opencode-session", "opencode-session".parse().unwrap());
+        assert_eq!(resolve_session(&headers, &payload), "opencode-session");
+
+        let empty = HeaderMap::new();
+        let hash = resolve_session(&empty, &payload);
+        assert_eq!(hash, session_id(&payload), "缺失入站头时回退稳定哈希");
+        assert_eq!(hash.len(), 16);
+    }
+
+    #[test]
+    fn resolve_session_ignores_blank_and_control_only_headers() {
+        let payload = json!({"model": "m", "messages": []});
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "   ".parse().unwrap());
+        headers.insert("x-conversation-id", "conv-1".parse().unwrap());
+        assert_eq!(resolve_session(&headers, &payload), "conv-1");
     }
 }
 

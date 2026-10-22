@@ -91,7 +91,9 @@ fn tabs_match_panels() {
         rest = &rest[end..];
     }
     assert_eq!(tabs, panels, "页签与面板必须一一对应");
-    for expected in ["overview", "model", "config", "usage", "free", "logs"] {
+    for expected in [
+        "overview", "model", "config", "usage", "prompts", "free", "logs",
+    ] {
         assert!(tabs.contains(expected), "缺少页签 {expected}");
     }
 }

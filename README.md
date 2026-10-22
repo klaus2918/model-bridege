@@ -509,6 +509,10 @@ curl http://127.0.0.1:8900/v1/models
 | `maxTokens` | 请求未带 `max_tokens` 时的默认上限 |
 | `timeoutSeconds` | 单请求整体超时（秒） |
 | `accessLog` | 是否打印每请求一行日志 |
+| `promptCapture` | 是否记录入站提示词（默认 `false`；只记 `messages`，不记响应） |
+| `promptRetentionDays` | 提示词保留天数，默认 `7`；`0` = 永久 |
+| `promptMaxRecords` | 提示词最多保留条数，默认 `5000`；`0` = 不按条数裁剪 |
+| `promptMaxChars` | 单条提示词最多保存字符数，默认 `100000`；超出按消息边界截断 |
 | `modelsCacheSeconds` | 模型列表缓存秒数（默认 300） |
 | `thinking.passthrough` | 是否自动回传思考内容（多轮会话必需，见第九节） |
 | `thinking.cacheSize` | 思考内容缓存条数上限，默认 `500` |
@@ -780,6 +784,29 @@ cch 已显式关掉两者：
 | `/v1/chat/completions` | POST | 对话主接口，支持流式与工具调用 |
 | `/v1/models` | GET | 模型列表 |
 | `/health` | GET | 健康检查，列出各上游状态 |
+| `/api/prompts` | GET | 提示词列表（range/from/to/model/session/q/limit/offset） |
+| `/api/prompts/{id}` | GET | 单条提示词详情（messages 数组） |
+| `/api/prompts/{id}/download` | GET | 单条提示词 JSON 下载 |
+| `/api/prompts/export` | GET | 当前筛选批量 JSONL 下载（已脱敏） |
+| `/api/prompts/clear` | POST | 按筛选清空提示词记录 |
+| `/api/prompts/evolution` | GET | 同会话请求时间轴与确定性统计 |
+| `/api/prompts/diff` | GET | 两条提示词记录的消息级 + 行级差异 |
+| `/api/prompts/diff/download` | GET | 差异 unified diff 文本下载 |
+| `/api/usage/sessions` | GET | 会话汇总（请求、token、错误、P50/P95、模型、首末活跃） |
+| `/api/usage/export?group=session` | GET | 会话汇总 CSV 导出 |
+
+### 提示词记录与会话统计
+
+面板「提示词」页签用于回看每次请求真正发出去的 `messages`，服务于提示词改进；「用量」页的会话下拉、会话统计表、会话详情与 CSV 导出用于按对话查看请求与成本。
+
+- **默认关闭**：`promptCapture` 默认 `false`，关闭时不产生任何序列化或写库开销。开启后只记录**入站** `messages`，不记录模型响应，也不记录无法解析的 `invalid_json` 请求。
+- **关联方式**：每次请求生成一个请求 ID，提示词记录与用量明细使用同一 ID；同一 `prompt_records.id` 可在用量明细里定位对应请求。
+- **会话 ID**：优先读取入站头 `x-session-id`、`x-opencode-session`、`x-conversation-id`（去除控制字符、最长 200 字符）；缺失时回退到「模型 + 首条 user 内容」的稳定哈希。旧数据没有会话时显示为 `(无会话)`。
+- **保留与容量**：默认保留 7 天、最多 5000 条、单条最多 100000 字符；超长内容按消息边界截断并标记 `truncated`，保证仍是合法 JSON。可在配置页调整，`0` 表示对应维度不限制。
+- **脱敏**：写入前按规则替换 Bearer/Authorization、常见 API Key 前缀（如 `sk-`、`sk-ant-`、`ghp_`、`xoxb-`、`AIza`、`AKIA`）、JWT、私钥块、敏感 JSON 字段名和 URL 中的 `key/api_key/token/access_token`；替换为 `[REDACTED:<kind>]`，不提供还原。规则脱敏不能保证覆盖所有自定义密钥格式，敏感场景请先关闭记录或自行清理。
+- **差异对比**：同会话「提示词演进」按时间轴选择两条记录，先做消息级 LCS 对齐（同 role 的删/增配对为修改），再对修改消息做行级 unified diff（默认上下文 3 行）；统计新增/删除/修改/未变、字符与估算 token 变化、system 哈希、重复消息占比，并给出固定规则化提示。**全程本地算法，不调用任何模型或网络**。
+- **下载**：单条详情可下载 JSON；列表可按当前筛选批量下载 JSONL；会话演进可下载 `.diff` 文本。所有下载内容都来自写入时已脱敏的记录。
+- **存储位置**：与用量同一 SQLite（`data/modelgate.db`）中的 `prompt_records` 表；面板「清空」只删提示词记录，不影响用量明细，反之亦然。
 
 不支持 `/v1/embeddings`、`/v1/completions` 等，返回 404。
 

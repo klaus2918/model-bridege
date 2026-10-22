@@ -91,6 +91,30 @@ pub async fn usage_export(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
     if let Some(session) = query.get("session").filter(|v| !v.is_empty()) {
         filters.session = Some(session.clone());
     }
+    if query.get("group").map(String::as_str) == Some("session") {
+        let sort = query.get("sort").map(String::as_str).unwrap_or("last_ts");
+        let order = query.get("order").map(String::as_str).unwrap_or("desc");
+        let rows = state.db.session_usage(&filters, 1000, sort, order);
+        let columns = [
+            "session",
+            "requests",
+            "errors",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cost",
+            "avg_duration_ms",
+            "avg_ttft_ms",
+            "p95_duration_ms",
+            "first_ts",
+            "last_ts",
+            "models_count",
+            "models",
+        ];
+        return csv_attachment("modelgate-sessions", &columns, &rows);
+    }
     let limit = 100_000_i64;
     let rows = state.db.list_usage(&filters, limit, 0, "ts", "asc");
     let count = rows.len();
@@ -155,6 +179,387 @@ pub async fn usage_export(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
         csv,
     )
         .into_response()
+}
+
+fn csv_attachment(prefix: &str, columns: &[&str], rows: &[Value]) -> Response {
+    let mut csv = String::from("\u{feff}");
+    csv.push_str(&columns.join(","));
+    csv.push('\n');
+    for row in rows {
+        let mut fields = Vec::new();
+        for col in columns {
+            let value = row.get(*col).cloned().unwrap_or(Value::Null);
+            let text = match value {
+                Value::Null => String::new(),
+                Value::String(s) => s,
+                other => other.to_string(),
+            };
+            fields.push(escape_csv(&text));
+        }
+        csv.push_str(&fields.join(","));
+        csv.push('\n');
+    }
+    let filename = format!(
+        "{prefix}-{}.csv",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "text/csv; charset=utf-8"),
+            (
+                "content-disposition",
+                &format!("attachment; filename=\"{filename}\""),
+            ),
+            ("x-row-count", &rows.len().to_string()),
+        ],
+        csv,
+    )
+        .into_response()
+}
+
+fn prompt_filters(uri: &Uri) -> crate::db::PromptFilters {
+    let query = params(uri);
+    let f = filters_from_query(uri.query().unwrap_or(""), now());
+    crate::db::PromptFilters {
+        since_ts: f.since_ts,
+        until_ts: f.until_ts,
+        model: f.model,
+        session: f.session,
+        upstream: None,
+        q: query.get("q").filter(|v| !v.is_empty()).cloned(),
+    }
+}
+
+pub async fn prompts_list(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let query = params(&uri);
+    let filters = prompt_filters(&uri);
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let offset = query
+        .get("offset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0);
+    let sort = query.get("sort").map(String::as_str).unwrap_or("ts");
+    let order = query.get("order").map(String::as_str).unwrap_or("desc");
+    let total = state.db.count_prompts(&filters);
+    let rows = state.db.list_prompts(&filters, limit, offset, sort, order);
+    Json(json!({
+        "total": total,
+        "rows": rows,
+        "limit": limit,
+        "offset": offset,
+        "capture": state.cfg().prompt_capture,
+        "stats": state.db.prompt_count_and_size(),
+        "facets": state.db.prompt_facets(),
+    }))
+    .into_response()
+}
+
+pub async fn prompt_detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.db.get_prompt(&id) {
+        Some(value) => Json(value).into_response(),
+        None => error_json(
+            StatusCode::NOT_FOUND,
+            "提示词记录不存在",
+            "invalid_request_error",
+            "prompt_not_found",
+        ),
+    }
+}
+
+pub async fn prompt_download(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(value) = state.db.get_prompt(&id) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "提示词记录不存在",
+            "invalid_request_error",
+            "prompt_not_found",
+        );
+    };
+    let body = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into());
+    let filename = format!("modelgate-prompt-{id}.json");
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "application/json; charset=utf-8"),
+            (
+                "content-disposition",
+                &format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub async fn prompts_export(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let filters = prompt_filters(&uri);
+    let rows = state.db.export_prompts(&filters, 100_000);
+    let mut body = String::new();
+    for row in &rows {
+        if let Ok(line) = serde_json::to_string(row) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    let filename = format!(
+        "modelgate-prompts-{}.jsonl",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "application/x-ndjson; charset=utf-8"),
+            (
+                "content-disposition",
+                &format!("attachment; filename=\"{filename}\""),
+            ),
+            ("x-row-count", &rows.len().to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub async fn prompts_clear(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let mut filters = crate::db::PromptFilters {
+        since_ts: body.get("from").and_then(Value::as_i64),
+        until_ts: body.get("to").and_then(Value::as_i64),
+        model: body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        session: body
+            .get("session")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        upstream: None,
+        q: None,
+    };
+    if filters.since_ts.is_none() && filters.until_ts.is_none() {
+        let range = body.get("range").and_then(Value::as_str).unwrap_or("all");
+        filters.since_ts = match range {
+            "all" => None,
+            "today" => Some(crate::proxy::today_start()),
+            "1h" => Some(now() - 3600),
+            "7d" => Some(now() - 7 * 86400),
+            "30d" => Some(now() - 30 * 86400),
+            _ => Some(now() - 86400),
+        };
+    }
+    let removed = state.db.clear_prompts(&filters);
+    Json(json!({"ok": true, "removed": removed})).into_response()
+}
+
+fn role_filtered(messages: &[Value], role: Option<&str>) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|m| {
+            role.filter(|r| !r.is_empty())
+                .and_then(|r| m.get("role").and_then(Value::as_str).map(|v| v == r))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+fn prompt_timeline_row(state: &AppState, id: &str) -> Option<Value> {
+    let value = state.db.get_prompt(id)?;
+    let messages = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut row = value.clone();
+    row.as_object_mut()?.remove("messages");
+    row["summary"] = crate::prompt::summarize_messages(&messages);
+    row["first_user"] = crate::prompt::content_text(
+        messages
+            .iter()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .unwrap_or(&Value::Null),
+    )
+    .chars()
+    .take(200)
+    .collect::<String>()
+    .into();
+    Some(row)
+}
+
+pub async fn prompts_evolution(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let query = params(&uri);
+    let Some(session) = query.get("session").filter(|v| !v.is_empty()).cloned() else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "缺少 session 参数",
+            "invalid_request_error",
+            "session_required",
+        );
+    };
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(20)
+        .clamp(2, 50);
+    let filters = crate::db::PromptFilters {
+        session: Some(session.clone()),
+        ..Default::default()
+    };
+    let mut rows = state.db.list_prompts(&filters, limit, 0, "ts", "desc");
+    rows.reverse();
+    let timeline: Vec<Value> = rows
+        .iter()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+        .filter_map(|id| prompt_timeline_row(&state, id))
+        .collect();
+    Json(json!({"session": session, "rows": timeline})).into_response()
+}
+
+pub async fn prompts_diff(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let query = params(&uri);
+    let (Some(base_id), Some(target_id)) = (query.get("base"), query.get("target")) else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "缺少 base/target 参数",
+            "invalid_request_error",
+            "diff_params_required",
+        );
+    };
+    let Some(base) = state.db.get_prompt(base_id) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "基准提示词记录不存在",
+            "invalid_request_error",
+            "prompt_not_found",
+        );
+    };
+    let Some(target) = state.db.get_prompt(target_id) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "目标提示词记录不存在",
+            "invalid_request_error",
+            "prompt_not_found",
+        );
+    };
+    let role = query.get("role").map(String::as_str);
+    let context = query
+        .get("context")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .min(20);
+    let base_messages = role_filtered(
+        base.get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        role,
+    );
+    let target_messages = role_filtered(
+        target
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        role,
+    );
+    let diff = crate::prompt::diff_messages(&base_messages, &target_messages, context);
+    Json(json!({
+        "base": {"id": base.get("id"), "ts": base.get("ts"), "session": base.get("session"),
+                 "requested_model": base.get("requested_model")},
+        "target": {"id": target.get("id"), "ts": target.get("ts"), "session": target.get("session"),
+                   "requested_model": target.get("requested_model")},
+        "diff": diff,
+    }))
+    .into_response()
+}
+
+pub async fn prompts_diff_download(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let query = params(&uri);
+    let (Some(base_id), Some(target_id)) = (query.get("base"), query.get("target")) else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "缺少 base/target 参数",
+            "invalid_request_error",
+            "diff_params_required",
+        );
+    };
+    let Some(base) = state.db.get_prompt(base_id) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "基准提示词记录不存在",
+            "invalid_request_error",
+            "prompt_not_found",
+        );
+    };
+    let Some(target) = state.db.get_prompt(target_id) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "目标提示词记录不存在",
+            "invalid_request_error",
+            "prompt_not_found",
+        );
+    };
+    let role = query.get("role").map(String::as_str);
+    let context = query
+        .get("context")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .min(20);
+    let base_messages = role_filtered(
+        base.get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        role,
+    );
+    let target_messages = role_filtered(
+        target
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        role,
+    );
+    let diff = crate::prompt::diff_messages(&base_messages, &target_messages, context);
+    let body = crate::prompt::unified_diff(base_id, target_id, &diff);
+    let filename = format!("modelgate-prompt-diff-{base_id}-{target_id}.diff");
+    (
+        StatusCode::OK,
+        [
+            ("content-type", "text/plain; charset=utf-8"),
+            (
+                "content-disposition",
+                &format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub async fn usage_sessions(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    let query = params(&uri);
+    let filters = filters_from_query(uri.query().unwrap_or(""), now());
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    let sort = query.get("sort").map(String::as_str).unwrap_or("last_ts");
+    let order = query.get("order").map(String::as_str).unwrap_or("desc");
+    let rows = state.db.session_usage(&filters, limit, sort, order);
+    Json(json!({"rows": rows, "limit": limit})).into_response()
 }
 
 fn escape_csv(text: &str) -> String {

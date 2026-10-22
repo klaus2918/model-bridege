@@ -4,9 +4,13 @@
 //! 用户都看不到；面板里也只有「下载并安装」这种含糊按钮。本模块把路径
 //! 这件事收成一处：
 //!
-//! - **下载目录**固定为 `%LOCALAPPDATA%\Model-Gate\updates`（可预期、可自己找到）；
-//! - **安装目录**以 Windows 注册表里 Inno Setup 卸载项记录的 `InstallLocation`
-//!   为准（已安装状态下 Inno 会忽略 `/DIR=` 改用它），读不到时回退 exe 所在目录；
+//! - **下载目录**默认是 Windows 的「下载」文件夹（Known Folder `FOLDERID_Downloads`，
+//!   跟随系统重定向，OneDrive 场景也正确）；取不到时回退 `%USERPROFILE%\Downloads`，
+//!   再取不到才回退历史默认 `%LOCALAPPDATA%\Model-Gate\updates`；
+//! - **安装目录**以 Windows 注册表里 Inno Setup 卸载项记录的安装位置为准：
+//!   `InstallLocation` → `DisplayIcon` → `UninstallString` 逐级回退
+//!   （真实机器上这三条不一定都存在，只有一条也能定位到安装目录），
+//!   都读不到时回退 exe 所在目录；
 //! - **打开位置**只允许打开服务端已知的路径，不接受任意路径入参。
 
 use std::path::{Path, PathBuf};
@@ -19,32 +23,70 @@ pub const APP_ID: &str = "{8F3C4A21-6D9E-4B7A-9C15-2B0E7D5F4A63}";
 /// 安装器写入的 exe 文件名（与 `ModelGate.iss` 的 `MyAppExeName` 一致）。
 pub const INNO_EXE_NAME: &str = "Model-Gate.exe";
 
-/// `%LOCALAPPDATA%` 下的应用数据目录名。
-const APP_DATA_DIR: &str = "Model-Gate";
+/// 旧版：应用数据目录名（仅用于识别「历史默认下载目录」）。
+const LEGACY_APP_DATA_DIR: &str = "Model-Gate";
 
-/// 下载子目录名。
-const DOWNLOAD_SUBDIR: &str = "updates";
+/// 旧版：下载子目录名（历史默认下载目录 = `%LOCALAPPDATA%\Model-Gate\updates`）。
+const LEGACY_DOWNLOAD_SUBDIR: &str = "updates";
 
 /// 没有 `LOCALAPPDATA` 时的回退目录名（放在临时目录下）。
 const FALLBACK_SUBDIR: &str = "model-gate-updates";
 
-/// 安装包下载目录：`%LOCALAPPDATA%\Model-Gate\updates`。
+/// 安装包默认下载目录：**Windows 的「下载」文件夹**。
 ///
-/// `LOCALAPPDATA` 缺失（或为空白）时回退 `%TEMP%\model-gate-updates`。
+/// 取值顺序：
+/// 1. `SHGetKnownFolderPath(FOLDERID_Downloads)` —— 系统真实的下载目录
+///    （跟随用户把下载重定向到 OneDrive 等场景）；
+/// 2. `%USERPROFILE%\Downloads`；
+/// 3. 历史默认 `%LOCALAPPDATA%\Model-Gate\updates`（最后兜底，保证功能不丢）。
 pub fn download_dir() -> PathBuf {
+    downloads_dir().unwrap_or_else(legacy_download_dir)
+}
+
+/// Windows 的「下载」目录；取不到时返回 `None`（由调用方决定回退）。
+pub fn downloads_dir() -> Option<PathBuf> {
+    imp::downloads_dir().or_else(user_profile_downloads)
+}
+
+/// 历史默认下载目录：`%LOCALAPPDATA%\Model-Gate\updates`。
+///
+/// 只用于「把用户此前保存下来的旧默认目录迁到新的 Windows「下载」目录」。
+pub fn legacy_download_dir() -> PathBuf {
     let local = std::env::var("LOCALAPPDATA").ok();
-    download_dir_with(local.as_deref(), &std::env::temp_dir())
+    legacy_download_dir_with(local.as_deref(), &std::env::temp_dir())
+}
+
+/// `%USERPROFILE%\Downloads` 兜底（Known Folder 不可用时）。
+fn user_profile_downloads() -> Option<PathBuf> {
+    let profile = std::env::var_os("USERPROFILE")?;
+    let dir = PathBuf::from(profile).join("Downloads");
+    dir.is_dir().then_some(dir)
 }
 
 /// 用户自定义下载目录的 DB setting key（存绝对路径；空值表示用默认目录）。
 pub const DOWNLOAD_DIR_SETTING: &str = "update.download_dir";
 
 /// 按设置值解析下载目录：自定义路径优先，空值/缺失回退 [`download_dir`]。
+///
+/// **历史默认目录自动迁移**：旧版本把默认目录写进了设置（用户点过「保存目录」），
+/// 这里把它视为「未自定义」，从而跟着新默认一起落到 Windows「下载」目录。
 pub fn resolve_download_dir(custom: Option<&str>) -> PathBuf {
     match custom.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => PathBuf::from(value),
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if is_legacy_download_dir(&path) {
+                download_dir()
+            } else {
+                path
+            }
+        }
         None => download_dir(),
     }
+}
+
+/// 判断路径是否就是「历史默认下载目录」（`%LOCALAPPDATA%\Model-Gate\updates`）。
+pub fn is_legacy_download_dir(path: &Path) -> bool {
+    same_dir(path, &legacy_download_dir())
 }
 
 /// 校验用户输入的下载目录。
@@ -75,30 +117,30 @@ pub fn validate_download_dir(raw: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// [`download_dir`] 的纯函数版本，便于单测。
-pub fn download_dir_with(local_app_data: Option<&str>, temp: &Path) -> PathBuf {
+/// [`legacy_download_dir`] 的纯函数版本，便于单测。
+pub fn legacy_download_dir_with(local_app_data: Option<&str>, temp: &Path) -> PathBuf {
     match local_app_data
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        Some(base) => Path::new(base).join(APP_DATA_DIR).join(DOWNLOAD_SUBDIR),
+        Some(base) => Path::new(base)
+            .join(LEGACY_APP_DATA_DIR)
+            .join(LEGACY_DOWNLOAD_SUBDIR),
         None => temp.join(FALLBACK_SUBDIR),
     }
 }
 
-/// 安装器实际写入的目录：Inno 卸载项记录的 `InstallLocation`。
+/// 安装器实际写入的目录：Inno 卸载项记录的安装位置。
 ///
 /// 读不到（未安装过 / 非 Windows / 权限不足 / 记录已失效）时返回 `None`。
 pub fn registered_install_dir() -> Option<PathBuf> {
     imp::registered_install_dir()
 }
 
-/// 生效安装目录：注册表优先，回退当前 exe 所在目录。
-pub fn effective_install_dir(exe_dir: &Path) -> PathBuf {
-    effective_install_dir_with(registered_install_dir().as_deref(), exe_dir)
-}
-
 /// [`effective_install_dir`] 的纯函数版本，便于单测。
+///
+/// 注册表位置由调用方传入：更新服务启动时读一次并缓存，避免每次渲染状态
+/// 都去查注册表。
 pub fn effective_install_dir_with(registered: Option<&Path>, exe_dir: &Path) -> PathBuf {
     match registered {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
@@ -111,6 +153,64 @@ pub fn effective_install_dir_with(registered: Option<&Path>, exe_dir: &Path) -> 
 /// 纯函数版本：注册表位置由调用方传入，便于单测与复用已读到的值。
 pub fn effective_install_target_with(registered: Option<&Path>, exe_dir: &Path) -> PathBuf {
     effective_install_dir_with(registered, exe_dir).join(INNO_EXE_NAME)
+}
+
+/// 从 `DisplayIcon` 值里取程序所在目录。
+///
+/// 卸载项里的 `DisplayIcon` 形如 `D:\mysoft\Model-Gate\Model-Gate.exe`
+/// 或带图标序号 `...,0`；两种写法都要能定位到目录。
+pub fn dir_from_icon_value(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim().trim_matches('"');
+    // 只有末尾是纯数字时才当成图标序号剥掉（路径里本身可能带逗号）。
+    let without_index = match trimmed.rsplit_once(',') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => trimmed,
+    };
+    let path = PathBuf::from(without_index);
+    if !path.is_absolute() {
+        return None;
+    }
+    path.parent().map(Path::to_path_buf)
+}
+
+/// 从 `UninstallString` 值里取程序所在目录。
+///
+/// 形如 `"D:\mysoft\Model-Gate\unins000.exe"`，也可能带 `/VERYSILENT` 之类参数。
+pub fn dir_from_uninstall_string(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    // 取第一对引号之间的内容；没有引号时退回整串（去掉尾部参数）。
+    let first = trimmed
+        .split('"')
+        .nth(1)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .unwrap_or_else(|| trimmed.split_whitespace().next().unwrap_or(""));
+    let path = PathBuf::from(first);
+    if !path.is_absolute() {
+        return None;
+    }
+    path.parent().map(Path::to_path_buf)
+}
+
+/// 比较两个目录是否指向同一位置（Windows 下忽略大小写与末尾分隔符）。
+pub fn same_dir(left: &Path, right: &Path) -> bool {
+    normalize_dir(left) == normalize_dir(right)
+}
+
+/// 目录归一化：去掉末尾分隔符（Windows 下再忽略大小写）。
+fn normalize_dir(path: &Path) -> String {
+    let text = path.to_string_lossy().to_string();
+    let trimmed = text.trim_end_matches(['\\', '/']);
+    let value = if trimmed.is_empty() {
+        text.as_str()
+    } else {
+        trimmed
+    };
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value.to_string()
+    }
 }
 
 /// 在系统文件管理器中打开路径。
@@ -128,11 +228,12 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
         KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ,
     };
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath, ShellExecuteW};
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     /// Inno 卸载项子键路径。
@@ -217,6 +318,38 @@ mod imp {
         }
     }
 
+    /// Windows「下载」目录：`SHGetKnownFolderPath(FOLDERID_Downloads)`。
+    ///
+    /// 走 Known Folder 而不是拼 `%USERPROFILE%\Downloads`：用户把「下载」
+    /// 重定向到 OneDrive / 其他盘时，这里拿到的是系统真实路径。
+    pub(super) fn downloads_dir() -> Option<PathBuf> {
+        unsafe {
+            let mut path: *mut u16 = std::ptr::null_mut();
+            // KF_FLAG_DEFAULT = 0；htoken = NULL 表示当前用户。
+            let hr = SHGetKnownFolderPath(&FOLDERID_Downloads, 0, std::ptr::null_mut(), &mut path);
+            // S_OK = 0；失败时 ppszPath 不保证被赋值。
+            if hr != 0 || path.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while *path.add(len) != 0 {
+                len += 1;
+            }
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+            CoTaskMemFree(path.cast());
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(trimmed))
+            }
+        }
+    }
+
+    /// 从卸载项里定位安装目录：逐个来源尝试，任一命中即可。
+    ///
+    /// 真实机器上这三条不一定都存在（例如注册表被清理过、卸载项键名不同），
+    /// 因此每条都要能独立定位到目录。
     pub(super) fn registered_install_dir() -> Option<PathBuf> {
         let subkey = uninstall_subkey(super::APP_ID);
         // 顺序：当前用户（安装器以 lowest 权限安装时写这里）→ 本机 64 位视图 → 本机 32 位视图。
@@ -226,13 +359,28 @@ mod imp {
             (HKEY_LOCAL_MACHINE, 0),
         ];
         for (root, flags) in roots {
-            let Some(value) = query_string_value(root, flags, &subkey, "InstallLocation") else {
-                continue;
-            };
-            let dir = PathBuf::from(value);
-            // 注册表可能留着已卸载的脏记录：目录不存在时不采信。
-            if dir.is_dir() {
-                return Some(dir);
+            // 来源 1：InstallLocation（Inno 标准写法，直接就是目录）。
+            if let Some(value) = query_string_value(root, flags, &subkey, "InstallLocation") {
+                let dir = PathBuf::from(value);
+                if dir.is_dir() {
+                    return Some(dir);
+                }
+            }
+            // 来源 2：DisplayIcon（`...Model-Gate.exe` 或 `...,0`）。
+            if let Some(value) = query_string_value(root, flags, &subkey, "DisplayIcon") {
+                if let Some(dir) = super::dir_from_icon_value(&value) {
+                    if dir.is_dir() {
+                        return Some(dir);
+                    }
+                }
+            }
+            // 来源 3：UninstallString（`"...\unins000.exe"`）。
+            if let Some(value) = query_string_value(root, flags, &subkey, "UninstallString") {
+                if let Some(dir) = super::dir_from_uninstall_string(&value) {
+                    if dir.is_dir() {
+                        return Some(dir);
+                    }
+                }
             }
         }
         None
@@ -276,6 +424,10 @@ mod imp {
 mod imp {
     use std::path::{Path, PathBuf};
 
+    pub(super) fn downloads_dir() -> Option<PathBuf> {
+        None
+    }
+
     pub(super) fn registered_install_dir() -> Option<PathBuf> {
         None
     }
@@ -304,8 +456,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn download_dir_prefers_local_app_data() {
-        let dir = download_dir_with(
+    fn legacy_download_dir_prefers_local_app_data() {
+        let dir = legacy_download_dir_with(
             Some(r"C:\Users\<user>\AppData\Local"),
             Path::new(r"C:\Temp"),
         );
@@ -318,14 +470,14 @@ mod tests {
     }
 
     #[test]
-    fn download_dir_falls_back_to_temp_without_local_app_data() {
-        let dir = download_dir_with(None, Path::new(r"C:\Temp"));
+    fn legacy_download_dir_falls_back_to_temp_without_local_app_data() {
+        let dir = legacy_download_dir_with(None, Path::new(r"C:\Temp"));
         assert_eq!(dir, PathBuf::from(r"C:\Temp").join("model-gate-updates"));
     }
 
     #[test]
-    fn download_dir_treats_blank_local_app_data_as_missing() {
-        let dir = download_dir_with(Some("   "), Path::new(r"C:\Temp"));
+    fn legacy_download_dir_treats_blank_local_app_data_as_missing() {
+        let dir = legacy_download_dir_with(Some("   "), Path::new(r"C:\Temp"));
         assert_eq!(dir, PathBuf::from(r"C:\Temp").join("model-gate-updates"));
     }
 
@@ -341,6 +493,25 @@ mod tests {
         assert_eq!(dir, download_dir());
         let dir = resolve_download_dir(None);
         assert_eq!(dir, download_dir());
+    }
+
+    #[test]
+    fn resolve_download_dir_migrates_legacy_default_to_downloads() {
+        // 旧版本把默认目录存进了设置：升级后必须回到 Windows「下载」目录，
+        // 不能继续留在 %LOCALAPPDATA% 里。
+        let legacy = legacy_download_dir();
+        let dir = resolve_download_dir(Some(&legacy.display().to_string()));
+        assert_eq!(dir, download_dir());
+        assert!(!same_dir(&dir, &legacy));
+    }
+
+    #[test]
+    fn download_dir_is_downloads_when_available() {
+        // Windows 上「下载」目录一定拿得到（Known Folder 或 USERPROFILE 兜底）。
+        if cfg!(windows) {
+            assert!(downloads_dir().is_some());
+            assert_eq!(download_dir(), downloads_dir().unwrap());
+        }
     }
 
     #[test]
@@ -408,5 +579,66 @@ mod tests {
             target,
             PathBuf::from(r"C:\Program Files\Model-Gate\Model-Gate.exe")
         );
+    }
+
+    #[test]
+    fn dir_from_icon_value_handles_plain_and_indexed() {
+        assert_eq!(
+            dir_from_icon_value(r"D:\mysoft\Model-Gate\Model-Gate.exe"),
+            Some(PathBuf::from(r"D:\mysoft\Model-Gate"))
+        );
+        assert_eq!(
+            dir_from_icon_value(r"D:\mysoft\Model-Gate\Model-Gate.exe,0"),
+            Some(PathBuf::from(r"D:\mysoft\Model-Gate"))
+        );
+        assert_eq!(
+            dir_from_icon_value(r#""D:\mysoft\Model-Gate\Model-Gate.exe""#),
+            Some(PathBuf::from(r"D:\mysoft\Model-Gate"))
+        );
+    }
+
+    #[test]
+    fn dir_from_icon_value_keeps_comma_in_path() {
+        assert_eq!(
+            dir_from_icon_value(r"D:\a,b\Model-Gate.exe"),
+            Some(PathBuf::from(r"D:\a,b"))
+        );
+    }
+
+    #[test]
+    fn dir_from_icon_value_rejects_relative() {
+        assert_eq!(dir_from_icon_value("Model-Gate.exe"), None);
+    }
+
+    #[test]
+    fn dir_from_uninstall_string_handles_quoted_and_args() {
+        assert_eq!(
+            dir_from_uninstall_string(r#""D:\mysoft\Model-Gate\unins000.exe""#),
+            Some(PathBuf::from(r"D:\mysoft\Model-Gate"))
+        );
+        assert_eq!(
+            dir_from_uninstall_string(r#""D:\mysoft\Model-Gate\unins000.exe" /VERYSILENT"#),
+            Some(PathBuf::from(r"D:\mysoft\Model-Gate"))
+        );
+        assert_eq!(
+            dir_from_uninstall_string(r"D:\mysoft\Model-Gate\unins000.exe"),
+            Some(PathBuf::from(r"D:\mysoft\Model-Gate"))
+        );
+    }
+
+    #[test]
+    fn same_dir_ignores_trailing_separator_and_case() {
+        assert!(same_dir(
+            Path::new(r"D:\mysoft\Model-Gate"),
+            Path::new(r"D:\mysoft\Model-Gate\")
+        ));
+        assert!(same_dir(
+            Path::new(r"D:\mysoft\Model-Gate"),
+            Path::new(r"d:\MYSOFT\model-gate")
+        ));
+        assert!(!same_dir(
+            Path::new(r"D:\mysoft\Model-Gate"),
+            Path::new(r"D:\mysoft\Other")
+        ));
     }
 }

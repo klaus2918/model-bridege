@@ -2,6 +2,8 @@
 //!
 //! 面板由 Rust 内核直接嵌入并交给系统默认浏览器打开；
 //! 本进程只保留托盘、剪贴板、Shell 打开等轻量交互。
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -14,11 +16,15 @@ use windows_sys::Win32::System::DataExchange::{
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 #[cfg(windows)]
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+#[cfg(windows)]
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 #[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, KillTimer, MessageBoxW, PostQuitMessage, SetTimer,
-    TranslateMessage, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG, SW_SHOWNORMAL, WM_TIMER,
+    CallWindowProcW, DefWindowProcW, DispatchMessageW, EnumThreadWindows, GetClassNameW,
+    GetMessageW, KillTimer, MessageBoxW, PostQuitMessage, PostThreadMessageW, SetTimer,
+    SetWindowLongPtrW, TranslateMessage, GWLP_WNDPROC, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG,
+    SW_SHOWNORMAL, WM_CLOSE, WM_TIMER, WNDPROC,
 };
 
 #[cfg(windows)]
@@ -26,6 +32,19 @@ include!(concat!(env!("OUT_DIR"), "/tray_icon.rs"));
 
 #[cfg(windows)]
 const CF_UNICODETEXT: u32 = 13;
+
+/// 托盘窗口的窗口类名（`tray-icon` crate 内部注册）。
+///
+/// 我们需要找到这个窗口并子类化它的窗口过程：Windows Restart Manager
+/// （Inno Setup 用它来关闭占用文件的进程）只会给**进程的一个顶层窗口**发
+/// `WM_CLOSE`。托盘窗口正是本进程唯一的顶层窗口，而它默认不处理 `WM_CLOSE`，
+/// 于是窗口被销毁、进程却不退出 —— Inno 就会一直等下去（用户看到的「卡死」）。
+#[cfg(windows)]
+const TRAY_WINDOW_CLASS: &str = "tray_icon_app";
+
+/// 托盘窗口原始窗口过程（子类化后转发到这里）。
+#[cfg(windows)]
+static TRAY_ORIGINAL_WNDPROC: AtomicUsize = AtomicUsize::new(0);
 
 /// 托盘指标刷新周期。
 #[cfg(windows)]
@@ -45,12 +64,17 @@ pub struct ShellOptions {
 
 /// 启动托盘壳并阻塞在主线程消息循环；`refresh_models` 由「刷新模型目录」菜单触发，
 /// `today_stats` 每 10 秒刷新托盘指标（tooltip + 只读菜单项）。
+///
+/// `shutdown` 是关闭协调器：更新流程或外部 `WM_CLOSE` 都会通过它让本循环退出。
 #[cfg(windows)]
 pub fn run(
     options: ShellOptions,
     refresh_models: Box<dyn Fn()>,
     today_stats: Box<dyn Fn() -> serde_json::Value>,
+    shutdown: Arc<crate::lifecycle::Shutdown>,
 ) -> anyhow::Result<()> {
+    // 登记托盘线程：关闭请求要靠它把「请退出」投递回本线程的消息队列。
+    shutdown.set_tray_thread(unsafe { GetCurrentThreadId() });
     let icon = tray_icon::Icon::from_rgba(TRAY_ICON_RGBA.to_vec(), TRAY_ICON_SIZE, TRAY_ICON_SIZE)?;
 
     let menu = Menu::new();
@@ -93,6 +117,13 @@ pub fn run(
         tracing::warn!("打开面板失败：{}", options.url);
     }
 
+    // 让托盘窗口正确响应 WM_CLOSE：外部（Inno 的 Restart Manager）发来的关闭
+    // 请求必须变成「优雅退出」，而不是「窗口没了但进程还在」——
+    // 后者正是安装器卡在关闭上的根因。
+    if !hook_tray_window_close() {
+        tracing::warn!("未能接管托盘窗口的 WM_CLOSE，外部关闭请求可能无法优雅退出");
+    }
+
     // 启动即读一次快照，之后每 10 秒刷新（WM_TIMER 投递到本线程消息队列）。
     apply_tray_stats(&tray, &today, &hit, &today_stats());
     // SAFETY: SetTimer 只登记本线程的定时器；窗口句柄为空时 WM_TIMER 进入线程队列。
@@ -108,6 +139,12 @@ pub fn run(
     loop {
         let ret = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
         if ret <= 0 {
+            break;
+        }
+        if msg.message == crate::lifecycle::WM_APP_SHUTDOWN {
+            // 「请退出」：来源可能是更新流程（要装新版本），也可能是外部
+            // WM_CLOSE 被托盘窗口转投递过来的。统一走优雅关闭流程。
+            shutdown.request();
             break;
         }
         unsafe {
@@ -168,6 +205,98 @@ fn is_stats_timer_message(message: u32, wparam: usize, timer_id: usize) -> bool 
     timer_id != 0 && message == WM_TIMER && wparam == timer_id
 }
 
+/// 找到本线程里 `tray-icon` 创建的托盘窗口，并子类化它的窗口过程。
+///
+/// 返回是否接管成功。失败不影响托盘本身（只是外部 `WM_CLOSE` 不会优雅退出）。
+#[cfg(windows)]
+fn hook_tray_window_close() -> bool {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+
+    /// 枚举用的上下文：找到目标窗口就停。
+    struct Search {
+        found: HWND,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let search = &mut *(lparam as *mut Search);
+        if search.found.is_null() {
+            let mut buffer = [0u16; 64];
+            let len = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+            if len > 0 {
+                let name = String::from_utf16_lossy(&buffer[..len as usize]);
+                if name == TRAY_WINDOW_CLASS {
+                    search.found = hwnd;
+                }
+            }
+        }
+        // 返回 0 结束枚举。
+        if search.found.is_null() {
+            1
+        } else {
+            0
+        }
+    }
+
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let mut search = Search {
+        found: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumThreadWindows(
+            thread_id,
+            Some(enum_proc),
+            &mut search as *mut Search as LPARAM,
+        );
+    }
+    if search.found.is_null() {
+        return false;
+    }
+    let previous = unsafe {
+        SetWindowLongPtrW(
+            search.found,
+            GWLP_WNDPROC,
+            tray_window_proc as *const () as isize,
+        )
+    };
+    if previous == 0 {
+        return false;
+    }
+    TRAY_ORIGINAL_WNDPROC.store(previous as usize, Ordering::SeqCst);
+    true
+}
+
+/// 托盘窗口的窗口过程（子类）。
+///
+/// 只拦一件事：`WM_CLOSE`。
+///
+/// 背景：Inno Setup 的 Restart Manager 通过 `WM_CLOSE` 请求关闭占用文件的进程。
+/// 托盘窗口默认走 `DefWindowProc` → 窗口被销毁、**进程却不退出**，
+/// Inno 就会一直等下去（安装卡在「关闭」这一步）。
+///
+/// 这里把 `WM_CLOSE` 翻译成「请退出消息循环」，由主循环统一走优雅关闭流程
+/// （停 HTTP 服务 → 数据库落盘 → 退出进程），并且**不销毁托盘窗口**。
+#[cfg(windows)]
+unsafe extern "system" fn tray_window_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    if msg == WM_CLOSE {
+        let thread_id = unsafe { GetCurrentThreadId() };
+        unsafe {
+            PostThreadMessageW(thread_id, crate::lifecycle::WM_APP_SHUTDOWN, 0, 0);
+        }
+        return 0;
+    }
+    let original = TRAY_ORIGINAL_WNDPROC.load(Ordering::SeqCst);
+    if original == 0 {
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    let original: WNDPROC = std::mem::transmute(original);
+    unsafe { CallWindowProcW(original, hwnd, msg, wparam, lparam) }
+}
+
 /// 把今日统计写入托盘 tooltip 与菜单只读项（命中率无样本时显示「—」）。
 #[cfg(windows)]
 fn apply_tray_stats(tray: &TrayIcon, today: &MenuItem, hit: &MenuItem, stats: &serde_json::Value) {
@@ -192,6 +321,7 @@ pub fn run(
     _options: ShellOptions,
     _refresh_models: Box<dyn Fn()>,
     _today_stats: Box<dyn Fn() -> serde_json::Value>,
+    _shutdown: Arc<crate::lifecycle::Shutdown>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("桌面壳仅支持 Windows")
 }

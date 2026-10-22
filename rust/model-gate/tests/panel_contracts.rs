@@ -169,6 +169,24 @@ fn config_endpoints_are_registered() {
 }
 
 #[test]
+fn prompt_endpoints_are_registered() {
+    let routes = rust_routes();
+    for path in [
+        "/api/prompts",
+        "/api/prompts/export",
+        "/api/prompts/evolution",
+        "/api/prompts/diff",
+        "/api/prompts/diff/download",
+        "/api/prompts/clear",
+        "/api/prompts/{id}",
+        "/api/prompts/{id}/download",
+        "/api/usage/sessions",
+    ] {
+        assert!(routes.contains(path), "Rust 未注册 {path}");
+    }
+}
+
+#[test]
 fn every_panel_api_call_has_a_registered_route() {
     let routes = rust_routes();
     let calls = panel_api_calls(&ui_dir());

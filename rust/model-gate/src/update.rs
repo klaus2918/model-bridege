@@ -30,7 +30,7 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TEMP_PREFIX: &str = "model-gate-update-";
 
-/// 启动安装器后，本进程延迟多久退出。
+/// 启动安装器后，本进程延迟多久才真正退出。
 ///
 /// 时序依据（实测，见 verify-log「运行中升级实测」）：
 ///
@@ -41,11 +41,16 @@ const TEMP_PREFIX: &str = "model-gate-update-";
 /// 2. 结论：必须由本进程**自己退出**来释放 exe 句柄。
 /// 3. 但若安装器在退出前就开始写文件，覆盖会因文件占用失败。
 ///
-/// 解决办法：用 `cmd` 包装一层，让安装器在包装进程里**等本进程退出后**才启动：
-/// `cmd /c "ping -n <n+1> 127.0.0.1 >nul & <installer> <args>"`。
-/// `ping` 的等待不依赖本进程是否还活着，只依赖时间；本进程在窗口内退出后，
-/// 安装器才真正开始执行，此时 exe 句柄已释放。
-const INSTALL_EXIT_DELAY_MS: u64 = 3_000;
+/// 现在的做法（见 `crate::lifecycle`）：
+///
+/// - 安装参数带 `/NOCLOSEAPPLICATIONS`，彻底不让 Inno 走 Restart Manager；
+/// - 本进程收到关闭请求后按序做三件事：停 HTTP 服务（释放端口）→
+///   数据库 WAL 落盘 → 退出进程（释放 exe 句柄）；
+/// - 由独立的看护脚本等本进程退出后再执行安装，装完拉起新版本。
+///
+/// 因此这里不再需要「固定延时退出」，只保留一个很短的延时，
+/// 让这次 HTTP 响应先写回浏览器。
+const INSTALL_EXIT_DELAY_MS: u64 = 300;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -313,10 +318,17 @@ pub struct UpdateService {
     ///
     /// 已安装状态下 Inno 会忽略 `/DIR=`，改用这个值——它才是「实际装到哪」的答案。
     registered_install_dir: Option<PathBuf>,
+    /// 关闭协调器：安装时用它让本进程按序退出。
+    shutdown: Arc<crate::lifecycle::Shutdown>,
 }
 
 impl UpdateService {
-    pub fn new(current: Version, db: Arc<Db>, install_dir: PathBuf) -> Self {
+    pub fn new(
+        current: Version,
+        db: Arc<Db>,
+        install_dir: PathBuf,
+        shutdown: Arc<crate::lifecycle::Shutdown>,
+    ) -> Self {
         cleanup_stale_temp();
         let client = build_client();
         let exe_path = std::env::current_exe().ok();
@@ -329,6 +341,7 @@ impl UpdateService {
             install_dir,
             exe_path,
             registered_install_dir,
+            shutdown,
         }
     }
 
@@ -349,7 +362,7 @@ impl UpdateService {
     }
 
     /// 生效下载目录：`update.download_dir` 设置优先，缺失/空值用默认目录
-    /// （`%LOCALAPPDATA%\Model-Gate\updates`）。
+    /// （Windows 的「下载」文件夹）。
     fn download_dir(&self) -> PathBuf {
         let custom = self.db.get_setting(update_paths::DOWNLOAD_DIR_SETTING);
         update_paths::resolve_download_dir(custom.as_deref())
@@ -489,26 +502,34 @@ impl UpdateService {
             return Err(UpdateError::checksum_mismatch());
         }
 
-        // 启动安装器（见 INSTALL_EXIT_DELAY_MS 的说明）：
-        // 用 cmd 包一层，先等本进程退出释放 exe 句柄，再让安装器真正执行。
-        // `ping -n N 127.0.0.1` 是一个不依赖本进程存活的一次性延时器
-        // （N = 等待秒数 + 1），退出码固定为 0，因此不会中断后续命令。
+        // 安装目录 = **原安装目录**：注册表卸载项记录的安装位置优先，
+        // 读不到才回退当前 exe 所在目录。安装参数里显式带上 `/DIR=`，
+        // 保证「面板显示的安装位置」与「安装器实际写入的位置」完全一致，
+        // 不再出现每次都要人工选目录的情况。
+        let install_dir = self.effective_install_dir();
+        let new_exe = install_dir.join(update_paths::INNO_EXE_NAME);
+        let log_file = path
+            .parent()
+            .map(|dir| dir.join("model-gate-install.log"))
+            .unwrap_or_else(|| std::env::temp_dir().join("model-gate-install.log"));
+
+        // 看护脚本接管后续三步：等本进程退出 → 静默安装 → 拉起新版本。
         //
-        // 安装目录取「生效安装目录」：已安装过时 Inno 会忽略 /DIR=，改用注册表
-        // 里记录的 InstallLocation；这里显式传入同一个值，保证「面板显示的安装
-        // 位置」与「安装器实际写入的位置」一致。
-        let wait_secs = INSTALL_EXIT_DELAY_MS / 1000 + 1;
-        let install_dir = update_paths::effective_install_dir(&self.install_dir);
-        let installer_args = format!(
-            "\"{}\" /SILENT /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /SP- /SUPPRESSMSGBOXES \"/DIR={}\"",
-            path.display(),
-            install_dir.display()
-        );
-        let cmd_line = format!("ping -n {} 127.0.0.1 >nul & {}", wait_secs, installer_args);
-        std::process::Command::new("cmd")
-            .args(["/C", &cmd_line])
-            .spawn()
+        // 关键：安装参数带 `/NOCLOSEAPPLICATIONS`，不让 Inno 用 Restart Manager
+        // 去「温柔关闭」本应用——托盘程序不响应 `WM_CLOSE`，那一步会一直卡住。
+        // 关闭改由本进程自己做（停服务释放端口 → 落盘数据库 → 退出释放 exe 句柄）。
+        let plan = crate::lifecycle::InstallPlan {
+            installer: path.clone(),
+            install_dir: install_dir.clone(),
+            new_exe,
+            log_file,
+            parent_pid: std::process::id(),
+            exit_marker: crate::lifecycle::exit_marker_path(std::process::id()),
+        };
+        crate::lifecycle::spawn_watch_script(&plan)
             .map_err(|err| UpdateError::install_failed(format!("安装程序启动失败：{err}")))?;
+        // 登记退出信号文件：退出前由主流程写出，看护脚本据此开始安装。
+        self.shutdown.set_exit_marker(plan.exit_marker.clone());
 
         {
             let mut state = self.state.lock().await;
@@ -520,11 +541,15 @@ impl UpdateService {
             self.status_json(&state)
         };
 
-        // 退出节奏：先给安装器一点时间确认已接手（避免它还没起来我们就退了，
-        // 造成窗口内没人执行安装），再退出释放 exe 句柄。
-        tokio::spawn(async {
+        // 触发关闭：HTTP 服务优雅停止（端口释放）→ 托盘退出 → 进程退出。
+        //
+        // 延迟一小段再触发：让这次 HTTP 响应先写回浏览器，
+        // 否则面板会看到「连接被重置」而不是明确的「正在关闭并安装」。
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(INSTALL_EXIT_DELAY_MS)).await;
-            std::process::exit(0);
+            tracing::info!("安装已交给看护脚本，开始关闭应用");
+            shutdown.request();
         });
 
         Ok(status)
@@ -534,7 +559,7 @@ impl UpdateService {
         let sums_text = self.fetch_text(&sums.url, MAX_SUMS_BYTES).await?;
         let expected_sha = parse_sha256sums(&sums_text, &setup.name)?;
 
-        // 下载目录可配置（默认 %LOCALAPPDATA%\Model-Gate\updates）：
+        // 下载目录可配置（默认 Windows 的「下载」文件夹）：
         // 用户要能自己找到安装包，随机临时目录做不到这一点。
         let dir = self.download_dir();
         tokio::fs::create_dir_all(&dir)
@@ -768,8 +793,16 @@ impl UpdateService {
                 .as_ref()
                 .map(|dir| dir.display().to_string()),
             "effective_install_dir": self.effective_install_dir().display().to_string(),
+            // 安装目录的来源：注册表（= 原安装目录）还是当前 exe 所在目录。
+            "install_dir_source": if self.registered_install_dir.is_some() {
+                "registry"
+            } else {
+                "exe"
+            },
             "install_target": self.effective_install_target().display().to_string(),
             "install_dir_matches_exe": self.effective_install_dir() == self.install_dir,
+            // 关闭请求已发出：面板据此提示「正在关闭并安装」。
+            "restart_pending": self.shutdown.is_requested(),
             "error": state.error.as_ref().map(|error| json!({
                 "code": error.code.clone(),
                 "message": error.message.clone(),
@@ -777,8 +810,13 @@ impl UpdateService {
         })
     }
 
+    /// 是否支持自动安装：安装目录里得有 Inno 的卸载器（unins*.exe）。
+    ///
+    /// 两个目录都查：注册表记录的安装目录，以及当前 exe 所在目录
+    /// （便携版升级、目录被手工搬过等情况下两者会不一致）。
     fn install_supported(&self) -> bool {
-        find_uninstaller(&self.install_dir).is_some()
+        find_uninstaller(&self.effective_install_dir()).is_some()
+            || find_uninstaller(&self.install_dir).is_some()
     }
 
     fn last_check_at(&self) -> Option<i64> {

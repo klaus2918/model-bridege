@@ -13,6 +13,10 @@
   "maxTokens": 8192,
   "timeoutSeconds": 600,
   "accessLog": true,
+  "promptCapture": false,
+  "promptRetentionDays": 7,
+  "promptMaxRecords": 5000,
+  "promptMaxChars": 100000,
   "modelsCacheSeconds": 300,
   "aliases": {},
   "thinking": {

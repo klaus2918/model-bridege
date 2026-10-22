@@ -51,6 +51,22 @@ const state = {
     upstreamSortKey: "total_tokens",
     upstreamSortDir: "desc",
     upstreamExpanded: "",
+    sessions: [],
+  },
+  // 提示词页：列表 / 会话演进共享筛选与选中记录，避免切换视图后丢上下文
+  prompt: {
+    view: "list",
+    range: "7d",
+    model: "",
+    session: "",
+    q: "",
+    rows: [],
+    total: 0,
+    capture: null,
+    stats: { records: 0, bytes: 0 },
+    facets: { models: [], sessions: [] },
+    expanded: "",
+    evolution: { session: "", role: "", onlyDiff: false, rows: [], base: "", target: "", diff: null },
   },
   // 概览页的上游表：完整数据、无分页，排序与展开都在前端即可
   overview: { sortKey: "name", sortDir: "asc", expanded: "" },
@@ -355,6 +371,7 @@ function initTabs() {
       if (btn.dataset.tab === "model") { loadCatalog(); loadPricing(); }
       if (btn.dataset.tab === "config") loadConfig();
       if (btn.dataset.tab === "usage") loadUsage();
+      if (btn.dataset.tab === "prompts") loadPrompts();
       if (btn.dataset.tab === "free") loadFreeSources();
       if (btn.dataset.tab === "logs") loadLogs();
     });
@@ -1657,6 +1674,10 @@ async function loadConfig() {
     f.aliases.value = Object.entries(state.config.aliases || {})
       .map(([k, v]) => `${k} = ${v}`).join("\n");
     f.accessLog.checked = state.config.accessLog !== false;
+    f.promptCapture.checked = state.config.promptCapture === true;
+    f.promptRetentionDays.value = state.config.promptRetentionDays ?? 7;
+    f.promptMaxRecords.value = state.config.promptMaxRecords ?? 5000;
+    f.promptMaxChars.value = state.config.promptMaxChars ?? 100000;
     f.thinkingPassthrough.checked =
       !state.config.thinking || state.config.thinking.passthrough !== false;
     renderUpstreamEditor();
@@ -1745,6 +1766,10 @@ function collectConfig() {
   cfg.models = parseModels(f.models.value);
   cfg.aliases = parseAliases(f.aliases.value);
   cfg.accessLog = f.accessLog.checked;
+  cfg.promptCapture = f.promptCapture.checked;
+  cfg.promptRetentionDays = num(f.promptRetentionDays, 7, "提示词保留天数", 0);
+  cfg.promptMaxRecords = num(f.promptMaxRecords, 5000, "提示词保留条数", 0);
+  cfg.promptMaxChars = num(f.promptMaxChars, 100000, "单条提示词最大字符数", 1000);
   cfg.thinking = Object.assign({}, state.config.thinking, {
     passthrough: f.thinkingPassthrough.checked,
   });
@@ -1869,6 +1894,9 @@ function validateConfig(cfg) {
   }
   if (Number(cfg.modelsCacheSeconds) < 0) add("error", "modelsCacheSeconds", "缓存秒数不能为负");
   if (Number(cfg.retentionDays) < 0) add("error", "retentionDays", "保留天数不能为负");
+  if (Number(cfg.promptRetentionDays) < 0) add("error", "promptRetentionDays", "提示词保留天数不能为负");
+  if (Number(cfg.promptMaxRecords) < 0) add("error", "promptMaxRecords", "提示词保留条数不能为负");
+  if (Number(cfg.promptMaxChars) < 1000) add("error", "promptMaxChars", "单条提示词最大字符数至少 1000");
 
   const ups = cfg.upstreams || {};
   const names = Object.keys(ups);
@@ -2223,6 +2251,10 @@ function initConfigActions() {
     f.timeoutSeconds.value = 600;
     f.modelsCacheSeconds.value = 300;
     f.retentionDays.value = 0;
+    f.promptCapture.checked = false;
+    f.promptRetentionDays.value = 7;
+    f.promptMaxRecords.value = 5000;
+    f.promptMaxChars.value = 100000;
     setConfigDirty(true);
     renderServiceFacts();
     toast("已填入默认值，保存后生效");
@@ -2335,6 +2367,13 @@ function initUsageControls() {
     loadUsage();
   });
 
+  const scopeSession = $("#scope-session");
+  if (scopeSession) scopeSession.addEventListener("change", () => {
+    state.filters.session = scopeSession.value;
+    state.page = 0;
+    loadUsage();
+  });
+
   [["#scope-from", "from"], ["#scope-to", "to"]].forEach(([sel, key]) => {
     const el = $(sel);
     if (!el) return;
@@ -2372,15 +2411,46 @@ function initUsageControls() {
 
   const sessionFilter = $("#filter-session");
   if (sessionFilter) sessionFilter.addEventListener("change", () => {
-    state.filters.session = sessionFilter.value;
-    state.page = 0;
-    loadUsage();
+    setSessionFilter(sessionFilter.value);
   });
 
   const exportCsv = $("#export-usage-csv");
   if (exportCsv) exportCsv.addEventListener("click", () => exportUsage("csv"));
   const exportJson = $("#export-usage-json");
   if (exportJson) exportJson.addEventListener("click", () => exportUsage("json"));
+  const exportSessions = $("#export-sessions-csv");
+  if (exportSessions) exportSessions.addEventListener("click", exportSessionCsv);
+
+  const sessionSort = $("#session-usage-sort");
+  if (sessionSort) sessionSort.addEventListener("change", () => loadSessionUsage());
+
+  const sessionTable = $("#session-usage-table");
+  if (sessionTable) sessionTable.addEventListener("click", (ev) => {
+    const row = ev.target.closest("tr[data-session]");
+    if (!row) return;
+    setSessionFilter(row.dataset.session || "");
+  });
+
+  const sessionClear = $("#session-clear-filter");
+  if (sessionClear) sessionClear.addEventListener("click", () => setSessionFilter(""));
+
+  const sessionPrompts = $("#session-prompts-btn");
+  if (sessionPrompts) sessionPrompts.addEventListener("click", () => {
+    state.prompt.session = state.filters.session;
+    state.prompt.evolution.session = state.filters.session;
+    switchTab("prompts");
+    setPromptView("evolution");
+    loadPrompts();
+    loadEvolution(state.filters.session);
+  });
+
+  const sessionExport = $("#session-export-btn");
+  if (sessionExport) sessionExport.addEventListener("click", () => {
+    if (!state.filters.session) return;
+    const q = usageScopeQuery({ format: "csv", session: state.filters.session });
+    downloadUrl(`/api/usage/export?${q.toString()}`);
+    toast("已开始导出该会话的请求明细");
+  });
 
   const applyBtn = $("#apply-retention");
   if (applyBtn) applyBtn.addEventListener("click", applyRetention);
@@ -2539,9 +2609,21 @@ function renderFilterOptions() {
   const session = $("#filter-session");
   if (session) {
     const values = state.options.sessions || [];
-    if (state.filters.session && !values.includes(state.filters.session)) state.filters.session = "";
-    session.innerHTML = optionsHtml("会话", values, state.filters.session);
+    if (state.filters.session && state.filters.session !== "(无会话)"
+        && !values.includes(state.filters.session)) state.filters.session = "";
+    session.innerHTML = optionsHtml("会话", values, state.filters.session)
+      + (state.filters.session === "(无会话)" ? '<option value="(无会话)" selected>（无会话）</option>' : "");
     session.value = state.filters.session;
+  }
+
+  const scopeSession = $("#scope-session");
+  if (scopeSession) {
+    const values = state.options.sessions || [];
+    if (state.filters.session && state.filters.session !== "(无会话)"
+        && !values.includes(state.filters.session)) state.filters.session = "";
+    scopeSession.innerHTML = optionsHtml("会话", values, state.filters.session)
+      + (state.filters.session === "(无会话)" ? '<option value="(无会话)" selected>（无会话）</option>' : "");
+    scopeSession.value = state.filters.session;
   }
 }
 
@@ -2554,6 +2636,593 @@ function exportUsage(format) {
   link.click();
   link.remove();
   toast(`已开始导出 ${format.toUpperCase()}（当前筛选与区间）`);
+}
+
+function downloadUrl(url) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function switchTab(tab) {
+  const btn = $(`.tab-btn[data-tab="${CSS.escape(tab)}"]`);
+  if (!btn) return;
+  $$(".tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+  $$(".panel").forEach((p) => p.classList.toggle("active", p.id === `panel-${tab}`));
+  if (tab === "overview") loadOverview();
+  if (tab === "model") { loadCatalog(); loadPricing(); }
+  if (tab === "config") loadConfig();
+  if (tab === "usage") loadUsage();
+  if (tab === "prompts") loadPrompts();
+  if (tab === "free") loadFreeSources();
+  if (tab === "logs") loadLogs();
+}
+
+function setSessionFilter(value) {
+  state.filters.session = value || "";
+  state.page = 0;
+  const scope = $("#scope-session");
+  if (scope) scope.value = state.filters.session;
+  const filter = $("#filter-session");
+  if (filter) filter.value = state.filters.session;
+  loadUsage();
+}
+
+async function loadSessionUsage() {
+  const tbody = $("#session-usage-table tbody");
+  if (!tbody) return;
+  const q = usageScopeQuery();
+  const sort = ($("#session-usage-sort") || {}).value || "last_ts";
+  q.set("sort", sort);
+  q.set("order", "desc");
+  q.set("limit", "100");
+  try {
+    const data = await api(`/api/usage/sessions?${q.toString()}`);
+    state.usage.sessions = data.rows || [];
+    renderSessionUsage(state.usage.sessions);
+    renderSessionDetail();
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="12" class="empty">${esc(err.message)}</td></tr>`;
+  }
+}
+
+function renderSessionUsage(rows) {
+  const tbody = $("#session-usage-table tbody");
+  if (!tbody) return;
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="12" class="empty">该区间暂无会话数据</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((r) => {
+    const session = r.session || "(无会话)";
+    const short = session === "(无会话)" ? "（无会话）" : String(session).slice(0, 12) + (String(session).length > 12 ? "…" : "");
+    const requests = Number(r.requests) || 0;
+    const errors = Number(r.errors) || 0;
+    const rate = requests ? ((requests - errors) / requests * 100).toFixed(1) + "%" : "—";
+    const p95 = r.p95_duration_ms === undefined || r.p95_duration_ms === null
+      ? "—" : fmtMs(r.p95_duration_ms);
+    const active = `${fmtTime(r.first_ts)} ~ ${fmtTime(r.last_ts)}`;
+    return `<tr data-session="${esc(session)}" class="${state.filters.session === session ? "row-active" : ""}">
+      <td class="mono" title="${esc(session)}">${esc(short)}</td>
+      <td class="num mono">${fmtInt(requests)}</td>
+      <td class="num mono${errors ? " slow" : ""}">${fmtInt(errors)}</td>
+      <td class="num mono">${fmtCn(r.prompt_tokens)}</td>
+      <td class="num mono">${fmtCn(r.completion_tokens)}</td>
+      <td class="num mono">${fmtCn(r.cache_read_tokens)}</td>
+      <td class="num mono">${fmtCn(r.total_tokens)}</td>
+      <td class="num mono">${rate}</td>
+      <td class="num mono">${fmtMs(r.avg_duration_ms)}</td>
+      <td class="num mono">${p95}</td>
+      <td class="num mono">${fmtInt(r.models_count)}</td>
+      <td class="mono">${esc(active)}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderSessionDetail() {
+  const box = $("#session-detail");
+  if (!box) return;
+  const session = state.filters.session;
+  if (!session) {
+    box.hidden = true;
+    return;
+  }
+  const row = (state.usage.sessions || []).find((r) => (r.session || "(无会话)") === session);
+  box.hidden = false;
+  $("#session-detail-title").textContent =
+    session === "(无会话)" ? "会话详情：（无会话）" : `会话详情：${String(session).slice(0, 16)}…`;
+  const stats = $("#session-detail-stats");
+  if (stats) {
+    const requests = Number(row && row.requests) || 0;
+    const errors = Number(row && row.errors) || 0;
+    const rate = requests ? ((requests - errors) / requests * 100).toFixed(1) + "%" : "—";
+    const items = [
+      ["请求", fmtInt(requests)],
+      ["错误", fmtInt(errors)],
+      ["成功率", rate],
+      ["总 token", fmtTok(row && row.total_tokens)],
+      ["均耗", row ? fmtMs(row.avg_duration_ms) : "—"],
+      ["P95", row && row.p95_duration_ms !== undefined ? fmtMs(row.p95_duration_ms) : "—"],
+      ["模型", row && row.models ? String(row.models) : "—"],
+      ["最近活跃", row ? fmtTime(row.last_ts) : "—"],
+    ];
+    stats.innerHTML = items.map(([k, v]) =>
+      `<div class="legend-row"><div class="legend-head"><span class="label">${esc(k)}</span>` +
+      `<span class="val mono">${esc(v)}</span></div></div>`).join("");
+  }
+  const hint = $("#session-detail-hint");
+  if (hint) hint.textContent = `完整会话：${session} · 下方明细已按该会话收窄；提示词记录可通过「查看提示词演进」关联`;
+}
+
+function exportSessionCsv() {
+  const q = usageScopeQuery({ format: "csv", group: "session" });
+  downloadUrl(`/api/usage/export?${q.toString()}`);
+  toast("已开始导出会话汇总 CSV（当前筛选区间）");
+}
+
+/* ── 提示词页 ────────────────────────────────────────────── */
+function promptRange() {
+  return state.prompt.range || "7d";
+}
+
+function promptQuery(extra = {}) {
+  const q = new URLSearchParams();
+  q.set("range", promptRange());
+  if (state.prompt.model) q.set("model", state.prompt.model);
+  if (state.prompt.session) q.set("session", state.prompt.session);
+  if (state.prompt.q) q.set("q", state.prompt.q);
+  Object.entries(extra).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") q.set(key, value);
+  });
+  return q;
+}
+
+function fillPromptSelect(sel, label, values, current) {
+  const el = $(sel);
+  if (!el) return;
+  const uniq = Array.from(new Set(values || []));
+  if (current && !uniq.includes(current)) uniq.push(current);
+  el.innerHTML = `<option value="">全部${label}</option>` +
+    uniq.map((v) => `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(v)}</option>`).join("");
+  el.value = current || "";
+}
+
+function fmtBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function loadPrompts() {
+  const hint = $("#prompt-hint");
+  try {
+    const data = await api(`/api/prompts?${promptQuery({ limit: 100 }).toString()}`);
+    state.prompt.capture = data.capture === true;
+    state.prompt.rows = data.rows || [];
+    state.prompt.total = Number(data.total) || 0;
+    state.prompt.stats = data.stats || { records: 0, bytes: 0 };
+    state.prompt.facets = data.facets || { models: [], sessions: [] };
+    const disabled = $("#prompt-disabled");
+    if (disabled) disabled.hidden = state.prompt.capture;
+    fillPromptSelect("#prompt-model", "模型", state.prompt.facets.models, state.prompt.model);
+    fillPromptSelect("#prompt-session", "会话", state.prompt.facets.sessions, state.prompt.session);
+    renderPromptTable(state.prompt.rows);
+    if (hint) {
+      hint.textContent = state.prompt.capture
+        ? `共 ${fmtInt(state.prompt.total)} 条 · ${fmtBytes(state.prompt.stats.bytes)} · 默认保留 ${state.config ? state.config.promptRetentionDays ?? 7 : 7} 天`
+        : "记录开关关闭：当前不会产生新的提示词记录";
+    }
+    if (state.prompt.view === "evolution") await loadEvolution();
+  } catch (err) {
+    if (hint) hint.textContent = `加载失败：${err.message}`;
+    toast(`提示词加载失败：${err.message}`, true);
+  }
+}
+
+function renderPromptTable(rows) {
+  const tbody = $("#prompt-table tbody");
+  if (!tbody) return;
+  const total = $("#prompt-total");
+  if (total) {
+    total.textContent = `共 ${fmtInt(state.prompt.total)} 条 · ${fmtBytes(state.prompt.stats.bytes)}`
+      + (state.prompt.total > rows.length ? ` · 显示最近 ${rows.length} 条` : "");
+  }
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">${
+      state.prompt.capture ? "当前筛选下暂无提示词记录" : "记录开关关闭；去配置页开启后会记录新的入站 messages"}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((r) => {
+    const session = r.session || "(无会话)";
+    const preview = String(r.preview || "").replace(/\s+/g, " ").slice(0, 160);
+    return `<tr data-prompt-id="${esc(r.id)}">
+      <td class="mono">${esc(fmtTime(r.ts, r.created_at))}</td>
+      <td class="mono" title="${esc(session)}">${esc(session === "(无会话)" ? "（无会话）" : String(session).slice(0, 12))}</td>
+      <td class="mono">${esc(r.requested_model || "—")}</td>
+      <td class="num mono">${fmtInt(r.message_count)}</td>
+      <td class="num mono">${fmtInt(r.size_bytes)}</td>
+      <td class="prompt-preview">${esc(preview || "（空）")}</td>
+      <td class="nowrap">
+        <button type="button" class="ghost tiny" data-prompt-view="${esc(r.id)}">查看</button>
+        <button type="button" class="ghost tiny" data-prompt-download="${esc(r.id)}">下载</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function promptContentText(message) {
+  const content = message && message.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === "string") return part;
+      if (part && typeof part.text === "string") return part.text;
+      return JSON.stringify(part);
+    }).join("\n");
+  }
+  if (content === null || content === undefined) return "";
+  return JSON.stringify(content);
+}
+
+async function showPromptDetail(id) {
+  try {
+    const data = await api(`/api/prompts/${encodeURIComponent(id)}`);
+    const messages = Array.isArray(data.messages) ? data.messages : [];
+    const meta = [
+      ["记录 id", data.id],
+      ["时间", fmtTime(data.ts, data.created_at)],
+      ["会话", data.session || "(无会话)"],
+      ["模型", data.requested_model || "—"],
+      ["上游", data.upstream || "—"],
+      ["状态", data.status === null || data.status === undefined ? "—" : String(data.status)],
+      ["消息数", String(data.message_count ?? messages.length)],
+      ["大小", fmtBytes(data.size_bytes)],
+      ["截断", data.truncated ? "是（按消息边界截断）" : "否"],
+    ];
+    const metaHtml = `<div class="detail-grid">${meta.map(([k, v]) =>
+      `<div class="detail-item"><span class="detail-key">${esc(k)}</span>` +
+      `<span class="detail-val mono">${esc(v ?? "—")}</span></div>`).join("")}</div>`;
+    const messagesHtml = `<div class="prompt-messages">${messages.map((m, i) => {
+      const role = m && m.role ? String(m.role) : "unknown";
+      const text = promptContentText(m);
+      return `<details class="prompt-msg"${i < 3 ? " open" : ""}>
+        <summary><span class="badge">${esc(role)}</span> #${i + 1}
+          <span class="hint">${fmtInt(text.length)} 字符</span></summary>
+        <pre>${esc(text)}</pre>
+      </details>`;
+    }).join("") || '<div class="empty">该记录没有 messages</div>'}</div>`;
+    openModal({
+      title: "提示词详情",
+      hint: "只读；内容已在写入前按规则脱敏，不包含模型响应",
+      wide: true,
+      body: metaHtml + messagesHtml,
+      actions: [
+        { label: "复制 JSON", onClick: () => { copyText(JSON.stringify(data, null, 2)); return true; } },
+        { label: "下载 JSON", className: "primary", onClick: () => {
+          downloadUrl(`/api/prompts/${encodeURIComponent(id)}/download`);
+        } },
+      ],
+    });
+  } catch (err) {
+    toast(`提示词详情加载失败：${err.message}`, true);
+  }
+}
+
+function setPromptView(view) {
+  state.prompt.view = view;
+  $$("#prompt-view-seg button").forEach((b) => b.classList.toggle("active", b.dataset.view === view));
+  const list = $("#prompt-list-view");
+  const evolution = $("#prompt-evolution-view");
+  if (list) list.hidden = view !== "list";
+  if (evolution) evolution.hidden = view !== "evolution";
+  if (view === "evolution") {
+    if (!state.prompt.evolution.session) state.prompt.evolution.session = state.prompt.session;
+    fillPromptSelect("#evolution-session", "会话", state.prompt.facets.sessions,
+      state.prompt.evolution.session);
+    loadEvolution(state.prompt.evolution.session);
+  }
+}
+
+async function loadEvolution(session) {
+  const ev = state.prompt.evolution;
+  const selected = session || ev.session || state.prompt.session;
+  const hint = $("#evolution-hint");
+  const timeline = $("#evolution-timeline");
+  if (!selected) {
+    ev.session = "";
+    ev.rows = [];
+    ev.base = "";
+    ev.target = "";
+    ev.diff = null;
+    if (timeline) timeline.innerHTML = '<div class="empty">先选择一个会话，再加载其请求时间轴</div>';
+    if (hint) hint.textContent = "会话来自提示词记录；可在上方「会话」下拉中选择";
+    return;
+  }
+  ev.session = selected;
+  fillPromptSelect("#evolution-session", "会话", state.prompt.facets.sessions, selected);
+  try {
+    const data = await api(`/api/prompts/evolution?session=${encodeURIComponent(selected)}&limit=20`);
+    ev.rows = data.rows || [];
+    const ids = ev.rows.map((r) => r.id);
+    if (!ids.includes(ev.base)) ev.base = "";
+    if (!ids.includes(ev.target)) ev.target = "";
+    if (!ev.base && ids.length >= 2) ev.base = ids[ids.length - 2];
+    if (!ev.target && ids.length >= 1) ev.target = ids[ids.length - 1];
+    if (ids.length === 1) { ev.base = ids[0]; ev.target = ""; }
+    renderEvolutionTimeline();
+    if (ev.base && ev.target) await loadPromptDiff();
+    else {
+      $("#evolution-stats").innerHTML = "";
+      $("#evolution-insights").textContent = "至少需要同一会话的两条提示词记录才能对比";
+      $("#prompt-diff").innerHTML = '<div class="empty">暂无对比</div>';
+      $("#evolution-pair").textContent = "—";
+      const link = $("#download-diff"); if (link) link.removeAttribute("href");
+    }
+    if (hint) hint.textContent = ev.rows.length
+      ? `同一会话最近 ${ev.rows.length} 条记录 · 点击时间轴选择基准/对比`
+      : "该会话暂无提示词记录";
+  } catch (err) {
+    if (timeline) timeline.innerHTML = `<div class="empty">加载失败：${esc(err.message)}</div>`;
+  }
+}
+
+function renderEvolutionTimeline() {
+  const timeline = $("#evolution-timeline");
+  if (!timeline) return;
+  const ev = state.prompt.evolution;
+  const count = $("#evolution-count");
+  if (count) count.textContent = ev.rows.length ? `${ev.rows.length} 条` : "—";
+  if (!ev.rows.length) {
+    timeline.innerHTML = '<div class="empty">该会话暂无提示词记录</div>';
+    return;
+  }
+  timeline.innerHTML = ev.rows.map((r, i) => {
+    const summary = r.summary || {};
+    const tag = r.id === ev.base ? '<span class="badge ok">基准</span>'
+      : r.id === ev.target ? '<span class="badge bad">对比</span>' : "";
+    return `<button type="button" class="prompt-timeline-row" data-evolution-id="${esc(r.id)}">
+      <span class="prompt-timeline-no">#${i + 1}</span>
+      <span class="prompt-timeline-main">
+        <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
+        <span class="hint">${esc(r.requested_model || "—")} · ${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符</span>
+        <span class="hint">估算 ${fmtInt(summary.estimated_tokens)} token · system#${esc(summary.system_hash || "—")}</span>
+        <span class="prompt-timeline-preview">${esc(String(r.first_user || "").slice(0, 120) || "（无 user 消息）")}</span>
+      </span>
+      ${tag}
+    </button>`;
+  }).join("");
+}
+
+async function loadPromptDiff() {
+  const ev = state.prompt.evolution;
+  if (!ev.base || !ev.target) return;
+  const q = new URLSearchParams({ base: ev.base, target: ev.target, context: "3" });
+  if (ev.role) q.set("role", ev.role);
+  try {
+    const data = await api(`/api/prompts/diff?${q.toString()}`);
+    ev.diff = data.diff || null;
+    renderPromptDiff();
+  } catch (err) {
+    $("#prompt-diff").innerHTML = `<div class="empty">对比失败：${esc(err.message)}</div>`;
+  }
+}
+
+function renderPromptDiff() {
+  const ev = state.prompt.evolution;
+  const diff = ev.diff;
+  if (!diff) return;
+  const s = diff.stats || {};
+  const stats = [
+    ["消息", `${fmtInt(s.base_messages)} → ${fmtInt(s.target_messages)}`],
+    ["字符", `${fmtInt(s.base_chars)} → ${fmtInt(s.target_chars)}（${s.delta_chars >= 0 ? "+" : ""}${fmtInt(s.delta_chars)}，${s.delta_percent >= 0 ? "+" : ""}${s.delta_percent}%）`],
+    ["新增 / 删除 / 修改", `${fmtInt(s.added)} / ${fmtInt(s.removed)} / ${fmtInt(s.modified)}`],
+    ["未变", fmtInt(s.same)],
+    ["system", s.system_changed ? "有变化" : "未变"],
+    ["重复消息", `${fmtInt(s.repeated_messages)} 条（字符占比 ${s.duplicate_percent}%）`],
+    ["估算 token", `${fmtInt(s.estimated_base_tokens)} → ${fmtInt(s.estimated_target_tokens)}`],
+  ];
+  $("#evolution-stats").innerHTML = stats.map(([k, v]) =>
+    `<div class="legend-row"><div class="legend-head"><span class="label">${esc(k)}</span>` +
+    `<span class="val mono">${esc(v)}</span></div></div>`).join("");
+  const insightLabels = {
+    system_changed: (x) => `system 消息发生变化：+${x.added_lines} / -${x.removed_lines} 行`,
+    context_growth: (x) => `上下文变化：${x.delta_chars >= 0 ? "+" : ""}${x.delta_chars} 字符（${x.delta_percent}%）`,
+    repeated_messages: (x) => `重复消息 ${x.count} 条，占目标字符 ${x.duplicate_percent}%`,
+  };
+  const insights = (diff.insights || []).map((x) => {
+    const fn = insightLabels[x.code];
+    return fn ? fn(x) : x.code;
+  });
+  $("#evolution-insights").innerHTML = insights.length
+    ? `<strong>规则化提示：</strong>${insights.map((x) => `<div>· ${esc(x)}</div>`).join("")}`
+    : "未命中规则化提示（system 未变、无重复消息）。";
+  const pair = $("#evolution-pair");
+  if (pair) pair.textContent = `基准 ${String(ev.base).slice(0, 8)}… → 对比 ${String(ev.target).slice(0, 8)}…`;
+  const link = $("#download-diff");
+  if (link) {
+    const q = new URLSearchParams({ base: ev.base, target: ev.target, context: "3" });
+    if (ev.role) q.set("role", ev.role);
+    link.href = `/api/prompts/diff/download?${q.toString()}`;
+  }
+  renderPromptDiffRows();
+}
+
+function renderPromptDiffRows() {
+  const ev = state.prompt.evolution;
+  const host = $("#prompt-diff");
+  if (!host) return;
+  const diff = ev.diff;
+  if (!diff) return;
+  const rows = (diff.messages || []).filter((row) =>
+    !ev.onlyDiff || row.status !== "same");
+  if (!rows.length) {
+    host.innerHTML = `<div class="empty">${ev.onlyDiff ? "没有差异（消息完全一致）" : "暂无消息"}</div>`;
+    return;
+  }
+  host.innerHTML = rows.map((row) => {
+    const head = `<div class="prompt-diff-head">
+      <span class="badge ${row.status === "added" ? "ok" : row.status === "removed" ? "bad" : ""}">${esc(row.status)}</span>
+      <span class="badge">${esc(row.role || "unknown")}</span>
+      <span class="hint">#${row.base_index === null || row.base_index === undefined ? "—" : row.base_index + 1}
+        → #${row.target_index === null || row.target_index === undefined ? "—" : row.target_index + 1}
+        · ${fmtInt(row.base_chars)} → ${fmtInt(row.target_chars)} 字符</span>
+    </div>`;
+    if (row.status === "modified" && Array.isArray(row.diff)) {
+      const lines = row.diff.map((line) => {
+        const left = line.base_line === null || line.base_line === undefined ? "" : line.base_line;
+        const right = line.target_line === null || line.target_line === undefined ? "" : line.target_line;
+        return `<div class="diff-line ${esc(line.kind)}"><span class="diff-no">${left}</span>` +
+          `<span class="diff-no">${right}</span><span class="diff-sign">${
+            line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "
+          }</span><span class="diff-text">${esc(line.text)}</span></div>`;
+      }).join("");
+      return `<div class="prompt-diff-row modified">${head}<div class="diff-lines">${lines}</div></div>`;
+    }
+    const content = row.content ? `<pre class="diff-content">${esc(row.content)}</pre>` : "";
+    return `<div class="prompt-diff-row ${esc(row.status)}">${head}${content}</div>`;
+  }).join("");
+}
+
+function clearPrompts() {
+  const range = promptRange();
+  confirmModal({
+    title: "清空提示词记录",
+    text: `将删除当前筛选（区间 ${range}${state.prompt.model ? "、模型 " + state.prompt.model : ""}${state.prompt.session ? "、会话 " + state.prompt.session : ""}）内的提示词记录，不可撤销；用量明细不受影响。`,
+    confirmLabel: "清空",
+  }).then(async (ok) => {
+    if (!ok) return;
+    try {
+      const body = { range };
+      if (state.prompt.model) body.model = state.prompt.model;
+      if (state.prompt.session) body.session = state.prompt.session;
+      const data = await postJson("/api/prompts/clear", body);
+      toast(`已清空 ${data.removed} 条提示词记录`);
+      state.prompt.evolution.base = "";
+      state.prompt.evolution.target = "";
+      state.prompt.evolution.diff = null;
+      loadPrompts();
+    } catch (err) {
+      toast(`清空失败：${err.message}`, true);
+    }
+  });
+}
+
+function initPromptControls() {
+  const viewSeg = $("#prompt-view-seg");
+  if (viewSeg) viewSeg.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-view]");
+    if (!btn) return;
+    setPromptView(btn.dataset.view);
+  });
+
+  const rangeSeg = $("#prompt-range-seg");
+  if (rangeSeg) rangeSeg.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-range]");
+    if (!btn) return;
+    $$("button[data-range]", rangeSeg).forEach((b) => b.classList.toggle("active", b === btn));
+    state.prompt.range = btn.dataset.range;
+    loadPrompts();
+  });
+
+  const model = $("#prompt-model");
+  if (model) model.addEventListener("change", () => {
+    state.prompt.model = model.value;
+    loadPrompts();
+  });
+  const session = $("#prompt-session");
+  if (session) session.addEventListener("change", () => {
+    state.prompt.session = session.value;
+    if (!state.prompt.evolution.session) state.prompt.evolution.session = session.value;
+    loadPrompts();
+  });
+
+  const q = $("#prompt-q");
+  if (q) {
+    let timer = null;
+    q.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        state.prompt.q = q.value.trim();
+        loadPrompts();
+      }, 300);
+    });
+  }
+
+  const refresh = $("#prompt-refresh");
+  if (refresh) refresh.addEventListener("click", () => loadPrompts());
+  const exportBtn = $("#export-prompts-jsonl");
+  if (exportBtn) exportBtn.addEventListener("click", () => {
+    downloadUrl(`/api/prompts/export?${promptQuery().toString()}`);
+    toast("已开始导出提示词 JSONL（当前筛选，已脱敏）");
+  });
+  const clearBtn = $("#clear-prompts");
+  if (clearBtn) clearBtn.addEventListener("click", clearPrompts);
+  const gotoConfig = $("#prompt-goto-config");
+  if (gotoConfig) gotoConfig.addEventListener("click", () => switchTab("config"));
+
+  const table = $("#prompt-table");
+  if (table) table.addEventListener("click", (ev) => {
+    const viewBtn = ev.target.closest("[data-prompt-view]");
+    const downBtn = ev.target.closest("[data-prompt-download]");
+    if (viewBtn) {
+      showPromptDetail(viewBtn.dataset.promptView);
+      return;
+    }
+    if (downBtn) {
+      downloadUrl(`/api/prompts/${encodeURIComponent(downBtn.dataset.promptDownload)}/download`);
+      return;
+    }
+    const row = ev.target.closest("tr[data-prompt-id]");
+    if (row) showPromptDetail(row.dataset.promptId);
+  });
+
+  const evSession = $("#evolution-session");
+  if (evSession) evSession.addEventListener("change", () => {
+    state.prompt.evolution.base = "";
+    state.prompt.evolution.target = "";
+    state.prompt.evolution.diff = null;
+    loadEvolution(evSession.value);
+  });
+  const evRole = $("#evolution-role");
+  if (evRole) evRole.addEventListener("change", () => {
+    state.prompt.evolution.role = evRole.value;
+    if (state.prompt.evolution.diff) loadPromptDiff();
+  });
+  const onlyDiff = $("#evolution-only-diff");
+  if (onlyDiff) onlyDiff.addEventListener("change", () => {
+    state.prompt.evolution.onlyDiff = onlyDiff.checked;
+    renderPromptDiffRows();
+  });
+  const evRefresh = $("#evolution-refresh");
+  if (evRefresh) evRefresh.addEventListener("click", () => loadEvolution(state.prompt.evolution.session));
+  const timeline = $("#evolution-timeline");
+  if (timeline) timeline.addEventListener("click", (ev) => {
+    const row = ev.target.closest("[data-evolution-id]");
+    if (!row) return;
+    const id = row.dataset.evolutionId;
+    const stateEv = state.prompt.evolution;
+    if (!stateEv.base || (stateEv.base && stateEv.target)) {
+      stateEv.base = id;
+      stateEv.target = "";
+      stateEv.diff = null;
+    } else if (stateEv.base === id) {
+      stateEv.base = "";
+    } else {
+      stateEv.target = id;
+    }
+    renderEvolutionTimeline();
+    if (stateEv.base && stateEv.target) loadPromptDiff();
+    else {
+      $("#prompt-diff").innerHTML = '<div class="empty">再选择一条记录作为对比</div>';
+      $("#evolution-stats").innerHTML = "";
+      $("#evolution-insights").textContent = "选择基准与对比记录后展示差异";
+      $("#evolution-pair").textContent = "—";
+    }
+  });
 }
 
 async function applyRetention() {
@@ -2585,7 +3254,7 @@ async function loadUsage() {
     $("#usage-kpis").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
   await Promise.all([loadSummary("day"), loadSummary(state.group),
-                     loadUsageList(), loadModelUsage(), loadUpstreamUsage()]);
+                     loadUsageList(), loadSessionUsage(), loadModelUsage(), loadUpstreamUsage()]);
   markFresh();
 }
 
@@ -3775,7 +4444,7 @@ function updateButtonLabel(status) {
   if (!status) return "检查更新";
   if (status.phase === "downloading") return "下载中…";
   if (status.phase === "ready") return "安装包已就绪";
-  if (status.phase === "installing") return "安装中…";
+  if (status.phase === "installing") return "关闭并安装中…";
   if (status.available && status.latest) return `有新版本 v${status.latest}`;
   return "检查更新";
 }
@@ -3824,9 +4493,13 @@ function updateModalHtml(status) {
   const downloadDir = s.installer_dir || s.download_dir || "";
   const installDir = s.effective_install_dir || s.install_dir || "";
   const downloadLabel = s.installer_ready ? "安装包已下载到" : "安装包将下载到";
+  // 安装目录来源：注册表记录 = 原安装目录；否则是当前 exe 所在目录。
+  const installFromRegistry = s.install_dir_source === "registry";
   const installLabel = s.install_dir_matches_exe === false
     ? "本次将安装到（与当前运行位置不同）"
-    : "本次将安装到";
+    : installFromRegistry
+      ? "本次将安装到（原安装目录）"
+      : "本次将安装到";
 
   let body = "";
   if (phase === "checking") {
@@ -3843,8 +4516,8 @@ function updateModalHtml(status) {
         progress.total ? ` / ${fmtBytes(progress.total)}` : ""}${
         percent == null ? "" : ` · ${Math.round(percent)}%`}</div>`;
   } else if (phase === "installing") {
-    body = `<p class="update-status">安装程序已启动，应用即将退出…</p>
-      <p class="hint">安装位置：<code>${esc(installDir || "—")}</code>。安装完成后会自动重启；若未自动打开，请手动启动 Model-Gate。</p>`;
+    body = `<p class="update-status">正在关闭应用并安装新版本…</p>
+      <p class="hint">安装位置：<code>${esc(installDir || "—")}</code>。应用会先关闭服务再退出，安装完成后自动重启；若未自动打开，请手动启动 Model-Gate。</p>`;
   } else if (phase === "error") {
     const message = s.error && s.error.message ? s.error.message : "检查更新失败";
     body = `<p class="update-error">${esc(message)}</p>`;
@@ -3910,14 +4583,14 @@ function updateModalHtml(status) {
           <button type="button" class="ghost tiny" data-update-action="save-download-dir">保存目录</button>
           <button type="button" class="ghost tiny" data-update-action="reset-download-dir">恢复默认</button>
         </div>
-        <p class="hint">填绝对路径（例如 <code>D:\\Model-Gate\\updates</code>）；目录不存在会自动创建，不可写时会提示原因。</p>
+        <p class="hint">默认是 Windows 的「下载」文件夹；填绝对路径（例如 <code>D:\\Model-Gate\\updates</code>）可改到别处，目录不存在会自动创建，不可写时会提示原因。</p>
       </div>`;
 
-  // 分步说明：把「下载 → 安装 → 覆盖 → 重启」讲清楚
+  // 分步说明：把「下载 → 关闭 → 安装 → 重启」讲清楚
   const steps = `<ol class="update-steps">
       <li>点「下载安装包」：安装包保存到上面的下载目录（点「打开下载位置」可直接查看）。</li>
       <li>下载完成并通过 SHA256 校验后，点「安装并重启」。</li>
-      <li>安装器把新版本写入上面的安装位置，覆盖旧的 <code>Model-Gate.exe</code>，然后自动重启应用。</li>
+      <li>应用会先关闭服务再退出，安装器把新版本写入上面的安装位置（默认就是原本的安装目录），覆盖旧的 <code>Model-Gate.exe</code>，然后自动重启应用。</li>
     </ol>`;
 
   // 安装二次确认：放在更新弹窗内部，不能用 confirmModal
@@ -3925,7 +4598,7 @@ function updateModalHtml(status) {
   const confirmPanel = state.update.confirmInstall
     ? `<div class="update-confirm">
         <p class="update-status">确认现在安装并重启？</p>
-        <p class="hint">应用将先退出，安装器会覆盖 <code>${esc(installDir || "—")}</code> 下的 Model-Gate.exe，安装完成后自动重启。</p>
+        <p class="hint">应用将先关闭服务再退出，安装器会覆盖 <code>${esc(installDir || "—")}</code> 下的 Model-Gate.exe，安装完成后自动重启。</p>
         <div class="update-actions">
           <button type="button" class="primary" data-update-action="install-confirm">确认安装并重启</button>
           <button type="button" class="ghost" data-update-action="install-cancel">取消</button>
@@ -4142,6 +4815,11 @@ const CONFIG_HELP_TOP_FIELDS = [
   ["timeoutSeconds", "number", "600", "转发上游的超时秒数"],
   ["modelsCacheSeconds", "number", "300", "模型清单缓存秒数"],
   ["accessLog", "boolean", "true", "是否写访问日志（data/modelgate.log）"],
+  ["retentionDays", "number", "30", "用量记录保留天数"],
+  ["promptCapture", "boolean", "false", "是否记录提示词；开启后保存入站 messages（默认关闭）"],
+  ["promptRetentionDays", "number", "7", "提示词记录保留天数"],
+  ["promptMaxRecords", "number", "5000", "提示词记录最多保留条数（超出按时间清理）"],
+  ["promptMaxChars", "number", "100000", "单条提示词最多保存字符数（超出按消息边界截断）"],
   ["aliases", "object", "{}", "模型别名：对外名 → 上游真实名"],
   ["thinking", "object", "—", "思考链回传：{\"passthrough\": true, \"cacheSize\": 500}"],
   ["upstreams", "object", "—", "上游清单：键是上游名，值见下一张表"],
@@ -4168,6 +4846,10 @@ const CONFIG_HELP_EXAMPLE = `{
   "defaultModel": "mimo-v2.6-flash-free",
   "models": ["mimo-v2.6-flash-free"],
   "accessLog": true,
+  "promptCapture": false,
+  "promptRetentionDays": 7,
+  "promptMaxRecords": 5000,
+  "promptMaxChars": 100000,
   "upstreams": {
     "zen": {
       "protocol": "openai",
@@ -4253,6 +4935,7 @@ function boot() {
   initUpdate();
   initTabs();
   initUsageControls();
+  initPromptControls();
   initModelUsageControls();
   initModelControls();
   initConfigActions();

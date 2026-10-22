@@ -18,6 +18,7 @@
     <button class="tab-btn" data-tab="model">模型</button>
     <button class="tab-btn" data-tab="config">配置</button>
     <button class="tab-btn" data-tab="usage">用量</button>
+    <button class="tab-btn" data-tab="prompts">提示词</button>
     <button class="tab-btn" data-tab="free">免费来源</button>
     <button class="tab-btn" data-tab="logs">日志</button>
   </nav>
@@ -229,6 +230,25 @@
           thinking 回传（多轮会话必需）</label>
       </div>
 
+      <div class="section-head" id="config-prompt"><h2>提示词记录</h2></div>
+      <div class="hint">
+        默认关闭；开启后仅记录入站 messages，保存在本机 data/modelgate.db。写入前会按规则过滤
+        Bearer / API Key / JWT / 私钥 / URL token 等敏感信息，但规则脱敏不能保证 100%，
+        请勿把密钥写进提示词。
+      </div>
+      <div class="grid grid-2">
+        <label class="check"><input type="checkbox" name="promptCapture"> 记录提示词</label>
+        <label>保留天数（0 = 永久）
+          <input name="promptRetentionDays" type="number" min="0">
+        </label>
+        <label>最多保留条数（0 = 不限）
+          <input name="promptMaxRecords" type="number" min="0">
+        </label>
+        <label>单条最大字符数（至少 1000）
+          <input name="promptMaxChars" type="number" min="1000">
+        </label>
+      </div>
+
       </details>
 
       <details class="box fold" id="config-group-upstreams" data-fold="config-upstreams" open>
@@ -313,6 +333,9 @@
       </label>
       <label class="inline-field" title="选择上游后只列出该上游的模型">模型
         <select id="scope-model" class="filter-select"></select>
+      </label>
+      <label class="inline-field" title="按会话收窄：KPI / 趋势 / 分布 / 明细统一跟随">会话
+        <select id="scope-session" class="filter-select"></select>
       </label>
       <label class="inline-field" title="自定义时间区间，优先于左侧预设">从
         <input type="datetime-local" id="scope-from" class="filter-input">
@@ -416,9 +439,56 @@
       </div>
     </div>
 
-    <div class="box">
+    <div class="box" id="session-usage-box">
       <div class="box-head">
-        <h2>模型用量</h2>
+        <h2>会话统计</h2>
+        <div class="section-actions">
+          <select id="session-usage-sort" class="filter-select">
+            <option value="last_ts">按最近活跃</option>
+            <option value="requests">按请求数</option>
+            <option value="total_tokens">按总 token</option>
+            <option value="errors">按错误数</option>
+            <option value="avg_duration_ms">按均耗</option>
+          </select>
+          <button class="ghost" id="export-sessions-csv" title="导出当前筛选区间的会话汇总">导出会话 CSV</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table id="session-usage-table" class="sortable-table">
+          <thead><tr>
+            <th>会话</th>
+            <th class="num">请求</th>
+            <th class="num">错误</th>
+            <th class="num">输入</th>
+            <th class="num">输出</th>
+            <th class="num">缓存</th>
+            <th class="num">总 token</th>
+            <th class="num">成功率</th>
+            <th class="num">均耗</th>
+            <th class="num">P95</th>
+            <th class="num">模型数</th>
+            <th>首末活跃</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="session-usage-hint">点击会话行收窄整页统计；同一会话的请求与提示词可关联查看</div>
+    </div>
+
+    <div class="box" id="session-detail" hidden>
+      <div class="box-head">
+        <h2 id="session-detail-title">会话详情</h2>
+        <div class="section-actions">
+          <button class="ghost" id="session-prompts-btn" title="跳到提示词页的会话演进">查看提示词演进</button>
+          <button class="ghost" id="session-export-btn" title="导出该会话的请求明细 CSV">导出该会话</button>
+          <button class="ghost" id="session-clear-filter">清除会话筛选</button>
+        </div>
+      </div>
+      <div class="legend" id="session-detail-stats"></div>
+      <div class="hint" id="session-detail-hint"></div>
+    </div>
+
+    <div class="box">
         <div class="section-actions">
           <input type="search" id="model-usage-search" class="filter-input" placeholder="搜索模型">
           <label class="inline-field"><input type="checkbox" id="model-usage-used"> 仅看用过的</label>
@@ -524,6 +594,109 @@
         <button class="ghost" id="apply-retention">立即清理</button>
       </div>
     </details>
+  </section>
+
+  <!-- ══════════ 提示词 ══════════ -->
+  <section class="panel" id="panel-prompts">
+    <div class="toolbar">
+      <div class="seg" id="prompt-view-seg">
+        <button data-view="list" class="active">提示词列表</button>
+        <button data-view="evolution">会话演进</button>
+      </div>
+      <div class="seg" id="prompt-range-seg">
+        <button data-range="today">今天</button>
+        <button data-range="1h">1 小时</button>
+        <button data-range="24h">24 小时</button>
+        <button data-range="7d" class="active">7 天</button>
+        <button data-range="30d">30 天</button>
+        <button data-range="all">全部</button>
+      </div>
+      <label class="inline-field">模型
+        <select id="prompt-model" class="filter-select"></select>
+      </label>
+      <label class="inline-field">会话
+        <select id="prompt-session" class="filter-select"></select>
+      </label>
+      <input type="search" id="prompt-q" class="filter-input" placeholder="搜索提示词内容">
+      <button class="ghost" id="prompt-refresh">刷新</button>
+      <button class="ghost" id="export-prompts-jsonl" title="导出当前筛选的提示词（JSONL，已脱敏）">导出 JSONL</button>
+      <button class="ghost" id="clear-prompts" title="清空当前筛选区间的提示词记录">清空</button>
+      <span class="hint" id="prompt-hint">—</span>
+    </div>
+
+    <div class="box" id="prompt-disabled" hidden>
+      <div class="box-head"><h2>提示词记录未开启</h2></div>
+      <p class="modal-text">开启后只记录入站请求的 <code>messages</code>，不记录模型响应；写入前会按规则过滤常见密钥与私钥，默认保留 7 天。</p>
+      <div class="section-actions">
+        <button class="primary" id="prompt-goto-config">去配置页开启</button>
+        <span class="hint">配置项：promptCapture / promptRetentionDays / promptMaxRecords / promptMaxChars</span>
+      </div>
+    </div>
+
+    <div id="prompt-list-view">
+      <div class="box">
+        <div class="box-head">
+          <h2>提示词记录</h2>
+          <span class="hint" id="prompt-total">—</span>
+        </div>
+        <div class="table-wrap">
+          <table id="prompt-table" class="sortable-table">
+            <thead><tr>
+              <th>时间</th>
+              <th>会话</th>
+              <th>模型</th>
+              <th class="num">消息数</th>
+              <th class="num">字符数</th>
+              <th>预览</th>
+              <th>操作</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="hint" id="prompt-table-hint">点击行查看完整 messages；下载内容为脱敏后的原始记录</div>
+      </div>
+    </div>
+
+    <div id="prompt-evolution-view" hidden>
+      <div class="toolbar">
+        <label class="inline-field">会话
+          <select id="evolution-session" class="filter-select"></select>
+        </label>
+        <label class="inline-field">角色
+          <select id="evolution-role" class="filter-select">
+            <option value="">全部角色</option>
+            <option value="system">system</option>
+            <option value="user">user</option>
+            <option value="assistant">assistant</option>
+            <option value="tool">tool</option>
+          </select>
+        </label>
+        <label class="inline-field"><input type="checkbox" id="evolution-only-diff"> 仅看差异</label>
+        <button class="ghost" id="evolution-refresh">加载时间轴</button>
+        <span class="hint" id="evolution-hint">在同一会话内选择两次请求进行对比；全部为本地算法，不调用任何模型</span>
+      </div>
+      <div class="split-2">
+        <div class="box">
+          <div class="box-head"><h2>请求时间轴</h2><span class="hint" id="evolution-count">—</span></div>
+          <div id="evolution-timeline" class="prompt-timeline"></div>
+        </div>
+        <div class="box">
+          <div class="box-head"><h2>差异概览</h2><span class="hint">规则统计</span></div>
+          <div class="legend" id="evolution-stats"></div>
+          <div id="evolution-insights" class="hint"></div>
+        </div>
+      </div>
+      <div class="box">
+        <div class="box-head">
+          <h2>差异明细</h2>
+          <div class="section-actions">
+            <span class="hint" id="evolution-pair">—</span>
+            <a class="ghost tiny" id="download-diff" href="#" download>下载 diff</a>
+          </div>
+        </div>
+        <div id="prompt-diff" class="prompt-diff"></div>
+      </div>
+    </div>
   </section>
 
   <!-- ══════════ 免费来源 ══════════ -->

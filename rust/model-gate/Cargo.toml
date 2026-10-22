@@ -1,6 +1,6 @@
 [package]
 name = "model-gate"
-version = "2.23.0"
+version = "2.24.0"
 edition = "2021"
 description = "Model-Gate 本地模型网关（Rust 实现）"
 license = "MIT"
@@ -38,6 +38,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_System_DataExchange",
+    "Win32_System_Com",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_UI_Shell",

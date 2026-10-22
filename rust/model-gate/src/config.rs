@@ -432,6 +432,14 @@ pub struct Config {
     /// 模型目录缓存秒数（与 Python modelsCacheSeconds 对齐；Task 9 使用）
     pub models_cache_seconds: u64,
     pub access_log: bool,
+    /// 提示词记录开关：默认关闭，开启后记录入站 messages。
+    pub prompt_capture: bool,
+    /// 提示词保留天数；0 = 永久。
+    pub prompt_retention_days: u64,
+    /// 提示词最多保留条数；0 = 不限。
+    pub prompt_max_records: u64,
+    /// 单条提示词最大字符数；超过按消息边界截断。
+    pub prompt_max_chars: u64,
     pub aliases: HashMap<String, String>,
     pub upstreams: Vec<Upstream>,
 }
@@ -478,6 +486,22 @@ impl Config {
             .get("accessLog")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let prompt_capture = obj
+            .get("promptCapture")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let prompt_retention_days = obj
+            .get("promptRetentionDays")
+            .and_then(Value::as_u64)
+            .unwrap_or(7);
+        let prompt_max_records = obj
+            .get("promptMaxRecords")
+            .and_then(Value::as_u64)
+            .unwrap_or(5000);
+        let prompt_max_chars = obj
+            .get("promptMaxChars")
+            .and_then(Value::as_u64)
+            .unwrap_or(100_000);
         let aliases = obj
             .get("aliases")
             .and_then(Value::as_object)
@@ -514,6 +538,10 @@ impl Config {
             timeout_seconds,
             models_cache_seconds,
             access_log,
+            prompt_capture,
+            prompt_retention_days,
+            prompt_max_records,
+            prompt_max_chars,
             aliases,
             upstreams,
         }
@@ -619,6 +647,10 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "maxTokens",
     "timeoutSeconds",
     "accessLog",
+    "promptCapture",
+    "promptRetentionDays",
+    "promptMaxRecords",
+    "promptMaxChars",
     "modelsCacheSeconds",
     "aliases",
     "thinking",
@@ -808,6 +840,18 @@ impl Config {
                 "maxTokens",
                 "maxTokens 必须大于 0".into(),
                 "默认 8192",
+            );
+        }
+        if self.prompt_max_chars < 1000 {
+            push(
+                "error",
+                "invalid_prompt_max_chars",
+                "promptMaxChars",
+                format!(
+                    "promptMaxChars={} 过小，至少 1000 字符",
+                    self.prompt_max_chars
+                ),
+                "建议 100000；0 不会被视为不限",
             );
         }
         if self.timeout_seconds < 1.0 {
@@ -2045,6 +2089,10 @@ fn fallback_default_config_value() -> Value {
         "maxTokens": 8192,
         "timeoutSeconds": 600,
         "accessLog": true,
+        "promptCapture": false,
+        "promptRetentionDays": 7,
+        "promptMaxRecords": 5000,
+        "promptMaxChars": 100000,
         "modelsCacheSeconds": 300,
         "aliases": {},
         "thinking": {"passthrough": true, "cacheSize": 500},
@@ -2076,6 +2124,27 @@ mod default_config_tests {
         let value = default_config_value();
         assert!(value.is_object(), "默认配置必须是 JSON 对象");
         assert_eq!(value.get("port").and_then(Value::as_u64), Some(8900));
+    }
+
+    #[test]
+    fn default_config_contains_prompt_capture_defaults() {
+        let value = default_config_value();
+        assert_eq!(
+            value.get("promptCapture").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            value.get("promptRetentionDays").and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            value.get("promptMaxRecords").and_then(Value::as_u64),
+            Some(5000)
+        );
+        assert_eq!(
+            value.get("promptMaxChars").and_then(Value::as_u64),
+            Some(100_000)
+        );
     }
 
     #[test]
@@ -2234,6 +2303,39 @@ mod tests {
 
     fn empty_root() -> Map<String, Value> {
         Map::new()
+    }
+
+    #[test]
+    fn prompt_config_defaults_are_safe() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": "http://x"}}
+        }));
+        assert!(!cfg.prompt_capture, "提示词记录默认必须关闭");
+        assert_eq!(cfg.prompt_retention_days, 7);
+        assert_eq!(cfg.prompt_max_records, 5000);
+        assert_eq!(cfg.prompt_max_chars, 100_000);
+    }
+
+    #[test]
+    fn prompt_config_parses_values_and_rejects_small_max_chars() {
+        let cfg = Config::from_value(json!({
+            "promptCapture": true,
+            "promptRetentionDays": 3,
+            "promptMaxRecords": 10,
+            "promptMaxChars": 500,
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": "http://x"}}
+        }));
+        assert!(cfg.prompt_capture);
+        assert_eq!(cfg.prompt_retention_days, 3);
+        assert_eq!(cfg.prompt_max_records, 10);
+        assert_eq!(cfg.prompt_max_chars, 500);
+        let diagnostics = cfg.diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "invalid_prompt_max_chars" && d.level == "error"),
+            "promptMaxChars < 1000 必须给出 error 诊断"
+        );
     }
 
     #[test]
