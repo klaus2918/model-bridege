@@ -1,7 +1,9 @@
 //! HTTP 代理内核（迁移中：先落地 OpenAI 上游，Anthropic/CommandCode 在 P2 补齐）。
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -50,9 +52,23 @@ pub struct ModelQueryError {
 /// 与内存无谓膨胀。超出部分截断，面板仍可看到足够多候选。
 pub const MODEL_QUERY_MAX_ITEMS: usize = 2000;
 
+/// 提示词后台队列容量。队列满时直接丢弃本次记录，绝不反压代理请求。
+const PROMPT_QUEUE_CAPACITY: usize = 256;
+/// 单批最多聚合的记录数。
+const PROMPT_BATCH_MAX: usize = 32;
+/// 单批等待窗口：先到的一条最多等这么久，把并发请求聚成一批。
+const PROMPT_BATCH_WAIT_MS: u64 = 50;
+/// 保留清理按写入条数/时间触发，避免每批都执行 DELETE。
+const PROMPT_CLEANUP_EVERY: u64 = 64;
+const PROMPT_CLEANUP_INTERVAL_SECS: i64 = 300;
+
 pub struct AppState {
     pub cfg: ArcSwap<Config>,
     pub db: Arc<Db>,
+    /// 提示词后台队列发送端；请求路径只做 try_send，不做等待。
+    pub prompt_tx: std::sync::mpsc::SyncSender<PromptJob>,
+    /// 因后台队列已满而丢弃的提示词记录数（用于诊断，不影响代理）。
+    pub prompt_dropped: AtomicU64,
     pub client: reqwest::Client,
     pub started: Instant,
     pub config_path: std::path::PathBuf,
@@ -112,9 +128,20 @@ impl AppState {
         // 启动即执行一次提示词保留策略：即使本次未开启记录，也清理上次遗留的超期数据。
         db.delete_prompts_older_than(cfg.prompt_retention_days as i64);
         db.trim_prompts(cfg.prompt_max_records as i64);
+        // 提示词专用后台 worker：请求路径只投递，解析/脱敏/批量写库都在这里完成。
+        let (prompt_tx, prompt_rx) = sync_channel(PROMPT_QUEUE_CAPACITY);
+        let prompt_db = db.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("prompt-writer".into())
+            .spawn(move || prompt_writer_loop(prompt_db, prompt_rx))
+        {
+            tracing::warn!("提示词后台线程启动失败（记录将不可用）：{err}");
+        }
         Self {
             cfg: ArcSwap::from_pointee(cfg),
             db,
+            prompt_tx,
+            prompt_dropped: AtomicU64::new(0),
             client,
             started: Instant::now(),
             config_path,
@@ -439,6 +466,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/upstreams", get(api_upstreams))
         .route("/api/config", get(api_config).post(api_config_save))
         .route("/api/config/validate", post(api_config_validate))
+        .route("/api/config/preview", post(api_config_preview))
         .route("/api/config/reload", axum::routing::post(api_config_reload))
         .route("/api/config/backups", get(crate::api_extra::backups_list))
         .route(
@@ -651,7 +679,7 @@ async fn chat_inner(
         id: uuid::Uuid::new_v4().simple().to_string(),
         session: resolve_session(&headers, &payload),
     };
-    capture_prompt(&state, &ctx, &requested_model, &payload);
+    capture_prompt(&state, body.clone(), &ctx, &requested_model);
     if requested_model.is_empty() {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -1530,42 +1558,120 @@ fn resolve_session(headers: &HeaderMap, payload: &Value) -> String {
     session_id(payload)
 }
 
-/// 记录入站提示词；开关关闭或没有 messages 时不产生任何序列化与写库开销。
+/// 提示词后台任务：只携带原始 body（`Bytes` 克隆是引用计数，不复制正文）、
+/// 请求上下文与本次请求生效的记录参数。
+struct PromptJob {
+    body: Bytes,
+    ctx: prompt::RequestCtx,
+    requested_model: String,
+    max_chars: usize,
+    retention_days: i64,
+    max_records: i64,
+}
+
+/// 记录入站提示词：请求路径只做开关判断、参数快照和入队，JSON 解析、脱敏、
+/// 批量写库、保留清理全部在专用后台线程完成。
+///
+/// 设计约束：
+/// - 开关关闭时不克隆 body、不入队；
+/// - 队列满时直接丢弃本次记录并计数，绝不等待或反压请求；
+/// - 后台线程失败只记日志，不影响已经返回的代理响应。
 fn capture_prompt(
-    state: &AppState,
+    state: &Arc<AppState>,
+    body: Bytes,
     ctx: &prompt::RequestCtx,
     requested_model: &str,
-    payload: &Value,
 ) {
     let cfg = state.cfg();
     if !cfg.prompt_capture {
         return;
     }
-    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
-        return;
-    };
-    if messages.is_empty() {
-        return;
-    }
-    let encoded = prompt::prepare_messages(messages, cfg.prompt_max_chars as usize);
-    let record = PromptRecord {
-        id: ctx.id.clone(),
-        ts: 0,
-        session: ctx.session.clone(),
+    let job = PromptJob {
+        body,
+        ctx: ctx.clone(),
         requested_model: requested_model.to_string(),
+        max_chars: cfg.prompt_max_chars as usize,
+        retention_days: cfg.prompt_retention_days as i64,
+        max_records: cfg.prompt_max_records as i64,
+    };
+    drop(cfg);
+
+    match state.prompt_tx.try_send(job) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            let dropped = state.prompt_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped % 100 == 0 {
+                tracing::warn!("提示词后台队列已满，本次记录丢弃（累计 {dropped}）");
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            tracing::warn!("提示词后台线程未运行，本次记录丢弃");
+        }
+    }
+}
+
+/// 专用后台线程：把并发请求聚成小批，一次事务写入；保留清理按批次/时间触发。
+fn prompt_writer_loop(db: Arc<Db>, rx: Receiver<PromptJob>) {
+    let mut written_since_cleanup: u64 = 0;
+    let mut last_cleanup = chrono::Local::now().timestamp();
+    loop {
+        let first = match rx.recv() {
+            Ok(job) => job,
+            Err(_) => break,
+        };
+        let mut jobs = vec![first];
+        let deadline = Instant::now() + Duration::from_millis(PROMPT_BATCH_WAIT_MS);
+        while jobs.len() < PROMPT_BATCH_MAX {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(job) => jobs.push(job),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let records: Vec<PromptRecord> = jobs.iter().filter_map(parse_prompt_record).collect();
+        if records.is_empty() {
+            continue;
+        }
+        let written = db.record_prompts_batch(&records);
+        written_since_cleanup += written as u64;
+        let now = chrono::Local::now().timestamp();
+        if written_since_cleanup >= PROMPT_CLEANUP_EVERY
+            || now.saturating_sub(last_cleanup) >= PROMPT_CLEANUP_INTERVAL_SECS
+        {
+            if let Some(last) = jobs.last() {
+                db.delete_prompts_older_than(last.retention_days);
+                db.trim_prompts(last.max_records);
+            }
+            written_since_cleanup = 0;
+            last_cleanup = now;
+        }
+    }
+}
+
+/// 后台线程内的解析与脱敏；独立函数便于单测直接验证。
+fn parse_prompt_record(job: &PromptJob) -> Option<PromptRecord> {
+    let payload: Value = serde_json::from_slice(&job.body).ok()?;
+    let messages = payload.get("messages").and_then(Value::as_array)?;
+    if messages.is_empty() {
+        return None;
+    }
+    let encoded = prompt::prepare_messages(messages, job.max_chars);
+    Some(PromptRecord {
+        id: job.ctx.id.clone(),
+        ts: 0,
+        session: job.ctx.session.clone(),
+        requested_model: job.requested_model.clone(),
         message_count: encoded.message_count,
         size_bytes: encoded.size_bytes,
         truncated: encoded.truncated,
         preview: encoded.preview,
         messages: encoded.messages,
-    };
-    if state.db.record_prompt(&record).is_empty() {
-        return;
-    }
-    state
-        .db
-        .delete_prompts_older_than(cfg.prompt_retention_days as i64);
-    state.db.trim_prompts(cfg.prompt_max_records as i64);
+    })
 }
 
 pub fn session_id(payload: &Value) -> String {
@@ -1960,11 +2066,72 @@ async fn api_config_validate(Json(payload): Json<Value>) -> Response {
     .into_response()
 }
 
+/// 只读预览：给新增/编辑表单用，返回这对 protocol/baseUrl/profile 的生效值。
+/// 不写配置、不发外网请求，也不读取密钥。
+async fn api_config_preview(Json(payload): Json<Value>) -> Response {
+    let protocol = payload
+        .get("protocol")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("openai");
+    let base_url = payload
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let profile = payload
+        .get("compat")
+        .and_then(Value::as_object)
+        .and_then(|c| c.get("profile"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("profile").and_then(Value::as_str))
+        .map(str::trim)
+        .unwrap_or("");
+
+    let mut upstream = serde_json::Map::new();
+    upstream.insert("protocol".into(), json!(protocol));
+    upstream.insert("baseUrl".into(), json!(base_url));
+    if !profile.is_empty() {
+        upstream.insert("compat".into(), json!({"profile": profile}));
+    }
+    let cfg = Config::from_value(json!({"upstreams": {"preview": upstream}}));
+    let effective = cfg
+        .effective_upstreams()
+        .get(0)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let diagnostics: Vec<Value> = cfg.diagnostics().iter().map(|d| d.to_json()).collect();
+    Json(json!({
+        "effective": effective,
+        "diagnostics": diagnostics,
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn config_preview_resolves_deepseek_profile() {
+        let resp = api_config_preview(Json(json!({
+            "protocol": "openai",
+            "baseUrl": "https://api.deepseek.com/v1",
+            "compat": {"profile": "deepseek"}
+        })))
+        .await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("读取 preview 响应");
+        let body: Value = serde_json::from_slice(&bytes).expect("preview 响应是 JSON");
+        assert_eq!(body["effective"]["profile"], "deepseek");
+        assert_eq!(body["effective"]["chatPath"], "/v1/chat/completions");
+        assert_eq!(body["effective"]["maxOutputTokens"], 393216);
+        assert_eq!(body["effective"]["capabilities"]["thinking"], true);
+    }
 
     /// 一次性假上游：最多服务 `serves` 个请求后关闭监听（用于模拟“上游下线”）。
     fn spawn_models_server(body: &'static str, serves: usize) -> String {
@@ -2003,6 +2170,67 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
         Arc::new(AppState::new(cfg, db, dir.join("c.json")))
+    }
+
+    fn state_with_prompt_capture() -> Arc<AppState> {
+        let cfg = crate::config::Config::from_value(json!({
+            "promptCapture": true,
+            "promptRetentionDays": 7,
+            "promptMaxRecords": 100,
+            "promptMaxChars": 100000,
+            "modelsCacheSeconds": 300,
+            "upstreams": {}
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-prompt-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        Arc::new(AppState::new(cfg, db, dir.join("c.json")))
+    }
+
+    /// 提示词记录必须走后台：请求路径只做入队，不解析、不脱敏、不写库；
+    /// body 再大也不能在调用方等待。后台则最终完成落库。
+    #[test]
+    fn prompt_capture_is_async_and_does_not_block() {
+        let state = state_with_prompt_capture();
+        let ctx = prompt::RequestCtx {
+            id: "req-async".into(),
+            session: "s-async".into(),
+        };
+        let long = "上下文".repeat(5000);
+        let body = Bytes::from(
+            json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": format!("bearer 鉴权 Authorization: 中文 {long}")}
+                ]
+            })
+            .to_string(),
+        );
+
+        let started = std::time::Instant::now();
+        capture_prompt(&state, body, &ctx, "m");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "capture_prompt 不得在请求路径解析或写库：{:?}",
+            elapsed
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if state.db.prompt_count_and_size()["records"].as_i64() == Some(1) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "后台提示词写入未在 5s 内完成"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let row = state.db.get_prompt("req-async").expect("提示词应已落库");
+        assert_eq!(row["session"], "s-async");
+        assert!(row["messages"].to_string().contains("bearer 鉴权"));
     }
 
     #[test]

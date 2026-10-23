@@ -231,39 +231,66 @@ impl Db {
         } else {
             r.id.clone()
         };
+        let mut record = r.clone();
+        record.id = id.clone();
+        if self.record_prompts_batch(std::slice::from_ref(&record)) == 1 {
+            id
+        } else {
+            String::new()
+        }
+    }
+
+    /// 批量写入提示词记录：一次事务、一次写锁，供后台 worker 聚合写入。
+    ///
+    /// 为什么批量：单条写入会让后台每来一个请求就争抢一次 SQLite 写锁；
+    /// 聚合成一批后，代理路径的用量写入最多等一个短事务，而不是等 N 次提交。
+    pub fn record_prompts_batch(&self, records: &[PromptRecord]) -> usize {
+        if records.is_empty() {
+            return 0;
+        }
         let now = Local::now();
-        let ts = if r.ts > 0 { r.ts } else { now.timestamp() };
+        let mut conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let result = (|| -> rusqlite::Result<()> {
-            let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute(
-                "INSERT INTO prompt_records (
-                    id, ts, created_at, session, requested_model,
-                    message_count, size_bytes, truncated, preview, messages
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                rusqlite::params![
-                    id.as_str(),
-                    ts,
-                    now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
-                    if r.session.is_empty() {
-                        None
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO prompt_records (
+                        id, ts, created_at, session, requested_model,
+                        message_count, size_bytes, truncated, preview, messages
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                )?;
+                for r in records {
+                    let id = if r.id.is_empty() {
+                        uuid::Uuid::new_v4().simple().to_string()
                     } else {
-                        Some(r.session.clone())
-                    },
-                    r.requested_model.as_str(),
-                    r.message_count,
-                    r.size_bytes,
-                    r.truncated as i64,
-                    r.preview.as_str(),
-                    r.messages.as_str(),
-                ],
-            )?;
-            Ok(())
+                        r.id.clone()
+                    };
+                    let ts = if r.ts > 0 { r.ts } else { now.timestamp() };
+                    stmt.execute(rusqlite::params![
+                        id.as_str(),
+                        ts,
+                        now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
+                        if r.session.is_empty() {
+                            None
+                        } else {
+                            Some(r.session.clone())
+                        },
+                        r.requested_model.as_str(),
+                        r.message_count,
+                        r.size_bytes,
+                        r.truncated as i64,
+                        r.preview.as_str(),
+                        r.messages.as_str(),
+                    ])?;
+                }
+            }
+            tx.commit()
         })();
         match result {
-            Ok(()) => id,
+            Ok(()) => records.len(),
             Err(err) => {
-                tracing::warn!("提示词落库失败: {err}");
-                String::new()
+                tracing::warn!("提示词批量落库失败: {err}");
+                0
             }
         }
     }
