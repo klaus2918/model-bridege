@@ -138,16 +138,30 @@ fn file_target_has_no_builtin_default_path() {
 }
 
 #[test]
-fn panel_exposes_key_write_target_and_file_fields() {
+fn panel_exposes_mutually_exclusive_key_sources() {
     let text = read("ui/app.js");
     assert!(
-        text.contains("keyWriteTarget"),
-        "面板 API Key 行必须提供「写入目标」选择（用户变量 / 指定文件）"
+        text.contains("keySourceMode"),
+        "面板必须提供密钥来源三选一（环境变量 / 凭据文件 / 暂不配置）"
     );
-    for field in ["keyWritePath", "keyWriteFormat", "keyWriteField"] {
+    assert!(
+        text.contains("data-key-group"),
+        "密钥来源选中后必须只展开对应字段组"
+    );
+    assert!(
+        !text.contains("keyWriteTarget"),
+        "密钥来源与写入目标不应再是两套下拉，避免同一件事混在一起"
+    );
+    for field in ["apiKeyAgentPath", "keyWriteFormat", "apiKeyAgentProvider"] {
         assert!(
             text.contains(field),
-            "面板缺少 {field}：指定文件写入需要路径、格式与字段三项输入"
+            "凭据文件来源缺少 {field}：需要路径、格式与字段/变量名"
+        );
+    }
+    for field in ["apiKeyEnvValue", "apiKeyFileValue"] {
+        assert!(
+            text.contains(field),
+            "缺少 {field}：环境变量与凭据文件各自需要独立的 API Key 输入"
         );
     }
     assert!(
@@ -156,7 +170,7 @@ fn panel_exposes_key_write_target_and_file_fields() {
     );
     assert!(
         text.contains("applyKeyFileReference"),
-        "写入成功后必须把路径引用回填到配置字段（apiKeyFile / apiKeyAgent*）"
+        "写入成功后必须把路径引用回填到配置字段（apiKeyAgent*）"
     );
 }
 

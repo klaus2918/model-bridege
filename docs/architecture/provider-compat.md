@@ -84,6 +84,10 @@
 2. 域名匹配，按注册表 `priority` 取最高（`commandcode.ai` 100 > `api.deepseek.com` 90 > `opencode.ai` 80）；
 3. 协议对应预设（`openai` / `anthropic` / `commandcode`）。
 
+每个预设还包含 `access` 接入元数据（`protocol` / `baseUrl` / `apiKeyEnv` / `defaultModels` / `docsUrl`），
+由 `/api/config.profiles` 返回给面板。面板选择具体预设后按「只填空字段」自动填充协议、地址、
+密钥变量和默认模型；`compat` 仍然只负责运行时兼容行为，不承载接入信息。
+
 `upstreams.<name>.modelOverrides`（顶层字段，不放进 `compat`）在预设/覆盖之上做模型级差异化：
 
 ```json

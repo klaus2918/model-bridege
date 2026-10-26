@@ -65,6 +65,37 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "rust/model-gate/target/release/model-gate.exe" "dist/Model-Gate-rust.exe" -Force
 
+      - name: 安装 Node（UI 冒烟与迁移冒烟需要 Node 22+）
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 后端测试
+        shell: pwsh
+        working-directory: rust/model-gate
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed: $LASTEXITCODE" }
+
+      - name: 面板 UI 冒烟
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          node --check rust/model-gate/ui/app.js
+          if ($LASTEXITCODE -ne 0) { throw "app.js syntax check failed" }
+          node --check scripts/ui_smoke.js
+          if ($LASTEXITCODE -ne 0) { throw "ui_smoke.js syntax check failed" }
+          node scripts/ui_smoke.js --exe dist/Model-Gate-rust.exe --port 18942 --debug-port 19222
+          if ($LASTEXITCODE -ne 0) { throw "UI smoke failed: $LASTEXITCODE" }
+
+      - name: 历史数据库迁移冒烟
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          node scripts/db_migration_smoke.js --exe dist/Model-Gate-rust.exe --port 18950
+          if ($LASTEXITCODE -ne 0) { throw "DB migration smoke failed: $LASTEXITCODE" }
+
       - name: 打包安装包（Inno Setup）
         shell: pwsh
         run: |

@@ -225,6 +225,106 @@ fn config_issues_precede_save_actions_in_dom() {
 }
 
 #[test]
+fn upstream_preset_and_key_source_contracts() {
+    // 顺序：预设在名称之前，名称在协议之前。
+    let name = APP_JS
+        .find("data-field=\"name\"")
+        .expect("缺少名称输入");
+    let preset = APP_JS.find("供应商预设").expect("缺少供应商预设");
+    let protocol = APP_JS
+        .find("data-field=\"protocol\"")
+        .expect("缺少协议选择");
+    assert!(
+        preset < name && name < protocol,
+        "预设必须位于名称之前、名称位于协议之前（preset={preset}, name={name}, protocol={protocol}）"
+    );
+
+    // 预设自动填充读取 access 元数据，而不是只写 compat.profile。
+    for marker in [
+        "const access = meta.access || {}",
+        "setText(\"baseUrl\", access.baseUrl, true)",
+        "setText(\"apiKeyEnv\", access.apiKeyEnv, true)",
+        "access.defaultModels.join",
+    ] {
+        assert!(APP_JS.contains(marker), "预设自动填充缺少 {marker}");
+    }
+
+    // 新增上游默认值：openai + 空 Base URL，不再落到本地 anthropic。
+    assert!(
+        APP_JS.contains("protocol: \"openai\""),
+        "新增上游默认协议不是 openai"
+    );
+    assert!(
+        APP_JS.contains("baseUrl: \"\""),
+        "新增上游默认 Base URL 不是空"
+    );
+
+    // 密钥来源三选一 + 保存时只保留选中来源。
+    for marker in [
+        "data-field=\"keySourceMode\" value=\"env\"",
+        "data-field=\"keySourceMode\" value=\"file\"",
+        "data-field=\"keySourceMode\" value=\"none\"",
+        "delete entry.apiKeyEnv;",
+        "delete entry.apiKeyFile;",
+        "delete entry.apiKeyAgent;",
+        "delete entry.apiKeyAgentPath;",
+        "delete entry.apiKeyAgentProvider;",
+        "if (keyMode === \"env\")",
+        "} else if (keyMode === \"file\")",
+    ] {
+        assert!(APP_JS.contains(marker), "密钥来源契约缺少 {marker}");
+    }
+
+    // 编辑时实时预览，且走只读接口。
+    assert!(APP_JS.contains("/api/config/preview"), "缺少生效预览接口");
+    assert!(
+        APP_JS.contains("scheduleUpstreamPreview"),
+        "缺少预览防抖调用"
+    );
+
+    // 编辑弹窗克隆表单时，单选框必须按 value 配对并同步 checked；
+    // 否则 env/file/none 三个 radio 会依次写进同一个节点，弹窗里丢失选项。
+    assert!(
+        APP_JS.contains("live.type === \"radio\""),
+        "编辑弹窗未按 radio 类型同步，密钥来源单选框会被覆盖"
+    );
+    assert!(
+        APP_JS.contains("twins.find((el) => el.value === live.value)"),
+        "编辑弹窗 radio 未按 value 配对"
+    );
+
+    // 布局契约：接入 / 密钥 / 模型三组 + 高级折叠 + 同一行三个来源 radio。
+    for marker in [
+        "form-section span-2",
+        "section-title",
+        "key-source-radios",
+        "up-advanced span-2",
+    ] {
+        assert!(APP_JS.contains(marker), "布局契约缺少 {marker}");
+    }
+
+    // 预设是主入口，「自定义」只是列表中的最后一项，不能排在预设前面。
+    let presets = APP_JS
+        .find("profileChoices().concat")
+        .expect("缺少预设选项列表");
+    let custom = APP_JS
+        .find("自定义 / 手动填写")
+        .expect("缺少自定义选项");
+    assert!(
+        presets < custom,
+        "预设必须排在自定义之前（presets={presets}, custom={custom}）"
+    );
+    assert!(
+        APP_JS.contains("applyPresetToScope(scope, profileSel.value, { force: true })"),
+        "切换预设必须强制刷新接入字段"
+    );
+    assert!(
+        APP_JS.contains("该预设未提供默认模型"),
+        "切换无默认模型的预设时必须提示手动填写"
+    );
+}
+
+#[test]
 fn free_source_endpoints_exist_in_router() {
     for route in [
         "/api/free-sources",

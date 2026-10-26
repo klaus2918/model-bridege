@@ -674,9 +674,14 @@ commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议�
 
 ### 预设注册表与模型级覆盖
 
-五套预设（`openai` / `opencode` / `anthropic` / `deepseek` / `commandcode`）由
+预设注册表（当前 14 套，含 `openai` / `opencode` / `anthropic` / `deepseek` / `commandcode` 及国内/聚合/本地供应商）由
 `rust/model-gate/provider_profiles.json` 单点定义并由 Rust 内核内嵌；面板「预设」下拉与
 `/api/config` 的 `profiles` 字段都来自它，不在代码里双写。
+
+注册表现在还为每个预设提供 `access` 接入元数据（`protocol` / `baseUrl` / `apiKeyEnv` /
+`defaultModels` / `docsUrl`）。面板把预设选择器前置到新增/编辑流程开头，选择后按「只填空字段」
+自动填充协议、地址、密钥变量和默认模型；密钥来源改为环境变量 / 凭据文件 / 暂不配置三选一，
+不再同时平铺 `apiKeyEnv`、`apiKeyFile`、`apiKeyAgent` 三套字段。`compat` 仍只负责运行时行为。
 
 **模型级覆盖**（`upstreams.<name>.modelOverrides`，可选）在 `compat` 之上声明单模型差异：
 
@@ -802,8 +807,12 @@ cch 已显式关掉两者：
 - **默认关闭**：`promptCapture` 默认 `false`，关闭时不产生任何序列化或写库开销。开启后只记录**入站** `messages`，不记录模型响应，也不记录无法解析的 `invalid_json` 请求。
 - **关联方式**：每次请求生成一个请求 ID，提示词记录与用量明细使用同一 ID；同一 `prompt_records.id` 可在用量明细里定位对应请求。
 - **会话 ID**：优先读取入站头 `x-session-id`、`x-opencode-session`、`x-conversation-id`（去除控制字符、最长 200 字符）；缺失时回退到「模型 + 首条 user 内容」的稳定哈希。旧数据没有会话时显示为 `(无会话)`。
-- **保留与容量**：默认保留 7 天、最多 5000 条、单条最多 100000 字符；超长内容按消息边界截断并标记 `truncated`，保证仍是合法 JSON。可在配置页调整，`0` 表示对应维度不限制。
-- **脱敏**：写入前按规则替换 Bearer/Authorization、常见 API Key 前缀（如 `sk-`、`sk-ant-`、`ghp_`、`xoxb-`、`AIza`、`AKIA`）、JWT、私钥块、敏感 JSON 字段名和 URL 中的 `key/api_key/token/access_token`；替换为 `[REDACTED:<kind>]`，不提供还原。规则脱敏不能保证覆盖所有自定义密钥格式，敏感场景请先关闭记录或自行清理。
+- **保留与容量**：默认保留 7 天、最多 5000 条、单条最多 100000 字符；超长内容采用**头尾保留**截断（保留头部上下文与最近消息/工具结果，中间丢弃部分仅记录数量、字符数与索引，不写入原文），并标记 `truncated` 与 `truncation` 元数据，保证仍是合法 JSON。可在配置页调整，`0` 表示对应维度不限制。
+- **脱敏**：写入前先按规则替换 Bearer/Authorization、常见 API Key 前缀（如 `sk-`、`sk-ant-`、`ghp_`、`xoxb-`、`AIza`、`AKIA`）、JWT、私钥块、敏感 JSON 字段名和 URL 中的 `key/api_key/token/access_token`；替换为 `[REDACTED:<kind>]`，不提供还原。**脱敏始终发生在截断与所有元数据计算之前**，预览、哈希、角色分布都只能基于脱敏后的内容。规则脱敏不能保证覆盖所有自定义密钥格式，敏感场景请先关闭记录或自行清理。
+- **审查与分析链路**：每条记录额外保存脱敏命中次数 `redactions`、内容哈希 `content_hash`、system 哈希 `system_hash`、角色分布 `role_counts`、截断元数据 `truncation` 与脱敏规则版本 `policy_version`；这些元数据**不包含任何消息原文**。面板详情页提供消息序列、全部展开/全部折叠、截断分隔提示、脱敏/截断徽标，以及「同会话演进」「与上一条对比」快捷入口；提示词列表与演进时间轴也会显示截断/脱敏标记，便于排查与分析。
+- **会话流程**：「提示词演进」的会话流程按请求回放**逐条消息预览**（角色、序号、字符数、工具名），并显示相邻请求的上下文增量（消息条数/字符数）；时间轴直接显示 system、首条与最后一条 user 摘要。每条请求都提供「详情 / 查看提示词」入口，可打开完整消息、调用链与关联用量。预览均来自脱敏后的记录，单条预览限长，不返回完整原文。
+- **历史数据兼容**：启动时对已有 SQLite 自动执行增量迁移（仅补列/补索引，不重写旧行）；旧提示词与用量记录保持原样，新增审查字段按默认值读取（`redactions=0`、`truncation=NULL`、`role_counts={}`、`policy_version=0`），迁移后仍可正常写入新记录。注意：`promptRetentionDays` / `promptMaxRecords` 仍会按配置清理超期或超额提示词；迁移本身不会删除数据，清理属于既有保留策略。
+- **查看与格式化**：详情页对整段为 JSON 对象/数组的消息、工具参数和工具结果自动缩进展示，并标记「JSON 已格式化」；普通文本与截断后的 JSON 片段保持原文，避免误判。消息序列、调用链与关联用量在同一弹窗内查看。
 - **差异对比**：同会话「提示词演进」按时间轴选择两条记录，先做消息级 LCS 对齐（同 role 的删/增配对为修改），再对修改消息做行级 unified diff（默认上下文 3 行）；统计新增/删除/修改/未变、字符与估算 token 变化、system 哈希、重复消息占比，并给出固定规则化提示。**全程本地算法，不调用任何模型或网络**。
 - **下载**：单条详情可下载 JSON；列表可按当前筛选批量下载 JSONL；会话演进可下载 `.diff` 文本。所有下载内容都来自写入时已脱敏的记录。
 - **存储位置**：与用量同一 SQLite（`data/modelgate.db`）中的 `prompt_records` 表；面板「清空」只删提示词记录，不影响用量明细，反之亦然。
@@ -932,6 +941,8 @@ Rust-only 迁移删除），不要继续堆积在 `scripts/` 根目录。
 | `assets/ModelGate.ico` | 应用与托盘图标 |
 | `docs/` | 架构、兼容性、维护规范与示例配置 |
 | `scripts/panel_api_smoke.ps1` | 面板接口与更新资源冒烟 |
+| `scripts/ui_smoke.js` | 无头浏览器 UI 冒烟（页签、弹窗、提示词详情、展开折叠、会话演进） |
+| `scripts/db_migration_smoke.js` | 历史数据库增量迁移冒烟（旧 schema + 旧数据启动、读取与新写入） |
 | `scripts/rust_shell_acceptance.ps1` | Rust 托盘壳黑盒验收 |
 | `scripts/upgrade_and_run.ps1` | 不停机升级辅助 |
 | `scripts/find_iscc.ps1` / `scripts/get_innosetup.ps1` | 查找/安装 Inno Setup |
@@ -1009,7 +1020,7 @@ iscc /DMyAppVersion=2.21.0 ^
 ### 发布
 
 1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `2.21.0`）。
-2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test` 与 `scripts\panel_api_smoke.ps1`。
+2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1` 与 `scripts\ui_smoke.js`。
 3. 打 tag 并推送：`git tag v2.21.0`、`git push origin v2.21.0`（Git 写操作需人工确认）。
 4. `.github/workflows/release-rust.yml` 构建并上传：
    - `Model-Gate-v<版本>-rust-setup.exe`
@@ -1035,6 +1046,8 @@ cargo fmt --check
 cargo check
 cargo test
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe
+node scripts\ui_smoke.js --exe dist\Model-Gate-rust.exe
+node scripts\db_migration_smoke.js --exe dist\Model-Gate-rust.exe
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\rust_shell_acceptance.ps1 -Exe dist\Model-Gate-rust.exe
 ```
 

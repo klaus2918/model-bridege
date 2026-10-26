@@ -130,7 +130,7 @@ function openModal(opts) {
     if (ev.target === root) closeModal();
   });
   const first = root.querySelector("input, textarea, select, button.primary");
-  if (first && first.focus) setTimeout(() => first.focus(), 30);
+  if (first && first.focus) setTimeout(() => first.focus({ preventScroll: true }), 30);
   return root;
 }
 
@@ -691,14 +691,34 @@ const CAPABILITY_LABELS = {
   systemPrompt: "系统提示",
 };
 
-const FALLBACK_PROFILE_CHOICES = ["openai", "opencode", "anthropic", "deepseek", "moonshot", "zhipu", "minimax", "dashscope", "ark", "siliconflow", "modelscope", "hunyuan", "commandcode"];
+const FALLBACK_PROFILE_CHOICES = ["openai", "opencode", "anthropic", "deepseek", "moonshot", "zhipu", "minimax", "dashscope", "ark", "siliconflow", "modelscope", "hunyuan", "commandcode", "kilo"];
 
-/* 预设下拉：优先用服务端注册表（/api/config 的 profiles）；缺失时回退旧硬编码。 */
-function profileChoices() {
+/* 预设列表：优先用服务端注册表（/api/config 的 profiles）；缺失时回退旧硬编码。
+ * 排序按 priority 降序（高优先级/更具体的供应商在前），同优先级按名称。 */
+function profileList() {
   const list = (state.profiles || []).filter((p) => p && p.id);
-  return list.length
-    ? list.map((p) => [p.id, p.label || p.id])
-    : FALLBACK_PROFILE_CHOICES.map((id) => [id, id]);
+  const items = list.length
+    ? list.slice()
+    : FALLBACK_PROFILE_CHOICES.map((id) => ({ id, label: id, priority: 0 }));
+  return items.sort((a, b) => {
+    const pa = Number(a.priority || 0), pb = Number(b.priority || 0);
+    if (pa !== pb) return pb - pa;
+    return String(a.label || a.id).localeCompare(String(b.label || b.id));
+  });
+}
+
+function profileMeta(id) {
+  return (state.profiles || []).find((p) => p && p.id === id) || null;
+}
+
+function profileChoices() {
+  return profileList().map((p) => [p.id, p.label || p.id]);
+}
+
+/* 预设接入元数据：服务端 /api/config.profiles 的 access 字段；旧后端没有时返回 null。 */
+function profileAccess(id) {
+  const meta = profileMeta(id);
+  return meta && meta.access ? meta.access : null;
 }
 
 function capabilityBadges(caps) {
@@ -714,12 +734,14 @@ function addUpstream() {
   let n = 1, name = `upstream${n}`;
   while (state.config.upstreams[name]) { n += 1; name = `upstream${n}`; }
   state.config.upstreams[name] = {
-    protocol: "anthropic",
-    baseUrl: "http://127.0.0.1:15721",
+    protocol: "openai",
+    baseUrl: "",
     models: [],
     default: Object.keys(state.config.upstreams).length === 0,
   };
   renderUpstreamEditor();
+  const card = $$("#upstream-editor .up-card").find((c) => c.dataset.name === name);
+  if (card) openUpstreamEditor(card);
 }
 
 /* 密钥写入目标二选一（用户确认口径）：
@@ -790,31 +812,177 @@ function applyKeyFileReference(cardEl, data) {
     if (el) el.value = v;
   };
   if (format === "json" && (!field || field === "apiKey")) {
-    setVal("apiKeyFile", path);
-    setVal("apiKeyAgent", "");
-    setVal("apiKeyAgentPath", "");
+    setVal("apiKeyAgentPath", path);
     setVal("apiKeyAgentProvider", "");
   } else {
-    setVal("apiKeyAgent", "custom");
     setVal("apiKeyAgentPath", path);
     setVal("apiKeyAgentProvider", field);
-    setVal("apiKeyFile", "");
   }
+  const fileRadio = cardEl.querySelector('[data-field="keySourceMode"][value="file"]');
+  if (fileRadio) fileRadio.checked = true;
   cardEl.dataset.keyConfigured = "1";
   cardEl.dataset.keySource = String((data && data.keySource) || "");
   setConfigDirty(true);
+  syncKeySourceFields(cardEl);
   renderUpstreamCfgTable();
 }
 
-/* 密钥写入目标切换：只有选「写入指定文件」才显示路径/格式/字段输入。 */
-function syncKeyTargetFields(scope) {
+/* 密钥来源单选：只显示当前选中组；保存时由 _readUpstreamEditor 清理未选来源。 */
+function syncKeySourceFields(scope) {
   if (!scope) return;
-  const sel = scope.querySelector('[data-field="keyWriteTarget"]');
-  const isFile = !!sel && sel.value === "file";
-  $$('[data-role="key-file-field"]', scope).forEach((el) => {
-    el.style.display = isFile ? "" : "none";
+  const checked = scope.querySelector('[data-field="keySourceMode"]:checked');
+  const mode = checked ? checked.value : "none";
+  $$("[data-key-group]", scope).forEach((el) => {
+    el.style.display = el.dataset.keyGroup === mode ? "" : "none";
   });
 }
+
+/* 预设接入元数据自动填充：默认只填空字段；force=true 时覆盖。 */
+function applyPresetToScope(scope, presetId, opts) {
+  if (!scope) return;
+  const force = !!(opts && opts.force);
+  const desc = scope.querySelector('[data-role="preset-desc"]');
+  const docs = scope.querySelector('[data-role="preset-docs"]');
+  if (!presetId) {
+    if (desc) desc.textContent = "自定义：保留手填值，并按 Base URL 域名自动识别兼容预设；不会改动已填字段。";
+    if (docs) { docs.hidden = true; docs.removeAttribute("href"); }
+    scheduleUpstreamPreview(scope);
+    return;
+  }
+  const meta = profileMeta(presetId);
+  if (!meta) return;
+  const access = meta.access || {};
+  const setText = (field, value, onlyEmpty) => {
+    const el = scope.querySelector(`[data-field="${field}"]`);
+    if (!el || value === undefined || value === null) return;
+    if (!force && onlyEmpty && String(el.value || "").trim()) return;
+    el.value = String(value);
+  };
+  const setSelect = (field, value, onlyEmpty) => {
+    const el = scope.querySelector(`[data-field="${field}"]`);
+    if (!el || !value) return;
+    if (!force && onlyEmpty && String(el.value || "").trim()) return;
+    el.value = value;
+  };
+  // 协议是预设的强关联字段：选择具体预设时总是对齐，避免 profile 与 wire 形态不匹配。
+  if (access.protocol) setSelect("protocol", access.protocol, false);
+  setText("baseUrl", access.baseUrl, true);
+  setText("apiKeyEnv", access.apiKeyEnv, true);
+  const modelsEl = scope.querySelector('[data-field="models"]');
+  if (modelsEl && Array.isArray(access.defaultModels)) {
+    if (force || !String(modelsEl.value || "").trim()) {
+      // 主动切换预设时整组刷新；预设没有默认模型就清空，避免旧供应商的模型残留。
+      modelsEl.value = access.defaultModels.join("\n");
+    }
+  }
+  // 有密钥变量时把来源切到环境变量；主动切换预设且新预设免密时切到「暂不配置」。
+  const envRadio = scope.querySelector('[data-field="keySourceMode"][value="env"]');
+  const noneRadio = scope.querySelector('[data-field="keySourceMode"][value="none"]');
+  if (access.apiKeyEnv) {
+    if (envRadio) envRadio.checked = true;
+  } else if (force && noneRadio) {
+    noneRadio.checked = true;
+  }
+  if (docs) {
+    if (access.docsUrl) { docs.href = access.docsUrl; docs.hidden = false; }
+    else { docs.hidden = true; docs.removeAttribute("href"); }
+  }
+  if (desc) {
+    let suffix = force ? "已用预设覆盖。" : "只填空字段，已填内容保留；需要整组替换时点「套用预设」。";
+    if (force && Array.isArray(access.defaultModels) && access.defaultModels.length === 0) {
+      suffix += " 该预设未提供默认模型，请手动填写模型清单。";
+    }
+    desc.textContent = `${meta.description || "已选择预设。"} ${suffix}`;
+  }
+  syncKeySourceFields(scope);
+  scheduleUpstreamPreview(scope);
+}
+
+/* 防抖预览：/api/config/preview 只读，不写配置、不发外网请求。 */
+const _previewTimers = new WeakMap();
+function scheduleUpstreamPreview(scope, immediate) {
+  if (!scope) return;
+  const prev = _previewTimers.get(scope);
+  if (prev) clearTimeout(prev);
+  const run = () => { refreshUpstreamPreview(scope); };
+  if (immediate) { run(); return; }
+  _previewTimers.set(scope, setTimeout(run, 350));
+}
+
+async function refreshUpstreamPreview(scope) {
+  const box = scope.querySelector('[data-role="effective-preview"]');
+  if (!box) return;
+  const val = (f) => {
+    const el = scope.querySelector(`[data-field="${f}"]`);
+    return el ? String(el.value || "").trim() : "";
+  };
+  const protocol = val("protocol") || "openai";
+  const baseUrl = val("baseUrl");
+  const profile = val("compatProfile");
+  if (!baseUrl && !profile) {
+    box.textContent = "当前生效：填 Base URL 或选预设后显示";
+    return;
+  }
+  const seq = String(Date.now()) + Math.random();
+  box.dataset.previewSeq = seq;
+  try {
+    const data = await postJson("/api/config/preview", { protocol, baseUrl, compat: { profile } });
+    if (box.dataset.previewSeq !== seq) return;
+    const eff = data.effective || {};
+    const caps = Object.entries(CAPABILITY_LABELS)
+      .filter(([k]) => eff.capabilities && eff.capabilities[k])
+      .map(([, label]) => label)
+      .join("/") || "—";
+    box.textContent = `当前生效：${eff.profile || "—"} · 鉴权 ${eff.authScheme || "—"} · 会话 ${eff.sessionHeader || "无"}`
+      + ` · 端点 ${eff.chatPath || "—"}${eff.maxOutputTokens ? ` · 输出上限 ${fmtInt(eff.maxOutputTokens)}` : ""}`
+      + ` · 能力 ${caps}`;
+  } catch (err) {
+    if (box.dataset.previewSeq !== seq) return;
+    box.textContent = `当前生效：预览失败（${err.message}）；保存后以实际为准`;
+  }
+}
+
+/* 卡片/弹窗的交互绑定：预设、密钥来源、Base URL/协议变化都触发字段联动与预览。 */
+function bindUpstreamInteractions(scope) {
+  if (!scope) return;
+  const profileSel = scope.querySelector('[data-field="compatProfile"]');
+  if (profileSel) {
+    profileSel.addEventListener("change", () => {
+      // 用户主动切换预设 = 明确要换供应商：覆盖预设负责的接入字段，
+      // 否则已填过 DeepSeek 后再选 Kimi，地址/密钥变量/模型不会刷新。
+      applyPresetToScope(scope, profileSel.value, { force: true });
+    });
+  }
+  $$('[data-field="keySourceMode"]', scope).forEach((radio) => {
+    radio.addEventListener("change", () => syncKeySourceFields(scope));
+  });
+  ["protocol", "baseUrl"].forEach((field) => {
+    const el = scope.querySelector(`[data-field="${field}"]`);
+    if (!el) return;
+    el.addEventListener("change", () => scheduleUpstreamPreview(scope));
+    el.addEventListener("input", () => scheduleUpstreamPreview(scope));
+  });
+  const applyBtn = scope.querySelector('[data-act="apply-preset"]');
+  if (applyBtn) {
+    applyBtn.addEventListener("click", async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const id = profileSel ? profileSel.value : "";
+      if (!id) { toast("先选择一个具体预设，再套用", true); return; }
+      const ok = await confirmModal({
+        title: "用预设覆盖当前字段？",
+        text: "将覆盖协议、Base URL、密钥环境变量和模型清单中能由预设提供的部分；你填的 API Key 本体不会被动。",
+        confirmLabel: "覆盖",
+      });
+      if (!ok) return;
+      applyPresetToScope(scope, id, { force: true });
+      toast("已套用预设，点「保存配置」后生效");
+    });
+  }
+  syncKeySourceFields(scope);
+  scheduleUpstreamPreview(scope, true);
+}
+
 
 /* 上游「列表 + 详情」：表格负责浏览与操作，隐藏的卡片仍是唯一表单源 */
 function upstreamDetailRowCfg(card) {
@@ -824,10 +992,16 @@ function upstreamDetailRowCfg(card) {
     return el.type === "checkbox" ? (el.checked ? "开" : "关") : (el.value || "");
   };
   const models = val("models").split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+  const keyModeEl = card.querySelector('[data-field="keySourceMode"]:checked');
+  const keyMode = keyModeEl ? keyModeEl.value : "none";
+  const keySourceText = keyMode === "env"
+    ? `环境变量 ${val("apiKeyEnv") || "未填变量名"}`
+    : keyMode === "file"
+      ? `凭据文件 ${val("apiKeyAgentPath") || "未填路径"}`
+      : "暂不配置";
   const items = [
     ["模型清单", models.slice(0, 12).join(", ") + (models.length > 12 ? ` …共 ${models.length} 个` : "")],
-    ["密钥环境变量", val("apiKeyEnv") || "未设置（仅用自定义凭据文件）"],
-    ["凭据文件", val("apiKeyFile") || val("apiKeyAgentPath") || "未设置"],
+    ["密钥来源", keySourceText],
     ["密钥状态", card.dataset.keyConfigured === "1"
       ? `已配置${card.dataset.keySource ? `（${card.dataset.keySource}）` : ""}`
       : "未配置（上游会返回 401）"],
@@ -956,18 +1130,29 @@ function renderUpstreamEditor() {
     const cOverrides = u.modelOverrides && Object.keys(u.modelOverrides).length
       ? JSON.stringify(u.modelOverrides, null, 2) : "";
     const keyConfigured = u._keyConfigured;
+    const keyMode = (u.apiKeyEnv || "").trim()
+      ? "env"
+      : ((u.apiKeyFile || "").trim() || (u.apiKeyAgent || "").trim() || (u.apiKeyAgentPath || "").trim())
+        ? "file"
+        : "none";
+    const keySourceCount = [
+      !!String(u.apiKeyEnv || "").trim(),
+      !!(String(u.apiKeyFile || "").trim() || String(u.apiKeyAgent || "").trim() || String(u.apiKeyAgentPath || "").trim()),
+    ].filter(Boolean).length;
     const eff = ((state.effective || []).find((row) => row.name === name)) || null;
     const keyWarn = keyConfigured ? "" :
-      `<div class="hint" style="color:var(--warn)">未配置密钥：上游会返回 401，请填写 apiKeyEnv 并点「写入密钥」（可选写入用户环境变量或你手动指定的文件），或设置自定义凭据路径</div>`;
+      keyMode === "none"
+        ? `<div class="hint" style="color:var(--warn)">未配置密钥：需要鉴权的上游会返回 401；免鉴权上游可忽略。</div>`
+        : `<div class="hint" style="color:var(--warn)">尚未写入密钥：填好 API Key 后点对应的「写入...」按钮；也可以只保存变量名/路径，稍后再写。</div>`;
     const legacyHints = [];
     if (u.apiKeyFile) {
-      legacyHints.push("apiKeyFile 为旧凭据来源：仍可用；路径可保存在 bridge.config.json，但必须由你手动指定，且文件内只应放密钥");
+      legacyHints.push("apiKeyFile 已归入「凭据文件」来源；保存后会迁移为 apiKeyAgentPath，读取行为不变");
     }
     const agentName = String(u.apiKeyAgent || "").trim();
     if (agentName && ["opencode", "jcode", "commandcode"].includes(agentName.toLowerCase())) {
       legacyHints.push(`内置预设「${agentName}」已移除：请填写自定义凭据路径，或改用 apiKeyEnv`);
     } else if (agentName) {
-      legacyHints.push("apiKeyAgent 为旧凭据来源：自定义路径仍可用，推荐改用 apiKeyEnv");
+      legacyHints.push("apiKeyAgent 已归入「凭据文件」来源；保存后继续使用当前路径");
     }
     const legacyHint = legacyHints.length
       ? `<div class="hint" style="color:var(--warn)">迁移提示：${legacyHints.map(esc).join("；")}</div>`
@@ -988,20 +1173,38 @@ function renderUpstreamEditor() {
       <details class="up-fields" data-up-fields="${esc(name)}">
       <summary>
         <span class="up-preview">${esc(u.protocol || "anthropic")}${u.transport ? ` / ${esc(u.transport)}` : ""} · ${esc(u.baseUrl || "未填 Base URL")} · ${
-          (u.models || []).length} 个模型${u.apiKeyEnv ? ` · 密钥变量 ${esc(u.apiKeyEnv)}` : ""}${
-          u.apiKeyAgent ? ` · agent 来源 ${esc(u.apiKeyAgent)}` : ""}</span>
+          (u.models || []).length} 个模型${keyMode === "env" && u.apiKeyEnv ? ` · 环境变量 ${esc(u.apiKeyEnv)}` : ""}${
+          keyMode === "file" && (u.apiKeyFile || u.apiKeyAgentPath) ? ` · 凭据文件 ${esc(u.apiKeyFile || u.apiKeyAgentPath)}` : ""}</span>
         <button type="button" class="ghost" data-act="edit">编辑</button>
       </summary>
-      <div class="grid">
-        <label>名称（同时是 URL 前缀 /${esc(name)}）
-          <input type="text" data-field="name" value="${esc(name)}">
+      <div class="grid grid-2">
+        <section class="form-section span-2">
+          <div class="section-title">1. 接入</div>
+          <div class="grid grid-2">
+        <label class="span-2">供应商预设
+          <div class="preset-row">
+            <select data-field="compatProfile">
+              ${profileChoices().concat([["", "自定义 / 手动填写（可按地址自动识别）"]])
+                .map(([v, label]) => `<option value="${esc(v)}"${cProfile === v ? " selected" : ""}>${esc(label)}</option>`)
+                .join("")}
+            </select>
+            <button type="button" class="ghost tiny" data-act="apply-preset"
+              title="用预设强制覆盖已填的协议、地址、密钥变量和默认模型">套用预设</button>
+            <a data-role="preset-docs" target="_blank" rel="noreferrer" hidden>文档</a>
+          </div>
+          <div class="hint" data-role="preset-desc">先选供应商预设；没有匹配时选最后的「自定义 / 手动填写」，再手填协议与地址。</div>
+        </label>
+        <label>名称（URL 前缀）
+          <input type="text" data-field="name" value="${esc(name)}" placeholder="例如 deepseek">
+          <span class="hint">必填且唯一；会作为 /名称/v1/... 的路径前缀。</span>
         </label>
         <label>协议
           <select data-field="protocol">
-            ${["anthropic", "openai", "commandcode"].map((p) =>
-              `<option value="${p}"${(u.protocol || "anthropic") === p ? " selected" : ""}>${p}</option>`
+            ${["openai", "anthropic", "commandcode"].map((p) =>
+              `<option value="${p}"${(u.protocol || "openai") === p ? " selected" : ""}>${p}</option>`
             ).join("")}
           </select>
+          <span class="hint">只决定 wire 形态；供应商差异由下方的预设/compat 承担。</span>
         </label>
         <label>传输适配（transport）
           <select data-field="transport">
@@ -1011,52 +1214,75 @@ function renderUpstreamEditor() {
         </label>
         <div class="span-2 hint">opencode：仅用于 OpenCode Zen 免费模型（-free / big-pickle / grok-code），固定匿名 key、强制流式并注入 bash/read；不要填 apiKey。</div>
         <label class="span-2">Base URL
-          <input type="text" data-field="baseUrl" value="${esc(u.baseUrl || "")}" placeholder="http://127.0.0.1:15721">
+          <input type="text" data-field="baseUrl" value="${esc(u.baseUrl || "")}" placeholder="例如 https://api.deepseek.com/v1">
+          <span class="hint">选择上方的供应商预设会自动填充；手填时请确认协议与地址匹配。</span>
         </label>
-        <label>API Key
-          <div class="key-row">
-            <input type="password" data-field="apiKey" value="" placeholder="${keyConfigured ? "已配置 · 留空保持不变" : "未配置"}">
-            <select data-field="keyWriteTarget" title="密钥写到哪里：Windows 用户环境变量，或你手动指定的文件">
-              <option value="env">写入用户环境变量</option>
-              <option value="file">写入指定文件</option>
-            </select>
-            <button type="button" class="ghost" data-act="save-env"
-              title="把上面填的密钥写入所选目标（用户环境变量 / 你指定的文件）并立即生效，无需重启">写入密钥</button>
+        <div class="span-2 hint" data-role="effective-preview">当前生效：保存后显示</div>
           </div>
-        </label>
-        <label class="span-2" data-role="key-file-field">凭据文件路径（写入指定文件时必填）
-          <input type="text" data-field="keyWritePath" value="${esc(u.apiKeyFile || u.apiKeyAgentPath || "")}" placeholder="如 D:\\secrets\\mykey.json 或 D:\\secrets\\app.env">
-        </label>
-        <label data-role="key-file-field">文件格式
-          <select data-field="keyWriteFormat">
-            <option value="json">JSON</option>
-            <option value="env">.env 文本</option>
-          </select>
-        </label>
-        <label data-role="key-file-field">字段 / 变量名
-          <input type="text" data-field="keyWriteField" value="${esc(u.apiKeyAgentProvider || "")}" placeholder="JSON 点路径（留空=根字段 apiKey）/ .env 变量名（必填）">
-        </label>
-        <div class="span-2 hint" data-role="key-file-field">凭据文件没有内置默认路径：只能写你手动指定的这个文件。写入后配置文件里只保存路径引用，不保存密钥。</div>
-        <label>密钥环境变量（apiKeyEnv）
-          <input type="text" data-field="apiKeyEnv" value="${esc(u.apiKeyEnv || "")}" placeholder="COMMAND_CODE_API_KEY">
-        </label>
-        <label class="span-2">密钥文件（apiKeyFile，可选）
-          <input type="text" data-field="apiKeyFile" value="${esc(u.apiKeyFile || "")}" placeholder="如 D:\\secrets\\mykey.json（读取 JSON 根字段 apiKey）">
-        </label>
-        <div class="span-2 hint">只读你手填的文件路径，没有内置默认位置；该路径会保存到 bridge.config.json（仅路径，不含密钥）。优先级低于 apiKeyEnv、高于下方自定义凭据文件。</div>
-        <label>密钥来源（自定义文件）
-          <select data-field="apiKeyAgent">
-            ${[["", "不启用"], ["custom", "自定义文件"]]
-              .map(([v, label]) => `<option value="${v}"${(u.apiKeyAgent || "") === v ? " selected" : ""}>${label}</option>`).join("")}
-          </select>
-        </label>
-        <label>自定义文件字段 / 变量名
-          <input type="text" data-field="apiKeyAgentProvider" value="${esc(u.apiKeyAgentProvider || "")}" placeholder="JSON 点路径或 .env 变量名（可留空）">
-        </label>
-        <label class="span-2">自定义凭据路径（必填）
-          <input type="text" data-field="apiKeyAgentPath" value="${esc(u.apiKeyAgentPath || "")}" placeholder="必填，如 D:\\secrets\\mykey.json">
-        </label>
-        <div class="span-2 hint">只读你手动指定的凭据文件；没有内置默认路径。优先级低于 apiKeyEnv / apiKeyFile；JSON 中的 apiKey 已不再作为凭据。</div>
+        </section>
+        <section class="form-section span-2">
+          <div class="section-title">2. 密钥来源（三选一）</div>
+          <div class="grid grid-2">
+        <div class="span-2 hint" data-role="key-source-hint">${keySourceCount > 1
+            ? `检测到 ${keySourceCount} 个来源并存；保存后只保留当前选中的来源`
+            : (keyConfigured ? `当前生效：${esc((eff && eff.keySource) || "已配置")}` : "当前未配置")}</div>
+        <div class="span-2 key-source-radios">
+          <label class="check key-source-radio">
+            <input type="radio" name="keySourceMode-${esc(name)}" data-field="keySourceMode" value="env" ${keyMode === "env" ? "checked" : ""}>
+            环境变量（推荐）
+          </label>
+          <label class="check key-source-radio">
+            <input type="radio" name="keySourceMode-${esc(name)}" data-field="keySourceMode" value="file" ${keyMode === "file" ? "checked" : ""}>
+            凭据文件
+          </label>
+          <label class="check key-source-radio">
+            <input type="radio" name="keySourceMode-${esc(name)}" data-field="keySourceMode" value="none" ${keyMode === "none" ? "checked" : ""}>
+            暂不配置
+          </label>
+        </div>
+        <div class="span-2 key-source-group" data-key-group="env">
+          <label>密钥环境变量（apiKeyEnv）
+            <input type="text" data-field="apiKeyEnv" value="${esc(u.apiKeyEnv || "")}" placeholder="DEEPSEEK_API_KEY">
+          </label>
+          <label>API Key（只用于本次写入）
+            <div class="key-row">
+              <input type="password" data-field="apiKeyEnvValue" value="" placeholder="${keyConfigured ? "已配置 · 留空保持不变" : "未配置"}">
+              <button type="button" class="ghost" data-act="save-env"
+                title="写入 HKCU\\Environment，当前进程立即生效，新进程自动继承">写入用户环境变量</button>
+            </div>
+          </label>
+          <div class="hint">优先级最高；配置文件里只保存变量名，不保存密钥本体。</div>
+        </div>
+        <div class="span-2 key-source-group" data-key-group="file">
+          <label>凭据文件路径
+            <input type="text" data-field="apiKeyAgentPath" value="${esc(u.apiKeyFile || u.apiKeyAgentPath || "")}" placeholder="如 D:\\secrets\\mykey.json 或 D:\\secrets\\app.env">
+          </label>
+          <label>文件格式
+            <select data-field="keyWriteFormat">
+              <option value="json">JSON</option>
+              <option value="env">.env 文本</option>
+            </select>
+          </label>
+          <label>字段 / 变量名
+            <input type="text" data-field="apiKeyAgentProvider" value="${esc(u.apiKeyAgentProvider || "")}" placeholder="JSON 点路径（留空=apiKey/key）/ .env 变量名">
+          </label>
+          <label>API Key（只用于本次写入）
+            <div class="key-row">
+              <input type="password" data-field="apiKeyFileValue" value="" placeholder="${keyConfigured ? "已配置 · 留空保持不变" : "未配置"}">
+              <button type="button" class="ghost" data-act="save-file"
+                title="写入上面指定的文件；配置文件里只保存路径引用">写入指定文件</button>
+            </div>
+          </label>
+          <div class="hint">支持 JSON 根字段 apiKey/key、JSON 点路径、.env 变量；路径必须手动指定，没有内置默认位置。</div>
+        </div>
+        <div class="span-2 key-source-group" data-key-group="none">
+          <div class="hint">未配置密钥：需要鉴权的上游会返回 401；免鉴权上游可以保持这一项。</div>
+        </div>
+          </div>
+        </section>
+        <section class="form-section span-2">
+          <div class="section-title">3. 模型与路由</div>
+          <div class="grid grid-2">
         <label class="span-2">模型清单（每行一个，也是路由依据）
           <div class="models-field-row">
             <textarea data-field="models" rows="3">${esc((u.models || []).join("\n"))}</textarea>
@@ -1074,15 +1300,14 @@ function renderUpstreamEditor() {
         ${isCC ? `
         <label class="check"><input type="checkbox" data-field="pauseTurn" ${u.pauseTurn !== false ? "checked" : ""}>pause_turn 自动续跑</label>
         <label class="check"><input type="checkbox" data-field="cmdZdr" ${u.cmdZdr !== false ? "checked" : ""}>ZDR 安全头 x-cmd-zdr: 1</label>` : ""}
-        ${isOAI ? `
-        <label class="check"><input type="checkbox" data-field="sessionHeader" ${u.sessionHeader !== false ? "checked" : ""}>注入 x-opencode-session 会话头</label>` : ""}
+          </div>
+        </section>
         <div class="span-2 hint">兼容能力（compat）：留空 = 跟随 provider 预设；这里只覆盖需要差异化的部分，保存时不会丢失。</div>
-        <label>Provider 预设
-          <select data-field="compatProfile">
-            ${[["", "自动识别"]].concat(profileChoices())
-              .map(([v, label]) => `<option value="${esc(v)}"${cProfile === v ? " selected" : ""}>${esc(label)}</option>`).join("")}
-          </select>
-        </label>
+        <div class="span-2 hint">当前预设：<span class="mono" data-role="profile-readout">${esc(cProfile || "自动识别")}</span>；在上方「供应商预设」里修改。</div>
+        <details class="up-advanced span-2">
+          <summary>高级兼容（compat）— 跟随 / 覆盖（默认折叠）</summary>
+        ${isOAI ? `
+        <label class="check"><input type="checkbox" data-field="sessionHeader" ${u.sessionHeader === true ? "checked" : ""}>注入 x-opencode-session 会话头</label>` : ""}
         <label>鉴权方式
           <select data-field="compatAuthScheme">
             ${[["", "跟随预设"], ["bearer", "Bearer"], ["x-api-key", "x-api-key"],
@@ -1130,12 +1355,8 @@ function renderUpstreamEditor() {
           <textarea data-field="modelOverrides" rows="3" placeholder='{"deepseek-reasoner":{"limits":{"maxOutputTokens":65536}}}'>${esc(cOverrides)}</textarea>
         </label>
         <div class="span-2 hint">键为模型 id，支持单个 * 通配；可设置 limits 与 capabilities，未知字段保存时原样保留。</div>
-        <div class="span-2 hint">当前生效：${eff
-          ? `${esc(eff.profile || "—")} · 鉴权 ${esc(eff.authScheme || "—")} · 会话 ${esc(eff.sessionHeader || "无")} · 端点 ${esc(eff.chatPath || "—")}${eff.maxOutputTokens ? ` · 输出上限 ${fmtInt(eff.maxOutputTokens)}` : ""}${eff.maxContextTokens ? ` · 上下文上限 ${fmtInt(eff.maxContextTokens)}` : ""}`
-          : "保存后显示解析结果"}</div>
-        <div class="span-2 hint">能力：${eff
-          ? (capabilityBadges(eff.capabilities) || "—")
-          : "保存后显示"}${eff ? ` · 模型覆盖 ${fmtInt(Object.keys(eff.modelOverrides || {}).length)} 条` : ""}</div>
+        <div class="span-2 hint">保存后可在表格行展开查看服务端最终生效值；上方「当前生效」是编辑时的实时预览。</div>
+        </details>
       </div>
       </details>
       ${keyWarn}
@@ -1143,60 +1364,72 @@ function renderUpstreamEditor() {
     </div>`;
   }).join("") || '<div class="empty">还没有上游，点「＋ 新增上游」创建</div>';
 
-  // 密钥写入目标：默认写用户环境变量；选「写入指定文件」才显示文件相关字段。
-  $$(".up-card", host).forEach((card) => syncKeyTargetFields(card));
-  $$('[data-field="keyWriteTarget"]', host).forEach((sel) => {
-    sel.addEventListener("change", () => {
-      syncKeyTargetFields(sel.closest(".up-card") || host);
-    });
+  // 每张卡片：密钥来源显隐 + 预设联动 + 实时预览 + 按钮动作。
+  $$(".up-card", host).forEach((card) => {
+    bindUpstreamInteractions(card);
+    bindUpstreamCardActions(card);
   });
+  renderUpstreamCfgTable();
+}
 
-  $$("[data-act]", host).forEach((btn) => {
+/* 卡片/弹窗里的按钮动作：写入密钥、编辑、删除、上移/下移。 */
+function bindUpstreamCardActions(cardEl) {
+  if (!cardEl) return;
+  $$("[data-act]", cardEl).forEach((btn) => {
     btn.addEventListener("click", async (ev) => {
       // summary 里的按钮：别让点击顺带把卡片折叠/展开
       if (btn.closest("summary")) ev.stopPropagation();
-      const cardEl = btn.closest(".up-card");
-      const key = cardEl.dataset.name;
+      const key = cardEl.dataset.name || "";
       if (btn.dataset.act === "save-env") {
-        const input = cardEl.querySelector('[data-field="apiKey"]');
+        const input = cardEl.querySelector('[data-field="apiKeyEnvValue"]');
         const secret = ((input && input.value) || "").trim();
         if (!secret) {
-          toast("请先在上面填入新的 API Key", true);
-          return;
-        }
-        const targetSel = cardEl.querySelector('[data-field="keyWriteTarget"]');
-        const target = (targetSel && targetSel.value === "file") ? "file" : "env";
-        if (target === "file") {
-          const pathEl = cardEl.querySelector('[data-field="keyWritePath"]');
-          const filePath = ((pathEl && pathEl.value) || "").trim();
-          if (!filePath) {
-            toast("请先填写「凭据文件路径」，再写入文件", true);
-            return;
-          }
-          const fmtEl = cardEl.querySelector('[data-field="keyWriteFormat"]');
-          const fileFormat = (fmtEl && fmtEl.value) || "json";
-          const fieldEl = cardEl.querySelector('[data-field="keyWriteField"]');
-          const field = ((fieldEl && fieldEl.value) || "").trim();
-          if (fileFormat === "env" && !field) {
-            toast(".env 格式必须填变量名（字段/变量名输入框）", true);
-            return;
-          }
-          saveUpstreamSecret(key, secret, input, {
-            target: "file",
-            filePath,
-            fileFormat,
-            field,
-            onWritten: (data) => applyKeyFileReference(cardEl, data),
-          });
+          toast("请先填入 API Key，再写入环境变量", true);
           return;
         }
         const envInput = cardEl.querySelector('[data-field="apiKeyEnv"]');
         const envName = ((envInput && envInput.value) || "").trim();
         if (!envName) {
-          toast("请先填写「密钥环境变量」名，再写入用户变量", true);
+          toast("请先填写「密钥环境变量」名", true);
           return;
         }
         saveUpstreamSecret(key, secret, input, { target: "env", envName });
+        return;
+      }
+      if (btn.dataset.act === "save-file") {
+        const input = cardEl.querySelector('[data-field="apiKeyFileValue"]');
+        const secret = ((input && input.value) || "").trim();
+        if (!secret) {
+          toast("请先填入 API Key，再写入文件", true);
+          return;
+        }
+        const pathEl = cardEl.querySelector('[data-field="apiKeyAgentPath"]');
+        const filePath = ((pathEl && pathEl.value) || "").trim();
+        if (!filePath) {
+          toast("请先填写「凭据文件路径」", true);
+          return;
+        }
+        const fmtEl = cardEl.querySelector('[data-field="keyWriteFormat"]');
+        const fileFormat = (fmtEl && fmtEl.value) || "json";
+        const fieldEl = cardEl.querySelector('[data-field="apiKeyAgentProvider"]');
+        const field = ((fieldEl && fieldEl.value) || "").trim();
+        if (fileFormat === "env" && !field) {
+          toast(".env 格式必须填变量名", true);
+          return;
+        }
+        saveUpstreamSecret(key, secret, input, {
+          target: "file",
+          filePath,
+          fileFormat,
+          field,
+          onWritten: (data) => applyKeyFileReference(cardEl, data),
+        });
+        return;
+      }
+      if (btn.dataset.act === "query-models") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openModelDiscovery(cardEl);
         return;
       }
       if (btn.dataset.act === "edit") {
@@ -1228,17 +1461,46 @@ function renderUpstreamEditor() {
       renderUpstreamEditor();
     });
   });
-  renderUpstreamCfgTable();
 }
 
 /* 上游编辑弹窗：克隆卡片字段到弹窗里改，点「应用到卡片」写回（读取路径不变） */
+/* 把卡片表单的当前值写回摘要行：编辑弹窗点「应用到卡片」后，
+ * 摘要不应继续显示旧协议/旧地址/旧密钥来源。 */
+function refreshUpstreamCardSummary(card) {
+  if (!card) return;
+  const get = (f) => {
+    const el = card.querySelector(`[data-field="${f}"]`);
+    return el ? String(el.value || "").trim() : "";
+  };
+  const protocol = get("protocol") || "anthropic";
+  const transport = get("transport");
+  const baseUrl = get("baseUrl") || "未填 Base URL";
+  const models = parseModels(get("models"));
+  const keyMode = card.querySelector('[data-field="keySourceMode"]:checked')?.value || "none";
+  const env = get("apiKeyEnv");
+  const file = get("apiKeyAgentPath") || get("apiKeyFile");
+  const parts = [`${protocol}${transport ? ` / ${transport}` : ""}`, baseUrl, `${models.length} 个模型`];
+  if (keyMode === "env" && env) parts.push(`环境变量 ${env}`);
+  if (keyMode === "file" && file) parts.push(`凭据文件 ${file}`);
+  const preview = card.querySelector(".up-preview");
+  if (preview) preview.textContent = parts.join(" · ");
+}
+
 function applyUpstreamEdits(targetGrid, sourceGrid) {
   $$("[data-field]", sourceGrid).forEach((src) => {
+    if (src.type === "radio") {
+      const dst = $$(`[data-field="${src.dataset.field}"]`, targetGrid)
+        .find((el) => el.value === src.value);
+      if (dst) dst.checked = src.checked;
+      return;
+    }
     const dst = $$("[data-field]", targetGrid).find((el) => el.dataset.field === src.dataset.field);
     if (!dst) return;
     if (src.type === "checkbox") dst.checked = src.checked;
     else dst.value = src.value;
   });
+  const card = targetGrid.closest(".up-card");
+  if (card) refreshUpstreamCardSummary(card);
 }
 
 /* ── 查询上游模型清单 + 多选写入 ────────────────────────────── */
@@ -1424,11 +1686,16 @@ function openUpstreamEditor(cardEl) {
   const grid = cardEl.querySelector(".grid");
   if (!grid) return;
   const clone = grid.cloneNode(true);
-  // cloneNode 不带「当前输入值」，先按卡片现状同步一遍
+  // cloneNode 不带「当前输入值」，先按卡片现状同步一遍。
+  // 单选框必须按 value 配对：同一 data-field 有 env/file/none 三个 radio，
+  // 只按字段名找第一个会把三个值依次写进同一个节点，弹窗里就只剩一个错误选项。
   $$("[data-field]", grid).forEach((live) => {
-    const twin = $$("[data-field]", clone).find((el) => el.dataset.field === live.dataset.field);
+    const twins = $$("[data-field]", clone).filter((el) => el.dataset.field === live.dataset.field);
+    const twin = live.type === "radio"
+      ? twins.find((el) => el.value === live.value)
+      : twins[0];
     if (!twin) return;
-    if (live.type === "checkbox") twin.checked = live.checked;
+    if (live.type === "checkbox" || live.type === "radio") twin.checked = live.checked;
     else twin.value = live.value;
   });
   const root = openModal({
@@ -1442,6 +1709,7 @@ function openUpstreamEditor(cardEl) {
         className: "primary",
         onClick: () => {
           applyUpstreamEdits(grid, clone);
+          renderUpstreamCfgTable();
           setConfigDirty(true);
           toast("已应用到卡片，记得点「保存配置」");
         },
@@ -1450,22 +1718,13 @@ function openUpstreamEditor(cardEl) {
   });
   const host = root && root.querySelector(".modal-grid-host");
   if (host) host.appendChild(clone);
-  // 弹窗里的「写入目标」也要能切换文件字段（cloneNode 不带事件监听器）。
-  const targetSel = clone.querySelector('[data-field="keyWriteTarget"]');
-  if (targetSel) {
-    syncKeyTargetFields(clone);
-    targetSel.addEventListener("change", () => syncKeyTargetFields(clone));
-  }
-  // cloneNode 不复制事件监听器：编辑弹窗里的「查询清单」要单独接上。
-  // 面板内嵌在弹窗内（不另开弹窗），否则会把正在编辑的字段冲掉。
-  const queryBtn = clone.querySelector('[data-act="query-models"]');
-  if (queryBtn) {
-    queryBtn.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      openModelDiscovery(clone);
-    });
-  }
+  // cloneNode 不复制事件监听器：给弹窗里的字段重新接上联动与按钮。
+  clone.dataset.name = name;
+  $$('[data-field="keySourceMode"]', clone).forEach((el) => {
+    el.name = `${el.name}-modal`;
+  });
+  bindUpstreamInteractions(clone);
+  bindUpstreamCardActions(clone);
   return root;
 }
 
@@ -1489,19 +1748,26 @@ const _readUpstreamEditor = () => {
     entry.models = parseModels(get("models").value);
     entry.default = get("default").checked;
     entry.autoModels = get("autoModels").checked;
-    const env = get("apiKeyEnv").value.trim();
-    if (env) entry.apiKeyEnv = env; else delete entry.apiKeyEnv;
-    const keyFileEl = get("apiKeyFile");
-    const keyFile = keyFileEl ? keyFileEl.value.trim() : "";
-    if (keyFile) entry.apiKeyFile = keyFile; else delete entry.apiKeyFile;
-    const agent = get("apiKeyAgent").value;
-    if (agent) entry.apiKeyAgent = agent; else delete entry.apiKeyAgent;
-    const agentProvider = get("apiKeyAgentProvider").value.trim();
-    if (agent && agentProvider) entry.apiKeyAgentProvider = agentProvider;
-    else delete entry.apiKeyAgentProvider;
-    const agentPath = get("apiKeyAgentPath").value.trim();
-    if (agent && agentPath) entry.apiKeyAgentPath = agentPath;
-    else delete entry.apiKeyAgentPath;
+    const keyModeEl = cardEl.querySelector('[data-field="keySourceMode"]:checked');
+    const keyMode = keyModeEl ? keyModeEl.value : "none";
+    // 三选一：保存时只保留选中来源，避免旧字段继续生效造成“选了却没生效”。
+    delete entry.apiKeyEnv;
+    delete entry.apiKeyFile;
+    delete entry.apiKeyAgent;
+    delete entry.apiKeyAgentPath;
+    delete entry.apiKeyAgentProvider;
+    if (keyMode === "env") {
+      const env = get("apiKeyEnv") ? get("apiKeyEnv").value.trim() : "";
+      if (env) entry.apiKeyEnv = env;
+    } else if (keyMode === "file") {
+      const path = get("apiKeyAgentPath") ? get("apiKeyAgentPath").value.trim() : "";
+      if (path) {
+        entry.apiKeyAgent = "custom";
+        entry.apiKeyAgentPath = path;
+        const provider = get("apiKeyAgentProvider") ? get("apiKeyAgentProvider").value.trim() : "";
+        if (provider) entry.apiKeyAgentProvider = provider;
+      }
+    }
     const ccBox = (f) => {
       const el = cardEl.querySelector(`[data-field="${f}"]`);
       return el ? el.checked : undefined;
@@ -2839,13 +3105,17 @@ function renderPromptTable(rows) {
   tbody.innerHTML = rows.map((r) => {
     const session = r.session || "(无会话)";
     const preview = String(r.preview || "").replace(/\s+/g, " ").slice(0, 160);
+    const badges = [
+      r.truncated ? `<span class="badge warn">截断</span>` : "",
+      Number(r.redactions || 0) > 0 ? `<span class="badge">脱敏 ${fmtInt(r.redactions)}</span>` : "",
+    ].filter(Boolean).join(" ");
     return `<tr data-prompt-id="${esc(r.id)}">
       <td class="mono">${esc(fmtTime(r.ts, r.created_at))}</td>
       <td class="mono" title="${esc(session)}">${esc(session === "(无会话)" ? "（无会话）" : String(session).slice(0, 12))}</td>
       <td class="mono">${esc(r.requested_model || "—")}</td>
       <td class="num mono">${fmtInt(r.message_count)}</td>
       <td class="num mono">${fmtInt(r.size_bytes)}</td>
-      <td class="prompt-preview">${esc(preview || "（空）")}</td>
+      <td class="prompt-preview">${badges ? `<span class="prompt-badges">${badges}</span>` : ""}${esc(preview || "（空）")}</td>
       <td class="nowrap">
         <button type="button" class="ghost tiny" data-prompt-view="${esc(r.id)}">查看</button>
         <button type="button" class="ghost tiny" data-prompt-download="${esc(r.id)}">下载</button>
@@ -2868,10 +3138,43 @@ function promptContentText(message) {
   return JSON.stringify(content);
 }
 
+/// 整段内容为 JSON 对象/数组时自动缩进；普通文本原样返回。
+/// 只处理可完整解析的内容，截断后的 JSON 片段保持原文，避免误判。
+function formatJsonText(text) {
+  const raw = String(text == null ? "" : text);
+  const trimmed = raw.trim();
+  if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) {
+    return { text: raw, formatted: false };
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed === null || typeof parsed !== "object") {
+      return { text: raw, formatted: false };
+    }
+    return { text: JSON.stringify(parsed, null, 2), formatted: true };
+  } catch {
+    return { text: raw, formatted: false };
+  }
+}
+
 async function showPromptDetail(id) {
   try {
     const data = await api(`/api/prompts/${encodeURIComponent(id)}`);
     const messages = Array.isArray(data.messages) ? data.messages : [];
+    const truncation = data.truncation && typeof data.truncation === "object" ? data.truncation : null;
+    const headCount = truncation ? Number(truncation.head_messages || messages.length) : messages.length;
+    const tailStart = truncation ? Number(truncation.tail_start_index || messages.length) : messages.length;
+    const dropped = truncation ? Number(truncation.dropped_messages || 0) : 0;
+    const droppedChars = truncation ? Number(truncation.dropped_chars || 0) : 0;
+    const cutIndices = new Set(
+      truncation && Array.isArray(truncation.cuts)
+        ? truncation.cuts.map((c) => Number(c.original_index))
+        : [],
+    );
+    const roleCounts = data.role_counts && typeof data.role_counts === "object" ? data.role_counts : {};
+    const roleSummary = Object.entries(roleCounts)
+      .map(([k, v]) => `${esc(k)} ${fmtInt(v)}`)
+      .join(" · ") || "—";
     const meta = [
       ["记录 id", data.id],
       ["时间", fmtTime(data.ts, data.created_at)],
@@ -2880,26 +3183,119 @@ async function showPromptDetail(id) {
       ["上游", data.upstream || "—"],
       ["状态", data.status === null || data.status === undefined ? "—" : String(data.status)],
       ["消息数", String(data.message_count ?? messages.length)],
-      ["大小", fmtBytes(data.size_bytes)],
-      ["截断", data.truncated ? "是（按消息边界截断）" : "否"],
+      ["字符数", fmtInt(data.size_bytes)],
+      ["脱敏", `${fmtInt(data.redactions || 0)} 处`],
+      ["截断", data.truncated
+        ? `是（头尾保留；丢弃 ${fmtInt(dropped)} 条 / ${fmtInt(droppedChars)} 字符${cutIndices.size > 0 ? `；部分截断 ${fmtInt(cutIndices.size)} 条` : ""}）`
+        : "否"],
+      ["内容哈希", data.content_hash || "—"],
+      ["system 哈希", data.system_hash || "—"],
+      ["角色分布", roleSummary],
+      ["脱敏规则", `v${data.policy_version || 1}`],
     ];
     const metaHtml = `<div class="detail-grid">${meta.map(([k, v]) =>
       `<div class="detail-item"><span class="detail-key">${esc(k)}</span>` +
       `<span class="detail-val mono">${esc(v ?? "—")}</span></div>`).join("")}</div>`;
-    const messagesHtml = `<div class="prompt-messages">${messages.map((m, i) => {
+    const renderMessages = (expandAll) => messages.map((m, i) => {
       const role = m && m.role ? String(m.role) : "unknown";
-      const text = promptContentText(m);
-      return `<details class="prompt-msg"${i < 3 ? " open" : ""}>
+      const formatted = formatJsonText(promptContentText(m));
+      const text = formatted.text;
+      let originalIndex = i;
+      if (truncation && i >= headCount) {
+        originalIndex = tailStart + (i - headCount);
+      }
+      const isCut = cutIndices.has(originalIndex);
+      const open = expandAll ? " open" : (i < 3 ? " open" : "");
+      const truncationText = truncation
+        ? (dropped > 0
+          ? `中间省略 ${fmtInt(dropped)} 条消息 / ${fmtInt(droppedChars)} 字符（原 ${fmtInt(truncation.original_chars)} 字符，保留 ${fmtInt(truncation.kept_chars)} 字符）`
+          : (cutIndices.size > 0
+            ? `消息内容已按预算截断（原 ${fmtInt(truncation.original_chars)} 字符，保留 ${fmtInt(truncation.kept_chars)} 字符）`
+            : ""))
+        : "";
+      const divider = truncation && i === headCount - 1 && truncationText
+        ? `<div class="prompt-truncation">${truncationText}</div>`
+        : "";
+      return `<details class="prompt-msg"${open}>
         <summary><span class="badge">${esc(role)}</span> #${i + 1}
-          <span class="hint">${fmtInt(text.length)} 字符</span></summary>
+          ${formatted.formatted ? '<span class="badge info">JSON 已格式化</span>' : ""}
+          <span class="hint">${fmtInt(text.length)} 字符${isCut ? " · 已部分截断" : ""}</span></summary>
         <pre>${esc(text)}</pre>
-      </details>`;
-    }).join("") || '<div class="empty">该记录没有 messages</div>'}</div>`;
-    openModal({
+      </details>${divider}`;
+    }).join("") || '<div class="empty">该记录没有 messages</div>';
+    const cc = data.call_chain && typeof data.call_chain === "object" ? data.call_chain : {};
+    const usage = data.usage && typeof data.usage === "object" ? data.usage : {};
+    const session = data.session || "";
+    const toolPairs = Array.isArray(cc.pairs) ? cc.pairs : [];
+    const messagePreviews = Array.isArray(cc.message_previews) ? cc.message_previews : [];
+    const sequenceHtml = messagePreviews.length
+      ? `<div class="prompt-message-sequence"><span class="hint">消息序列</span>${messagePreviews
+          .filter((p) => p && p.role !== "_gap")
+          .map((p) => {
+            const tools = Array.isArray(p.tool_names) && p.tool_names.length
+              ? ` ${p.tool_names.map((name) => `[${name}]`).join("")}`
+              : "";
+            return `<span class="badge" title="${esc(String(p.preview || ""))}">#${Number(p.index) + 1} ${esc(p.role || "unknown")}${esc(tools)}</span>`;
+          })
+          .join("")}</div>`
+      : "";
+    const toolTable = toolPairs.length
+      ? `<table class="prompt-tool-table"><thead><tr><th>工具</th><th>参数</th><th>结果</th></tr></thead><tbody>${toolPairs.map((p) => {
+          const args = formatJsonText(p.arguments_preview || "");
+          const result = formatJsonText(p.result_preview || "");
+          return `
+        <tr>
+          <td class="mono">${esc(p.name || "—")}</td>
+          <td>${args.text ? `<pre class="prompt-tool-pre">${esc(args.text)}</pre>` : '<span class="hint">—</span>'}${args.formatted ? ' <span class="badge info">JSON</span>' : ""}</td>
+          <td>${p.has_result
+            ? `<span class="badge ok">已返回</span>${result.text ? `<pre class="prompt-tool-pre">${esc(result.text)}</pre>` : ""}${result.formatted ? ' <span class="badge info">JSON</span>' : ""}`
+            : '<span class="badge bad">无结果</span>'}</td>
+        </tr>`;
+        }).join("")}</tbody></table>`
+      : '<div class="empty">本次请求未调用工具</div>';
+    const usageRows = [
+      ["输入 token", usage.prompt_tokens],
+      ["输出 token", usage.completion_tokens],
+      ["缓存读", usage.cache_read_tokens],
+      ["缓存写", usage.cache_write_tokens],
+      ["总 token", usage.total_tokens],
+      ["耗时", usage.duration_ms !== null && usage.duration_ms !== undefined ? `${fmtInt(usage.duration_ms)} ms` : null],
+      ["首字延迟", usage.ttft_ms !== null && usage.ttft_ms !== undefined ? `${fmtInt(usage.ttft_ms)} ms` : null],
+      ["成本", usage.cost !== null && usage.cost !== undefined ? String(usage.cost) : null],
+      ["状态", usage.status !== null && usage.status !== undefined ? String(usage.status) : (data.status === null || data.status === undefined ? null : String(data.status))],
+      ["流式", usage.stream === null || usage.stream === undefined ? null : (usage.stream ? "是" : "否")],
+      ["错误", usage.error],
+      ["上游模型", usage.upstream_model],
+    ].filter(([, v]) => v !== null && v !== undefined && v !== "");
+    const usageHtml = usageRows.length
+      ? `<div class="detail-grid">${usageRows.map(([k, v]) =>
+          `<div class="detail-item"><span class="detail-key">${esc(k)}</span>` +
+          `<span class="detail-val mono">${esc(v)}</span></div>`).join("")}</div>`
+      : '<div class="empty">无关联用量记录</div>';
+    const chainHtml = `<div class="prompt-call-chain">
+      <h4>调用链</h4>
+      <div class="hint">角色序列：${esc((cc.role_sequence || []).join(" → ") || "—")}</div>
+      <div class="hint">assistant ${fmtInt(cc.assistant_turns || 0)} 轮 · user ${fmtInt(cc.user_turns || 0)} 轮 · tool ${fmtInt(cc.tool_turns || 0)} 轮 · 工具调用 ${fmtInt(cc.tool_call_count || 0)} · 结果 ${fmtInt(cc.tool_result_count || 0)} · 未匹配 ${fmtInt(cc.unmatched_tool_calls || 0)}</div>
+      ${cc.system_preview ? `<div class="hint">system：${esc(String(cc.system_preview).slice(0, 160))}</div>` : ""}
+      ${cc.last_user_preview ? `<div class="hint">最后 user：${esc(String(cc.last_user_preview).slice(0, 160))}</div>` : ""}
+      ${cc.last_assistant_preview ? `<div class="hint">最后 assistant：${esc(String(cc.last_assistant_preview).slice(0, 160))}</div>` : ""}
+      ${toolTable}
+    </div>`;
+    const usagePanelHtml = `<div class="prompt-usage-panel">
+      <h4>关联用量</h4>
+      ${usageHtml}
+    </div>`;
+    const body = `<div class="prompt-detail-toolbar">
+      <button type="button" class="ghost tiny" data-prompt-expand-all>全部展开</button>
+      <button type="button" class="ghost tiny" data-prompt-collapse-all>全部折叠</button>
+      ${data.neighbors && data.neighbors.prev ? `<button type="button" class="ghost tiny" data-prompt-diff-base="${esc(data.neighbors.prev.id)}" data-prompt-diff-target="${esc(id)}" data-prompt-diff-session="${esc(session)}">与上一条对比</button>` : ""}
+      ${session ? `<button type="button" class="ghost tiny" data-prompt-evolution="${esc(session)}">同会话演进</button>` : ""}
+    </div>` + metaHtml + sequenceHtml + chainHtml + usagePanelHtml + `<div class="prompt-messages">${renderMessages(false)}</div>`;
+    const root = openModal({
       title: "提示词详情",
-      hint: "只读；内容已在写入前按规则脱敏，不包含模型响应",
+      hint: "只读；内容已在写入前按规则脱敏，不包含模型响应；元数据不含消息原文",
       wide: true,
-      body: metaHtml + messagesHtml,
+      body,
       actions: [
         { label: "复制 JSON", onClick: () => { copyText(JSON.stringify(data, null, 2)); return true; } },
         { label: "下载 JSON", className: "primary", onClick: () => {
@@ -2907,6 +3303,44 @@ async function showPromptDetail(id) {
         } },
       ],
     });
+    if (root) {
+      const messagesHost = root.querySelector(".prompt-messages");
+      const expandAll = () => root.querySelectorAll(".prompt-msg").forEach((el) => el.setAttribute("open", ""));
+      const collapseAll = () => root.querySelectorAll(".prompt-msg").forEach((el) => el.removeAttribute("open"));
+      root.querySelectorAll("[data-prompt-expand-all]").forEach((b) => b.addEventListener("click", expandAll));
+      root.querySelectorAll("[data-prompt-collapse-all]").forEach((b) => b.addEventListener("click", collapseAll));
+      root.querySelectorAll("[data-prompt-diff-base]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const base = btn.dataset.promptDiffBase;
+          const target = btn.dataset.promptDiffTarget;
+          const s = btn.dataset.promptDiffSession;
+          closeModal();
+          state.prompt.session = s;
+          state.prompt.evolution.session = s;
+          switchTab("prompts");
+          setPromptView("evolution");
+          loadEvolution(s).then(() => {
+            const ev = state.prompt.evolution;
+            const ids = ev.rows.map((r) => r.id);
+            if (ids.includes(base)) ev.base = base;
+            if (ids.includes(target)) ev.target = target;
+            renderEvolutionTimeline();
+            if (ev.base && ev.target) loadPromptDiff();
+          });
+        });
+      });
+      root.querySelectorAll("[data-prompt-evolution]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const s = btn.dataset.promptEvolution;
+          closeModal();
+          state.prompt.session = s;
+          state.prompt.evolution.session = s;
+          switchTab("prompts");
+          setPromptView("evolution");
+          loadEvolution(s);
+        });
+      });
+    }
   } catch (err) {
     toast(`提示词详情加载失败：${err.message}`, true);
   }
@@ -2954,6 +3388,7 @@ async function loadEvolution(session) {
     if (!ev.target && ids.length >= 1) ev.target = ids[ids.length - 1];
     if (ids.length === 1) { ev.base = ids[0]; ev.target = ""; }
     renderEvolutionTimeline();
+    renderEvolutionTranscript();
     if (ev.base && ev.target) await loadPromptDiff();
     else {
       $("#evolution-stats").innerHTML = "";
@@ -2982,21 +3417,104 @@ function renderEvolutionTimeline() {
   }
   timeline.innerHTML = ev.rows.map((r, i) => {
     const summary = r.summary || {};
+    const cc = r.call_chain || {};
+    const usage = r.usage || {};
     const tag = r.id === ev.base ? '<span class="badge ok">基准</span>'
       : r.id === ev.target ? '<span class="badge bad">对比</span>' : "";
+    const badges = [
+      r.truncated ? '<span class="badge warn">截断</span>' : "",
+      Number(r.redactions || 0) > 0 ? `<span class="badge">脱敏 ${fmtInt(r.redactions)}</span>` : "",
+      Number(cc.tool_call_count || 0) > 0 ? `<span class="badge info">工具 ${fmtInt(cc.tool_call_count)}</span>` : "",
+    ].filter(Boolean).join("");
+    const tokenText = usage.total_tokens !== null && usage.total_tokens !== undefined
+      ? `${fmtInt(usage.total_tokens)} tok`
+      : `${fmtInt(summary.estimated_tokens || 0)} 估算`;
+    const durationText = usage.duration_ms !== null && usage.duration_ms !== undefined
+      ? `${fmtInt(usage.duration_ms)} ms`
+      : "";
+    const statusText = r.status === null || r.status === undefined ? "" : `状态 ${r.status}`;
+    const detail = `<span class="prompt-timeline-detail" data-evolution-detail="${esc(r.id)}" title="查看完整提示词">详情</span>`;
     return `<button type="button" class="prompt-timeline-row" data-evolution-id="${esc(r.id)}">
       <span class="prompt-timeline-no">#${i + 1}</span>
       <span class="prompt-timeline-main">
         <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
-        <span class="hint">${esc(r.requested_model || "—")} · ${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符</span>
-        <span class="hint">估算 ${fmtInt(summary.estimated_tokens)} token · system#${esc(summary.system_hash || "—")}</span>
-        <span class="prompt-timeline-preview">${esc(String(r.first_user || "").slice(0, 120) || "（无 user 消息）")}</span>
+        <span class="hint">${esc(r.requested_model || "—")} · ${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符${badges ? " · " + badges : ""}</span>
+        <span class="hint">估算 ${fmtInt(summary.estimated_tokens)} token · system#${esc(summary.system_hash || "—")} · ${tokenText}${durationText ? " · " + durationText : ""}${statusText ? " · " + statusText : ""}</span>
+        <span class="hint">角色：${esc((cc.role_sequence || []).join(" → ") || "—")}</span>
+        <span class="prompt-timeline-preview">首条 user：${esc(String(r.first_user || "").slice(0, 200) || "（无 user 消息）")}</span>
+        ${cc.system_preview ? `<span class="prompt-timeline-preview">system：${esc(String(cc.system_preview).slice(0, 160))}</span>` : ""}
+        ${cc.last_user_preview ? `<span class="prompt-timeline-preview">最后 user：${esc(String(cc.last_user_preview).slice(0, 160))}</span>` : ""}
       </span>
-      ${tag}
+      ${detail}${tag}
     </button>`;
   }).join("");
 }
 
+function renderEvolutionTranscript() {
+  const host = $("#evolution-transcript");
+  if (!host) return;
+  const ev = state.prompt.evolution;
+  if (!ev.rows.length) {
+    host.innerHTML = '<div class="empty">该会话暂无提示词记录</div>';
+    return;
+  }
+  host.innerHTML = ev.rows.map((r, i) => {
+    const summary = r.summary || {};
+    const cc = r.call_chain || {};
+    const usage = r.usage || {};
+    const prev = i > 0 ? ev.rows[i - 1] : null;
+    const deltaMessages = prev ? Number(r.message_count || 0) - Number(prev.message_count || 0) : null;
+    const deltaChars = prev ? Number(r.size_bytes || 0) - Number(prev.size_bytes || 0) : null;
+    const previews = Array.isArray(cc.message_previews) ? cc.message_previews : [];
+    const fallback = [];
+    fallback.push(`<div class="prompt-transcript-msg role-system"><strong>system</strong> · ${fmtInt((summary.system_chars || 0))} 字符 · #${esc(summary.system_hash || "—")}</div>`);
+    if (cc.last_user_preview) fallback.push(`<div class="prompt-transcript-msg role-user"><strong>user</strong> · ${esc(String(cc.last_user_preview).slice(0, 120))}</div>`);
+    if (cc.last_assistant_preview) fallback.push(`<div class="prompt-transcript-msg role-assistant"><strong>assistant</strong> · ${esc(String(cc.last_assistant_preview).slice(0, 120))}</div>`);
+    if (Array.isArray(cc.pairs) && cc.pairs.length) {
+      cc.pairs.forEach((p) => {
+        fallback.push(`<div class="prompt-transcript-msg role-tool"><strong>tool</strong> · ${esc(p.name || "—")} · ${p.has_result ? "已返回" : "无结果"}</div>`);
+      });
+    }
+    const renderPreview = (p) => {
+      if (!p || p.role === "_gap") {
+        return `<div class="prompt-transcript-msg role-gap"><strong>…</strong> ${esc(String((p && p.preview) || "中间消息已省略"))}</div>`;
+      }
+      const toolNames = Array.isArray(p.tool_names) && p.tool_names.length
+        ? ` <span class="badge">${esc(p.tool_names.join(", "))}</span>`
+        : "";
+      return `<div class="prompt-transcript-msg role-${esc(p.role || "unknown")}">
+        <span class="prompt-transcript-index">#${Number(p.index) + 1}</span>
+        <strong>${esc(p.role || "unknown")}</strong> · ${esc(String(p.preview || "").slice(0, 160))}${toolNames}
+        <span class="hint">${fmtInt(p.chars || 0)} 字符</span>
+      </div>`;
+    };
+    const messageHtml = previews.length
+      ? `<details class="prompt-transcript-details"${i === ev.rows.length - 1 ? " open" : ""}>
+          <summary>消息序列 ${fmtInt(previews.length)} 条</summary>
+          ${previews.map(renderPreview).join("")}
+        </details>`
+      : fallback.join("");
+    const tokenText = usage.total_tokens !== null && usage.total_tokens !== undefined ? `${fmtInt(usage.total_tokens)} tok` : `${fmtInt(summary.estimated_tokens || 0)} 估算`;
+    const durationText = usage.duration_ms !== null && usage.duration_ms !== undefined ? `${fmtInt(usage.duration_ms)} ms` : "";
+    const deltaText = deltaMessages === null
+      ? ""
+      : `上下文 ${deltaMessages >= 0 ? "+" : ""}${fmtInt(deltaMessages)} 条 / ${deltaChars >= 0 ? "+" : ""}${fmtInt(deltaChars)} 字符`;
+    return `<div class="prompt-transcript-row">
+      <div class="prompt-transcript-head">
+        <span class="prompt-timeline-no">#${i + 1}</span>
+        <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
+        <span class="hint">${esc(r.requested_model || "—")}</span>
+        <span class="hint">${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符</span>
+        ${deltaText ? `<span class="badge">${esc(deltaText)}</span>` : ""}
+        ${r.truncated ? '<span class="badge warn">截断</span>' : ""}
+        ${Number(r.redactions || 0) > 0 ? `<span class="badge">脱敏 ${fmtInt(r.redactions)}</span>` : ""}
+        <button type="button" class="ghost tiny prompt-transcript-detail" data-evolution-detail="${esc(r.id)}">查看提示词</button>
+      </div>
+      <div class="prompt-transcript-body">${messageHtml}</div>
+      <div class="hint">用量：${tokenText}${durationText ? " · " + durationText : ""} · system#${esc(summary.system_hash || "—")}</div>
+    </div>`;
+  }).join("");
+}
 async function loadPromptDiff() {
   const ev = state.prompt.evolution;
   if (!ev.base || !ev.target) return;
@@ -3201,6 +3719,11 @@ function initPromptControls() {
   if (evRefresh) evRefresh.addEventListener("click", () => loadEvolution(state.prompt.evolution.session));
   const timeline = $("#evolution-timeline");
   if (timeline) timeline.addEventListener("click", (ev) => {
+    const detail = ev.target.closest("[data-evolution-detail]");
+    if (detail) {
+      showPromptDetail(detail.dataset.evolutionDetail);
+      return;
+    }
     const row = ev.target.closest("[data-evolution-id]");
     if (!row) return;
     const id = row.dataset.evolutionId;
@@ -3222,6 +3745,12 @@ function initPromptControls() {
       $("#evolution-insights").textContent = "选择基准与对比记录后展示差异";
       $("#evolution-pair").textContent = "—";
     }
+  });
+  const transcript = $("#evolution-transcript");
+  if (transcript) transcript.addEventListener("click", (ev) => {
+    const detail = ev.target.closest("[data-evolution-detail]");
+    if (!detail) return;
+    showPromptDetail(detail.dataset.evolutionDetail);
   });
 }
 
@@ -4826,11 +5355,11 @@ const CONFIG_HELP_TOP_FIELDS = [
 ];
 
 const CONFIG_HELP_UPSTREAM_FIELDS = [
-  ["protocol", "string", "openai", "上游协议：openai / anthropic / deepseek / opencode / commandcode 等"],
-  ["baseUrl", "string", "—", "上游地址（一般带 /v1 后缀）"],
-  ["apiKeyEnv", "string", "—", "密钥的环境变量名（推荐；不要写明文密钥）"],
-  ["apiKeyFile", "string", "—", "从文件读密钥的路径（自己指定才有默认值）"],
-  ["apiKeyAgent", "string", "—", "从 agent 客户端取密钥：opencode / jcode / commandcode / custom"],
+  ["protocol", "string", "openai", "wire 协议：openai / anthropic / commandcode；deepseek/opencode 是兼容预设（compat.profile），不是 protocol"],
+  ["baseUrl", "string", "—", "上游地址（一般带 /v1 后缀；选择预设会自动填充）"],
+  ["apiKeyEnv", "string", "—", "密钥环境变量名（面板「密钥来源」选环境变量时使用；只存变量名）"],
+  ["apiKeyFile", "string", "—", "旧字段：从 JSON 根字段 apiKey 读密钥；面板已归入「凭据文件」来源"],
+  ["apiKeyAgent", "string", "—", "旧字段：custom 时配合 apiKeyAgentPath/Provider 读取 JSON 点路径或 .env；面板已归入「凭据文件」来源"],
   ["default", "boolean", "false", "是否兜底上游；都没标时取第一条"],
   ["models", "string[]", "—", "该上游提供的模型清单（面板可「查询清单」自动写入）"],
   ["modelMap", "object", "{}", "模型映射：对外名 → 上游真实名"],

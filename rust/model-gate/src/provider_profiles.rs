@@ -142,6 +142,10 @@ pub fn profiles_meta() -> Vec<Value> {
                 "id": pid,
                 "label": entry.get("label").and_then(Value::as_str).unwrap_or(pid),
                 "description": entry.get("description").and_then(Value::as_str).unwrap_or(""),
+                "priority": entry.get("priority").and_then(Value::as_u64).unwrap_or(0),
+                "protocols": entry.get("protocols").cloned().unwrap_or_else(|| json!([])),
+                "access": entry.get("access").cloned().unwrap_or(Value::Null),
+                "detect": entry.get("detect").cloned().unwrap_or(Value::Null),
                 "capabilities": caps.to_json(),
             })
         })
@@ -324,6 +328,17 @@ mod tests {
                 assert!(row["capabilities"].get(key).is_some(), "缺少能力字段 {key}");
             }
         }
+        let deepseek = meta
+            .iter()
+            .find(|v| v["id"] == "deepseek")
+            .expect("deepseek 元数据");
+        assert_eq!(deepseek["access"]["baseUrl"], "https://api.deepseek.com/v1");
+        assert_eq!(deepseek["access"]["apiKeyEnv"], "DEEPSEEK_API_KEY");
+        assert!(deepseek["access"]["defaultModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "deepseek-chat"));
         assert!(is_known_profile("deepseek"));
         assert!(!is_known_profile("mystery"));
     }

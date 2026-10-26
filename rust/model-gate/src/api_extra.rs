@@ -262,7 +262,16 @@ pub async fn prompts_list(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
 
 pub async fn prompt_detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.db.get_prompt(&id) {
-        Some(value) => Json(value).into_response(),
+        Some(mut value) => {
+            value["neighbors"] = state.db.prompt_neighbors(&id);
+            let messages = value
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            value["call_chain"] = crate::prompt::summarize_call_chain(&messages);
+            Json(value).into_response()
+        }
         None => error_json(
             StatusCode::NOT_FOUND,
             "提示词记录不存在",
@@ -384,6 +393,7 @@ fn prompt_timeline_row(state: &AppState, id: &str) -> Option<Value> {
     let mut row = value.clone();
     row.as_object_mut()?.remove("messages");
     row["summary"] = crate::prompt::summarize_messages(&messages);
+    row["call_chain"] = crate::prompt::summarize_call_chain(&messages);
     row["first_user"] = crate::prompt::content_text(
         messages
             .iter()

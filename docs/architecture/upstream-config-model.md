@@ -11,7 +11,7 @@
 自上而下：后者覆盖前者。
 
 ```
-provider_profiles.json（唯一数据源，五套预设）
+provider_profiles.json（唯一数据源，当前 14 套预设）
         │ 按 profile 判定加载
         ▼
 profile compat 默认值
@@ -67,8 +67,9 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 
 合并顺序：`openai 基线 compat` → 目标 profile `compat` → 目标 profile 对应协议 `variants`。
 
-五套预设：`openai`（基线）、`opencode`（会话头）、`anthropic`（双写鉴权 + 思考回传 + messages 端点）、
-`deepseek`（思考回传 + 384K/1M 上限，含 anthropic 变体）、`commandcode`（会话头 + ZDR + CLI 头 + 64K 上限）。
+当前 14 套预设：`openai`（基线）、`opencode`（会话头）、`anthropic`（双写鉴权 + 思考回传 + messages 端点）、
+`deepseek`（思考回传 + 384K/1M 上限，含 anthropic 变体）、`commandcode`（会话头 + ZDR + CLI 头 + 64K 上限），
+以及 Moonshot / 智谱 / MiniMax / DashScope / Ark / SiliconFlow / ModelScope / 混元 / Kilo 等供应商预设。
 
 ## 4. 模型级覆盖 `modelOverrides`
 
@@ -233,6 +234,9 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 ## 9. 面板行为
 
 - 预设下拉改读 `config.profiles`（缺失时回退现有硬编码，兼容旧后端）；当前 `compat.profile` 不在列表时追加显示；
+- 预设选择器前置到新增/编辑流程开头，按 `priority` 排序并展示 `description`；选择后按「只填空字段」自动填充 `protocol` / `baseUrl` / `apiKeyEnv` / `defaultModels`，冲突时保留用户值并提供「套用预设」显式覆盖；
+- 密钥来源改为互斥三选一（环境变量 / 凭据文件 / 暂不配置），只展开选中组；保存时只保留选中来源，避免旧字段继续生效造成「选了却没生效」；
+- 新增只读「当前生效」实时预览（`POST /api/config/preview`，改动 `baseUrl` / `profile` / `protocol` 后防抖刷新），保存后仍以服务端 `effective` 为准；
 - 高级区新增「模型级覆盖（JSON）」文本域，保存前 `JSON.parse` 校验对象结构；非法时阻止保存并提示；
 - 新增只读「能力」徽标与「生效值」摘要（profile、上游 limits、模型覆盖条数）；
 - 保存沿用未知字段保留策略；`modelOverrides` 与既有字段一样参与 `collectConfig`。

@@ -48,7 +48,13 @@ CREATE TABLE IF NOT EXISTS prompt_records (
     size_bytes      INTEGER NOT NULL DEFAULT 0,
     truncated       INTEGER NOT NULL DEFAULT 0,
     preview         TEXT,
-    messages        TEXT NOT NULL
+    messages        TEXT NOT NULL,
+    redactions      INTEGER NOT NULL DEFAULT 0,
+    truncation      TEXT,
+    content_hash    TEXT,
+    system_hash     TEXT,
+    role_counts     TEXT,
+    policy_version  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_ts      ON prompt_records(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_prompt_session ON prompt_records(session);
@@ -63,6 +69,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("usage_records", "cost REAL NOT NULL DEFAULT 0"),
     ("usage_records", "session TEXT"),
     ("usage_records", "ttft_ms INTEGER NOT NULL DEFAULT 0"),
+    ("prompt_records", "redactions INTEGER NOT NULL DEFAULT 0"),
+    ("prompt_records", "truncation TEXT"),
+    ("prompt_records", "content_hash TEXT"),
+    ("prompt_records", "system_hash TEXT"),
+    ("prompt_records", "role_counts TEXT"),
+    ("prompt_records", "policy_version INTEGER NOT NULL DEFAULT 0"),
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -113,6 +125,18 @@ pub struct PromptRecord {
     pub preview: String,
     /// 入站 messages 的 JSON 数组字符串。
     pub messages: String,
+    /// 写入前脱敏命中的次数；只记录计数，不记录命中的原文。
+    pub redactions: i64,
+    /// 截断元数据 JSON（策略、丢弃数量、头尾边界、被截断消息索引）。
+    pub truncation: Option<String>,
+    /// 脱敏后完整 messages 的 SHA-256 前 16 位。
+    pub content_hash: String,
+    /// system 消息的稳定摘要。
+    pub system_hash: String,
+    /// 角色分布 JSON。
+    pub role_counts: String,
+    /// 脱敏规则版本。
+    pub policy_version: i64,
 }
 
 /// 提示词查询条件；与用量 `Filters` 分开，避免把 LIKE 条件带进用量查询。
@@ -256,8 +280,9 @@ impl Db {
                 let mut stmt = tx.prepare(
                     "INSERT INTO prompt_records (
                         id, ts, created_at, session, requested_model,
-                        message_count, size_bytes, truncated, preview, messages
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                        message_count, size_bytes, truncated, preview, messages,
+                        redactions, truncation, content_hash, system_hash, role_counts, policy_version
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 )?;
                 for r in records {
                     let id = if r.id.is_empty() {
@@ -281,6 +306,12 @@ impl Db {
                         r.truncated as i64,
                         r.preview.as_str(),
                         r.messages.as_str(),
+                        r.redactions,
+                        r.truncation.as_deref(),
+                        r.content_hash.as_str(),
+                        r.system_hash.as_str(),
+                        r.role_counts.as_str(),
+                        r.policy_version,
                     ])?;
                 }
             }
@@ -321,9 +352,11 @@ impl Db {
             String::new()
         };
         let sql = format!(
-            "SELECT p.id, p.ts, p.created_at, p.session, p.requested_model, \
-             u.upstream, u.protocol, u.status, p.message_count, p.size_bytes, \
-             p.truncated, p.preview \
+            "SELECT p.* , u.upstream, u.protocol, u.status, \
+             u.prompt_tokens, u.completion_tokens, u.cache_read_tokens, \
+             u.cache_write_tokens, u.total_tokens, u.duration_ms, u.ttft_ms, \
+             u.stream, u.paused, u.error, u.cost, u.upstream_model, \
+             u.truncated AS usage_truncated \
              FROM prompt_records p LEFT JOIN usage_records u ON u.id = p.id{where_sql} \
              ORDER BY {column} {direction}{tie} LIMIT ? OFFSET ?"
         );
@@ -340,7 +373,10 @@ impl Db {
         query_args.push(SqlValue::Integer(offset.max(0)));
         stmt.query_map(params_from_iter(query_args.iter()), prompt_row_json)
             .map(|rows| rows.flatten().collect())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                eprintln!("export_prompts error: {e}");
+                Vec::new()
+            })
     }
 
     pub fn count_prompts(&self, f: &PromptFilters) -> i64 {
@@ -359,7 +395,9 @@ impl Db {
 
     pub fn get_prompt(&self, id: &str) -> Option<Value> {
         let conn = self.reader();
-        let sql = "SELECT p.*, u.upstream, u.protocol, u.status \
+        let sql = "SELECT p.*, u.upstream, u.protocol, u.status, \
+                   u.prompt_tokens, u.completion_tokens, u.cache_read_tokens, \
+                   u.cache_write_tokens, u.duration_ms, u.ttft_ms, u.total_tokens \
                    FROM prompt_records p LEFT JOIN usage_records u ON u.id = p.id \
                    WHERE p.id = ?1";
         let mut stmt = conn.prepare(sql).ok()?;
@@ -374,10 +412,68 @@ impl Db {
         Some(value)
     }
 
+    /// 同会话中按时间相邻的记录，用于详情页直接发起进化对比。
+    /// 只返回定位信息，不返回消息内容。
+    pub fn prompt_neighbors(&self, id: &str) -> Value {
+        let conn = self.reader();
+        let Ok((session, ts, rowid)) = conn.query_row(
+            "SELECT session, ts, rowid FROM prompt_records WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        ) else {
+            return json!({"prev": null, "next": null});
+        };
+        let Some(session) = session else {
+            // 无会话记录无法可靠判断相邻关系，宁可不提供快捷对比。
+            return json!({"prev": null, "next": null});
+        };
+        let prev = conn
+            .query_row(
+                "SELECT id, ts, created_at FROM prompt_records
+                 WHERE session = ?1 AND (ts < ?2 OR (ts = ?2 AND rowid < ?3))
+                 ORDER BY ts DESC, rowid DESC LIMIT 1",
+                rusqlite::params![session.as_str(), ts, rowid],
+                |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "created_at": r.get::<_, String>(2)?,
+                    }))
+                },
+            )
+            .ok();
+        let next = conn
+            .query_row(
+                "SELECT id, ts, created_at FROM prompt_records
+                 WHERE session = ?1 AND (ts > ?2 OR (ts = ?2 AND rowid > ?3))
+                 ORDER BY ts ASC, rowid ASC LIMIT 1",
+                rusqlite::params![session.as_str(), ts, rowid],
+                |r| {
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "ts": r.get::<_, i64>(1)?,
+                        "created_at": r.get::<_, String>(2)?,
+                    }))
+                },
+            )
+            .ok();
+        json!({"prev": prev, "next": next})
+    }
+
     pub fn export_prompts(&self, f: &PromptFilters, limit: i64) -> Vec<Value> {
         let (where_sql, args) = prompt_where_clause(f);
         let sql = format!(
-            "SELECT p.*, u.upstream, u.protocol, u.status \
+            "SELECT p.*, u.upstream, u.protocol, u.status, \
+             u.prompt_tokens, u.completion_tokens, u.cache_read_tokens, \
+             u.cache_write_tokens, u.total_tokens, u.duration_ms, u.ttft_ms, \
+             u.stream, u.paused, u.error, u.cost, u.upstream_model, \
+             u.truncated AS usage_truncated \
              FROM prompt_records p LEFT JOIN usage_records u ON u.id = p.id{where_sql} \
              ORDER BY p.ts ASC, p.rowid ASC LIMIT ?"
         );
@@ -445,16 +541,33 @@ impl Db {
     pub fn prompt_count_and_size(&self) -> Value {
         let conn = self.reader();
         conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM prompt_records",
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0),
+                    COALESCE(SUM(CASE WHEN truncated != 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN redactions > 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(redactions), 0),
+                    COALESCE(MAX(size_bytes), 0),
+                    COALESCE(CAST(AVG(size_bytes) AS INTEGER), 0)
+             FROM prompt_records",
             [],
             |r| {
                 Ok(json!({
                     "records": r.get::<_, i64>(0)?,
                     "bytes": r.get::<_, i64>(1)?,
+                    "truncated": r.get::<_, i64>(2)?,
+                    "redacted_records": r.get::<_, i64>(3)?,
+                    "redactions": r.get::<_, i64>(4)?,
+                    "max_bytes": r.get::<_, i64>(5)?,
+                    "avg_bytes": r.get::<_, i64>(6)?,
                 }))
             },
         )
-        .unwrap_or_else(|_| json!({"records": 0, "bytes": 0}))
+        .unwrap_or_else(|_| {
+            json!({
+                "records": 0, "bytes": 0, "truncated": 0,
+                "redacted_records": 0, "redactions": 0,
+                "max_bytes": 0, "avg_bytes": 0,
+            })
+        })
     }
 
     /// 提示词页的筛选项：只取非空值，避免把 `(无会话)` 当作可选会话。
@@ -965,6 +1078,13 @@ fn prompt_where_clause(f: &PromptFilters) -> (String, Vec<SqlValue>) {
 
 fn prompt_row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let truncated: i64 = row.get("truncated")?;
+    let truncation: Option<Value> = row
+        .get::<_, Option<String>>("truncation")?
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let role_counts: Value = row
+        .get::<_, Option<String>>("role_counts")?
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
     Ok(json!({
         "id": row.get::<_, String>("id")?,
         "ts": row.get::<_, i64>("ts")?,
@@ -978,6 +1098,21 @@ fn prompt_row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "size_bytes": row.get::<_, i64>("size_bytes")?,
         "truncated": truncated != 0,
         "preview": row.get::<_, Option<String>>("preview")?,
+        "redactions": row.get::<_, i64>("redactions")?,
+        "truncation": truncation,
+        "content_hash": row.get::<_, Option<String>>("content_hash")?,
+        "system_hash": row.get::<_, Option<String>>("system_hash")?,
+        "role_counts": role_counts,
+        "policy_version": row.get::<_, i64>("policy_version")?,
+        "usage": {
+            "prompt_tokens": row.get::<_, Option<i64>>("prompt_tokens")?,
+            "completion_tokens": row.get::<_, Option<i64>>("completion_tokens")?,
+            "cache_read_tokens": row.get::<_, Option<i64>>("cache_read_tokens")?,
+            "cache_write_tokens": row.get::<_, Option<i64>>("cache_write_tokens")?,
+            "total_tokens": row.get::<_, Option<i64>>("total_tokens")?,
+            "duration_ms": row.get::<_, Option<i64>>("duration_ms")?,
+            "ttft_ms": row.get::<_, Option<i64>>("ttft_ms")?,
+        }
     }))
 }
 
@@ -1215,6 +1350,98 @@ mod tests {
         let stats = db.today_stats();
         assert_eq!(stats["requests"].as_i64(), Some(0));
         assert!(stats["cache_hit_rate"].is_null());
+    }
+
+    #[test]
+    fn legacy_prompt_database_migrates_without_data_loss() {
+        let dir = std::env::temp_dir().join(format!("mg-db-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("modelgate.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE usage_records (
+                    id TEXT PRIMARY KEY, ts INTEGER NOT NULL, created_at TEXT NOT NULL,
+                    upstream TEXT, protocol TEXT, requested_model TEXT, upstream_model TEXT,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    status INTEGER, stream INTEGER NOT NULL DEFAULT 0,
+                    truncated INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0,
+                    error TEXT, cost REAL NOT NULL DEFAULT 0, session TEXT
+                );
+                CREATE TABLE prompt_records (
+                    id TEXT PRIMARY KEY, ts INTEGER NOT NULL, created_at TEXT NOT NULL,
+                    session TEXT, requested_model TEXT, message_count INTEGER NOT NULL DEFAULT 0,
+                    size_bytes INTEGER NOT NULL DEFAULT 0, truncated INTEGER NOT NULL DEFAULT 0,
+                    preview TEXT, messages TEXT NOT NULL
+                );
+                INSERT INTO usage_records (
+                    id, ts, created_at, upstream, requested_model, prompt_tokens,
+                    completion_tokens, total_tokens, status, session
+                ) VALUES (
+                    'old-usage', 1700000000, '2023-11-14T00:00:00.000+08:00',
+                    'legacy', 'm', 10, 2, 12, 200, 'legacy-session'
+                );
+                INSERT INTO prompt_records (
+                    id, ts, created_at, session, requested_model, message_count,
+                    size_bytes, truncated, preview, messages
+                ) VALUES (
+                    'old-prompt', 1700000000, '2023-11-14T00:00:00.000+08:00',
+                    'legacy-session', 'm', 1, 25, 0, 'hello',
+                    '[{"role":"user","content":"hello"}]'
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        {
+            let conn = db.write.lock().unwrap();
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA table_info(prompt_records)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .flatten()
+                .collect();
+            for column in [
+                "redactions",
+                "truncation",
+                "content_hash",
+                "system_hash",
+                "role_counts",
+                "policy_version",
+            ] {
+                assert!(
+                    columns.iter().any(|name| name == column),
+                    "迁移后缺少列 {column}"
+                );
+            }
+        }
+
+        let old = db.get_prompt("old-prompt").expect("旧提示词记录必须保留");
+        assert_eq!(old["messages"][0]["content"], "hello");
+        assert_eq!(old["redactions"], 0);
+        assert!(old["truncation"].is_null());
+        assert_eq!(old["role_counts"], json!({}));
+        assert_eq!(old["policy_version"], 0);
+
+        let rows = db.list_prompts(&PromptFilters::default(), 10, 0, "ts", "desc");
+        assert_eq!(rows.len(), 1, "旧记录必须仍可列出");
+        assert_eq!(rows[0]["id"], "old-prompt");
+
+        db.record_prompt(&sample_prompt("new-prompt", "m", "legacy-session", "new"));
+        let new = db.get_prompt("new-prompt").expect("迁移后必须能写新记录");
+        assert_eq!(new["messages"][0]["content"], "new");
+
+        let neighbors = db.prompt_neighbors("old-prompt");
+        assert_eq!(neighbors["next"]["id"], "new-prompt");
     }
 
     #[test]

@@ -1671,6 +1671,14 @@ fn parse_prompt_record(job: &PromptJob) -> Option<PromptRecord> {
         truncated: encoded.truncated,
         preview: encoded.preview,
         messages: encoded.messages,
+        redactions: encoded.redactions as i64,
+        truncation: encoded
+            .truncation
+            .and_then(|v| serde_json::to_string(&v).ok()),
+        content_hash: encoded.content_hash,
+        system_hash: encoded.system_hash,
+        role_counts: encoded.role_counts,
+        policy_version: crate::prompt::REDACTION_POLICY_VERSION,
     })
 }
 

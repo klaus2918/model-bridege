@@ -9,6 +9,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://platform.openai.com/docs"
+      },
       "detect": {
         "baseUrlContains": []
       },
@@ -65,6 +72,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://opencode.ai/zen/v1",
+        "apiKeyEnv": "",
+        "defaultModels": [],
+        "docsUrl": "https://opencode.ai/docs/zen/"
+      },
       "detect": {
         "baseUrlContains": [
           "opencode.ai"
@@ -90,6 +104,13 @@
       "protocols": [
         "anthropic"
       ],
+      "access": {
+        "protocol": "anthropic",
+        "baseUrl": "https://api.anthropic.com",
+        "apiKeyEnv": "ANTHROPIC_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://docs.anthropic.com"
+      },
       "detect": {
         "baseUrlContains": []
       },
@@ -133,6 +154,16 @@
         "openai",
         "anthropic"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api.deepseek.com/v1",
+        "apiKeyEnv": "DEEPSEEK_API_KEY",
+        "defaultModels": [
+          "deepseek-chat",
+          "deepseek-reasoner"
+        ],
+        "docsUrl": "https://api-docs.deepseek.com"
+      },
       "detect": {
         "baseUrlContains": [
           "api.deepseek.com"
@@ -185,6 +216,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api.moonshot.cn/v1",
+        "apiKeyEnv": "MOONSHOT_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://platform.moonshot.cn/docs"
+      },
       "detect": {
         "baseUrlContains": [
           "api.moonshot.cn",
@@ -218,6 +256,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+        "apiKeyEnv": "ZHIPU_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://open.bigmodel.cn/dev/api"
+      },
       "detect": {
         "baseUrlContains": [
           "open.bigmodel.cn",
@@ -251,6 +296,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api.minimax.chat/v1",
+        "apiKeyEnv": "MINIMAX_API_KEY",
+        "defaultModels": [],
+        "docsUrl": ""
+      },
       "detect": {
         "baseUrlContains": [
           "api.minimax.chat",
@@ -284,6 +336,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "apiKeyEnv": "DASHSCOPE_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://help.aliyun.com/zh/model-studio/"
+      },
       "detect": {
         "baseUrlContains": [
           "dashscope.aliyuncs.com",
@@ -317,6 +376,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+        "apiKeyEnv": "ARK_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://www.volcengine.com/docs/82379"
+      },
       "detect": {
         "baseUrlContains": [
           "ark.cn-beijing.volces.com",
@@ -350,6 +416,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api.siliconflow.cn/v1",
+        "apiKeyEnv": "SILICONFLOW_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://docs.siliconflow.cn"
+      },
       "detect": {
         "baseUrlContains": [
           "api.siliconflow.cn",
@@ -383,6 +456,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api-inference.modelscope.cn/v1",
+        "apiKeyEnv": "MODELSCOPE_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://www.modelscope.cn/docs"
+      },
       "detect": {
         "baseUrlContains": [
           "api-inference.modelscope.cn"
@@ -415,6 +495,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api.hunyuan.cloud.tencent.com/v1",
+        "apiKeyEnv": "HUNYUAN_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://cloud.tencent.com/document/product/1729"
+      },
       "detect": {
         "baseUrlContains": [
           "api.hunyuan.cloud.tencent.com"
@@ -447,6 +534,13 @@
       "protocols": [
         "commandcode"
       ],
+      "access": {
+        "protocol": "commandcode",
+        "baseUrl": "https://api.commandcode.ai",
+        "apiKeyEnv": "COMMAND_CODE_API_KEY",
+        "defaultModels": [],
+        "docsUrl": "https://commandcode.ai/docs"
+      },
       "detect": {
         "baseUrlContains": [
           "commandcode.ai"
@@ -500,6 +594,13 @@
       "protocols": [
         "openai"
       ],
+      "access": {
+        "protocol": "openai",
+        "baseUrl": "https://api.kilo.ai/api/openrouter",
+        "apiKeyEnv": "",
+        "defaultModels": [],
+        "docsUrl": "https://kilo.ai/docs"
+      },
       "detect": {
         "baseUrlContains": [
           "api.kilo.ai",
