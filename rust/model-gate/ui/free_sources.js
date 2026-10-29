@@ -33,10 +33,51 @@ function freePrivacyBanner(source) {
   </div>`;
 }
 
+/* 来源卡的折叠状态：已接入默认展开、未接入默认收起；手动切换记进 localStorage */
+const FREE_COLLAPSE_KEY = "mg-free-collapsed";
+function freeCollapseMap() {
+  try {
+    return JSON.parse(localStorage.getItem(FREE_COLLAPSE_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+function saveFreeCollapse(id, collapsed) {
+  const map = freeCollapseMap();
+  map[id] = collapsed;
+  try { localStorage.setItem(FREE_COLLAPSE_KEY, JSON.stringify(map)); } catch { /* 忽略 */ }
+}
+function isSourceCollapsed(id, configured) {
+  const map = freeCollapseMap();
+  if (typeof map[id] === "boolean") return map[id];
+  return !configured;
+}
+
+/* 顶部概览：来源数、接入数、探测水位 —— 一行看全当前态势 */
+function renderFreeSummary() {
+  const el = $("#free-summary");
+  if (!el) return;
+  const sources = state.free.sources || [];
+  const configured = sources.filter((s) => s.configured).length;
+  let candidates = 0;
+  let available = 0;
+  sources.forEach((s) => {
+    const lv = state.free.level[s.id] || {};
+    candidates += Number(lv.candidates || 0);
+    available += Number(lv.available || 0);
+  });
+  el.innerHTML = [
+    ["来源", fmtInt(sources.length)],
+    ["已接入", fmtInt(configured)],
+    ["已探测可用", candidates ? `${fmtInt(available)} / ${fmtInt(candidates)}` : "未探测"],
+  ].map(([k, v]) => `<span class="ev-stat-chip">${esc(k)}<b>${esc(v)}</b></span>`).join("");
+}
+
 function renderFreeSources() {
   const box = $("#free-sources");
   if (!box) return;
   const sources = state.free.sources || [];
+  renderFreeSummary();
   if (!sources.length) {
     box.innerHTML = '<div class="empty">没有可用的免费来源</div>';
     return;
@@ -46,53 +87,71 @@ function renderFreeSources() {
     const ratio = Number(level.ratio || 0);
     const available = Number(level.available || 0);
     const candidates = Number(level.candidates || 0);
-    const levelText = candidates
-      ? `鱼缸水位 ${ratio}%（${available}/${candidates} 可用）`
-      : "尚未探测";
-    const levelTone = !candidates ? "" : (ratio >= 60 ? "ok" : (ratio >= 30 ? "warn" : "bad"));
     const configured = s.configured;
-    const actions = configured
-      ? `<button class="ghost" data-free-act="catalog" data-source="${esc(s.id)}">查看模型</button>`
-      : `<button class="primary" data-free-act="attach" data-source="${esc(s.id)}">一键接入</button>`;
+    const collapsed = isSourceCollapsed(s.id, configured);
     const transportNote = s.transport
       ? `客户端指纹：${esc(s.transport)}`
       : "标准 OpenAI 兼容端点";
-    return `<div class="box free-source-card">
-      <div class="box-head">
+    const levelBadge = candidates
+      ? `<span class="badge ${ratio >= 60 ? "ok" : ratio >= 30 ? "warn" : "bad"}"
+           title="鱼缸水位：探测可用模型占比">水位 ${fmtInt(ratio)}% · ${fmtInt(available)}/${fmtInt(candidates)}</span>`
+      : '<span class="badge">未探测</span>';
+    const stateBadge = configured
+      ? '<span class="badge ok">已接入</span>'
+      : '<span class="badge">未接入</span>';
+    return `<div class="box free-source-card${collapsed ? " free-collapsed" : ""}" data-free-card="${esc(s.id)}">
+      <div class="box-head free-card-head" data-free-toggle="${esc(s.id)}" role="button" tabindex="0"
+        title="点击展开/收起来源详情" aria-expanded="${collapsed ? "false" : "true"}">
         <h2>${esc(s.label)}</h2>
-        <span class="hint">${esc(s.id)} · ${esc(transportNote)}</span>
+        ${stateBadge}${levelBadge}
+        <span class="hint">${esc(s.id)} · ${transportNote}</span>
+        <span class="ev-caret" aria-hidden="true">▾</span>
       </div>
-      <div class="grid grid-2">
-        <div class="detail-item">
-          <span class="detail-key">端点</span>
-          <span class="detail-val mono">${esc(s.baseUrl || "")}</span>
+      <div class="free-card-body">
+        <div class="grid grid-2">
+          <div class="detail-item">
+            <span class="detail-key">端点</span>
+            <span class="detail-val mono">${esc(s.baseUrl || "")}</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-key">鉴权</span>
+            <span class="detail-val">免密（${esc(s.auth || "none")}）</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-key">状态</span>
+            <span class="detail-val">${configured
+              ? `<span class="badge ok">已接入</span> 已声明 ${fmtInt(s.declaredModels || 0)} 个模型`
+              : `<span class="badge">未接入</span>`}</span>
+          </div>
+          <div class="detail-item">
+            <span class="detail-key">可用性</span>
+            <span class="detail-val">${candidates
+              ? `<span class="badge ${ratio >= 60 ? "ok" : ratio >= 30 ? "warn" : "bad"}">鱼缸水位 ${fmtInt(ratio)}%（${fmtInt(available)}/${fmtInt(candidates)} 可用）</span>`
+              : '<span class="hint">尚未探测</span>'}</span>
+          </div>
         </div>
-        <div class="detail-item">
-          <span class="detail-key">鉴权</span>
-          <span class="detail-val">免密（${esc(s.auth || "none")}）</span>
+        ${freePrivacyBanner(s)}
+        <div class="actions">
+          ${configured
+            ? `<button class="ghost" data-free-act="catalog" data-source="${esc(s.id)}">查看模型</button>`
+            : `<button class="primary" data-free-act="attach" data-source="${esc(s.id)}">一键接入</button>`}
+          <button class="ghost" data-free-act="probe-all" data-source="${esc(s.id)}"
+            title="对全部候选模型逐个发一次真实对话，会消耗免费额度">全部探测</button>
+          <a class="ghost" href="${esc(s.docsUrl || "#")}" target="_blank" rel="noreferrer">官方文档</a>
         </div>
-        <div class="detail-item">
-          <span class="detail-key">状态</span>
-          <span class="detail-val">${configured
-            ? `<span class="badge ok">已接入</span> 已声明 ${fmtInt(s.declaredModels || 0)} 个模型`
-            : `<span class="badge">未接入</span>`}</span>
-        </div>
-        <div class="detail-item">
-          <span class="detail-key">可用性</span>
-          <span class="detail-val">${levelTone
-            ? `<span class="badge ${levelTone}">${esc(levelText)}</span>`
-            : `<span class="hint">${esc(levelText)}</span>`}</span>
-        </div>
-      </div>
-      ${freePrivacyBanner(s)}
-      <div class="actions">
-        ${actions}
-        <button class="ghost" data-free-act="probe-all" data-source="${esc(s.id)}"
-          title="对全部候选模型逐个发一次真实对话，会消耗免费额度">全部探测</button>
-        <a class="ghost" href="${esc(s.docsUrl || "#")}" target="_blank" rel="noreferrer">官方文档</a>
       </div>
     </div>`;
   }).join("");
+}
+
+function toggleFreeCard(id, force) {
+  const card = document.querySelector(`[data-free-card="${CSS.escape(id)}"]`);
+  if (!card) return;
+  const collapsed = force !== undefined ? force : !card.classList.contains("free-collapsed");
+  card.classList.toggle("free-collapsed", collapsed);
+  const head = card.querySelector("[data-free-toggle]");
+  if (head) head.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  saveFreeCollapse(id, collapsed);
 }
 
 function renderFreeModelTable() {
@@ -102,14 +161,17 @@ function renderFreeModelTable() {
   const results = state.free.results || {};
   if (!models.length) {
     tbody.innerHTML = '<tr><td colspan="7" class="empty">还没有模型清单</td></tr>';
+    const hint = $("#free-model-hint");
+    if (hint) hint.textContent = "—";
     return;
   }
   // 分组顺序：可用 → 疑似 → 暂时不可用 → 地区受限 → 明确不可用
   const order = ["available", "suspect", "transient", "region", "unavailable"];
+  const filter = state.free.filter || "";
   const rows = models.map((m) => {
     const r = results[m.id] || {};
     return { m, r, state: r.state || "" };
-  });
+  }).filter((x) => !filter || x.state === filter);
   rows.sort((a, b) => {
     const oa = order.indexOf(a.state);
     const ob = order.indexOf(b.state);
@@ -119,30 +181,35 @@ function renderFreeModelTable() {
     return String(a.m.id).localeCompare(String(b.m.id));
   });
 
-  tbody.innerHTML = rows.map(({ m, r, state }) => {
-    const efforts = (m.reasoningEfforts || []).join(" / ");
-    const privacy = m.mayTrainOnYourPrompts === true
-      ? `<span class="badge bad" title="上游可能用你的提示词训练">会记录提示词</span>`
-      : (m.mayTrainOnYourPromosts === true ? `<span class="badge bad">会记录提示词</span>` : "");
-    const reason = r.reasonCode
-      ? `<div><b>${esc(r.reasonLabel || r.reasonCode)}</b>：${esc(r.advice || "")}</div>
-         <div class="hint">${esc((r.raw || "").slice(0, 160))}</div>`
-      : `<span class="hint">${esc(r.probedAt ? "探测于 " + r.probedAt : "未探测")}</span>`;
-    const globalBtn = `<button class="ghost tiny" data-free-act="globalize"
-      data-model="${esc(m.id)}" title="把这个模型加入对外模型清单（会写进顶层 models）">加入全局清单</button>`;
-    const probeBtn = `<button class="ghost tiny" data-free-act="probe-one"
-      data-model="${esc(m.id)}" title="对这一个模型发一次真实对话（消耗免费额度）">探测</button>`;
-    return `<tr>
-      <td><div class="up-name">${esc(m.id)}</div>
-          <div class="hint">${esc(m.name || "")} ${privacy}</div></td>
-      <td>${freeStateBadge(state)}</td>
-      <td class="num">${m.contextLength ? fmtInt(m.contextLength) : "—"}</td>
-      <td>${efforts ? esc(efforts) : "—"}</td>
-      <td class="num">${r.latencyMs ? fmtInt(r.latencyMs) + "ms" : "—"}</td>
-      <td>${reason}</td>
-      <td>${probeBtn} ${globalBtn}</td>
-    </tr>`;
-  }).join("");
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">${
+      filter ? "该状态下暂无模型" : "暂无模型"}</td></tr>`;
+  } else {
+    tbody.innerHTML = rows.map(({ m, r, state }) => {
+      const efforts = (m.reasoningEfforts || []).join(" / ");
+      const privacy = m.mayTrainOnYourPrompts === true
+        ? `<span class="badge bad" title="上游可能用你的提示词训练">会记录提示词</span>`
+        : (m.mayTrainOnYourPromosts === true ? `<span class="badge bad">会记录提示词</span>` : "");
+      const reason = r.reasonCode
+        ? `<div><b>${esc(r.reasonLabel || r.reasonCode)}</b>：${esc(r.advice || "")}</div>
+           <div class="hint">${esc((r.raw || "").slice(0, 160))}</div>`
+        : `<span class="hint">${esc(r.probedAt ? "探测于 " + r.probedAt : "未探测")}</span>`;
+      const globalBtn = `<button class="ghost tiny" data-free-act="globalize"
+        data-model="${esc(m.id)}" title="把这个模型加入对外模型清单（会写进顶层 models）">加入全局清单</button>`;
+      const probeBtn = `<button class="ghost tiny" data-free-act="probe-one"
+        data-model="${esc(m.id)}" title="对这一个模型发一次真实对话（消耗免费额度）">探测</button>`;
+      return `<tr>
+        <td><div class="up-name">${esc(m.id)}</div>
+            <div class="hint">${esc(m.name || "")} ${privacy}</div></td>
+        <td>${freeStateBadge(state)}</td>
+        <td class="num">${m.contextLength ? fmtInt(m.contextLength) : "—"}</td>
+        <td>${efforts ? esc(efforts) : "—"}</td>
+        <td class="num">${r.latencyMs ? fmtInt(r.latencyMs) + "ms" : "—"}</td>
+        <td>${reason}</td>
+        <td>${probeBtn} ${globalBtn}</td>
+      </tr>`;
+    }).join("");
+  }
 
   const hint = $("#free-model-hint");
   if (hint) {
@@ -150,7 +217,8 @@ function renderFreeModelTable() {
     const available = rows.filter((x) => x.state === "available").length;
     const transient = rows.filter((x) => x.state === "transient").length;
     const unavailable = rows.filter((x) => x.state === "unavailable").length;
-    hint.textContent = `共 ${fmtInt(total)} 个候选 · 可用 ${available} · 暂时不可用 ${transient} · 明确不可用 ${unavailable}`;
+    const scope = filter ? `（已筛选，共 ${fmtInt(total)} 个候选）` : "";
+    hint.textContent = `共 ${fmtInt(rows.length)} 个${scope} · 可用 ${available} · 暂时不可用 ${transient} · 明确不可用 ${unavailable}`;
   }
 }
 
@@ -307,13 +375,41 @@ function initFreeActions() {
     });
   }
 
+  const filterSeg = $("#free-model-filter");
+  if (filterSeg) filterSeg.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-state]");
+    if (!btn) return;
+    state.free.filter = btn.dataset.state || "";
+    filterSeg.querySelectorAll("button").forEach((b) =>
+      b.classList.toggle("active", b === btn));
+    renderFreeModelTable();
+  });
+
+  // 卡片头点击折叠/展开；点按钮或链接时不触发
+  const toggle = (target) => {
+    const head = target.closest("[data-free-toggle]");
+    if (!head) return;
+    if (target.closest("[data-free-act], a, button")) return;
+    toggleFreeCard(head.dataset.freeToggle);
+    return true;
+  };
+  document.addEventListener("click", (ev) => { toggle(ev.target); });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    if (toggle(ev.target)) ev.preventDefault();
+  });
+
   document.addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-free-act]");
     if (!btn) return;
     const act = btn.dataset.freeAct;
     const source = btn.dataset.source || state.free.source;
     if (act === "attach") { attachFreeSource(source); return; }
-    if (act === "catalog") { loadFreeCatalog(source); return; }
+    if (act === "catalog") {
+      toggleFreeCard(source, false);
+      loadFreeCatalog(source);
+      return;
+    }
     if (act === "probe-all") { probeAllFreeModels(source); return; }
     if (act === "probe-one") { probeFreeModel(source, btn.dataset.model); return; }
     if (act === "globalize") { globalizeFreeModel(btn.dataset.model); return; }

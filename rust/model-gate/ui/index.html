@@ -228,6 +228,8 @@
         <label class="check"><input type="checkbox" name="accessLog"> 访问日志</label>
         <label class="check"><input type="checkbox" name="thinkingPassthrough">
           thinking 回传（多轮会话必需）</label>
+        <label class="check" title="默认隐藏；勾选并保存后，导航栏才会出现「免费来源」页签">
+          <input type="checkbox" name="freeSourcesPanel"> 显示「免费来源」页签</label>
       </div>
 
       <div class="section-head" id="config-prompt"><h2>提示词记录</h2></div>
@@ -320,14 +322,22 @@
   <!-- ══════════ 用量 ══════════ -->
   <section class="panel" id="panel-usage">
     <div class="toolbar">
-      <div class="seg" id="range-seg">
-        <button data-range="today" title="今天 00:00 至今">今天</button>
-        <button data-range="1h">1 小时</button>
-        <button data-range="24h" class="active">24 小时</button>
-        <button data-range="7d">7 天</button>
-        <button data-range="30d">30 天</button>
-        <button data-range="all">全部</button>
-      </div>
+      <label class="inline-field" title="KPI / 趋势 / 分布 / 明细统一跟随此范围">范围
+        <select id="scope-range" class="filter-select">
+          <option value="today">今日</option>
+          <option value="yesterday">昨日</option>
+          <option value="24h">24 小时</option>
+          <option value="3d">3 天</option>
+          <option value="7d">7 天</option>
+          <option value="30d">30 天</option>
+          <option value="all">全部</option>
+          <option value="custom">自定义…</option>
+        </select>
+      </label>
+      <button type="button" class="range-trigger" id="scope-range-btn" hidden
+        title="自定义时间区间（优先于范围预设）；点击重新调整">
+        <span class="range-trigger-text mono">—</span><span class="range-caret" aria-hidden="true">▾</span>
+      </button>
       <label class="inline-field" title="页面内所有统计按此上游收窄">上游
         <select id="scope-upstream" class="filter-select"></select>
       </label>
@@ -336,12 +346,6 @@
       </label>
       <label class="inline-field" title="按会话收窄：KPI / 趋势 / 分布 / 明细统一跟随">会话
         <select id="scope-session" class="filter-select"></select>
-      </label>
-      <label class="inline-field" title="自定义时间区间，优先于左侧预设">从
-        <input type="datetime-local" id="scope-from" class="filter-input">
-      </label>
-      <label class="inline-field">到
-        <input type="datetime-local" id="scope-to" class="filter-input">
       </label>
       <button class="ghost" id="scope-clear" title="清除上游/模型/自定义时间">清除筛选</button>
       <span class="hint" id="scope-hint">KPI / 趋势 / 分布 / 明细统一跟随此作用域</span>
@@ -443,6 +447,7 @@
       <div class="box-head">
         <h2>会话统计</h2>
         <div class="section-actions">
+          <input type="search" id="session-usage-search" class="filter-input" placeholder="搜索会话 id" title="按会话 id 过滤下方列表（本地即时过滤）">
           <select id="session-usage-sort" class="filter-select">
             <option value="last_ts">按最近活跃</option>
             <option value="requests">按请求数</option>
@@ -472,7 +477,7 @@
           <tbody></tbody>
         </table>
       </div>
-      <div class="hint" id="session-usage-hint">点击会话行收窄整页统计；同一会话的请求与提示词可关联查看</div>
+      <div class="hint" id="session-usage-hint">点击会话行收窄整页统计；再次点击同一会话行或「清除会话筛选」可收起详情、回到完整列表</div>
     </div>
 
     <div class="box" id="session-detail" hidden>
@@ -603,14 +608,22 @@
         <button data-view="list" class="active">提示词列表</button>
         <button data-view="evolution">会话演进</button>
       </div>
-      <div class="seg" id="prompt-range-seg">
-        <button data-range="today">今天</button>
-        <button data-range="1h">1 小时</button>
-        <button data-range="24h">24 小时</button>
-        <button data-range="7d" class="active">7 天</button>
-        <button data-range="30d">30 天</button>
-        <button data-range="all">全部</button>
-      </div>
+      <label class="inline-field">范围
+        <select id="prompt-range" class="filter-select">
+          <option value="today">今日</option>
+          <option value="yesterday">昨日</option>
+          <option value="24h">24 小时</option>
+          <option value="3d">3 天</option>
+          <option value="7d">7 天</option>
+          <option value="30d">30 天</option>
+          <option value="all">全部</option>
+          <option value="custom">自定义…</option>
+        </select>
+      </label>
+      <button type="button" class="range-trigger" id="prompt-range-btn" hidden
+        title="自定义时间区间（优先于范围预设）；点击重新调整">
+        <span class="range-trigger-text mono">—</span><span class="range-caret" aria-hidden="true">▾</span>
+      </button>
       <label class="inline-field">模型
         <select id="prompt-model" class="filter-select"></select>
       </label>
@@ -620,7 +633,8 @@
       <input type="search" id="prompt-q" class="filter-input" placeholder="搜索提示词内容">
       <button class="ghost" id="prompt-refresh">刷新</button>
       <button class="ghost" id="export-prompts-jsonl" title="导出当前筛选的提示词（JSONL，已脱敏）">导出 JSONL</button>
-      <button class="ghost" id="clear-prompts" title="清空当前筛选区间的提示词记录">清空</button>
+      <button class="ghost" id="clear-prompts" title="清空当前筛选区间的提示词记录（完成后自动回收磁盘空间）">清空</button>
+      <button class="ghost" id="vacuum-prompts" title="删除记录后 SQLite 不会自动缩小文件；此操作整理数据库文件、归还空闲空间，GB 级库可能耗时较久">回收空间</button>
       <span class="hint" id="prompt-hint">—</span>
     </div>
 
@@ -662,56 +676,99 @@
         <label class="inline-field">会话
           <select id="evolution-session" class="filter-select"></select>
         </label>
-        <label class="inline-field">角色
-          <select id="evolution-role" class="filter-select">
-            <option value="">全部角色</option>
-            <option value="system">system</option>
-            <option value="user">user</option>
-            <option value="assistant">assistant</option>
-            <option value="tool">tool</option>
-          </select>
-        </label>
-        <label class="inline-field"><input type="checkbox" id="evolution-only-diff"> 仅看差异</label>
-        <button class="ghost" id="evolution-refresh">加载时间轴</button>
-        <span class="hint" id="evolution-hint">在同一会话内选择两次请求进行对比；全部为本地算法，不调用任何模型</span>
+        <button class="ghost" id="evolution-refresh">刷新</button>
+        <span class="hint" id="evolution-hint">默认对比最近两轮；点行展开该轮消息序列，点「基准 / 对比」任选两条记录；全部为本地算法，不调用任何模型</span>
       </div>
-      <div class="split-2">
+      <div class="ev-compare-bar" id="evolution-compare-bar">
+        <div class="ev-compare-main">
+          <span class="ev-compare-label">对比</span>
+          <span class="ev-compare-node is-base" id="evolution-compare-base">—</span>
+          <span class="ev-compare-arrow">→</span>
+          <span class="ev-compare-node is-target" id="evolution-compare-target">—</span>
+          <span class="ev-compare-delta mono" id="evolution-compare-delta" hidden></span>
+        </div>
+        <div class="ev-compare-actions">
+          <button type="button" class="ghost tiny" id="evolution-prev-pair" title="基准与对比同时前移一轮">‹ 上一轮</button>
+          <button type="button" class="ghost tiny" id="evolution-next-pair" title="基准与对比同时后移一轮">下一轮 ›</button>
+          <span class="hint" id="evolution-pair">—</span>
+          <a class="ghost tiny" id="download-diff" href="#" download>下载 diff</a>
+        </div>
+      </div>
+      <div class="split-2 ev-split">
         <div class="box">
           <div class="box-head"><h2>请求时间轴</h2><span class="hint" id="evolution-count">—</span></div>
           <div id="evolution-timeline" class="prompt-timeline"></div>
+          <div class="hint" style="margin-top: 8px;">点行展开消息序列 · 每行可设为「基准 / 对比」· 行间徽标显示与上一轮的差异</div>
         </div>
         <div class="box">
-          <div class="box-head"><h2>差异概览</h2><span class="hint">规则统计</span></div>
-          <div class="legend" id="evolution-stats"></div>
+          <div class="box-head">
+            <h2>差异分析</h2>
+            <div class="section-actions">
+              <label class="inline-field">角色
+                <select id="evolution-role" class="filter-select">
+                  <option value="">全部角色</option>
+                  <option value="system">system</option>
+                  <option value="user">user</option>
+                  <option value="assistant">assistant</option>
+                  <option value="tool">tool</option>
+                </select>
+              </label>
+              <label class="inline-field" title="只显示有变化的消息；未变消息折叠隐藏"><input type="checkbox" id="evolution-only-diff" checked> 仅看差异</label>
+            </div>
+          </div>
+          <div class="ev-stat-chips" id="evolution-stats"></div>
           <div id="evolution-insights" class="hint"></div>
+          <div class="ev-diff-nav" id="evolution-diff-nav" hidden>
+            <span class="hint" id="evolution-diff-count">—</span>
+            <button type="button" class="ghost tiny" id="evolution-diff-prev">上一处</button>
+            <button type="button" class="ghost tiny" id="evolution-diff-next">下一处</button>
+          </div>
+          <div id="prompt-diff" class="prompt-diff"></div>
         </div>
       </div>
-      <div class="box">
+      <div class="box" id="evolution-tool-box">
         <div class="box-head">
-          <h2>会话流程</h2>
-          <span class="hint">按时间顺序回放每轮请求：消息演进、工具调用与用量</span>
-        </div>
-        <div id="evolution-transcript" class="prompt-transcript"></div>
-      </div>
-      <div class="box">
-        <div class="box-head">
-          <h2>差异明细</h2>
+          <h2>工具执行评估</h2>
+          <span class="hint" id="evolution-tool-meta">—</span>
           <div class="section-actions">
-            <span class="hint" id="evolution-pair">—</span>
-            <a class="ghost tiny" id="download-diff" href="#" download>下载 diff</a>
+            <button type="button" class="ghost tiny" id="copy-tool-report" title="复制 Markdown 评估报告（会话信息 + 工具画像 + 问题与建议），可直接发给 agent 做工具调用改进">复制评估报告</button>
           </div>
         </div>
-        <div id="prompt-diff" class="prompt-diff"></div>
+        <div class="ev-stat-chips" id="evolution-session-chips"></div>
+        <div id="evolution-tool-findings" class="ev-findings"></div>
+        <div class="table-wrap">
+          <table id="evolution-tool-table" class="sortable-table">
+            <thead><tr>
+              <th>工具</th>
+              <th class="num">调用</th>
+              <th class="num">未匹配</th>
+              <th class="num">重复调用</th>
+              <th class="num">结果消息</th>
+              <th class="num">结果字符合计</th>
+              <th class="num">单次最大</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <details class="fold" id="evolution-report-fold">
+          <summary>
+            <span class="fold-title">评估报告（Markdown）</span>
+            <span class="hint">会话信息 + 工具画像 + 问题清单 + 优化建议；复制后可直接投喂给 agent 复盘</span>
+          </summary>
+          <pre id="evolution-tool-report" class="cfg-help-code"></pre>
+        </details>
       </div>
     </div>
   </section>
 
-  <!-- ══════════ 免费来源 ══════════ -->
+  <!-- ══════════ 免费来源（配置开启 freeSourcesPanel 后显示） ══════════ -->
   <section class="panel" id="panel-free">
     <div class="toolbar">
       <span class="hint" id="free-hint">免密来源：无需账号、无需 API Key。先「一键接入」，再「探测」看此刻哪些模型真的能用。</span>
       <button class="ghost" id="free-refresh">刷新</button>
     </div>
+
+    <div class="ev-stat-chips" id="free-summary"></div>
 
     <div id="free-sources" class="free-source-list"></div>
 
@@ -721,6 +778,12 @@
         <span class="hint" id="free-models-meta">—</span>
       </div>
       <div class="toolbar">
+        <div class="seg" id="free-model-filter">
+          <button data-state="" class="active">全部</button>
+          <button data-state="available">可用</button>
+          <button data-state="transient">暂时不可用</button>
+          <button data-state="unavailable">明确不可用</button>
+        </div>
         <button class="primary" id="free-probe-all" title="对全部候选模型逐个发一次真实对话，会消耗免费额度">全部探测</button>
         <span class="hint" id="free-probe-hint">探测会真实调用上游，消耗免费额度；限流中的模型会自动退避跳过。</span>
       </div>

@@ -424,6 +424,15 @@ async function main() {
   });
 
   for (const tab of tabs) {
+    // 免费来源等面板由配置控制可见性（默认隐藏）；隐藏页签不参与点击遍历，
+    // 其「配置开启后可见」的契约在下面的专项用例中验证。
+    const hiddenByDefault = await evaluate(
+      `document.querySelector('[data-tab="${tab}"]')?.hidden === true`,
+    );
+    if (hiddenByDefault) {
+      await check(`页签默认隐藏（配置开启后显示）：${tab}`, async () => "hidden");
+      continue;
+    }
     await check(`页签可切换：${tab}`, async () => {
       await click(`[data-tab="${tab}"]`);
       await sleep(220);
@@ -595,56 +604,72 @@ async function main() {
         8000,
         "演进时间轴",
       );
-      const transcript = await evaluate(`document.querySelectorAll("#evolution-transcript .prompt-transcript-row").length`);
-      if (transcript < 2) throw new Error(`会话流程行数不足：${transcript}`);
-      const previews = await evaluate(`document.querySelectorAll("#evolution-transcript .prompt-transcript-details").length`);
-      const messageRows = await evaluate(`document.querySelectorAll("#evolution-transcript .prompt-transcript-msg").length`);
-      if (previews < 2) throw new Error(`消息序列折叠块不足：${previews}`);
-      if (messageRows < 5) throw new Error(`消息预览行数不足：${messageRows}`);
-      const transcriptText = await evaluate(`document.querySelector("#evolution-transcript").textContent`);
-      if (!transcriptText.includes("上下文 +") && !transcriptText.includes("上下文 -")) {
-        throw new Error("未显示相邻请求的上下文增量");
+      // 默认已选最近两轮为基准/对比，差异明细应自动加载
+      await waitFor(
+        () => evaluate(`document.querySelector("#prompt-diff").textContent.trim().length > 0`),
+        8000,
+        "差异明细（默认对比最近两轮）",
+      );
+      const barText = await evaluate(`document.querySelector("#evolution-compare-bar").textContent`);
+      if (!barText.includes("基准 #") || !barText.includes("对比 #")) {
+        throw new Error(`对比条缺少基准/对比标记：${barText.slice(0, 80)}`);
       }
       const timelineText = await evaluate(`document.querySelector("#evolution-timeline").textContent`);
-      for (const label of ["首条 user：", "system：", "最后 user："]) {
-        if (!timelineText.includes(label)) throw new Error(`时间轴缺少具体信息：${label}`);
+      for (const label of ["首条 user：", "字符", "基准", "对比", "详情"]) {
+        if (!timelineText.includes(label)) throw new Error(`时间轴缺少关键信息：${label}`);
       }
+      // 点行展开消息序列（原「会话流程」面板已合并进行内展开）
       const ids = await evaluate(
         `Array.from(document.querySelectorAll("#evolution-timeline [data-evolution-id]")).map((e) => e.dataset.evolutionId)`,
       );
       await click(`[data-evolution-id="${ids[0]}"]`);
-      await click(`[data-evolution-id="${ids[ids.length - 1]}"]`);
       await waitFor(
-        () => evaluate(`document.querySelector("#prompt-diff").textContent.trim().length > 0`),
-        8000,
-        "差异明细",
+        () => evaluate(`document.querySelectorAll("#evolution-timeline .expanded .prompt-transcript-msg").length >= 5`),
+        5000,
+        "行内消息序列",
       );
-      return `timeline=${ids.length}, transcript=${transcript}`;
+      const expanded = await evaluate(
+        `document.querySelectorAll("#evolution-timeline .expanded .prompt-transcript-msg").length`,
+      );
+      // 槽位切换：把第一轮设为对比对象，差异应按新基准/对比刷新
+      await click(`[data-evolution-id="${ids[0]}"] [data-evolution-slot="target"]`);
+      await waitFor(
+        () => evaluate(`document.querySelector("#evolution-pair").textContent.includes("对比 #1")`),
+        8000,
+        "槽位切换后差异刷新",
+      );
+      // 工具执行评估：会话概览 chips + 可复制的 Markdown 报告
+      const toolChips = await evaluate(
+        `document.querySelectorAll("#evolution-session-chips .ev-stat-chip").length`,
+      );
+      if (toolChips < 5) throw new Error(`会话概览 chips 不足：${toolChips}`);
+      const reportLen = await evaluate(`document.querySelector("#evolution-tool-report").textContent.length`);
+      if (reportLen < 200) throw new Error(`评估报告过短：${reportLen}`);
+      const toolRows = await evaluate(
+        `document.querySelectorAll("#evolution-tool-table tbody tr").length`,
+      );
+      if (toolRows < 1) throw new Error("工具画像表为空");
+      return `timeline=${ids.length}, expandedMsgs=${expanded}, report=${reportLen}`;
     });
 
     await check("会话演进可查看完整提示词", async () => {
-      const selectors = [
-        "#evolution-timeline [data-evolution-detail]",
-        "#evolution-transcript [data-evolution-detail]",
-      ];
-      for (const selector of selectors) {
-        await click(selector);
-        try {
-          await waitFor(
-            () => evaluate(`!document.querySelector("#modal-root").hidden && !!document.querySelector(".prompt-messages")`),
-            5000,
-            "演进详情弹窗",
-          );
-        } catch (error) {
-          const toastText = await evaluate(`document.querySelector("#toast")?.textContent || ""`);
-          throw new Error(`${error.message}${toastText ? `；toast=${toastText}` : ""}`);
-        }
-        if (await evaluate(`!document.querySelector("#modal-root").hidden`)) {
-          await click("[data-modal-close]");
-          await waitFor(() => evaluate(`document.querySelector("#modal-root").hidden`), 3000, "详情弹窗关闭");
-        }
+      const selector = "#evolution-timeline [data-evolution-detail]";
+      await click(selector);
+      try {
+        await waitFor(
+          () => evaluate(`!document.querySelector("#modal-root").hidden && !!document.querySelector(".prompt-messages")`),
+          5000,
+          "演进详情弹窗",
+        );
+      } catch (error) {
+        const toastText = await evaluate(`document.querySelector("#toast")?.textContent || ""`);
+        throw new Error(`${error.message}${toastText ? `；toast=${toastText}` : ""}`);
       }
-      return "时间轴与流程均提供详情入口";
+      if (await evaluate(`!document.querySelector("#modal-root").hidden`)) {
+        await click("[data-modal-close]");
+        await waitFor(() => evaluate(`document.querySelector("#modal-root").hidden`), 3000, "详情弹窗关闭");
+      }
+      return "时间轴提供详情入口";
     });
   }
 
@@ -677,10 +702,31 @@ async function main() {
     return "usage-table 可见";
   });
 
-  await check("免费来源页基础元素", async () => {
+  await check("免费来源页默认隐藏，配置开启后可见", async () => {
+    if (!(await evaluate(`document.querySelector('[data-tab="free"]')?.hidden === true`))) {
+      throw new Error("免费来源页签默认应为隐藏（freeSourcesPanel 未开启）");
+    }
+    // 走配置接口开启面板开关（与面板「显示『免费来源』页签」同一字段），再刷新页面
+    await evaluate(`(async () => {
+      const res = await fetch("/api/config");
+      const data = await res.json();
+      const config = { ...(data.config || {}), freeSourcesPanel: true };
+      await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config }),
+      });
+    })()`);
+    await cdp.send("Page.navigate", { url: pageUrl });
+    await sleep(1200);
+    await waitFor(
+      () => evaluate(`document.querySelector('[data-tab="free"]')?.hidden === false`),
+      5000,
+      "免费来源页签出现",
+    );
     await click('[data-tab="free"]');
     await waitFor(() => isVisible("#free-sources"), 3000, "免费来源列表");
-    return "free-sources 可见";
+    return "开启后 free-sources 可见";
   });
 
   await check("提示词页最终无 JS 异常", async () => {

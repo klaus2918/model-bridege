@@ -16,7 +16,7 @@ const state = {
   effective: [],
   upstreams: [],
   health: {},
-  range: "24h",
+  range: "today",
   group: "day",
   trendMetric: "total_tokens",
   pieKind: "model",
@@ -56,7 +56,9 @@ const state = {
   // 提示词页：列表 / 会话演进共享筛选与选中记录，避免切换视图后丢上下文
   prompt: {
     view: "list",
-    range: "7d",
+    range: "today",
+    // 自定义时间区间（datetime-local 值）；非空时优先于 range 预设
+    custom: { from: "", to: "" },
     model: "",
     session: "",
     q: "",
@@ -66,7 +68,7 @@ const state = {
     stats: { records: 0, bytes: 0 },
     facets: { models: [], sessions: [] },
     expanded: "",
-    evolution: { session: "", role: "", onlyDiff: false, rows: [], base: "", target: "", diff: null },
+    evolution: { session: "", role: "", onlyDiff: true, rows: [], base: "", target: "", diff: null, expanded: {}, diffNav: null },
   },
   // 概览页的上游表：完整数据、无分页，排序与展开都在前端即可
   overview: { sortKey: "name", sortDir: "asc", expanded: "" },
@@ -83,7 +85,7 @@ const state = {
   // confirmInstall 为「安装并重启」的弹窗内二次确认态。
   update: { status: null, busy: false, timer: null, notesOpen: false, confirmInstall: false },
   // 免费来源页：来源清单、当前来源、候选模型、探测结果、各来源水位
-  free: { sources: [], states: [], source: "", models: [], results: {}, level: {} },
+  free: { sources: [], states: [], source: "", models: [], results: {}, level: {}, filter: "" },
 };
 
 /* ── 弹窗：维护类操作统一走对话框，不再用原生 confirm ─────────── */
@@ -343,21 +345,29 @@ function costExtra(pricing) {
 function copyText(text) {
   const done = () => toast(`已复制 ${text}`);
   const fail = () => toast("复制失败，请手动选择复制", true);
+  // execCommand 降级：clipboard API 被权限策略拒绝时仍尽量完成复制
+  const copyViaExec = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  };
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(done, fail);
+    navigator.clipboard.writeText(text).then(done, () => {
+      if (copyViaExec()) done(); else fail();
+    });
     return;
   }
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
-    done();
-  } catch (_) {
-    fail();
-  }
+  if (copyViaExec()) done(); else fail();
 }
 
 /* ── 页签 ──────────────────────────────────────────────── */
@@ -1941,6 +1951,7 @@ async function loadConfig() {
       .map(([k, v]) => `${k} = ${v}`).join("\n");
     f.accessLog.checked = state.config.accessLog !== false;
     f.promptCapture.checked = state.config.promptCapture === true;
+    f.freeSourcesPanel.checked = state.config.freeSourcesPanel === true;
     f.promptRetentionDays.value = state.config.promptRetentionDays ?? 7;
     f.promptMaxRecords.value = state.config.promptMaxRecords ?? 5000;
     f.promptMaxChars.value = state.config.promptMaxChars ?? 100000;
@@ -1948,6 +1959,7 @@ async function loadConfig() {
       !state.config.thinking || state.config.thinking.passthrough !== false;
     renderUpstreamEditor();
     setConfigDirty(false);
+    applyPanelVisibility();
     state.autoFixNotes = [];
     state.serverDiagnostics = data.diagnostics || [];
     renderConfigIssues(serverIssues(state.serverDiagnostics));
@@ -1957,6 +1969,17 @@ async function loadConfig() {
     $("#config-hint").classList.remove("err");
   } catch (err) {
     toast(`配置加载失败：${err.message}`, true);
+  }
+}
+
+/* 面板可见性：免费来源默认隐藏，配置开启（freeSourcesPanel）后导航才显示 */
+function applyPanelVisibility() {
+  const enabled = !!(state.config && state.config.freeSourcesPanel === true);
+  const btn = document.querySelector('.tab-btn[data-tab="free"]');
+  if (btn) btn.hidden = !enabled;
+  // 正停在免费来源页时被关闭：退回概览，避免看着一个被隐藏的页面
+  if (!enabled && document.querySelector(".panel.active")?.id === "panel-free") {
+    switchTab("overview");
   }
 }
 
@@ -2033,6 +2056,7 @@ function collectConfig() {
   cfg.aliases = parseAliases(f.aliases.value);
   cfg.accessLog = f.accessLog.checked;
   cfg.promptCapture = f.promptCapture.checked;
+  cfg.freeSourcesPanel = f.freeSourcesPanel.checked;
   cfg.promptRetentionDays = num(f.promptRetentionDays, 7, "提示词保留天数", 0);
   cfg.promptMaxRecords = num(f.promptMaxRecords, 5000, "提示词保留条数", 0);
   cfg.promptMaxChars = num(f.promptMaxChars, 100000, "单条提示词最大字符数", 1000);
@@ -2518,6 +2542,7 @@ function initConfigActions() {
     f.modelsCacheSeconds.value = 300;
     f.retentionDays.value = 0;
     f.promptCapture.checked = false;
+    f.freeSourcesPanel.checked = false;
     f.promptRetentionDays.value = 7;
     f.promptMaxRecords.value = 5000;
     f.promptMaxChars.value = 100000;
@@ -2562,6 +2587,248 @@ function initConfigActions() {
 }
 
 /* ── 用量 ──────────────────────────────────────────────── */
+/* 预设范围的展示名：确认弹窗等文案里给用户可读的区间 */
+const RANGE_LABELS = {
+  today: "今日", yesterday: "昨日", "1h": "1 小时", "24h": "24 小时",
+  "3d": "3 天", "7d": "7 天", "30d": "30 天", all: "全部",
+};
+function rangeLabel(v) { return RANGE_LABELS[v] || v; }
+
+/* 时间范围控件：预设下拉 + 自定义「双月历范围选择器」。
+ * 自定义区间在弹层内一次选完（点起点 → 点终点，支持跨月与悬停预览，
+ * 底部可微调时刻），按「确定」才生效；「清除」回退到预设；
+ * 「取消」/ Esc / 点击弹层外部直接关闭，不做任何修改。 */
+function bindRangeDropdown(opts) {
+  const select = $(opts.select);
+  const trigger = $(opts.trigger);
+  if (!select || !trigger) return null;
+
+  let pop = null;    // 打开中的弹层（每次打开重建）
+  let draft = null;  // { start, end: Date|null, fromTime, toTime: "HH:mm" }
+  let view = null;   // 弹层左月 { y, m }
+
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const toLocal = (d) =>
+    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const dateOnly = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const sameDay = (a, b) => !!a && !!b
+    && a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  const fmtRange = (s) => `${s.getFullYear()}-${pad2(s.getMonth() + 1)}-${pad2(s.getDate())}`;
+  const fmtTime = (s) => `${pad2(s.getHours())}:${pad2(s.getMinutes())}`;
+
+  const parseCustom = () => {
+    const c = opts.getCustom();
+    if (!c.from && !c.to) return null;
+    const f = c.from ? new Date(c.from) : null;
+    const t = c.to ? new Date(c.to) : null;
+    return {
+      start: f && !isNaN(f) ? dateOnly(f) : null,
+      end: t && !isNaN(t) ? dateOnly(t) : null,
+      fromTime: f && !isNaN(f) ? fmtTime(f) : "00:00",
+      toTime: t && !isNaN(t) ? fmtTime(t) : "23:59",
+    };
+  };
+
+  const closePop = () => {
+    if (pop) pop.remove();
+    pop = null;
+    document.removeEventListener("mousedown", onDocDown, true);
+    document.removeEventListener("keydown", onDocKey, true);
+  };
+  const onDocDown = (ev) => {
+    if (!pop || pop.contains(ev.target) || trigger.contains(ev.target)) return;
+    closePop();
+  };
+  const onDocKey = (ev) => {
+    if (ev.key === "Escape" && pop) { closePop(); ev.stopPropagation(); }
+  };
+
+  const dayClass = (date) => {
+    let cls = "";
+    if (sameDay(date, draft.start)) cls = " sel-start";
+    else if (sameDay(date, draft.end)) cls = " sel-end";
+    else if (draft.start && draft.end && date > draft.start && date < draft.end) cls = " in-range";
+    if (sameDay(date, new Date())) cls += " today";
+    return cls;
+  };
+
+  const monthHtml = (first) => {
+    const y = first.getFullYear();
+    const m = first.getMonth();
+    const lead = (new Date(y, m, 1).getDay() + 6) % 7; // 周一起始
+    const daysIn = new Date(y, m + 1, 0).getDate();
+    let cells = "";
+    for (let i = 0; i < lead; i += 1) cells += '<span class="range-day pad"></span>';
+    for (let d = 1; d <= daysIn; d += 1) {
+      const date = new Date(y, m, d);
+      cells += `<button type="button" class="range-day${dayClass(date)}" data-date="${y}-${m}-${d}">${d}</button>`;
+    }
+    return `<div class="range-month">
+      <div class="range-month-title">${y} 年 ${m + 1} 月</div>
+      <div class="range-dow">${["一", "二", "三", "四", "五", "六", "日"].map((x) => `<span>${x}</span>`).join("")}</div>
+      <div class="range-grid">${cells}</div>
+    </div>`;
+  };
+
+  const renderMonths = () => {
+    pop.querySelector(".range-months").innerHTML =
+      monthHtml(new Date(view.y, view.m, 1)) + monthHtml(new Date(view.y, view.m + 1, 1));
+  };
+
+  const openPop = () => {
+    closePop();
+    const existing = parseCustom();
+    if (existing) {
+      draft = existing;
+    } else {
+      // 预填最近 24 小时（仅草稿，按「确定」才生效）
+      const now = new Date();
+      draft = { start: dateOnly(new Date(now.getTime() - 86400000)), end: dateOnly(now), fromTime: "00:00", toTime: "23:59" };
+    }
+    const anchor = draft.start || dateOnly(new Date());
+    view = { y: anchor.getFullYear(), m: anchor.getMonth() };
+    pop = document.createElement("div");
+    pop.className = "range-pop";
+    pop.setAttribute("role", "dialog");
+    pop.setAttribute("aria-label", "选择自定义时间范围");
+    pop.innerHTML = `<div class="range-head">
+        <button type="button" class="ghost tiny" data-nav="-1" title="往前一个月">‹</button>
+        <span class="hint">点起点再点终点；点错了重新点一次即可</span>
+        <button type="button" class="ghost tiny" data-nav="1" title="往后一个月">›</button>
+      </div>
+      <div class="range-months"></div>
+      <div class="range-foot">
+        <label class="range-time">从 <input type="time" class="range-from-time" value="${draft.fromTime}"></label>
+        <label class="range-time">到 <input type="time" class="range-to-time" value="${draft.toTime}"></label>
+        <span class="range-foot-actions">
+          <button type="button" class="ghost tiny" data-act="clear" title="清除自定义区间，回到当前预设">清除</button>
+          <button type="button" class="ghost tiny" data-act="cancel">取消</button>
+          <button type="button" class="primary tiny" data-act="ok">确定</button>
+        </span>
+      </div>`;
+    document.body.appendChild(pop);
+    renderMonths();
+    // 定位：锚点下方；靠右放不下时改为右对齐，避免溢出视口
+    const r = trigger.getBoundingClientRect();
+    pop.style.top = `${r.bottom + window.scrollY + 6}px`;
+    const left = Math.min(r.left + window.scrollX,
+      window.scrollX + document.documentElement.clientWidth - pop.offsetWidth - 12);
+    pop.style.left = `${Math.max(12, left)}px`;
+
+    pop.addEventListener("click", (ev) => {
+      const nav = ev.target.closest("[data-nav]");
+      if (nav) {
+        view = { y: view.y, m: view.m + Number(nav.dataset.nav) };
+        renderMonths();
+        return;
+      }
+      const day = ev.target.closest("[data-date]");
+      if (day) {
+        const [y, m, d] = day.dataset.date.split("-").map(Number);
+        const date = new Date(y, m, d);
+        if (!draft.start || (draft.start && draft.end)) {
+          draft.start = date;
+          draft.end = null;
+        } else if (date < draft.start) {
+          draft.end = draft.start;
+          draft.start = date;
+        } else {
+          draft.end = date;
+        }
+        renderMonths();
+        return;
+      }
+      const act = ev.target.closest("[data-act]");
+      if (!act) return;
+      if (act.dataset.act === "ok") applyDraft();
+      else if (act.dataset.act === "cancel") closePop();
+      else if (act.dataset.act === "clear") {
+        opts.setCustom({ from: "", to: "" });
+        closePop();
+        sync();
+        opts.reload();
+      }
+    });
+    // 选了起点后悬停：预览即将形成的区间
+    pop.addEventListener("mouseover", (ev) => {
+      const day = ev.target.closest("[data-date]");
+      pop.querySelectorAll(".range-day.hover-in").forEach((el) => el.classList.remove("hover-in"));
+      if (!day || !draft.start || draft.end) return;
+      const [y, m, d] = day.dataset.date.split("-").map(Number);
+      const hover = new Date(y, m, d);
+      const lo = hover < draft.start ? hover : draft.start;
+      const hi = hover < draft.start ? draft.start : hover;
+      pop.querySelectorAll("[data-date]").forEach((el) => {
+        const [yy, mm, dd] = el.dataset.date.split("-").map(Number);
+        const cur = new Date(yy, mm, dd);
+        if (cur > lo && cur < hi) el.classList.add("hover-in");
+      });
+    });
+    pop.addEventListener("change", (ev) => {
+      if (ev.target.classList.contains("range-from-time")) draft.fromTime = ev.target.value || "00:00";
+      if (ev.target.classList.contains("range-to-time")) draft.toTime = ev.target.value || "23:59";
+    });
+
+    document.addEventListener("mousedown", onDocDown, true);
+    document.addEventListener("keydown", onDocKey, true);
+  };
+
+  const applyDraft = () => {
+    if (!draft.start) {
+      toast("先选择起始日期", true);
+      return;
+    }
+    const end = draft.end || draft.start;
+    const [fh, fm] = draft.fromTime.split(":").map(Number);
+    const [th, tm] = draft.toTime.split(":").map(Number);
+    const from = new Date(draft.start.getFullYear(), draft.start.getMonth(), draft.start.getDate(), fh || 0, fm || 0);
+    const to = new Date(end.getFullYear(), end.getMonth(), end.getDate(), th || 0, tm || 0);
+    if (from >= to) {
+      toast("起始时间必须早于结束时间", true);
+      return;
+    }
+    opts.setCustom({ from: toLocal(from), to: toLocal(to) });
+    closePop();
+    sync();
+    opts.reload();
+  };
+
+  const sync = () => {
+    const c = opts.getCustom();
+    const isCustom = !!(c.from || c.to);
+    select.value = isCustom ? "custom" : opts.getRange();
+    if (select.selectedIndex < 0) select.value = "today";  // 预设被移除时兜底
+    if (trigger) {
+      trigger.hidden = !isCustom;
+      if (isCustom) {
+        const f = c.from ? new Date(c.from) : null;
+        const t = c.to ? new Date(c.to) : null;
+        const show = (d, fallback) => (d && !isNaN(d) ? `${fmtRange(d)} ${fmtTime(d)}` : fallback);
+        trigger.querySelector(".range-trigger-text").textContent =
+          `${show(f, "最早")} ~ ${show(t, "现在")}`;
+      }
+    }
+  };
+
+  select.addEventListener("change", () => {
+    if (select.value === "custom") {
+      openPop();
+      // 弹层只是草稿：未确定前下拉仍显示原状态
+      const c = opts.getCustom();
+      select.value = (c.from || c.to) ? "custom" : opts.getRange();
+      return;
+    }
+    opts.setRange(select.value);
+    opts.setCustom({ from: "", to: "" });
+    closePop();
+    sync();
+    opts.reload();
+  });
+  trigger.addEventListener("click", openPop);
+  sync();
+  return { sync };
+}
+
 function initUsageControls() {
   const bind = (sel, key) => {
     const root = $(sel);
@@ -2570,25 +2837,24 @@ function initUsageControls() {
       const btn = ev.target.closest("button[data-" + key + "]");
       if (!btn) return;
       $$("button[data-" + key + "]", root).forEach((b) => b.classList.toggle("active", b === btn));
-      if (key === "range") {
-        state.range = btn.dataset.range;
-        state.custom = { from: "", to: "" };
-        const from = $("#scope-from");
-        const to = $("#scope-to");
-        if (from) from.value = "";
-        if (to) to.value = "";
-        state.page = 0;
-      }
       if (key === "group") { state.group = btn.dataset.group; }
       if (key === "metric") { state.trendMetric = btn.dataset.metric; renderTrend(); }
       if (key === "pie") { state.pieKind = btn.dataset.pie; renderPie(); }
-      if (key === "range" || key === "group") loadUsage();
+      if (key === "group") loadUsage();
     });
   };
-  bind("#range-seg", "range");
   bind("#group-seg", "group");
   bind("#trend-metric-seg", "metric");
   bind("#pie-seg", "pie");
+
+  const usageRange = bindRangeDropdown({
+    select: "#scope-range", trigger: "#scope-range-btn",
+    getRange: () => state.range,
+    setRange: (v) => { state.range = v; state.page = 0; },
+    getCustom: () => state.custom,
+    setCustom: (v) => { state.custom = v; state.page = 0; },
+    reload: () => loadUsage(),
+  });
 
   const refresh = $("#refresh-usage");
   if (refresh) refresh.addEventListener("click", () => loadUsage());
@@ -2598,7 +2864,7 @@ function initUsageControls() {
     const custom = !!(state.custom.from || state.custom.to);
     const desc = custom
       ? `自定义区间 ${state.custom.from || "最早"} ~ ${state.custom.to || "现在"}`
-      : `预设区间 ${state.range}`;
+      : `预设区间 ${rangeLabel(state.range)}`;
     const ok = await confirmModal({
       title: "清空用量明细",
       text: `将删除${desc}内的全部用量明细（含所有上游与模型），此操作不可撤销；代理转发不受影响。`,
@@ -2640,37 +2906,11 @@ function initUsageControls() {
     loadUsage();
   });
 
-  [["#scope-from", "from"], ["#scope-to", "to"]].forEach(([sel, key]) => {
-    const el = $(sel);
-    if (!el) return;
-    el.addEventListener("change", () => {
-      state.custom[key] = el.value || "";
-      if (state.custom.from && state.custom.to && state.custom.from >= state.custom.to) {
-        toast("起始时间必须早于结束时间", true);
-        state.custom[key] = "";
-        el.value = "";
-        return;
-      }
-      state.page = 0;
-      // 自定义时间优先于预设：取消预设按钮的 active 态
-      if (state.custom.from || state.custom.to) {
-        $$("#range-seg button").forEach((b) => b.classList.remove("active"));
-      }
-      loadUsage();
-    });
-  });
-
   const clearScope = $("#scope-clear");
   if (clearScope) clearScope.addEventListener("click", () => {
     state.filters = { upstream: "", model: "", session: "" };
     state.custom = { from: "", to: "" };
-    const from = $("#scope-from");
-    const to = $("#scope-to");
-    if (from) from.value = "";
-    if (to) to.value = "";
-    $$("#range-seg button").forEach((b) => {
-      b.classList.toggle("active", b.dataset.range === state.range);
-    });
+    if (usageRange) usageRange.sync();
     state.page = 0;
     loadUsage();
   });
@@ -2690,11 +2930,26 @@ function initUsageControls() {
   const sessionSort = $("#session-usage-sort");
   if (sessionSort) sessionSort.addEventListener("change", () => loadSessionUsage());
 
+  // 会话统计就近搜索：本地过滤当前已加载的会话行，不触发请求
+  const sessionSearch = $("#session-usage-search");
+  if (sessionSearch) {
+    let sessionSearchTimer = null;
+    sessionSearch.addEventListener("input", () => {
+      clearTimeout(sessionSearchTimer);
+      sessionSearchTimer = setTimeout(() => {
+        state.usage.sessionQuery = sessionSearch.value.trim();
+        renderSessionUsage(state.usage.sessions || []);
+      }, 200);
+    });
+  }
+
   const sessionTable = $("#session-usage-table");
   if (sessionTable) sessionTable.addEventListener("click", (ev) => {
     const row = ev.target.closest("tr[data-session]");
     if (!row) return;
-    setSessionFilter(row.dataset.session || "");
+    const value = row.dataset.session || "";
+    // 再次点击已收窄的会话 = 取消收窄，回到完整会话列表；不用去找清除按钮
+    setSessionFilter(state.filters.session === value ? "" : value);
   });
 
   const sessionClear = $("#session-clear-filter");
@@ -2958,11 +3213,17 @@ async function loadSessionUsage() {
 function renderSessionUsage(rows) {
   const tbody = $("#session-usage-table tbody");
   if (!tbody) return;
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="12" class="empty">该区间暂无会话数据</td></tr>`;
+  // 本地即时过滤：会话 id 常被截断展示，靠下拉很难定位，直接给一个就近的搜索框
+  const query = (state.usage.sessionQuery || "").trim().toLowerCase();
+  const filtered = query
+    ? rows.filter((r) => String(r.session || "(无会话)").toLowerCase().includes(query))
+    : rows;
+  if (!filtered.length) {
+    tbody.innerHTML = `<tr><td colspan="12" class="empty">${
+      rows.length ? "没有匹配的会话" : "该区间暂无会话数据"}</td></tr>`;
     return;
   }
-  tbody.innerHTML = rows.map((r) => {
+  tbody.innerHTML = filtered.map((r) => {
     const session = r.session || "(无会话)";
     const short = session === "(无会话)" ? "（无会话）" : String(session).slice(0, 12) + (String(session).length > 12 ? "…" : "");
     const requests = Number(r.requests) || 0;
@@ -3031,12 +3292,18 @@ function exportSessionCsv() {
 
 /* ── 提示词页 ────────────────────────────────────────────── */
 function promptRange() {
-  return state.prompt.range || "7d";
+  return state.prompt.range || "today";
 }
 
 function promptQuery(extra = {}) {
   const q = new URLSearchParams();
-  q.set("range", promptRange());
+  const c = state.prompt.custom || { from: "", to: "" };
+  if (c.from || c.to) {
+    if (c.from) q.set("from", c.from);
+    if (c.to) q.set("to", c.to);
+  } else {
+    q.set("range", promptRange());
+  }
   if (state.prompt.model) q.set("model", state.prompt.model);
   if (state.prompt.session) q.set("session", state.prompt.session);
   if (state.prompt.q) q.set("q", state.prompt.q);
@@ -3081,6 +3348,11 @@ async function loadPrompts() {
       hint.textContent = state.prompt.capture
         ? `共 ${fmtInt(state.prompt.total)} 条 · ${fmtBytes(state.prompt.stats.bytes)} · 默认保留 ${state.config ? state.config.promptRetentionDays ?? 7 : 7} 天`
         : "记录开关关闭：当前不会产生新的提示词记录";
+    }
+    // 演进视图默认聚焦最近可对比的会话（列表按时间倒序），避免进来是空白
+    if (state.prompt.view === "evolution" && !state.prompt.evolution.session
+      && !state.prompt.session && state.prompt.rows.length) {
+      state.prompt.evolution.session = evolutionDefaultSession(state.prompt.rows);
     }
     if (state.prompt.view === "evolution") await loadEvolution();
   } catch (err) {
@@ -3361,9 +3633,28 @@ function setPromptView(view) {
   }
 }
 
+/* 最近一个「有至少两条记录」的会话：只有一条时无从对比，不适合做默认聚焦 */
+function evolutionDefaultSession(rows) {
+  const seen = {};
+  for (const r of rows || []) {
+    const s = r.session || "";
+    if (!s) continue;
+    seen[s] = (seen[s] || 0) + 1;
+    if (seen[s] >= 2) return s;
+  }
+  return "";
+}
+
 async function loadEvolution(session) {
   const ev = state.prompt.evolution;
-  const selected = session || ev.session || state.prompt.session;
+  let selected = session || ev.session || state.prompt.session;
+  // 首次进入且未选会话：自动聚焦最近可对比（≥2 条记录）的会话，避免进来是空白
+  if (!selected) {
+    try {
+      const latest = await api("/api/prompts?limit=50");
+      selected = evolutionDefaultSession(latest.rows);
+    } catch { /* 拿不到最近会话就维持空态 */ }
+  }
   const hint = $("#evolution-hint");
   const timeline = $("#evolution-timeline");
   if (!selected) {
@@ -3372,8 +3663,12 @@ async function loadEvolution(session) {
     ev.base = "";
     ev.target = "";
     ev.diff = null;
+    ev.expanded = {};
     if (timeline) timeline.innerHTML = '<div class="empty">先选择一个会话，再加载其请求时间轴</div>';
     if (hint) hint.textContent = "会话来自提示词记录；可在上方「会话」下拉中选择";
+    renderEvolutionDiffEmpty("先选择一个会话");
+    renderEvolutionCompareBar();
+    renderEvolutionToolAnalysis();
     return;
   }
   ev.session = selected;
@@ -3381,28 +3676,60 @@ async function loadEvolution(session) {
   try {
     const data = await api(`/api/prompts/evolution?session=${encodeURIComponent(selected)}&limit=20`);
     ev.rows = data.rows || [];
+    ev.expanded = {};
+    ev.diffNav = null;
+    // 默认对比最近两轮；上一次选中的记录不属于本会话时重置
     const ids = ev.rows.map((r) => r.id);
     if (!ids.includes(ev.base)) ev.base = "";
     if (!ids.includes(ev.target)) ev.target = "";
     if (!ev.base && ids.length >= 2) ev.base = ids[ids.length - 2];
     if (!ev.target && ids.length >= 1) ev.target = ids[ids.length - 1];
     if (ids.length === 1) { ev.base = ids[0]; ev.target = ""; }
-    renderEvolutionTimeline();
-    renderEvolutionTranscript();
-    if (ev.base && ev.target) await loadPromptDiff();
-    else {
-      $("#evolution-stats").innerHTML = "";
-      $("#evolution-insights").textContent = "至少需要同一会话的两条提示词记录才能对比";
-      $("#prompt-diff").innerHTML = '<div class="empty">暂无对比</div>';
-      $("#evolution-pair").textContent = "—";
-      const link = $("#download-diff"); if (link) link.removeAttribute("href");
+    if (ev.base && ev.target && ev.base === ev.target) {
+      const ti = ids.indexOf(ev.target);
+      if (ti > 0) ev.base = ids[ti - 1]; else ev.target = "";
     }
+    renderEvolutionTimeline();
+    renderEvolutionToolAnalysis();
+    if (ev.base && ev.target) await loadPromptDiff();
+    else renderEvolutionDiffEmpty(ids.length === 1
+      ? "该会话只有一条记录；至少两条才能对比"
+      : "该会话暂无提示词记录");
     if (hint) hint.textContent = ev.rows.length
-      ? `同一会话最近 ${ev.rows.length} 条记录 · 点击时间轴选择基准/对比`
+      ? `同一会话最近 ${ev.rows.length} 条记录 · 点行展开消息序列，点「基准 / 对比」更换对比对象`
       : "该会话暂无提示词记录";
   } catch (err) {
     if (timeline) timeline.innerHTML = `<div class="empty">加载失败：${esc(err.message)}</div>`;
   }
+}
+
+function evIdx(id) {
+  return state.prompt.evolution.rows.findIndex((r) => r.id === id);
+}
+
+/* 大数的紧凑显示：1214 → 1.2k，避免时间轴被长数字撑爆 */
+function evCompact(n) {
+  n = Number(n) || 0;
+  const abs = Math.abs(n);
+  if (abs >= 100000) return `${Math.round(n / 1000)}k`;
+  if (abs >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
+/* 展开区里的一行消息预览；role === "_gap" 表示中段被后端省略 */
+function evPreviewLine(p) {
+  if (!p || p.role === "_gap") {
+    return `<div class="prompt-transcript-msg role-gap"><strong>…</strong> ${esc(String((p && p.preview) || "中间消息已省略"))}</div>`;
+  }
+  const toolNames = Array.isArray(p.tool_names) && p.tool_names.length
+    ? ` <span class="badge">${esc(p.tool_names.join(", "))}</span>`
+    : "";
+  const idx = Number(p.index) >= 0 ? `#${Number(p.index) + 1} ` : "";
+  return `<div class="prompt-transcript-msg role-${esc(p.role || "unknown")}">
+    <span class="prompt-transcript-index">${idx}</span><strong>${esc(p.role || "unknown")}</strong>
+    <span class="ev-msg-preview">${esc(String(p.preview || "").slice(0, 160))}</span>${toolNames}
+    <span class="hint">${fmtInt(p.chars || 0)} 字符</span>
+  </div>`;
 }
 
 function renderEvolutionTimeline() {
@@ -3413,108 +3740,164 @@ function renderEvolutionTimeline() {
   if (count) count.textContent = ev.rows.length ? `${ev.rows.length} 条` : "—";
   if (!ev.rows.length) {
     timeline.innerHTML = '<div class="empty">该会话暂无提示词记录</div>';
+    renderEvolutionCompareBar();
     return;
   }
+  const maxSize = Math.max(...ev.rows.map((r) => Number(r.size_bytes) || 0), 1);
   timeline.innerHTML = ev.rows.map((r, i) => {
     const summary = r.summary || {};
     const cc = r.call_chain || {};
     const usage = r.usage || {};
-    const tag = r.id === ev.base ? '<span class="badge ok">基准</span>'
-      : r.id === ev.target ? '<span class="badge bad">对比</span>' : "";
+    const prev = i > 0 ? ev.rows[i - 1] : null;
+    const deltaMsgs = prev ? Number(r.message_count || 0) - Number(prev.message_count || 0) : null;
+    const deltaChars = prev ? Number(r.size_bytes || 0) - Number(prev.size_bytes || 0) : null;
+    const systemChanged = !!(prev && summary.system_hash && (prev.summary || {}).system_hash
+      && summary.system_hash !== prev.summary.system_hash);
+    const isBase = r.id === ev.base;
+    const isTarget = r.id === ev.target;
+    const classes = ["prompt-timeline-row"];
+    if (isBase) classes.push("is-base");
+    if (isTarget) classes.push("is-target");
+    if (ev.expanded[r.id]) classes.push("expanded");
+    const statusBadge = r.status !== null && r.status !== undefined && Number(r.status) >= 400
+      ? `<span class="badge bad">状态 ${esc(String(r.status))}</span>` : "";
+    // 同一轮内「同工具 + 同参数」的重复调用：agent 徒劳往返的直接信号
+    const dupCalls = (() => {
+      const seen = {};
+      (Array.isArray(cc.pairs) ? cc.pairs : []).forEach((p) => {
+        const key = String(p.name || "unknown") + "\u0000" + String(p.arguments_preview || "");
+        seen[key] = (seen[key] || 0) + 1;
+      });
+      return Object.values(seen).reduce((acc, n) => acc + (n > 1 ? n - 1 : 0), 0);
+    })();
     const badges = [
       r.truncated ? '<span class="badge warn">截断</span>' : "",
       Number(r.redactions || 0) > 0 ? `<span class="badge">脱敏 ${fmtInt(r.redactions)}</span>` : "",
-      Number(cc.tool_call_count || 0) > 0 ? `<span class="badge info">工具 ${fmtInt(cc.tool_call_count)}</span>` : "",
+      Number(cc.tool_call_count || 0) > 0 ? `<span class="badge">工具 ${fmtInt(cc.tool_call_count)}</span>` : "",
+      dupCalls > 0 ? `<span class="badge warn">重复调用 ${fmtInt(dupCalls)}</span>` : "",
+      systemChanged ? '<span class="badge warn">system 变化</span>' : "",
+      statusBadge,
     ].filter(Boolean).join("");
     const tokenText = usage.total_tokens !== null && usage.total_tokens !== undefined
-      ? `${fmtInt(usage.total_tokens)} tok`
-      : `${fmtInt(summary.estimated_tokens || 0)} 估算`;
-    const durationText = usage.duration_ms !== null && usage.duration_ms !== undefined
-      ? `${fmtInt(usage.duration_ms)} ms`
+      ? `${fmtInt(usage.total_tokens)} tok` : `${fmtInt(summary.estimated_tokens || 0)} tok 估算`;
+    const delta = prev
+      ? `<span class="ev-delta${deltaChars < 0 ? " neg" : ""}" title="相比上一轮：消息 ${deltaMsgs >= 0 ? "+" : ""}${fmtInt(deltaMsgs)} 条 · 字符 ${deltaChars >= 0 ? "+" : ""}${fmtInt(deltaChars)}">` +
+        `${deltaChars >= 0 ? "+" : "−"}${esc(evCompact(Math.abs(deltaChars)))} 字符</span>`
       : "";
-    const statusText = r.status === null || r.status === undefined ? "" : `状态 ${r.status}`;
-    const detail = `<span class="prompt-timeline-detail" data-evolution-detail="${esc(r.id)}" title="查看完整提示词">详情</span>`;
-    return `<button type="button" class="prompt-timeline-row" data-evolution-id="${esc(r.id)}">
+    const roles = [["system", "S", "r-s"], ["user", "U", "r-u"], ["assistant", "A", "r-a"], ["tool", "T", "r-t"]]
+      .map(([role, letter, cls]) => {
+        const n = Number(cc[`${role}_turns`] || 0);
+        return n ? `<span class="${cls}" title="${role} × ${n}">${letter}${n}</span>` : "";
+      }).join("") || '<span title="没有消息">—</span>';
+    const durationText = usage.duration_ms !== null && usage.duration_ms !== undefined
+      ? ` · ${fmtInt(usage.duration_ms)} ms` : "";
+    const previews = Array.isArray(cc.message_previews) ? cc.message_previews : [];
+    const seq = `<div class="ev-row-seq">${previews.length
+      ? previews.map(evPreviewLine).join("")
+      : '<div class="hint">（无消息预览）</div>'}</div>`;
+    return `<div class="${classes.join(" ")}" data-evolution-id="${esc(r.id)}" role="button" tabindex="0" aria-expanded="${ev.expanded[r.id] ? "true" : "false"}" title="点击展开/收起该轮消息序列">
       <span class="prompt-timeline-no">#${i + 1}</span>
       <span class="prompt-timeline-main">
-        <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
-        <span class="hint">${esc(r.requested_model || "—")} · ${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符${badges ? " · " + badges : ""}</span>
-        <span class="hint">估算 ${fmtInt(summary.estimated_tokens)} token · system#${esc(summary.system_hash || "—")} · ${tokenText}${durationText ? " · " + durationText : ""}${statusText ? " · " + statusText : ""}</span>
-        <span class="hint">角色：${esc((cc.role_sequence || []).join(" → ") || "—")}</span>
-        <span class="prompt-timeline-preview">首条 user：${esc(String(r.first_user || "").slice(0, 200) || "（无 user 消息）")}</span>
-        ${cc.system_preview ? `<span class="prompt-timeline-preview">system：${esc(String(cc.system_preview).slice(0, 160))}</span>` : ""}
-        ${cc.last_user_preview ? `<span class="prompt-timeline-preview">最后 user：${esc(String(cc.last_user_preview).slice(0, 160))}</span>` : ""}
+        <span class="prompt-timeline-head">
+          <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
+          <span class="ev-model">${esc(r.requested_model || "—")}</span>
+          ${delta}
+          ${badges}
+          <span class="ev-caret" aria-hidden="true">▾</span>
+        </span>
+        <span class="prompt-growth" title="本轮共 ${fmtInt(r.size_bytes)} 字符"><i style="width:${Math.max(2, Math.round((Number(r.size_bytes) || 0) / maxSize * 100))}%"></i></span>
+        <span class="prompt-timeline-preview">首条 user：${esc(String(r.first_user || "").replace(/\s+/g, " ").slice(0, 200) || "（无 user 消息）")}</span>
+        <span class="hint ev-meta">${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符 · ${tokenText}${durationText} · ${roles}</span>
+        <span class="ev-row-actions">
+          <span class="ev-slot${isBase ? " active-base" : ""}" data-evolution-slot="base" role="button" tabindex="0" title="把该轮设为对比基准">${isBase ? "● 基准" : "○ 基准"}</span>
+          <span class="ev-slot${isTarget ? " active-target" : ""}" data-evolution-slot="target" role="button" tabindex="0" title="把该轮设为对比目标">${isTarget ? "● 对比" : "○ 对比"}</span>
+          <span class="prompt-timeline-detail" data-evolution-detail="${esc(r.id)}" title="查看完整提示词">详情</span>
+        </span>
+        ${seq}
       </span>
-      ${detail}${tag}
-    </button>`;
-  }).join("");
-}
-
-function renderEvolutionTranscript() {
-  const host = $("#evolution-transcript");
-  if (!host) return;
-  const ev = state.prompt.evolution;
-  if (!ev.rows.length) {
-    host.innerHTML = '<div class="empty">该会话暂无提示词记录</div>';
-    return;
-  }
-  host.innerHTML = ev.rows.map((r, i) => {
-    const summary = r.summary || {};
-    const cc = r.call_chain || {};
-    const usage = r.usage || {};
-    const prev = i > 0 ? ev.rows[i - 1] : null;
-    const deltaMessages = prev ? Number(r.message_count || 0) - Number(prev.message_count || 0) : null;
-    const deltaChars = prev ? Number(r.size_bytes || 0) - Number(prev.size_bytes || 0) : null;
-    const previews = Array.isArray(cc.message_previews) ? cc.message_previews : [];
-    const fallback = [];
-    fallback.push(`<div class="prompt-transcript-msg role-system"><strong>system</strong> · ${fmtInt((summary.system_chars || 0))} 字符 · #${esc(summary.system_hash || "—")}</div>`);
-    if (cc.last_user_preview) fallback.push(`<div class="prompt-transcript-msg role-user"><strong>user</strong> · ${esc(String(cc.last_user_preview).slice(0, 120))}</div>`);
-    if (cc.last_assistant_preview) fallback.push(`<div class="prompt-transcript-msg role-assistant"><strong>assistant</strong> · ${esc(String(cc.last_assistant_preview).slice(0, 120))}</div>`);
-    if (Array.isArray(cc.pairs) && cc.pairs.length) {
-      cc.pairs.forEach((p) => {
-        fallback.push(`<div class="prompt-transcript-msg role-tool"><strong>tool</strong> · ${esc(p.name || "—")} · ${p.has_result ? "已返回" : "无结果"}</div>`);
-      });
-    }
-    const renderPreview = (p) => {
-      if (!p || p.role === "_gap") {
-        return `<div class="prompt-transcript-msg role-gap"><strong>…</strong> ${esc(String((p && p.preview) || "中间消息已省略"))}</div>`;
-      }
-      const toolNames = Array.isArray(p.tool_names) && p.tool_names.length
-        ? ` <span class="badge">${esc(p.tool_names.join(", "))}</span>`
-        : "";
-      return `<div class="prompt-transcript-msg role-${esc(p.role || "unknown")}">
-        <span class="prompt-transcript-index">#${Number(p.index) + 1}</span>
-        <strong>${esc(p.role || "unknown")}</strong> · ${esc(String(p.preview || "").slice(0, 160))}${toolNames}
-        <span class="hint">${fmtInt(p.chars || 0)} 字符</span>
-      </div>`;
-    };
-    const messageHtml = previews.length
-      ? `<details class="prompt-transcript-details"${i === ev.rows.length - 1 ? " open" : ""}>
-          <summary>消息序列 ${fmtInt(previews.length)} 条</summary>
-          ${previews.map(renderPreview).join("")}
-        </details>`
-      : fallback.join("");
-    const tokenText = usage.total_tokens !== null && usage.total_tokens !== undefined ? `${fmtInt(usage.total_tokens)} tok` : `${fmtInt(summary.estimated_tokens || 0)} 估算`;
-    const durationText = usage.duration_ms !== null && usage.duration_ms !== undefined ? `${fmtInt(usage.duration_ms)} ms` : "";
-    const deltaText = deltaMessages === null
-      ? ""
-      : `上下文 ${deltaMessages >= 0 ? "+" : ""}${fmtInt(deltaMessages)} 条 / ${deltaChars >= 0 ? "+" : ""}${fmtInt(deltaChars)} 字符`;
-    return `<div class="prompt-transcript-row">
-      <div class="prompt-transcript-head">
-        <span class="prompt-timeline-no">#${i + 1}</span>
-        <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
-        <span class="hint">${esc(r.requested_model || "—")}</span>
-        <span class="hint">${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符</span>
-        ${deltaText ? `<span class="badge">${esc(deltaText)}</span>` : ""}
-        ${r.truncated ? '<span class="badge warn">截断</span>' : ""}
-        ${Number(r.redactions || 0) > 0 ? `<span class="badge">脱敏 ${fmtInt(r.redactions)}</span>` : ""}
-        <button type="button" class="ghost tiny prompt-transcript-detail" data-evolution-detail="${esc(r.id)}">查看提示词</button>
-      </div>
-      <div class="prompt-transcript-body">${messageHtml}</div>
-      <div class="hint">用量：${tokenText}${durationText ? " · " + durationText : ""} · system#${esc(summary.system_hash || "—")}</div>
     </div>`;
   }).join("");
+  renderEvolutionCompareBar();
 }
+
+/* 顶部常驻对比条：不管滚到哪里都知道当前在比哪两轮、差多少 */
+function renderEvolutionCompareBar() {
+  const ev = state.prompt.evolution;
+  const baseEl = $("#evolution-compare-base");
+  const targetEl = $("#evolution-compare-target");
+  const deltaEl = $("#evolution-compare-delta");
+  const pairEl = $("#evolution-pair");
+  const prevBtn = $("#evolution-prev-pair");
+  const nextBtn = $("#evolution-next-pair");
+  if (!baseEl || !targetEl) return;
+  const bi = evIdx(ev.base);
+  const ti = evIdx(ev.target);
+  const nodeText = (i, fallback) => i >= 0
+    ? `#${i + 1} · ${fmtTime(ev.rows[i].ts, ev.rows[i].created_at)} · ${evCompact(ev.rows[i].size_bytes)} 字符`
+    : (fallback || "未选择");
+  baseEl.textContent = nodeText(bi, ev.base ? "（不在时间轴）" : "");
+  targetEl.textContent = nodeText(ti, ev.target ? "（不在时间轴）" : "");
+  if (bi >= 0 && ti >= 0) {
+    const dc = Number(ev.rows[ti].size_bytes || 0) - Number(ev.rows[bi].size_bytes || 0);
+    const dm = Number(ev.rows[ti].message_count || 0) - Number(ev.rows[bi].message_count || 0);
+    const pct = Number(ev.rows[bi].size_bytes) ? Math.round(dc / Number(ev.rows[bi].size_bytes) * 100) : 0;
+    if (deltaEl) {
+      deltaEl.hidden = false;
+      deltaEl.textContent = `${dc >= 0 ? "+" : "−"}${fmtInt(Math.abs(dc))} 字符（${pct >= 0 ? "+" : "−"}${Math.abs(pct)}%）· 消息 ${dm >= 0 ? "+" : "−"}${Math.abs(dm)}`;
+      deltaEl.classList.toggle("neg", dc < 0);
+    }
+    if (pairEl) pairEl.textContent = `基准 #${bi + 1} → 对比 #${ti + 1}`;
+  } else {
+    if (deltaEl) deltaEl.hidden = true;
+    if (pairEl) pairEl.textContent = "—";
+  }
+  // 前移一轮 = target 落到 index 1（base 才有落点）；后移一轮 = target 到最后一行
+  if (prevBtn) prevBtn.disabled = ti < 1;
+  if (nextBtn) nextBtn.disabled = ti < 0 || ti >= ev.rows.length - 1;
+}
+
+/* ‹ › 按钮：把「基准+对比」窗口整体移动一轮，逐轮回看每次请求改了什么 */
+function shiftEvolutionPair(dir) {
+  const ev = state.prompt.evolution;
+  const ti = evIdx(ev.target);
+  const next = ti + dir;
+  if (ti < 0 || next < 1 || next > ev.rows.length - 1) return;
+  ev.base = ev.rows[next - 1].id;
+  ev.target = ev.rows[next].id;
+  renderEvolutionTimeline();
+  loadPromptDiff();
+}
+
+/* 行内「基准 / 对比」小圆钮：重复点击同一槽位即交换方向 */
+function setEvolutionSlot(slot, id) {
+  const ev = state.prompt.evolution;
+  if (slot === "base") {
+    if (ev.target === id) ev.target = ev.base;
+    ev.base = id;
+  } else {
+    if (ev.base === id) ev.base = ev.target;
+    ev.target = id;
+  }
+  renderEvolutionTimeline();
+  if (ev.base && ev.target) loadPromptDiff();
+  else renderEvolutionDiffEmpty("再选一条记录作为对比对象");
+}
+
+function renderEvolutionDiffEmpty(msg) {
+  const stats = $("#evolution-stats");
+  const insights = $("#evolution-insights");
+  const host = $("#prompt-diff");
+  const nav = $("#evolution-diff-nav");
+  const link = $("#download-diff");
+  if (stats) stats.innerHTML = "";
+  if (insights) insights.textContent = "";
+  if (host) host.innerHTML = `<div class="empty">${esc(msg || "暂无对比")}</div>`;
+  if (nav) nav.hidden = true;
+  if (link) link.removeAttribute("href");
+  state.prompt.evolution.diff = null;
+  state.prompt.evolution.diffNav = null;
+}
+
 async function loadPromptDiff() {
   const ev = state.prompt.evolution;
   if (!ev.base || !ev.target) return;
@@ -3523,9 +3906,11 @@ async function loadPromptDiff() {
   try {
     const data = await api(`/api/prompts/diff?${q.toString()}`);
     ev.diff = data.diff || null;
+    ev.diffNav = null;
     renderPromptDiff();
   } catch (err) {
-    $("#prompt-diff").innerHTML = `<div class="empty">对比失败：${esc(err.message)}</div>`;
+    const host = $("#prompt-diff");
+    if (host) host.innerHTML = `<div class="empty">对比失败：${esc(err.message)}</div>`;
   }
 }
 
@@ -3534,18 +3919,23 @@ function renderPromptDiff() {
   const diff = ev.diff;
   if (!diff) return;
   const s = diff.stats || {};
-  const stats = [
-    ["消息", `${fmtInt(s.base_messages)} → ${fmtInt(s.target_messages)}`],
-    ["字符", `${fmtInt(s.base_chars)} → ${fmtInt(s.target_chars)}（${s.delta_chars >= 0 ? "+" : ""}${fmtInt(s.delta_chars)}，${s.delta_percent >= 0 ? "+" : ""}${s.delta_percent}%）`],
-    ["新增 / 删除 / 修改", `${fmtInt(s.added)} / ${fmtInt(s.removed)} / ${fmtInt(s.modified)}`],
-    ["未变", fmtInt(s.same)],
-    ["system", s.system_changed ? "有变化" : "未变"],
-    ["重复消息", `${fmtInt(s.repeated_messages)} 条（字符占比 ${s.duplicate_percent}%）`],
-    ["估算 token", `${fmtInt(s.estimated_base_tokens)} → ${fmtInt(s.estimated_target_tokens)}`],
+  const chips = [
+    ["消息", `${fmtInt(s.base_messages)} → ${fmtInt(s.target_messages)}`, ""],
+    ["字符", `${evCompact(s.base_chars)} → ${evCompact(s.target_chars)}`,
+      `（${s.delta_chars >= 0 ? "+" : "−"}${fmtInt(Math.abs(s.delta_chars))}，${s.delta_percent >= 0 ? "+" : "−"}${Math.abs(s.delta_percent)}%）`],
+    ["新增", fmtInt(s.added), "", "add"],
+    ["删除", fmtInt(s.removed), "", "rem"],
+    ["修改", fmtInt(s.modified), "", ""],
+    ["未变", fmtInt(s.same), "", ""],
+    ["system", s.system_changed ? "有变化" : "未变", "", s.system_changed ? "rem" : ""],
+    ["重复消息", `${fmtInt(s.repeated_messages)} 条`, `（字符占比 ${fmtInt(s.duplicate_percent)}%）`, ""],
+    ["token", `${evCompact(s.estimated_base_tokens)} → ${evCompact(s.estimated_target_tokens)}`, "", ""],
   ];
-  $("#evolution-stats").innerHTML = stats.map(([k, v]) =>
-    `<div class="legend-row"><div class="legend-head"><span class="label">${esc(k)}</span>` +
-    `<span class="val mono">${esc(v)}</span></div></div>`).join("");
+  const statsEl = $("#evolution-stats");
+  if (statsEl) {
+    statsEl.innerHTML = chips.map(([k, v, extra, tone]) =>
+      `<span class="ev-stat-chip${tone ? " " + tone : ""}" title="${esc(k)}">${esc(k)}<b>${esc(v)}</b>${extra ? `<span class="hint">${esc(extra)}</span>` : ""}</span>`).join("");
+  }
   const insightLabels = {
     system_changed: (x) => `system 消息发生变化：+${x.added_lines} / -${x.removed_lines} 行`,
     context_growth: (x) => `上下文变化：${x.delta_chars >= 0 ? "+" : ""}${x.delta_chars} 字符（${x.delta_percent}%）`,
@@ -3555,17 +3945,19 @@ function renderPromptDiff() {
     const fn = insightLabels[x.code];
     return fn ? fn(x) : x.code;
   });
-  $("#evolution-insights").innerHTML = insights.length
-    ? `<strong>规则化提示：</strong>${insights.map((x) => `<div>· ${esc(x)}</div>`).join("")}`
-    : "未命中规则化提示（system 未变、无重复消息）。";
-  const pair = $("#evolution-pair");
-  if (pair) pair.textContent = `基准 ${String(ev.base).slice(0, 8)}… → 对比 ${String(ev.target).slice(0, 8)}…`;
+  const insightsEl = $("#evolution-insights");
+  if (insightsEl) {
+    insightsEl.innerHTML = insights.length
+      ? `<strong>规则化提示：</strong>${insights.map((x) => `<div>· ${esc(x)}</div>`).join("")}`
+      : "";
+  }
   const link = $("#download-diff");
   if (link) {
     const q = new URLSearchParams({ base: ev.base, target: ev.target, context: "3" });
     if (ev.role) q.set("role", ev.role);
     link.href = `/api/prompts/diff/download?${q.toString()}`;
   }
+  renderEvolutionCompareBar();
   renderPromptDiffRows();
 }
 
@@ -3575,12 +3967,22 @@ function renderPromptDiffRows() {
   if (!host) return;
   const diff = ev.diff;
   if (!diff) return;
+  const nav = $("#evolution-diff-nav");
   const rows = (diff.messages || []).filter((row) =>
     !ev.onlyDiff || row.status !== "same");
+  const changeTotal = (diff.messages || []).filter((row) => row.status !== "same").length;
+  if (nav) {
+    nav.hidden = !changeTotal;
+    const cnt = $("#evolution-diff-count");
+    if (cnt) cnt.textContent = ev.onlyDiff
+      ? `${changeTotal} 处变化`
+      : `${changeTotal} 处变化 · 共 ${fmtInt((diff.messages || []).length)} 条消息`;
+  }
   if (!rows.length) {
     host.innerHTML = `<div class="empty">${ev.onlyDiff ? "没有差异（消息完全一致）" : "暂无消息"}</div>`;
     return;
   }
+  let changeNo = 0;
   host.innerHTML = rows.map((row) => {
     const head = `<div class="prompt-diff-head">
       <span class="badge ${row.status === "added" ? "ok" : row.status === "removed" ? "bad" : ""}">${esc(row.status)}</span>
@@ -3598,27 +4000,338 @@ function renderPromptDiffRows() {
             line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "
           }</span><span class="diff-text">${esc(line.text)}</span></div>`;
       }).join("");
-      return `<div class="prompt-diff-row modified">${head}<div class="diff-lines">${lines}</div></div>`;
+      const anchor = row.status !== "same" ? ` id="ev-change-${changeNo++}"` : "";
+      return `<div class="prompt-diff-row modified"${anchor}>${head}<div class="diff-lines">${lines}</div></div>`;
     }
     const content = row.content ? `<pre class="diff-content">${esc(row.content)}</pre>` : "";
-    return `<div class="prompt-diff-row ${esc(row.status)}">${head}${content}</div>`;
+    const anchor = row.status !== "same" ? ` id="ev-change-${changeNo++}"` : "";
+    return `<div class="prompt-diff-row ${esc(row.status)}"${anchor}>${head}${content}</div>`;
   }).join("");
+  ev.diffNav = null;
+}
+
+/* 差异导航：在 changed 消息之间跳转，环回循环并闪烁定位 */
+function jumpDiffChange(dir) {
+  const ev = state.prompt.evolution;
+  const host = $("#prompt-diff");
+  if (!host) return;
+  const nodes = host.querySelectorAll(".prompt-diff-row[id^='ev-change-']");
+  if (!nodes.length) return;
+  const total = nodes.length;
+  ev.diffNav = ev.diffNav === null
+    ? (dir > 0 ? 0 : total - 1)
+    : (ev.diffNav + dir + total) % total;
+  const el = nodes[ev.diffNav];
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  el.classList.remove("ev-flash");
+  requestAnimationFrame(() => el.classList.add("ev-flash"));
+  clearTimeout(el._evFlashTimer);
+  el._evFlashTimer = setTimeout(() => el.classList.remove("ev-flash"), 1400);
+}
+
+/* ── 工具执行评估 ─────────────────────────────────────────
+   把演进时间轴里每轮「assistant 发起调用 → tool 返回结果」的交互
+   聚合为会话级信号：哪些工具被反复调用、哪些调用没等到结果、
+   哪些结果把上下文撑大、截断从哪来 —— 用于常规 agent 的工具调用改进。
+   全部为本地规则计算，不调用任何模型。 */
+const TOOL_ANALYSIS = {
+  bigResultChars: 8000,    // 单次工具结果字符超过该值视为「返回过大」
+  contextSharePct: 40,     // 工具结果字符合计占整轮上下文比例阈值
+  manyCallsPerRequest: 8,  // 单轮平均工具调用次数阈值
+};
+
+function analyzeEvolutionTools() {
+  const rows = state.prompt.evolution.rows || [];
+  const tools = {};
+  const session = {
+    requests: rows.length, models: new Set(), messages: 0, chars: 0,
+    tokens: 0, tokensEstimated: false, durationMs: 0, durationKnown: false,
+    truncated: 0, redactions: 0, statusErrors: 0, toolCalls: 0, toolResults: 0,
+    unmatched: 0, dupCalls: 0, firstTs: null, lastTs: null,
+  };
+  const dupEvents = [];        // 同轮内完全相同的调用
+  const crossRepeatEvents = [];// 相邻请求间完全相同的调用
+  const bigResults = [];       // 单次过大的工具结果
+  const rowToolChars = [];     // 每轮工具结果字符占比
+  const callKeysByRow = [];    // 每轮的调用指纹集合（跨轮重复检测）
+  let knownResults = 0;        // 能映射到结果消息字符数的调用数（长会话中段被省略时未知）
+
+  rows.forEach((r, i) => {
+    const cc = r.call_chain || {};
+    const usage = r.usage || {};
+    const previews = Array.isArray(cc.message_previews) ? cc.message_previews : [];
+    const previewByIndex = new Map(previews.map((p) => [Number(p.index), p]));
+    const pairs = Array.isArray(cc.pairs) ? cc.pairs : [];
+    session.models.add(r.requested_model || "—");
+    session.messages += Number(r.message_count || 0);
+    session.chars += Number(r.size_bytes || 0);
+    if (usage.total_tokens !== null && usage.total_tokens !== undefined) {
+      session.tokens += Number(usage.total_tokens);
+    } else {
+      session.tokens += Number((r.summary || {}).estimated_tokens || 0);
+      session.tokensEstimated = true;
+    }
+    if (usage.duration_ms !== null && usage.duration_ms !== undefined) {
+      session.durationMs += Number(usage.duration_ms);
+      session.durationKnown = true;
+    }
+    if (r.truncated) session.truncated += 1;
+    session.redactions += Number(r.redactions || 0);
+    if (r.status !== null && r.status !== undefined && Number(r.status) >= 400) session.statusErrors += 1;
+    if (r.ts) {
+      if (session.firstTs === null) session.firstTs = r.ts;
+      session.lastTs = r.ts;
+    }
+
+    const seen = new Map();
+    (pairs).forEach((p) => {
+      const name = String(p.name || "unknown");
+      const t = tools[name] || (tools[name] = {
+        calls: 0, unmatched: 0, dupCalls: 0, results: 0, resultChars: 0, maxResult: 0,
+      });
+      t.calls += 1;
+      session.toolCalls += 1;
+      if (!p.has_result) { t.unmatched += 1; session.unmatched += 1; }
+      const key = name + "\u0000" + String(p.arguments_preview || "");
+      seen.set(key, (seen.get(key) || 0) + 1);
+      const rp = p.has_result ? previewByIndex.get(Number(p.result_index)) : null;
+      if (rp) {
+        knownResults += 1;
+        t.results += 1;
+        session.toolResults += 1;
+        t.resultChars += Number(rp.chars || 0);
+        if (Number(rp.chars || 0) > t.maxResult) t.maxResult = Number(rp.chars);
+        if (Number(rp.chars || 0) >= TOOL_ANALYSIS.bigResultChars) {
+          bigResults.push({ rowNo: i + 1, name, chars: Number(rp.chars || 0) });
+        }
+      }
+    });
+    let rowDup = 0;
+    seen.forEach((n, key) => {
+      if (n < 2) return;
+      const name = key.split("\u0000")[0];
+      const wasted = n - 1;
+      rowDup += wasted;
+      tools[name].dupCalls += wasted;
+      session.dupCalls += wasted;
+      dupEvents.push({ rowNo: i + 1, name, count: n });
+    });
+    callKeysByRow.push(new Set(seen.keys()));
+
+    let toolChars = 0;
+    previews.forEach((p) => { if (p.role === "tool") toolChars += Number(p.chars || 0); });
+    rowToolChars.push({ rowNo: i + 1, chars: toolChars, total: Number(r.size_bytes || 0), dup: rowDup });
+  });
+
+  // 相邻请求间的完全相同调用（参数也一致）——上下文丢失导致重复读取的典型信号
+  for (let i = 1; i < callKeysByRow.length; i += 1) {
+    const shared = [...callKeysByRow[i]].filter((k) => callKeysByRow[i - 1].has(k));
+    if (shared.length) {
+      crossRepeatEvents.push({
+        rowNo: i + 1, count: shared.length,
+        names: [...new Set(shared.map((k) => k.split("\u0000")[0]))],
+      });
+    }
+  }
+
+  const totalToolChars = rowToolChars.reduce((a, x) => a + x.chars, 0);
+  const contextSharePct = session.chars ? Math.round(totalToolChars / session.chars * 100) : 0;
+  const avgCalls = session.requests ? session.toolCalls / session.requests : 0;
+  return {
+    rows, tools, session, dupEvents, crossRepeatEvents, bigResults, rowToolChars,
+    totalToolChars, contextSharePct, avgCalls, knownResults,
+  };
+}
+
+function evolutionFindings(a) {
+  const f = [];
+  const { session } = a;
+  if (a.dupEvents.length) {
+    const sample = a.dupEvents.slice(0, 4)
+      .map((d) => `第${d.rowNo}轮 ${d.name}×${d.count}`).join("、");
+    f.push({ tone: "warn", title: `同轮重复调用 ${fmtInt(session.dupCalls)} 次`,
+      text: `同一轮里出现完全相同的「工具 + 参数」调用（${sample}${a.dupEvents.length > 4 ? " 等" : ""}），是无效往返：结果已在上一条 tool 消息里。` });
+  }
+  if (a.crossRepeatEvents.length) {
+    const sample = a.crossRepeatEvents.slice(0, 4)
+      .map((d) => `第${d.rowNo}轮与上一轮相同的调用有 ${d.count} 个（${d.names.join("、")}）`).join("；");
+    f.push({ tone: "warn", title: `跨轮重复调用 ${a.crossRepeatEvents.length} 处`,
+      text: `相邻请求里出现了完全相同的调用（工具与参数都一致）：${sample}。通常因上一轮结果被截断/挤出上下文，agent 只好重读。` });
+  }
+  if (session.unmatched > 0) {
+    f.push({ tone: "bad", title: `未匹配调用 ${fmtInt(session.unmatched)} 次`,
+      text: "这些 tool_calls 没有等到对应的 tool 结果（中断、超时或客户端未回填），会导致对话状态不完整。" });
+  }
+  if (a.bigResults.length) {
+    const sample = a.bigResults.sort((x, y) => y.chars - x.chars).slice(0, 3)
+      .map((d) => `第${d.rowNo}轮 ${d.name} ${evCompact(d.chars)} 字符`).join("、");
+    f.push({ tone: "warn", title: `超大工具结果 ${a.bigResults.length} 次（≥${fmtInt(TOOL_ANALYSIS.bigResultChars)} 字符）`,
+      text: `${sample}。大结果会长期占据上下文，是截断与成本的主要来源。` });
+  }
+  if (a.contextSharePct >= TOOL_ANALYSIS.contextSharePct) {
+    f.push({ tone: "warn", title: `工具结果占上下文 ${a.contextSharePct}%`,
+      text: `工具返回合计约 ${evCompact(a.totalToolChars)} 字符，占会话上下文 ${a.contextSharePct}%；稀释关键信息并推高 token 成本。` });
+  }
+  if (a.avgCalls >= TOOL_ANALYSIS.manyCallsPerRequest) {
+    f.push({ tone: "info", title: `平均每轮 ${a.avgCalls.toFixed(1)} 次工具调用`,
+      text: "调用密度偏高：考虑合并读取（批量接口 / 一次多资源），或把固定序列封装成一个复合工具。" });
+  }
+  if (session.truncated > 0) {
+    f.push({ tone: "bad", title: `${fmtInt(session.truncated)} 轮触发上下文截断`,
+      text: "截断丢弃的是中段消息（多为旧工具结果）；恢复后 agent 可能重新调用同样的工具，请优先压缩旧工具结果。" });
+  }
+  if (session.statusErrors > 0) {
+    f.push({ tone: "bad", title: `${fmtInt(session.statusErrors)} 轮请求返回 ${"≥400"}`,
+      text: "请求级失败可能与某次工具调用后的消息结构有关，值得对照差异明细定位。" });
+  }
+  if (!f.length) {
+    f.push({ tone: "ok", title: "未发现明显反模式",
+      text: "没有同轮/跨轮重复调用、没有未匹配调用、结果体量与上下文占比都在阈值内。" });
+  }
+  return f;
+}
+
+const TOOL_SUGGESTIONS = {
+  dup: "为读取类工具加去重/缓存；在 system 指令中明确「同一参数不重复调用，先查已有结果」。",
+  cross: "保留上一轮工具结果供复用：若因截断丢失，压缩旧结果而不是整体丢弃；必要时在 system 里提示「已读取过 X」。",
+  unmatched: "检查工具超时与异常路径：失败也应回填结构化错误消息，避免调用悬空。",
+  bigResult: "对大结果做摘要、分页或字段裁剪；超大内容写入文件后只返回路径与关键片段。",
+  share: "控制工具结果的上下文占比：旧结果替换为摘要，只保留最近 N 条原文。",
+  avgCalls: "提供批量/复合工具，减少单轮调用次数。",
+  truncated: "截断多由大工具结果引起：优先裁剪旧 tool 消息，保留最新结果原文。",
+  status: "对照差异明细定位导致请求失败的调用。",
+};
+
+function evolutionReportMarkdown(a) {
+  const { session: s } = a;
+  const ev = state.prompt.evolution;
+  const fmtTs = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "—");
+  const lines = [];
+  lines.push("# 会话工具执行评估");
+  lines.push("");
+  lines.push("## 会话信息");
+  lines.push(`- 会话 ID：${ev.session || "—"}`);
+  lines.push(`- 时间范围：${fmtTs(s.firstTs)} ~ ${fmtTs(s.lastTs)}（共 ${fmtInt(s.requests)} 次请求，本报告基于最近 ${fmtInt(a.rows.length)} 条记录）`);
+  lines.push(`- 模型：${[...s.models].join(", ") || "—"}`);
+  lines.push(`- 消息总数：${fmtInt(s.messages)} · 字符总数：${fmtInt(s.chars)} · token：${fmtInt(s.tokens)}${s.tokensEstimated ? "（估算）" : ""}`);
+  lines.push(`- 总耗时：${s.durationKnown ? fmtInt(Math.round(s.durationMs)) + " ms" : "未知"} · 请求错误（≥400）：${fmtInt(s.statusErrors)} 轮`);
+  lines.push(`- 工具调用：${fmtInt(s.toolCalls)} 次 · 其中未匹配 ${fmtInt(s.unmatched)} 次、同参重复 ${fmtInt(s.dupCalls)} 次`);
+  lines.push(`- 工具结果字符：${fmtInt(a.totalToolChars)}（占上下文 ${a.contextSharePct}%）· 截断轮数：${fmtInt(s.truncated)} · 脱敏 ${fmtInt(s.redactions)} 处`);
+  lines.push("");
+  lines.push("## 工具画像");
+  const names = Object.keys(a.tools).sort((x, y) => a.tools[y].calls - a.tools[x].calls);
+  if (!names.length) {
+    lines.push("（该会话没有工具调用）");
+  } else {
+    lines.push("| 工具 | 调用 | 未匹配 | 重复调用 | 结果消息 | 结果字符合计 | 单次最大 |");
+    lines.push("|---|---:|---:|---:|---:|---:|---:|");
+    names.forEach((name) => {
+      const t = a.tools[name];
+      lines.push(`| ${name} | ${t.calls} | ${t.unmatched} | ${t.dupCalls} | ${t.results} | ${fmtInt(t.resultChars)} | ${fmtInt(t.maxResult)} |`);
+    });
+  }
+  lines.push("");
+  lines.push("## 问题清单");
+  evolutionFindings(a).forEach((x) => { lines.push(`- [${x.tone === "ok" ? "正常" : x.tone === "info" ? "提示" : x.tone === "warn" ? "注意" : "问题"}] ${x.title}：${x.text}`); });
+  lines.push("");
+  lines.push("## 优化建议");
+  const sug = [];
+  if (a.dupEvents.length) sug.push(TOOL_SUGGESTIONS.dup);
+  if (a.crossRepeatEvents.length) sug.push(TOOL_SUGGESTIONS.cross);
+  if (s.unmatched > 0) sug.push(TOOL_SUGGESTIONS.unmatched);
+  if (a.bigResults.length) sug.push(TOOL_SUGGESTIONS.bigResult);
+  if (a.contextSharePct >= TOOL_ANALYSIS.contextSharePct) sug.push(TOOL_SUGGESTIONS.share);
+  if (a.avgCalls >= TOOL_ANALYSIS.manyCallsPerRequest) sug.push(TOOL_SUGGESTIONS.avgCalls);
+  if (s.truncated > 0) sug.push(TOOL_SUGGESTIONS.truncated);
+  if (s.statusErrors > 0) sug.push(TOOL_SUGGESTIONS.status);
+  if (!sug.length) sug.push("保持现状：当前会话的工具调用模式健康，无需要调整的信号。");
+  sug.forEach((x, i) => lines.push(`${i + 1}. ${x}`));
+  lines.push("");
+  lines.push("> 数据来源：Model-Gate 提示词记录（入站 messages，写入前已按规则脱敏；不包含模型响应）。");
+  return lines.join("\n");
+}
+
+function renderEvolutionToolAnalysis() {
+  const ev = state.prompt.evolution;
+  const chips = $("#evolution-session-chips");
+  const findingsEl = $("#evolution-tool-findings");
+  const tbody = $("#evolution-tool-table tbody");
+  const reportEl = $("#evolution-tool-report");
+  const meta = $("#evolution-tool-meta");
+  if (!chips || !findingsEl || !tbody || !reportEl) return;
+  if (!ev.rows.length) {
+    chips.innerHTML = "";
+    findingsEl.innerHTML = "";
+    tbody.innerHTML = "";
+    reportEl.textContent = "";
+    if (meta) meta.textContent = "—";
+    return;
+  }
+  const a = analyzeEvolutionTools();
+  const s = a.session;
+  ev.toolReport = evolutionReportMarkdown(a);
+  reportEl.textContent = ev.toolReport;
+
+  chips.innerHTML = [
+    ["会话", String(ev.session || "—").slice(0, 8) + "…"],
+    ["请求", fmtInt(s.requests)],
+    ["消息", fmtInt(s.messages)],
+    ["字符", evCompact(s.chars)],
+    ["token", evCompact(s.tokens) + (s.tokensEstimated ? " 估算" : "")],
+    ["总耗时", s.durationKnown ? evCompact(Math.round(s.durationMs / 1000)) + " s" : "—"],
+    ["工具调用", fmtInt(s.toolCalls)],
+    ["未匹配", fmtInt(s.unmatched)],
+    ["重复调用", fmtInt(s.dupCalls)],
+    ["结果占比", a.contextSharePct + "%"],
+    ["截断", fmtInt(s.truncated) + " 轮"],
+  ].map(([k, v]) => `<span class="ev-stat-chip" title="${esc(k)}">${esc(k)}<b>${esc(v)}</b></span>`).join("");
+
+  findingsEl.innerHTML = evolutionFindings(a).map((x) =>
+    `<div class="ev-finding ${esc(x.tone)}"><b>${esc(x.title)}</b><span>${esc(x.text)}</span></div>`).join("");
+
+  const names = Object.keys(a.tools).sort((x, y) => a.tools[y].calls - a.tools[x].calls);
+  tbody.innerHTML = names.length
+    ? names.map((name) => {
+      const t = a.tools[name];
+      return `<tr>
+        <td class="mono">${esc(name)}</td>
+        <td class="num mono">${fmtInt(t.calls)}</td>
+        <td class="num mono">${t.unmatched ? `<span class="warn-text">${fmtInt(t.unmatched)}</span>` : "0"}</td>
+        <td class="num mono">${t.dupCalls ? `<span class="warn-text">${fmtInt(t.dupCalls)}</span>` : "0"}</td>
+        <td class="num mono">${fmtInt(t.results)}</td>
+        <td class="num mono">${fmtInt(t.resultChars)}</td>
+        <td class="num mono">${fmtInt(t.maxResult)}</td>
+      </tr>`;
+    }).join("")
+    : '<tr><td colspan="7" class="empty">该会话没有工具调用</td></tr>';
+
+  if (meta) {
+    meta.textContent = `基于最近 ${fmtInt(a.rows.length)} 条记录 · 仅入站 messages（不含模型响应）`
+      + (a.knownResults < s.toolResults ? " · 长会话中段结果已省略，部分字符数未计入" : "");
+  }
 }
 
 function clearPrompts() {
-  const range = promptRange();
+  const c = state.prompt.custom || { from: "", to: "" };
+  const custom = !!(c.from || c.to);
+  const rangeDesc = custom
+    ? `自定义区间 ${c.from || "最早"} ~ ${c.to || "现在"}`
+    : `预设区间 ${rangeLabel(promptRange())}`;
   confirmModal({
     title: "清空提示词记录",
-    text: `将删除当前筛选（区间 ${range}${state.prompt.model ? "、模型 " + state.prompt.model : ""}${state.prompt.session ? "、会话 " + state.prompt.session : ""}）内的提示词记录，不可撤销；用量明细不受影响。`,
+    text: `将删除当前筛选（区间 ${rangeDesc}${state.prompt.model ? "、模型 " + state.prompt.model : ""}${state.prompt.session ? "、会话 " + state.prompt.session : ""}）内的提示词记录，不可撤销；用量明细不受影响。删除后会整理数据库文件回收磁盘空间，数据量大时可能需要一点时间。`,
     confirmLabel: "清空",
   }).then(async (ok) => {
     if (!ok) return;
     try {
-      const body = { range };
+      const body = custom ? { from: c.from, to: c.to } : { range: promptRange() };
       if (state.prompt.model) body.model = state.prompt.model;
       if (state.prompt.session) body.session = state.prompt.session;
       const data = await postJson("/api/prompts/clear", body);
-      toast(`已清空 ${data.removed} 条提示词记录`);
+      // 清理含 VACUUM，GB 级库上可能需要一段时间；先给出删除结果
+      const reclaimed = Number(data.bytes_reclaimed) || 0;
+      toast(`已清空 ${fmtInt(data.removed)} 条提示词记录`
+        + (reclaimed > 0 ? `，回收 ${fmtBytes(reclaimed)} 磁盘空间` : ""));
       state.prompt.evolution.base = "";
       state.prompt.evolution.target = "";
       state.prompt.evolution.diff = null;
@@ -3629,6 +4342,23 @@ function clearPrompts() {
   });
 }
 
+/* 手动回收磁盘空间：删除记录后 SQLite 不会自动缩小文件 */
+async function vacuumPrompts() {
+  const btn = $("#vacuum-prompts");
+  if (btn) btn.disabled = true;
+  try {
+    const data = await postJson("/api/prompts/vacuum", {});
+    const reclaimed = Number(data.bytes_reclaimed) || 0;
+    toast(reclaimed > 0
+      ? `空间回收完成：释放 ${fmtBytes(reclaimed)}（${fmtBytes(data.bytes_before)} → ${fmtBytes(data.bytes_after)}）`
+      : "没有可回收的空闲空间");
+  } catch (err) {
+    toast(`空间回收失败：${err.message}`, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function initPromptControls() {
   const viewSeg = $("#prompt-view-seg");
   if (viewSeg) viewSeg.addEventListener("click", (ev) => {
@@ -3637,13 +4367,13 @@ function initPromptControls() {
     setPromptView(btn.dataset.view);
   });
 
-  const rangeSeg = $("#prompt-range-seg");
-  if (rangeSeg) rangeSeg.addEventListener("click", (ev) => {
-    const btn = ev.target.closest("button[data-range]");
-    if (!btn) return;
-    $$("button[data-range]", rangeSeg).forEach((b) => b.classList.toggle("active", b === btn));
-    state.prompt.range = btn.dataset.range;
-    loadPrompts();
+  bindRangeDropdown({
+    select: "#prompt-range", trigger: "#prompt-range-btn",
+    getRange: () => state.prompt.range,
+    setRange: (v) => { state.prompt.range = v; },
+    getCustom: () => state.prompt.custom,
+    setCustom: (v) => { state.prompt.custom = v; },
+    reload: () => loadPrompts(),
   });
 
   const model = $("#prompt-model");
@@ -3679,6 +4409,8 @@ function initPromptControls() {
   });
   const clearBtn = $("#clear-prompts");
   if (clearBtn) clearBtn.addEventListener("click", clearPrompts);
+  const vacuumBtn = $("#vacuum-prompts");
+  if (vacuumBtn) vacuumBtn.addEventListener("click", vacuumPrompts);
   const gotoConfig = $("#prompt-goto-config");
   if (gotoConfig) gotoConfig.addEventListener("click", () => switchTab("config"));
 
@@ -3717,41 +4449,62 @@ function initPromptControls() {
   });
   const evRefresh = $("#evolution-refresh");
   if (evRefresh) evRefresh.addEventListener("click", () => loadEvolution(state.prompt.evolution.session));
-  const timeline = $("#evolution-timeline");
-  if (timeline) timeline.addEventListener("click", (ev) => {
-    const detail = ev.target.closest("[data-evolution-detail]");
-    if (detail) {
-      showPromptDetail(detail.dataset.evolutionDetail);
+  const prevPair = $("#evolution-prev-pair");
+  if (prevPair) prevPair.addEventListener("click", () => shiftEvolutionPair(-1));
+  const nextPair = $("#evolution-next-pair");
+  if (nextPair) nextPair.addEventListener("click", () => shiftEvolutionPair(1));
+  const diffPrev = $("#evolution-diff-prev");
+  if (diffPrev) diffPrev.addEventListener("click", () => jumpDiffChange(-1));
+  const diffNext = $("#evolution-diff-next");
+  if (diffNext) diffNext.addEventListener("click", () => jumpDiffChange(1));
+  const copyReport = $("#copy-tool-report");
+  if (copyReport) copyReport.addEventListener("click", () => {
+    const report = state.prompt.evolution.toolReport;
+    if (!report) {
+      toast("先加载一个会话再复制评估报告", true);
       return;
     }
-    const row = ev.target.closest("[data-evolution-id]");
-    if (!row) return;
-    const id = row.dataset.evolutionId;
-    const stateEv = state.prompt.evolution;
-    if (!stateEv.base || (stateEv.base && stateEv.target)) {
-      stateEv.base = id;
-      stateEv.target = "";
-      stateEv.diff = null;
-    } else if (stateEv.base === id) {
-      stateEv.base = "";
-    } else {
-      stateEv.target = id;
-    }
-    renderEvolutionTimeline();
-    if (stateEv.base && stateEv.target) loadPromptDiff();
-    else {
-      $("#prompt-diff").innerHTML = '<div class="empty">再选择一条记录作为对比</div>';
-      $("#evolution-stats").innerHTML = "";
-      $("#evolution-insights").textContent = "选择基准与对比记录后展示差异";
-      $("#evolution-pair").textContent = "—";
-    }
+    copyText(report);
+    toast("评估报告已复制（Markdown）");
   });
-  const transcript = $("#evolution-transcript");
-  if (transcript) transcript.addEventListener("click", (ev) => {
-    const detail = ev.target.closest("[data-evolution-detail]");
-    if (!detail) return;
-    showPromptDetail(detail.dataset.evolutionDetail);
-  });
+  const timeline = $("#evolution-timeline");
+  if (timeline) {
+    // 行内三类点击：详情弹窗、基准/对比槽位、其余区域整行展开/收起
+    timeline.addEventListener("click", (ev) => {
+      const detail = ev.target.closest("[data-evolution-detail]");
+      if (detail) {
+        showPromptDetail(detail.dataset.evolutionDetail);
+        return;
+      }
+      const slot = ev.target.closest("[data-evolution-slot]");
+      if (slot) {
+        const row = slot.closest("[data-evolution-id]");
+        if (row) setEvolutionSlot(slot.dataset.evolutionSlot, row.dataset.evolutionId);
+        return;
+      }
+      const row = ev.target.closest("[data-evolution-id]");
+      if (!row) return;
+      const e = state.prompt.evolution;
+      e.expanded[row.dataset.evolutionId] = !e.expanded[row.dataset.evolutionId];
+      renderEvolutionTimeline();
+    });
+    timeline.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      const slot = ev.target.closest("[data-evolution-slot]");
+      if (slot) {
+        ev.preventDefault();
+        const row = slot.closest("[data-evolution-id]");
+        if (row) setEvolutionSlot(slot.dataset.evolutionSlot, row.dataset.evolutionId);
+        return;
+      }
+      const row = ev.target.closest("[data-evolution-id]");
+      if (!row) return;
+      ev.preventDefault();
+      const e = state.prompt.evolution;
+      e.expanded[row.dataset.evolutionId] = !e.expanded[row.dataset.evolutionId];
+      renderEvolutionTimeline();
+    });
+  }
 }
 
 async function applyRetention() {
@@ -4592,7 +5345,9 @@ async function savePricing() {
       : (backup ? "" : "，未生成备份（备份开关已关闭）");
     toast(`单价表已保存${data.recomputed ? `，重算 ${data.recomputed} 条历史` : ""}${backupNote}`);
     state.pricing = { currency: data.currency, configured: data.configured, pricing: data.pricing };
-    renderKpis((await api(`/api/usage/totals?range=${state.range}`)).totals || {});
+    const totalsData = await api(`/api/usage/totals?${usageScopeQuery({ compare: 1 })}`);
+    state.usage.previous = totalsData.previous || null;
+    renderKpis(totalsData.totals || {});
     loadCatalog();
   } catch (err) {
     toast(`保存失败：${err.message}`, true);
@@ -5346,6 +6101,7 @@ const CONFIG_HELP_TOP_FIELDS = [
   ["accessLog", "boolean", "true", "是否写访问日志（data/modelgate.log）"],
   ["retentionDays", "number", "30", "用量记录保留天数"],
   ["promptCapture", "boolean", "false", "是否记录提示词；开启后保存入站 messages（默认关闭）"],
+  ["freeSourcesPanel", "boolean", "false", "是否在导航显示「免费来源」页签（免密上游目录；默认隐藏）"],
   ["promptRetentionDays", "number", "7", "提示词记录保留天数"],
   ["promptMaxRecords", "number", "5000", "提示词记录最多保留条数（超出按时间清理）"],
   ["promptMaxChars", "number", "100000", "单条提示词最多保存字符数（超出按消息边界截断）"],
@@ -5474,6 +6230,11 @@ function boot() {
   initFolds();
   loadOverview();
   loadPricing();
+  // 启动即取配置：免费来源等面板可见性开关不等到用户进配置页才生效
+  api("/api/config").then((d) => {
+    state.config = d.config || {};
+    applyPanelVisibility();
+  }).catch(() => { /* 配置读取失败时保持默认可见性 */ });
   setInterval(loadInfo, 15000);
   // 日志自动刷新统一由 setLogAuto（#log-auto 选择器）驱动，这里不再另起一个定时器
 }

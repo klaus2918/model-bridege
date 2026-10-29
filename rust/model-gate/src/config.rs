@@ -648,6 +648,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "timeoutSeconds",
     "accessLog",
     "promptCapture",
+    "freeSourcesPanel",
     "promptRetentionDays",
     "promptMaxRecords",
     "promptMaxChars",

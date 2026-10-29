@@ -363,7 +363,10 @@ fn shorten_message(message: &Value, keep_chars: usize) -> (Value, usize, usize) 
     let cut: String = text.chars().take(keep).collect();
     let mut shortened = message.clone();
     if let Some(obj) = shortened.as_object_mut() {
-        obj.insert("content".into(), Value::String(format!("{cut}…[truncated]")));
+        obj.insert(
+            "content".into(),
+            Value::String(format!("{cut}…[truncated]")),
+        );
     }
     (shortened, keep, original_chars)
 }
@@ -770,7 +773,7 @@ pub fn summarize_call_chain(messages: &[Value]) -> Value {
 }
 
 /// 单条消息的确定性统计，供会话演进时间轴使用。
- pub fn summarize_messages(messages: &[Value]) -> Value {
+pub fn summarize_messages(messages: &[Value]) -> Value {
     let char_count: usize = messages
         .iter()
         .map(|m| content_text(m).chars().count())
@@ -807,8 +810,7 @@ pub fn summarize_call_chain(messages: &[Value]) -> Value {
         .filter_map(|m| m.get("tool_calls").and_then(Value::as_array))
         .flatten()
         .filter_map(|call| {
-            call
-                .get("function")
+            call.get("function")
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
@@ -1334,7 +1336,8 @@ mod tests {
     fn prepare_messages_keeps_head_and_tail_under_budget() {
         let mut messages = Vec::new();
         for i in 0..20 {
-            messages.push(json!({"role":"user","content": format!("message {i}: {}", "x".repeat(80))}));
+            messages
+                .push(json!({"role":"user","content": format!("message {i}: {}", "x".repeat(80))}));
         }
         messages.insert(0, json!({"role":"system","content":"SYSTEM PROMPT"}));
         let encoded = prepare_messages(&messages, 1000);
@@ -1342,7 +1345,10 @@ mod tests {
         let parsed: Value = serde_json::from_str(&encoded.messages).expect("valid json");
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr[0]["role"], "system");
-        assert!(arr.last().unwrap()["content"].as_str().unwrap().contains("message 19"));
+        assert!(arr.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("message 19"));
         let truncation = encoded.truncation.as_ref().expect("truncation metadata");
         assert_eq!(truncation["strategy"], "head_tail");
         assert!(truncation["dropped_messages"].as_i64().unwrap() > 0);
@@ -1356,7 +1362,8 @@ mod tests {
     #[test]
     fn prepare_messages_redacts_before_truncation() {
         let secret = format!("sk-{}", "a".repeat(32));
-        let messages = vec![json!({"role":"user","content": format!("{} {}", secret, "y".repeat(5000))})];
+        let messages =
+            vec![json!({"role":"user","content": format!("{} {}", secret, "y".repeat(5000))})];
         let encoded = prepare_messages(&messages, 1000);
         assert!(!encoded.messages.contains(&secret));
         assert!(encoded.messages.contains("[REDACTED:key]"));
@@ -1382,7 +1389,10 @@ mod tests {
         let pairs = cc["pairs"].as_array().unwrap();
         assert_eq!(pairs[0]["name"], "read");
         assert_eq!(pairs[0]["has_result"], true);
-        assert!(pairs[0]["result_preview"].as_str().unwrap().contains("file contents"));
+        assert!(pairs[0]["result_preview"]
+            .as_str()
+            .unwrap()
+            .contains("file contents"));
         let seq = cc["role_sequence"].as_array().unwrap();
         assert_eq!(seq[0], "system");
         let previews = cc["message_previews"].as_array().unwrap();
@@ -1390,7 +1400,10 @@ mod tests {
         assert_eq!(previews[0]["role"], "system");
         assert_eq!(previews[2]["role"], "assistant");
         assert_eq!(previews[2]["tool_names"][0], "read");
-        assert!(previews[2]["preview"].as_str().unwrap().contains("[tool_calls] read"));
+        assert!(previews[2]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("[tool_calls] read"));
         assert_eq!(previews[3]["role"], "tool");
         assert_eq!(previews[3]["tool_name"], "read");
     }

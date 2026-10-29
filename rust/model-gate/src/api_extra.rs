@@ -31,10 +31,20 @@ fn params(uri: &Uri) -> std::collections::HashMap<String, String> {
     out
 }
 
+/// from/to 兼容 epoch 秒与 datetime-local 字符串（面板自定义区间直接传字符串）。
+/// 不兼容字符串会把「清空自定义区间」降级成「清空全部」，属于数据破坏，必须拦住。
+fn parse_body_ts(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => crate::proxy::parse_ts(s),
+        _ => None,
+    }
+}
+
 pub async fn usage_clear(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let mut filters = crate::db::Filters {
-        since_ts: body.get("from").and_then(Value::as_i64),
-        until_ts: body.get("to").and_then(Value::as_i64),
+        since_ts: parse_body_ts(body.get("from")),
+        until_ts: parse_body_ts(body.get("to")),
         upstream: body
             .get("upstream")
             .and_then(Value::as_str)
@@ -50,16 +60,22 @@ pub async fn usage_clear(State(state): State<Arc<AppState>>, Json(body): Json<Va
         only: None,
     };
     if filters.since_ts.is_none() && filters.until_ts.is_none() {
-        // 面板传 range（24h/7d/all）；缺省按 all 清空，与 Python 版一致。
+        // 面板传 range（today/yesterday/24h/3d/7d/30d/all）；缺省按 all 清空，与 Python 版一致。
         let range = body.get("range").and_then(Value::as_str).unwrap_or("all");
-        filters.since_ts = match range {
-            "all" => None,
-            "today" => Some(crate::proxy::today_start()),
-            "1h" => Some(now() - 3600),
-            "7d" => Some(now() - 7 * 86400),
-            "30d" => Some(now() - 30 * 86400),
-            _ => Some(now() - 86400),
-        };
+        match range {
+            "all" => {}
+            "today" => filters.since_ts = Some(crate::proxy::today_start()),
+            "yesterday" => {
+                filters.since_ts = Some(crate::proxy::day_start(1));
+                filters.until_ts = Some(crate::proxy::today_start());
+            }
+            "1h" => filters.since_ts = Some(now() - 3600),
+            "24h" => filters.since_ts = Some(now() - 86400),
+            "3d" => filters.since_ts = Some(now() - 3 * 86400),
+            "7d" => filters.since_ts = Some(now() - 7 * 86400),
+            "30d" => filters.since_ts = Some(now() - 30 * 86400),
+            _ => filters.since_ts = Some(now() - 86400),
+        }
     }
     let removed = state.db.clear_usage(&filters);
     Json(json!({"ok": true, "removed": removed})).into_response()
@@ -343,8 +359,8 @@ pub async fn prompts_clear(
     Json(body): Json<Value>,
 ) -> Response {
     let mut filters = crate::db::PromptFilters {
-        since_ts: body.get("from").and_then(Value::as_i64),
-        until_ts: body.get("to").and_then(Value::as_i64),
+        since_ts: parse_body_ts(body.get("from")),
+        until_ts: parse_body_ts(body.get("to")),
         model: body
             .get("model")
             .and_then(Value::as_str)
@@ -358,17 +374,64 @@ pub async fn prompts_clear(
     };
     if filters.since_ts.is_none() && filters.until_ts.is_none() {
         let range = body.get("range").and_then(Value::as_str).unwrap_or("all");
-        filters.since_ts = match range {
-            "all" => None,
-            "today" => Some(crate::proxy::today_start()),
-            "1h" => Some(now() - 3600),
-            "7d" => Some(now() - 7 * 86400),
-            "30d" => Some(now() - 30 * 86400),
-            _ => Some(now() - 86400),
-        };
+        match range {
+            "all" => {}
+            "today" => filters.since_ts = Some(crate::proxy::today_start()),
+            "yesterday" => {
+                filters.since_ts = Some(crate::proxy::day_start(1));
+                filters.until_ts = Some(crate::proxy::today_start());
+            }
+            "1h" => filters.since_ts = Some(now() - 3600),
+            "24h" => filters.since_ts = Some(now() - 86400),
+            "3d" => filters.since_ts = Some(now() - 3 * 86400),
+            "7d" => filters.since_ts = Some(now() - 7 * 86400),
+            "30d" => filters.since_ts = Some(now() - 30 * 86400),
+            _ => filters.since_ts = Some(now() - 86400),
+        }
     }
-    let removed = state.db.clear_prompts(&filters);
-    Json(json!({"ok": true, "removed": removed})).into_response()
+    // 删除 + VACUUM 可能在 GB 级库上耗时数十秒：放阻塞线程池，
+    // 避免 long-running VACUUM 占住 tokio worker。
+    let db = state.db.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let before = std::fs::metadata(&db.path).map(|m| m.len()).unwrap_or(0);
+        let removed = db.clear_prompts(&filters);
+        let mut vacuumed = 0i64;
+        if removed > 0 {
+            let after = db.vacuum();
+            vacuumed = (before as i64 - after as i64).max(0);
+        }
+        (removed, before, vacuumed)
+    })
+    .await
+    .unwrap_or((0, 0, 0));
+    let (removed, before, vacuumed) = result;
+    Json(json!({
+        "ok": true,
+        "removed": removed,
+        "bytes_before": before,
+        "bytes_reclaimed": vacuumed,
+    }))
+    .into_response()
+}
+
+/// 提示词删除后 SQLite 不会缩小文件；此接口手动回收空闲页，
+/// 把 VACUUM 放阻塞线程池执行并回报前后体积。
+pub async fn prompts_vacuum(State(state): State<Arc<AppState>>) -> Response {
+    let db = state.db.clone();
+    let (before, after) = tokio::task::spawn_blocking(move || {
+        let before = std::fs::metadata(&db.path).map(|m| m.len()).unwrap_or(0);
+        let after = db.vacuum();
+        (before, after)
+    })
+    .await
+    .unwrap_or((0, 0));
+    Json(json!({
+        "ok": true,
+        "bytes_before": before,
+        "bytes_after": after,
+        "bytes_reclaimed": (before as i64 - after as i64).max(0),
+    }))
+    .into_response()
 }
 
 fn role_filtered(messages: &[Value], role: Option<&str>) -> Vec<Value> {

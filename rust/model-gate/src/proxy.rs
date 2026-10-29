@@ -498,6 +498,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/api/prompts/clear", post(crate::api_extra::prompts_clear))
         .route(
+            "/api/prompts/vacuum",
+            post(crate::api_extra::prompts_vacuum),
+        )
+        .route(
             "/api/prompts/{id}/download",
             get(crate::api_extra::prompt_download),
         )
@@ -2519,6 +2523,41 @@ mod tests {
         assert!(since < until);
     }
 
+    /// yesterday 对比前天一整天；24h/3d 沿用滚动区间口径。
+    #[test]
+    fn previous_window_for_yesterday_and_rolling_presets() {
+        let now = 1_700_000_000i64;
+        assert_eq!(
+            previous_window("range=yesterday", now),
+            Some((day_start(2), day_start(1))),
+            "yesterday 的上一段是前天 00:00 ~ 昨天 00:00"
+        );
+        assert_eq!(
+            previous_window("range=24h", now),
+            Some((now - 2 * 86400, now - 86400))
+        );
+        assert_eq!(
+            previous_window("range=3d", now),
+            Some((now - 6 * 86400, now - 3 * 86400))
+        );
+    }
+
+    /// 面板下拉新增预设：yesterday 是自然日口径（含上界），24h/3d 是滚动窗口。
+    #[test]
+    fn filters_from_query_supports_yesterday_24h_3d() {
+        let now = chrono::Utc::now().timestamp();
+        let f = filters_from_query("range=yesterday", now);
+        assert_eq!(f.since_ts, Some(day_start(1)), "左边界是昨天 00:00");
+        assert_eq!(f.until_ts, Some(today_start()), "右边界是今天 00:00");
+
+        let f = filters_from_query("range=3d", now);
+        assert_eq!(f.since_ts, Some(now - 3 * 86400));
+        assert_eq!(f.until_ts, None);
+
+        let f = filters_from_query("range=24h", now);
+        assert_eq!(f.since_ts, Some(now - 86400));
+    }
+
     #[test]
     fn resolve_session_prefers_client_header_and_falls_back_to_hash() {
         let payload = json!({
@@ -2715,14 +2754,23 @@ pub fn filters_from_query(query: &str, now: i64) -> Filters {
         }
     }
     if f.since_ts.is_none() {
-        f.since_ts = match range.as_str() {
-            "all" => None,
-            "today" => Some(today_start()),
-            "1h" => Some(now - 3600),
-            "7d" => Some(now - 7 * 86400),
-            "30d" => Some(now - 30 * 86400),
-            _ => Some(now - 86400),
-        };
+        match range.as_str() {
+            "all" => {}
+            "today" => f.since_ts = Some(today_start()),
+            "yesterday" => {
+                // 昨日 = 完整的上一个自然日 [昨天 00:00, 今天 00:00)
+                f.since_ts = Some(day_start(1));
+                if f.until_ts.is_none() {
+                    f.until_ts = Some(today_start());
+                }
+            }
+            "1h" => f.since_ts = Some(now - 3600),
+            "24h" => f.since_ts = Some(now - 86400),
+            "3d" => f.since_ts = Some(now - 3 * 86400),
+            "7d" => f.since_ts = Some(now - 7 * 86400),
+            "30d" => f.since_ts = Some(now - 30 * 86400),
+            _ => f.since_ts = Some(now - 86400),
+        }
     }
     f
 }
@@ -2732,7 +2780,7 @@ pub fn filters_from_query(query: &str, now: i64) -> Filters {
 /// 口径与 Python 版一致：
 /// - `range=all` 没有可比区间 → 返回 None（调用方跳过对比）；
 /// - 自定义区间按 `[from, to]` 的实际跨度向前平移；
-/// - `today` 对比「今天 00:00 之前等长的上一段」（避免与 24h 混淆）。
+/// - `today` 对比「今天 00:00 之前等长的上一段」，`yesterday` 对比前天（避免与 24h 混淆）。
 pub fn previous_window(query: &str, now: i64) -> Option<(i64, i64)> {
     let params = query_map_from(query);
     if params.contains_key("from") || params.contains_key("to") {
@@ -2745,14 +2793,18 @@ pub fn previous_window(query: &str, now: i64) -> Option<(i64, i64)> {
         return Some((since - span, since));
     }
     let range = params.get("range").map(String::as_str).unwrap_or("24h");
-    if range == "today" {
+    if range == "today" || range == "yesterday" {
         let start = today_start();
+        if range == "yesterday" {
+            return Some((day_start(2), day_start(1)));
+        }
         let span = (now - start).max(1);
         return Some((start - span, start));
     }
     let seconds = match range {
         "1h" => 3600,
         "24h" => 86400,
+        "3d" => 3 * 86400,
         "7d" => 7 * 86400,
         "30d" => 30 * 86400,
         _ => return None,
@@ -2792,9 +2844,15 @@ pub fn parse_ts(raw: &str) -> Option<i64> {
 }
 
 pub fn today_start() -> i64 {
+    day_start(0)
+}
+
+/// n 天前（0 = 今天）的本地 00:00；今日/昨日这类自然日口径用它，避免夏令时下的 ±86400 漂移。
+pub fn day_start(days_ago: i64) -> i64 {
     let now = chrono::Local::now();
     now.date_naive()
-        .and_hms_opt(0, 0, 0)
+        .checked_sub_signed(chrono::Duration::days(days_ago))
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
         .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
         .map(|dt| dt.timestamp())
         .unwrap_or(0)

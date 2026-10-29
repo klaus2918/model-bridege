@@ -227,9 +227,7 @@ fn config_issues_precede_save_actions_in_dom() {
 #[test]
 fn upstream_preset_and_key_source_contracts() {
     // 顺序：预设在名称之前，名称在协议之前。
-    let name = APP_JS
-        .find("data-field=\"name\"")
-        .expect("缺少名称输入");
+    let name = APP_JS.find("data-field=\"name\"").expect("缺少名称输入");
     let preset = APP_JS.find("供应商预设").expect("缺少供应商预设");
     let protocol = APP_JS
         .find("data-field=\"protocol\"")
@@ -307,9 +305,7 @@ fn upstream_preset_and_key_source_contracts() {
     let presets = APP_JS
         .find("profileChoices().concat")
         .expect("缺少预设选项列表");
-    let custom = APP_JS
-        .find("自定义 / 手动填写")
-        .expect("缺少自定义选项");
+    let custom = APP_JS.find("自定义 / 手动填写").expect("缺少自定义选项");
     assert!(
         presets < custom,
         "预设必须排在自定义之前（presets={presets}, custom={custom}）"

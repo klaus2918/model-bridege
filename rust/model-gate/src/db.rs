@@ -74,7 +74,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("prompt_records", "content_hash TEXT"),
     ("prompt_records", "system_hash TEXT"),
     ("prompt_records", "role_counts TEXT"),
-    ("prompt_records", "policy_version INTEGER NOT NULL DEFAULT 0"),
+    (
+        "prompt_records",
+        "policy_version INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -154,6 +157,9 @@ pub struct Db {
     pub path: PathBuf,
     write: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
+    /// 全表聚合（prompt_count_and_size）的短 TTL 缓存；只用于面板提示行，
+    /// 宁可短暂陈旧也不在每次列表刷新时全表扫描。
+    prompt_stats_cache: Mutex<Option<(std::time::Instant, Value)>>,
 }
 
 impl Db {
@@ -174,6 +180,7 @@ impl Db {
             path: path.to_path_buf(),
             write: Mutex::new(write),
             readers,
+            prompt_stats_cache: Mutex::new(None),
         })
     }
 
@@ -326,6 +333,13 @@ impl Db {
         }
     }
 
+    /// 列表/导出共用的提示词列。刻意不含 `messages`：那是单条可达数百 KB 的
+    /// 大字段，列表页只用 preview 与元数据；把整页的 messages 拖出来是
+    /// 大库（GB 级）下列表查询慢的主因。消息正文只走 get_prompt / export。
+    const PROMPT_LIST_COLUMNS: &str = "p.id, p.ts, p.created_at, p.session, p.requested_model, \
+         p.message_count, p.size_bytes, p.truncated, p.preview, p.redactions, \
+         p.truncation, p.content_hash, p.system_hash, p.role_counts, p.policy_version";
+
     pub fn list_prompts(
         &self,
         f: &PromptFilters,
@@ -352,13 +366,14 @@ impl Db {
             String::new()
         };
         let sql = format!(
-            "SELECT p.* , u.upstream, u.protocol, u.status, \
+            "SELECT {} , u.upstream, u.protocol, u.status, \
              u.prompt_tokens, u.completion_tokens, u.cache_read_tokens, \
              u.cache_write_tokens, u.total_tokens, u.duration_ms, u.ttft_ms, \
              u.stream, u.paused, u.error, u.cost, u.upstream_model, \
              u.truncated AS usage_truncated \
              FROM prompt_records p LEFT JOIN usage_records u ON u.id = p.id{where_sql} \
-             ORDER BY {column} {direction}{tie} LIMIT ? OFFSET ?"
+             ORDER BY {column} {direction}{tie} LIMIT ? OFFSET ?",
+            Self::PROMPT_LIST_COLUMNS
         );
         let conn = self.reader();
         let mut stmt = match conn.prepare(&sql) {
@@ -381,12 +396,16 @@ impl Db {
 
     pub fn count_prompts(&self, f: &PromptFilters) -> i64 {
         let (where_sql, args) = prompt_where_clause(f);
+        // 计数不需要 usage 列；只有按上游筛选时才需要关联，否则把百万级
+        // 提示词逐条去做 PK lookup 纯属浪费。
+        let join = if f.upstream.is_some() {
+            " LEFT JOIN usage_records u ON u.id = p.id"
+        } else {
+            ""
+        };
         let conn = self.reader();
         conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM prompt_records p \
-                 LEFT JOIN usage_records u ON u.id = p.id{where_sql}"
-            ),
+            &format!("SELECT COUNT(*) FROM prompt_records p{join}{where_sql}"),
             params_from_iter(args.iter()),
             |r| r.get::<_, i64>(0),
         )
@@ -500,17 +519,30 @@ impl Db {
 
     pub fn clear_prompts(&self, f: &PromptFilters) -> i64 {
         let (where_sql, args) = prompt_where_clause(f);
+        // 只有按上游筛选时才需要关联 usage_records（口径与 count_prompts 一致）。
+        let join = if f.upstream.is_some() {
+            " LEFT JOIN usage_records u ON u.id = p.id"
+        } else {
+            ""
+        };
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            &format!(
-                "DELETE FROM prompt_records WHERE id IN (\
-                 SELECT p.id FROM prompt_records p \
-                 LEFT JOIN usage_records u ON u.id = p.id{where_sql})"
-            ),
-            params_from_iter(args.iter()),
-        )
-        .map(|n| n as i64)
-        .unwrap_or(0)
+        // 分批删除：一次清掉百万行会长时间占住写锁、撑大 WAL；
+        // 每批独立提交，写锁在批次之间释放，代理写入基本无感。
+        let mut removed = 0i64;
+        loop {
+            let sql = format!(
+                "DELETE FROM prompt_records WHERE rowid IN (\
+                 SELECT p.rowid FROM prompt_records p{join}{where_sql} LIMIT {PROMPT_DELETE_BATCH})"
+            );
+            let n = conn
+                .execute(&sql, params_from_iter(args.iter()))
+                .unwrap_or(0) as i64;
+            removed += n;
+            if n < PROMPT_DELETE_BATCH {
+                break;
+            }
+        }
+        removed
     }
 
     pub fn delete_prompts_older_than(&self, days: i64) -> i64 {
@@ -519,9 +551,23 @@ impl Db {
         }
         let cutoff = Local::now().timestamp() - days * 86400;
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute("DELETE FROM prompt_records WHERE ts < ?1", [cutoff])
-            .map(|n| n as i64)
-            .unwrap_or(0)
+        let mut removed = 0i64;
+        loop {
+            let n = conn
+                .execute(
+                    "DELETE FROM prompt_records WHERE rowid IN (\
+                     SELECT rowid FROM prompt_records WHERE ts < ?1 \
+                     LIMIT ?2)",
+                    rusqlite::params![cutoff, PROMPT_DELETE_BATCH],
+                )
+                .map(|n| n as i64)
+                .unwrap_or(0);
+            removed += n;
+            if n < PROMPT_DELETE_BATCH {
+                break;
+            }
+        }
+        removed
     }
 
     pub fn trim_prompts(&self, max_records: i64) -> i64 {
@@ -529,45 +575,77 @@ impl Db {
             return 0;
         }
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            "DELETE FROM prompt_records WHERE id IN (\
-             SELECT id FROM prompt_records ORDER BY ts DESC LIMIT -1 OFFSET ?1)",
-            [max_records],
-        )
-        .map(|n| n as i64)
-        .unwrap_or(0)
+        // OFFSET 固定为保留条数：每批删除「保留窗口之外」的下一批，
+        // 直到保留窗口之外不足一批为止。
+        let mut removed = 0i64;
+        loop {
+            let n = conn
+                .execute(
+                    "DELETE FROM prompt_records WHERE rowid IN (\
+                     SELECT rowid FROM prompt_records ORDER BY ts DESC \
+                     LIMIT ?2 OFFSET ?1)",
+                    rusqlite::params![max_records, PROMPT_DELETE_BATCH],
+                )
+                .map(|n| n as i64)
+                .unwrap_or(0);
+            removed += n;
+            if n < PROMPT_DELETE_BATCH {
+                break;
+            }
+        }
+        removed
     }
 
     pub fn prompt_count_and_size(&self) -> Value {
+        // 全表 SUM/COUNT 在 GB 级库上是秒级操作，而它只服务于提示词页的
+        // 一行提示文案；缓存 5 秒，面板的高频刷新不再反复全表扫描。
+        {
+            let cache = self
+                .prompt_stats_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((at, value)) = cache.as_ref() {
+                if at.elapsed() < std::time::Duration::from_secs(5) {
+                    return value.clone();
+                }
+            }
+        }
         let conn = self.reader();
-        conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0),
-                    COALESCE(SUM(CASE WHEN truncated != 0 THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN redactions > 0 THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(redactions), 0),
-                    COALESCE(MAX(size_bytes), 0),
-                    COALESCE(CAST(AVG(size_bytes) AS INTEGER), 0)
-             FROM prompt_records",
-            [],
-            |r| {
-                Ok(json!({
-                    "records": r.get::<_, i64>(0)?,
-                    "bytes": r.get::<_, i64>(1)?,
-                    "truncated": r.get::<_, i64>(2)?,
-                    "redacted_records": r.get::<_, i64>(3)?,
-                    "redactions": r.get::<_, i64>(4)?,
-                    "max_bytes": r.get::<_, i64>(5)?,
-                    "avg_bytes": r.get::<_, i64>(6)?,
-                }))
-            },
-        )
-        .unwrap_or_else(|_| {
-            json!({
-                "records": 0, "bytes": 0, "truncated": 0,
-                "redacted_records": 0, "redactions": 0,
-                "max_bytes": 0, "avg_bytes": 0,
-            })
-        })
+        let value = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0),
+                        COALESCE(SUM(CASE WHEN truncated != 0 THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN redactions > 0 THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(redactions), 0),
+                        COALESCE(MAX(size_bytes), 0),
+                        COALESCE(CAST(AVG(size_bytes) AS INTEGER), 0)
+                 FROM prompt_records",
+                [],
+                |r| {
+                    Ok(json!({
+                        "records": r.get::<_, i64>(0)?,
+                        "bytes": r.get::<_, i64>(1)?,
+                        "truncated": r.get::<_, i64>(2)?,
+                        "redacted_records": r.get::<_, i64>(3)?,
+                        "redactions": r.get::<_, i64>(4)?,
+                        "max_bytes": r.get::<_, i64>(5)?,
+                        "avg_bytes": r.get::<_, i64>(6)?,
+                    }))
+                },
+            )
+            .unwrap_or_else(|_| {
+                json!({
+                    "records": 0, "bytes": 0, "truncated": 0,
+                    "redacted_records": 0, "redactions": 0,
+                    "max_bytes": 0, "avg_bytes": 0,
+                })
+            });
+        let mut cache = self
+            .prompt_stats_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some((std::time::Instant::now(), value.clone()));
+        value
     }
 
     /// 提示词页的筛选项：只取非空值，避免把 `(无会话)` 当作可选会话。
@@ -785,9 +863,17 @@ impl Db {
             other => return Err(format!("不支持的分组维度: {other}")),
         };
         let (where_sql, args) = where_clause(f, f.only.as_deref());
+        // 分组桶的来源列按维度取；error/upstream_model 等宽列不进 CTE。
+        let bucket_source = match group_by {
+            "day" | "hour" => "created_at, ",
+            "model" => "requested_model, ",
+            "upstream" => "upstream, ",
+            _ => "session, ",
+        };
         let sql = format!(
             "WITH ranked AS (
-                SELECT *, {bucket} AS bucket,
+                SELECT {bucket_source} {bucket} AS bucket,
+                       {USAGE_AGG_COLUMNS},
                        ROW_NUMBER() OVER (PARTITION BY {bucket} ORDER BY duration_ms) - 1 AS _rn,
                        COUNT(*) OVER (PARTITION BY {bucket}) AS _n
                 FROM usage_records{where_sql}
@@ -855,7 +941,7 @@ impl Db {
         };
         let sql = format!(
             "WITH ranked AS (
-                SELECT *, {expr} AS grp,
+                SELECT {expr} AS grp, {USAGE_AGG_COLUMNS}, requested_model,
                        ROW_NUMBER() OVER (PARTITION BY {expr} ORDER BY duration_ms) - 1 AS _rn,
                        COUNT(*) OVER (PARTITION BY {expr}) AS _n
                 FROM usage_records{where_sql}
@@ -915,9 +1001,16 @@ impl Db {
         } else {
             String::new()
         };
+        // upstream 维度还要统计模型数，所以 requested_model 一并投影。
+        let dims = if kind == "upstream" {
+            "upstream, requested_model, "
+        } else {
+            "upstream, "
+        };
         let sql = format!(
             "WITH ranked AS (
-                SELECT *, {expr} AS grp,
+                SELECT {dims} {expr} AS grp,
+                       {USAGE_AGG_COLUMNS},
                        ROW_NUMBER() OVER (PARTITION BY {expr} ORDER BY duration_ms) - 1 AS _rn,
                        COUNT(*) OVER (PARTITION BY {expr}) AS _n
                 FROM usage_records{where_sql}
@@ -996,6 +1089,10 @@ impl Db {
 
 static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// 提示词批量删除的批大小：把「清空百万行」拆成独立小事务，
+/// 避免长时间占住写锁与一次性撑大 WAL。
+const PROMPT_DELETE_BATCH: i64 = 5000;
+
 fn connect(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
@@ -1021,6 +1118,11 @@ fn migrate(conn: &Connection) {
     }
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_records(session)",
+        [],
+    );
+    // 会话演进按「会话 + 时间」取最近 N 条；(session, ts) 复合索引避免逐会话排序。
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prompt_session_ts ON prompt_records(session, ts)",
         [],
     );
 }
@@ -1115,6 +1217,12 @@ fn prompt_row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         }
     }))
 }
+
+/// 窗口函数 CTE 只投影聚合要用的列：usage_records 里有 error/upstream_model
+/// 等文本列，SELECT * 会把整表拖进 CTE 物化，大库上白耗内存与时间。
+/// WHERE/分组仍直接作用于基表，不受投影影响。
+const USAGE_AGG_COLUMNS: &str = "duration_ms, status, ttft_ms, prompt_tokens, completion_tokens, \
+     total_tokens, cache_read_tokens, cache_write_tokens, cost, ts";
 
 pub fn where_clause(f: &Filters, only: Option<&str>) -> (String, Vec<SqlValue>) {
     let mut clauses = Vec::new();
@@ -1494,6 +1602,45 @@ mod tests {
         assert_eq!(got["message_count"], 1);
         assert_eq!(got["messages"][0]["content"], "hello");
         assert!(got["upstream"].is_null());
+    }
+
+    /// 列表查询刻意不取 messages 大字段；这里守住列表行仍需携带的
+    /// 联查元数据（上游、状态、token、耗时），防止窄列化时漏列。
+    #[test]
+    fn prompt_list_rows_carry_joined_usage_metadata() {
+        let db = temp_db();
+        db.record_prompt(&sample_prompt("req-u", "m1", "s1", "hello"));
+        db.record_usage(&UsageRecord {
+            id: "req-u".into(),
+            upstream: "u1".into(),
+            protocol: "openai".into(),
+            requested_model: "m1".into(),
+            upstream_model: "up-m1".into(),
+            prompt_tokens: 11,
+            completion_tokens: 3,
+            cache_read_tokens: 4,
+            duration_ms: 123,
+            ttft_ms: 45,
+            status: 200,
+            ..Default::default()
+        });
+        let rows = db.list_prompts(&PromptFilters::default(), 10, 0, "ts", "desc");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["upstream"], "u1");
+        assert_eq!(row["protocol"], "openai");
+        assert_eq!(row["status"], 200);
+        assert_eq!(row["usage"]["prompt_tokens"], 11);
+        assert_eq!(row["usage"]["completion_tokens"], 3);
+        assert_eq!(row["usage"]["cache_read_tokens"], 4);
+        assert_eq!(row["usage"]["duration_ms"], 123);
+        assert_eq!(row["usage"]["ttft_ms"], 45);
+        assert_eq!(row["preview"], "hello");
+        assert_eq!(row["session"], "s1");
+        assert!(
+            row.get("messages").is_none(),
+            "列表行不得携带 messages 大字段"
+        );
     }
 
     #[test]
