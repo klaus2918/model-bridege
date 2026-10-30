@@ -283,33 +283,35 @@ mod tests {
     /// 测试专用变量名：避免与用户真实变量冲突。
     const TEST_VAR: &str = "MODEL_GATE_TEST_USER_ENV_VAR";
 
-    fn cleanup() {
-        let _ = delete_user_var(TEST_VAR);
+    fn cleanup(name: &str) {
+        let _ = delete_user_var(name);
     }
 
     #[test]
     fn write_then_read_user_var_round_trips() {
-        cleanup();
+        cleanup(TEST_VAR);
         let value = "sk-test-value-1234567890";
         write_user_var(TEST_VAR, value).expect("写入用户变量应成功");
         let read_back = read_user_var(TEST_VAR);
-        cleanup();
+        cleanup(TEST_VAR);
         assert_eq!(read_back.as_deref(), Some(value));
     }
 
     #[test]
     fn write_overwrites_existing_value() {
-        cleanup();
-        write_user_var(TEST_VAR, "first").expect("首次写入应成功");
-        write_user_var(TEST_VAR, "second").expect("覆盖写入应成功");
-        let read_back = read_user_var(TEST_VAR);
-        cleanup();
+        // 与 round_trips 用不同变量名：cargo test 默认并行，共用变量会互相覆盖。
+        const OVERWRITE_VAR: &str = "MODEL_GATE_TEST_USER_ENV_VAR_OVERWRITE";
+        cleanup(OVERWRITE_VAR);
+        write_user_var(OVERWRITE_VAR, "first").expect("首次写入应成功");
+        write_user_var(OVERWRITE_VAR, "second").expect("覆盖写入应成功");
+        let read_back = read_user_var(OVERWRITE_VAR);
+        cleanup(OVERWRITE_VAR);
         assert_eq!(read_back.as_deref(), Some("second"));
     }
 
     #[test]
     fn missing_var_reads_as_none() {
-        cleanup();
+        cleanup(TEST_VAR);
         assert!(read_user_var("MODEL_GATE_TEST_VAR_SHOULD_NOT_EXIST").is_none());
     }
 

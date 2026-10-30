@@ -351,13 +351,19 @@ fn init_logging(db_path: &std::path::Path) {
     let appender = tracing_appender::rolling::never(&dir, "modelgate.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,hyper=warn".into());
+    // 时间戳统一用**本地时区**（中国 = UTC+8）并显式带偏移。
+    // tracing-subscriber 默认用 SystemTime，输出 `...Z` 的 UTC 时间，
+    // 机器上看到的日志会整体早 8 小时（曾因此误判请求时间）。
+    let timer =
+        tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f %:z".to_string());
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_timer(timer.clone()))
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_timer(timer),
         )
         .try_init();
     // guard 必须活到进程结束，否则后台日志线程会被提前回收。

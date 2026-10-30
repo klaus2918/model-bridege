@@ -316,6 +316,40 @@ pub fn is_local_endpoint(base_url: &str) -> bool {
     false
 }
 
+/// 逐模型密钥：同一个上游下不同模型使用不同厂商密钥。
+///
+/// 背景：`cch.skytech.io` 这类网关**按键选厂商**，同一 `baseUrl` 下
+/// `deepseek-flash` / `MiniMax-M3` 必须分别使用各自的 API Key。
+///
+/// 匹配规则与 `modelOverrides` 一致：精确命中优先，其次最长单 `*` 通配。
+/// 键必须是**最终发给上游的模型 id**（`modelMap` 解析后的 `target_model`），
+/// 而不是客户端请求里写的名字。
+#[derive(Debug, Clone)]
+pub struct ModelKey {
+    /// 模型 id（精确或只含一个 `*` 的通配）。
+    pub pattern: String,
+    /// 解析后的密钥；读不到时为空。
+    pub api_key: String,
+    /// 来源：env / user-env / file / agent:... / none。
+    pub source: String,
+    /// 环境变量名（面板展示与「写入密钥」使用）。
+    pub env_name: Option<String>,
+    /// 配置里声明的来源（变量名 / 文件路径），用于诊断展示。
+    pub configured_from: String,
+    /// 读不到密钥的原因；`None` 表示可用。
+    pub missing: Option<String>,
+}
+
+/// 一次请求最终选用的密钥及其来源。
+#[derive(Debug, Clone)]
+pub struct KeySelection {
+    pub key: String,
+    pub source: String,
+    pub env_name: Option<String>,
+    /// `model` = 命中逐模型密钥；`upstream` = 上游级兜底。
+    pub from: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Upstream {
     pub name: String,
@@ -340,6 +374,9 @@ pub struct Upstream {
     pub api_key_file: Option<String>,
     /// 从 agent 客户端工具读取密钥的预设名（opencode/jcode/commandcode/custom）。
     pub api_key_agent: Option<String>,
+    /// 逐模型密钥：模型 id（精确或单个 `*` 通配）→ 已解析的凭据。
+    /// 命中时优先于上游级 `api_key`；未命中回落到上游级。
+    pub model_keys: Vec<ModelKey>,
     /// 模型级覆盖：键为模型 id（精确或单个 `*` 通配），按配置顺序保留。
     pub model_overrides: Map<String, Value>,
     /// 解析后的兼容能力（预设 + 旧字段 + 显式 compat）。
@@ -350,6 +387,90 @@ impl Upstream {
     /// 是否真正拿到可用凭据（未配置时为空值，不算已配置）。
     pub fn key_configured(&self) -> bool {
         !self.api_key.is_empty() && self.key_source != "none"
+    }
+
+    /// 上游级或任一逐模型密钥可用（面板状态展示用）。
+    pub fn any_key_configured(&self) -> bool {
+        self.key_configured() || self.model_keys.iter().any(|mk| !mk.api_key.is_empty())
+    }
+
+    /// 面板展示用的密钥来源：上游级优先，其次 `model`，最后 `none`。
+    pub fn display_key_source(&self) -> &str {
+        if self.key_configured() {
+            self.key_source.as_str()
+        } else if self.model_keys.iter().any(|mk| !mk.api_key.is_empty()) {
+            "model"
+        } else {
+            "none"
+        }
+    }
+
+    /// 命中逐模型密钥：精确优先，其次最长单 `*` 通配。
+    ///
+    /// 与 [`Self::model_override`] 使用同一套评分规则；多个 `*` 视为非法，
+    /// 不参与匹配（诊断会单独报 `multi_wildcard_model_key`）。
+    pub fn model_key(&self, model_id: &str) -> Option<&ModelKey> {
+        if model_id.is_empty() {
+            return None;
+        }
+        let mut best: Option<(u64, usize, &ModelKey)> = None;
+        for (order, entry) in self.model_keys.iter().enumerate() {
+            let stars = entry.pattern.matches('*').count();
+            let score = if stars == 0 {
+                if entry.pattern != model_id {
+                    continue;
+                }
+                u64::MAX
+            } else if stars == 1 {
+                let (prefix, suffix) = entry.pattern.split_once('*').unwrap_or(("", ""));
+                if model_id.len() < prefix.len() + suffix.len()
+                    || !model_id.starts_with(prefix)
+                    || !model_id.ends_with(suffix)
+                {
+                    continue;
+                }
+                (entry.pattern.len() - 1) as u64
+            } else {
+                continue;
+            };
+            let order_key = usize::MAX - order;
+            let better = match best {
+                Some((s, o, _)) => (score, order_key) > (s, o),
+                None => true,
+            };
+            if better {
+                best = Some((score, order_key, entry));
+            }
+        }
+        best.map(|(_, _, entry)| entry)
+    }
+
+    /// 上游级密钥（逐模型表未命中 / 条目读不到时的兜底）。
+    pub fn upstream_key(&self) -> KeySelection {
+        KeySelection {
+            key: self.api_key.clone(),
+            source: self.key_source.clone(),
+            env_name: self.api_key_env.clone(),
+            from: "upstream".into(),
+        }
+    }
+
+    /// 本次请求该用哪把密钥：命中逐模型条目且已读到值 → 用它；否则回落上游级。
+    ///
+    /// `model_id` 必须是**最终发给上游的模型名**（`target_model`），
+    /// 不能是客户端请求名 —— 否则配了 `modelMap` 时会静默用错 key。
+    pub fn key_for_model(&self, model_id: &str) -> KeySelection {
+        if let Some(entry) = self.model_key(model_id) {
+            if !entry.api_key.is_empty() {
+                return KeySelection {
+                    key: entry.api_key.clone(),
+                    source: entry.source.clone(),
+                    env_name: entry.env_name.clone(),
+                    from: "model".into(),
+                };
+            }
+        }
+        self.upstream_key()
     }
 
     /// 命中模型级覆盖：精确优先，其次最长通配；多个 `*` 视为非法不参与匹配。
@@ -691,6 +812,7 @@ const UPSTREAM_KEYS: &[&str] = &[
     "apiKeyAgent",
     "apiKeyAgentProvider",
     "apiKeyAgentPath",
+    "modelKeys",
     "anthropicVersion",
     "default",
     "fetchModels",
@@ -771,10 +893,18 @@ impl Config {
                     "extraHeaders": headers,
                     "models": u.models,
                     "default": u.default,
-                    "keySource": u.key_source,
-                    "keyConfigured": u.key_configured(),
+                    "keySource": u.display_key_source(),
+                    "keyConfigured": u.any_key_configured(),
                     "apiKeyAgent": u.api_key_agent,
                     "capabilities": u.compat.capabilities.to_json(),
+                    // 逐模型密钥只回显变量名/来源与可用性，绝不回显密钥本体。
+                    "modelKeys": u.model_keys.iter().map(|mk| json!({
+                        "model": mk.pattern,
+                        "env": mk.env_name,
+                        "source": mk.source,
+                        "configured": mk.missing.is_none(),
+                        "missing": mk.missing,
+                    })).collect::<Vec<_>>(),
                     "modelOverrides": u.model_overrides,
                 })
             })
@@ -1449,6 +1579,156 @@ impl Config {
                     }
                 }
             }
+            // ── 逐模型密钥（modelKeys）──────────────────────────────────
+            if let Some(raw_keys) = raw_up.and_then(|r| r.get("modelKeys")) {
+                let base = format!("{prefix}.modelKeys");
+                match raw_keys.as_object() {
+                    None => push(
+                        "error",
+                        "invalid_model_keys",
+                        &base,
+                        format!(
+                            "上游「{}」的 modelKeys 必须是对象（模型 id → 环境变量名 / 密钥来源对象）",
+                            up.name
+                        ),
+                        "例如 {\"MiniMax-M3\":\"MINIMAX_API_KEY\"}",
+                    ),
+                    Some(keys) => {
+                        if keys.is_empty() {
+                            push(
+                                "warn",
+                                "invalid_model_keys",
+                                &base,
+                                format!("上游「{}」的 modelKeys 是空对象，不会生效", up.name),
+                                "删除该字段，或补充「模型 → 密钥来源」",
+                            );
+                        }
+                        for (pattern, value) in keys {
+                            let path = format!("{base}.{pattern}");
+                            if pattern.trim().is_empty() {
+                                push(
+                                    "error",
+                                    "invalid_model_keys",
+                                    &path,
+                                    "模型键必须是非空字符串".into(),
+                                    "",
+                                );
+                                continue;
+                            }
+                            let stars = pattern.matches('*').count();
+                            if stars > 1 {
+                                push(
+                                    "error",
+                                    "multi_wildcard_model_key",
+                                    &path,
+                                    format!("模型键「{pattern}」包含多个 *，不参与匹配"),
+                                    "只支持一个 * 通配",
+                                );
+                                continue;
+                            }
+                            if stars == 0
+                                && !up.models.is_empty()
+                                && !up.models.iter().any(|m| m == pattern)
+                            {
+                                push(
+                                    "warn",
+                                    "model_key_unknown_model",
+                                    &path,
+                                    format!(
+                                        "逐模型密钥「{pattern}」不在上游「{}」的模型清单里",
+                                        up.name
+                                    ),
+                                    "检查模型 id（必须是 modelMap 解析后的真实模型名），或先在上游 models 中声明",
+                                );
+                            }
+                            let spec = match value {
+                                Value::String(env) => {
+                                    if env.trim().is_empty() {
+                                        push(
+                                            "error",
+                                            "invalid_model_keys",
+                                            &path,
+                                            "环境变量名不能为空".into(),
+                                            "填写环境变量名，或改用对象写法",
+                                        );
+                                    }
+                                    None
+                                }
+                                Value::Object(obj) => Some(obj),
+                                _ => {
+                                    push(
+                                        "error",
+                                        "invalid_model_keys",
+                                        &path,
+                                        "条目必须是环境变量名字符串或对象（apiKeyEnv / apiKeyFile / apiKeyAgentPath）".into(),
+                                        "",
+                                    );
+                                    None
+                                }
+                            };
+                            if let Some(obj) = spec {
+                                if obj
+                                    .get("apiKey")
+                                    .and_then(Value::as_str)
+                                    .map(|s| !s.trim().is_empty())
+                                    .unwrap_or(false)
+                                {
+                                    push(
+                                        "warn",
+                                        "model_key_literal_ignored",
+                                        &path,
+                                        format!(
+                                            "逐模型密钥「{pattern}」写有明文 apiKey，运行期已忽略"
+                                        ),
+                                        "改用 apiKeyEnv / apiKeyFile，并通过面板写入密钥",
+                                    );
+                                }
+                                let has_source = ["apiKeyEnv", "apiKeyFile", "apiKeyAgent", "apiKeyAgentPath"]
+                                    .iter()
+                                    .any(|k| obj.contains_key(*k));
+                                if !has_source {
+                                    push(
+                                        "error",
+                                        "invalid_model_keys",
+                                        &path,
+                                        "条目必须包含 apiKeyEnv / apiKeyFile / apiKeyAgentPath".into(),
+                                        "",
+                                    );
+                                }
+                                if let Some(env) = obj.get("apiKeyEnv") {
+                                    match env.as_str() {
+                                        Some(name) if !name.trim().is_empty() => {}
+                                        _ => push(
+                                            "error",
+                                            "invalid_model_keys",
+                                            &format!("{path}.apiKeyEnv"),
+                                            "apiKeyEnv 必须是非空字符串".into(),
+                                            "",
+                                        ),
+                                    }
+                                }
+                            }
+                            if let Some(entry) = up.model_keys.iter().find(|m| m.pattern == *pattern)
+                            {
+                                if let Some(reason) = &entry.missing {
+                                    // 无效条目已经单独报错，这里只报告「配置合法但读不到值」。
+                                    if entry.configured_from != "(未配置密钥来源)" {
+                                        push(
+                                            "warn",
+                                            "model_key_missing",
+                                            &path,
+                                            format!(
+                                                "模型「{pattern}」的密钥未读到（{reason}），请求会回落到上游级密钥"
+                                            ),
+                                            "检查环境变量 / 凭据文件，或用面板「写入逐模型密钥」",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if c.thinking_passthrough && up.protocol != "anthropic" {
                 push(
                     "info",
@@ -1478,6 +1758,9 @@ impl Config {
                 && up.api_key_env.is_none()
                 && up.api_key_file.is_none()
                 && up.api_key_agent.is_none()
+                // 纯逐模型密钥的上游：整体缺失由 model_key_missing 逐条报告，
+                // 不再额外报一条容易误导的 missing_credentials。
+                && up.model_keys.is_empty()
             {
                 push(
                     "warn",
@@ -1698,6 +1981,8 @@ fn normalize_upstream(name: &str, value: &Value, root: &Map<String, Value>) -> U
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        // 逐模型密钥：字符串简写（环境变量名）或对象（apiKeyEnv / apiKeyFile / …）。
+        model_keys: resolve_model_keys(u.get("modelKeys")),
         model_overrides: u
             .get("modelOverrides")
             .and_then(Value::as_object)
@@ -1942,6 +2227,96 @@ pub(crate) fn expand_home(path: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     PathBuf::from(path)
+}
+
+/// 解析「逐模型密钥」表。
+///
+/// 支持的写法（与 model-bridge 对齐）：
+/// ```json
+/// "modelKeys": {
+///   "MiniMax-M3": "MINIMAX_API_KEY",
+///   "mimo-*": { "apiKeyEnv": "XIAOMI_MIMO_API_KEY" },
+///   "deepseek-pro": { "apiKeyFile": "D:/secrets/deepseek.json" }
+/// }
+/// ```
+///
+/// - 字符串简写等价于 `{ "apiKeyEnv": "<值>" }`；
+/// - 对象写法复用上游级 `resolve_api_key` 的优先级（env → file → agent）；
+/// - 读不到值的条目**保留**在列表里并标记 `missing`，由诊断与健康检查点名，
+///   运行时回落到上游级密钥（与 model-bridge 的兜底行为一致）。
+fn resolve_model_keys(value: Option<&Value>) -> Vec<ModelKey> {
+    let Some(spec) = value.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    spec.iter()
+        .map(|(pattern, raw)| {
+            let mut obj: Map<String, Value> = match raw {
+                Value::String(env) => {
+                    let mut m = Map::new();
+                    m.insert("apiKeyEnv".into(), json!(env));
+                    m
+                }
+                Value::Object(m) => m.clone(),
+                _ => Map::new(),
+            };
+            // 明文 apiKey 永不作为凭据；保留字段只为诊断提示，读取时忽略。
+            obj.remove("apiKey");
+            // 环境变量名两侧空白不应影响读取（面板输入常见）。
+            if let Some(env) = obj
+                .get("apiKeyEnv")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_string)
+            {
+                obj.insert("apiKeyEnv".into(), json!(env));
+            }
+            let (api_key, source) = resolve_api_key(&obj, &Map::new());
+            let env_name = obj
+                .get("apiKeyEnv")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let configured_from = model_key_source_label(&obj);
+            let missing = if api_key.is_empty() {
+                Some(format!("{configured_from} 未读到值"))
+            } else {
+                None
+            };
+            ModelKey {
+                pattern: pattern.clone(),
+                api_key,
+                source,
+                env_name,
+                configured_from,
+                missing,
+            }
+        })
+        .collect()
+}
+
+/// 逐模型条目声明的来源描述（用于诊断；不包含任何密钥值）。
+fn model_key_source_label(spec: &Map<String, Value>) -> String {
+    let text = |key: &str| {
+        spec.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(env) = text("apiKeyEnv") {
+        return env;
+    }
+    if let Some(file) = text("apiKeyFile") {
+        return file;
+    }
+    if let Some(path) = text("apiKeyAgentPath") {
+        return path;
+    }
+    if spec.get("apiKeyAgent").is_some() {
+        return "agent 凭据（未指定路径）".into();
+    }
+    "(未配置密钥来源)".into()
 }
 
 /// 密钥优先级：apiKeyEnv → apiKeyFile → agent 自定义路径 → 无凭据。
@@ -3124,5 +3499,89 @@ mod tests {
                 "面板缺少提醒区控件 #{id}"
             );
         }
+    }
+
+    /// 逐模型密钥：字符串简写 + 对象写法 + 精确优先于通配。
+    #[test]
+    fn model_keys_string_and_object_and_precedence() {
+        let dir = std::env::temp_dir().join(format!("mg-model-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_a = dir.join("a.json");
+        let key_b = dir.join("b.json");
+        std::fs::write(&key_a, r#"{"apiKey":"key-a"}"#).unwrap();
+        std::fs::write(&key_b, r#"{"apiKey":"key-b"}"#).unwrap();
+
+        let up = normalize_upstream(
+            "u",
+            &json!({
+                "protocol": "openai",
+                "baseUrl": "http://127.0.0.1:1/v1",
+                "apiKeyEnv": "MG_MODEL_KEYS_FALLBACK_NOT_SET",
+                "models": ["model-a", "model-b"],
+                "modelKeys": {
+                    "model-a": {"apiKeyFile": key_a.to_string_lossy()},
+                    "model-*": {"apiKeyFile": key_b.to_string_lossy()},
+                    "bad*b*c": {"apiKeyFile": key_b.to_string_lossy()}
+                }
+            }),
+            &empty_root(),
+        );
+
+        // 精确命中优先于通配
+        let a = up.key_for_model("model-a");
+        assert_eq!(a.key, "key-a");
+        assert_eq!(a.from, "model");
+        // 通配命中
+        let b = up.key_for_model("model-extra");
+        assert_eq!(b.key, "key-b");
+        assert_eq!(b.from, "model");
+        // 未命中 → 上游级兜底（本用例未设置该环境变量，故为空）
+        let fallback = up.key_for_model("other");
+        assert_eq!(fallback.from, "upstream");
+        assert!(fallback.key.is_empty());
+        // 多个 `*` 非法：不参与匹配
+        assert!(up.model_key("badxxbyyc").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 逐模型密钥诊断：非法条目、未知模型、缺失、多通配、明文 apiKey。
+    #[test]
+    fn diagnostics_model_keys_codes() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "u": {
+                    "protocol": "openai",
+                    "baseUrl": "https://api.example.com/v1",
+                    "models": ["model-a"],
+                    "modelKeys": {
+                        "model-a": "MG_MODEL_KEYS_MISSING_ENV_NOT_SET",
+                        "ghost": "MG_MODEL_KEYS_GHOST_NOT_SET",
+                        "a*b*c": "MG_MODEL_KEYS_MULTI_NOT_SET",
+                        "bad": 123,
+                        "literal": {"apiKey": "sk-plain"},
+                        "empty": ""
+                    }
+                }
+            }
+        }));
+        let diags = cfg.diagnostics();
+        let has = |code: &str, path: &str| diags.iter().any(|d| d.code == code && d.path == path);
+        assert!(has("model_key_missing", "upstreams.u.modelKeys.model-a"));
+        assert!(has(
+            "model_key_unknown_model",
+            "upstreams.u.modelKeys.ghost"
+        ));
+        assert!(has(
+            "multi_wildcard_model_key",
+            "upstreams.u.modelKeys.a*b*c"
+        ));
+        assert!(has("invalid_model_keys", "upstreams.u.modelKeys.bad"));
+        assert!(has(
+            "model_key_literal_ignored",
+            "upstreams.u.modelKeys.literal"
+        ));
+        assert!(has("invalid_model_keys", "upstreams.u.modelKeys.literal"));
+        assert!(has("invalid_model_keys", "upstreams.u.modelKeys.empty"));
     }
 }

@@ -97,6 +97,56 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 - `capabilities` 仅用于展示与配置诊断，不改变转发行为（避免误判导致请求被错误拒绝）；
 - 未知模型 key：警告 `model_override_unknown_model`，不报错（模型目录可能动态变化）。
 
+## 4.1 逐模型密钥 `modelKeys`
+
+位置：`upstreams.<name>.modelKeys`（顶层字段）。
+
+用途：同一个上游（同一 `baseUrl` / 协议）下，不同模型必须使用不同厂商密钥。
+典型场景是 `cch.skytech.io` 这类**按密钥选厂商**的网关：模型名只是参考，真正决定
+由哪家回答的是请求里带的 key。
+
+```json
+{
+  "modelKeys": {
+    "MiniMax-M3": "MINIMAX_API_KEY",
+    "mimo-*": { "apiKeyEnv": "XIAOMI_MIMO_API_KEY" },
+    "deepseek-pro": { "apiKeyFile": "D:/secrets/deepseek.json" }
+  }
+}
+```
+
+规则：
+
+- 键为**路由解析后的模型 id**（`modelMap` 解析后的 `target_model`），
+  不是客户端请求里写的名字；写错会静默回落到上游级密钥。
+- 值支持两种写法：环境变量名字符串（简写），或对象
+  `{ "apiKeyEnv" | "apiKeyFile" | "apiKeyAgent" | "apiKeyAgentPath" }`。
+- 匹配优先级：精确命中 > 最长单 `*` 通配 > 上游级 `apiKeyEnv` / `apiKeyFile` / `apiKeyAgent`。
+- 多个 `*` 视为非法，不参与匹配（`multi_wildcard_model_key`）。
+- 条目存在但读不到密钥时，请求**回落到上游级密钥**，同时产生 `model_key_missing` 警告；
+  与 model-bridge 的兜底行为一致，避免一个模型配置缺失拖垮整条上游。
+- 明文 `apiKey` 永不作为凭据：条目不参与解析，诊断报 `model_key_literal_ignored`；
+  落盘前 `strip_secrets` 也会清掉 `modelKeys.*.apiKey`。
+
+诊断：
+
+| 码 | 级别 | 条件 |
+|---|---|---|
+| `invalid_model_keys` | error | `modelKeys` 非对象、条目类型非法、空键/空环境变量名、条目无任何来源字段 |
+| `multi_wildcard_model_key` | error | 模型键含一个以上 `*` |
+| `model_key_unknown_model` | warn | 精确键不在上游 `models` 中 |
+| `model_key_missing` | warn | 条目声明了来源但读不到密钥（请求会回落上游级 key） |
+| `model_key_literal_ignored` | warn | 条目里写了明文 `apiKey`，运行期忽略 |
+
+API/面板：
+
+- `GET /api/upstreams` 与 `GET /api/config` 的 `effective` 新增 `modelKeys`
+  （`model` / `env` / `source` / `configured` / `missing`），**不含密钥值**；
+- `POST /api/upstreams/secret` 新增可选 `model`：按该模型 `modelKeys` 条目的
+  `apiKeyEnv` 写入用户环境变量；未知模型 / 未配置 `apiKeyEnv` 返回 400；
+  逐模型写入暂只支持 `target=env`，`target=file` 返回 `unsupported_model_key_target`；
+- 面板上游编辑器「4. 逐模型密钥」提供 JSON 编辑与「写入逐模型密钥」按钮。
+
 ## 5. 能力元数据 `capabilities`
 
 固定字段：`stream`、`tools`、`vision`、`thinking`、`cache`、`systemPrompt`。
@@ -213,6 +263,7 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 | `apiKey` | 是 | 明文密钥；为空 → 400 `empty_key`；含换行/控制字符 → 400 `invalid_key` |
 | `target` | 否 | `env`（默认，写用户变量）/ `file`（写用户指定文件）；其它值 → 400 `invalid_target` |
 | `envName` | 否 | 变量名；缺省时用该上游已配置的 `apiKeyEnv`；都没有 → 400 `missing_env_name`；含 `=` → 400 `invalid_env_name` |
+| `model` | 否 | 逐模型写入：模型 id（`modelKeys` 的键）；按该条目的 `apiKeyEnv` 写变量，忽略 `envName`；未知模型 → 400 `unknown_model_key`，条目无 `apiKeyEnv` → 400 `model_key_missing_env`；与 `target=file` 同用 → 400 `unsupported_model_key_target` |
 | `filePath` | 否 | 凭据文件路径；缺省时回退该上游的 `apiKeyFile` / `apiKeyAgentPath`；都没有 → 400 `missing_file_path`；非绝对路径 → 400 `invalid_file_path` |
 | `fileFormat` | 否 | `json`（默认）/ `env`；其它值 → 400 `invalid_file_format` |
 | `field` | 否 | JSON 点路径（缺省 `apiKey`）/ `.env` 变量名（`.env` 必填） |

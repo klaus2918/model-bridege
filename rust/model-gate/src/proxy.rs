@@ -208,27 +208,10 @@ impl AppState {
                 headers.insert(n, v);
             }
         }
-        // 未配置凭据时 apiKey 为空：不伪造占位密钥，也不发送鉴权头。
-        if !up.api_key.is_empty() && up.compat.auth_scheme != "none" {
-            let key = up.api_key.clone();
-            let bearer = key_with_prefix(&up.compat.auth_prefix, &key);
-            match up.compat.auth_scheme.as_str() {
-                "x-api-key" => insert_header(&mut headers, "x-api-key", &key),
-                "both" => {
-                    insert_header(&mut headers, "authorization", &format!("Bearer {key}"));
-                    insert_header(&mut headers, "x-api-key", &key);
-                }
-                "header" => {
-                    let name = if up.compat.auth_header.is_empty() {
-                        "authorization"
-                    } else {
-                        &up.compat.auth_header
-                    };
-                    insert_header(&mut headers, name, &bearer);
-                }
-                _ => insert_header(&mut headers, "authorization", &bearer),
-            }
-        }
+        // 模型清单没有具体模型上下文：使用上游级密钥。
+        // 与 chat 共用同一套鉴权头构造，避免两处行为漂移。
+        let selection = up.upstream_key();
+        apply_auth_headers(&mut headers, up, &selection.key);
         let is_opencode = up.transport == "opencode";
         if is_opencode {
             // 与 chat 路径完全一致：客户端指纹（匿名 key + UA + 会话/请求 ID）。
@@ -725,6 +708,20 @@ async fn chat_inner(
         .get(&requested_model)
         .cloned()
         .unwrap_or_else(|| requested_model.clone());
+    // 逐模型密钥：必须用最终发给上游的 target_model 选 key。
+    // 用 requested_model 会漏掉 modelMap 映射，静默用错厂商密钥。
+    let model_key = upstream.key_for_model(&target_model);
+    if !upstream.model_keys.is_empty() {
+        // 只记录来源，不记录密钥值。
+        tracing::debug!(
+            upstream = %upstream.name,
+            model = %target_model,
+            key_from = %model_key.from,
+            key_source = %model_key.source,
+            key_env = model_key.env_name.as_deref().unwrap_or(""),
+            "逐模型密钥选择"
+        );
+    }
 
     let client_stream = payload
         .get("stream")
@@ -786,9 +783,7 @@ async fn chat_inner(
             );
         }
         "commandcode" => {
-            if (upstream.api_key.is_empty() || upstream.key_source == "none")
-                && upstream.compat.auth_scheme != "none"
-            {
+            if model_key.key.is_empty() && upstream.compat.auth_scheme != "none" {
                 return error_json(StatusCode::UNAUTHORIZED,
                                   "未配置 CommandCode 凭据：请设置 COMMAND_CODE_API_KEY 环境变量，或在面板「写入密钥」保存",
                                   "authentication_error", "missing_api_key");
@@ -825,46 +820,8 @@ async fn chat_inner(
         }
     }
     // 2) 鉴权：bearer / x-api-key / both / header；空 key 表示不发送鉴权头。
-    if !upstream.api_key.is_empty() && upstream.compat.auth_scheme != "none" {
-        let key = upstream.api_key.as_str();
-        match upstream.compat.auth_scheme.as_str() {
-            "x-api-key" => {
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(key) {
-                    headers.insert("x-api-key", value);
-                }
-            }
-            "both" => {
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-                {
-                    headers.insert(reqwest::header::AUTHORIZATION, value);
-                }
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(key) {
-                    headers.insert("x-api-key", value);
-                }
-            }
-            "header" => {
-                let name = upstream.compat.auth_header.to_lowercase();
-                let value = format!("{}{key}", upstream.compat.auth_prefix);
-                if let (Ok(name), Ok(value)) = (
-                    reqwest::header::HeaderName::from_bytes(name.as_bytes()),
-                    reqwest::header::HeaderValue::from_str(&value),
-                ) {
-                    headers.insert(name, value);
-                }
-            }
-            _ => {
-                let prefix = if upstream.compat.auth_prefix.is_empty() {
-                    "Bearer "
-                } else {
-                    upstream.compat.auth_prefix.as_str()
-                };
-                if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("{prefix}{key}"))
-                {
-                    headers.insert(reqwest::header::AUTHORIZATION, value);
-                }
-            }
-        }
-    }
+    // 逐模型命中时用该模型的 key，否则回落到上游级 key；头风格始终由 compat 决定。
+    apply_auth_headers(&mut headers, &upstream, &model_key.key);
     // 3) 会话头：opencode / commandcode 等由 compat 声明，不再写死协议名。
     if !upstream.compat.session_header.is_empty() {
         let raw = session_id(&payload);
@@ -2041,11 +1998,19 @@ async fn api_upstreams(State(state): State<Arc<AppState>>) -> impl IntoResponse 
                 "default": u.default,
                 "models": u.models,
                 "modelsAll": u.models,
-                "keySource": u.key_source,
-                "keyConfigured": u.key_configured(),
+                "keySource": u.display_key_source(),
+                "keyConfigured": u.any_key_configured(),
                 "apiKeyEnv": u.api_key_env,
                 "apiKeyFile": u.api_key_file,
                 "apiKeyAgent": u.api_key_agent,
+                // 逐模型密钥：只回显变量名/来源与可用性，绝不回显密钥本体。
+                "modelKeys": u.model_keys.iter().map(|mk| json!({
+                    "model": mk.pattern,
+                    "env": mk.env_name,
+                    "source": mk.source,
+                    "configured": mk.missing.is_none(),
+                    "missing": mk.missing,
+                })).collect::<Vec<_>>(),
                 "plan": Value::Null,
                 "planError": Value::Null,
             })
@@ -2061,8 +2026,16 @@ async fn api_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         for up in cfg.upstreams.iter() {
             if let Some(target) = ups.get_mut(&up.name).and_then(Value::as_object_mut) {
                 target.remove("apiKey");
-                target.insert("_keyConfigured".into(), json!(up.key_configured()));
-                target.insert("_keySource".into(), json!(up.key_source));
+                // 逐模型条目里的历史明文 apiKey 也不得回显给面板。
+                if let Some(keys) = target.get_mut("modelKeys").and_then(Value::as_object_mut) {
+                    for (_, spec) in keys.iter_mut() {
+                        if let Some(spec) = spec.as_object_mut() {
+                            spec.remove("apiKey");
+                        }
+                    }
+                }
+                target.insert("_keyConfigured".into(), json!(up.any_key_configured()));
+                target.insert("_keySource".into(), json!(up.display_key_source()));
             }
         }
     }
@@ -2211,6 +2184,129 @@ mod tests {
         Arc::new(AppState::new(cfg, db, dir.join("c.json")))
     }
 
+    /// 假上游：记录每次请求的 `x-api-key` / `authorization`，并返回标准 OpenAI 响应。
+    ///
+    /// 用于断言「同一个上游、不同模型」实际发出的密钥不同。
+    fn spawn_key_capture_server(
+        serves: usize,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<(Option<String>, Option<String>)>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(serves) {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("复制流"));
+                let mut content_length = 0usize;
+                let mut x_api_key = None;
+                let mut authorization = None;
+                loop {
+                    let mut line = String::new();
+                    if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':') {
+                        let name = name.trim().to_ascii_lowercase();
+                        let value = value.trim().to_string();
+                        match name.as_str() {
+                            "x-api-key" => x_api_key = Some(value),
+                            "authorization" => authorization = Some(value),
+                            "content-length" => {
+                                content_length = value.parse().unwrap_or(0);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                }
+                let _ = tx.send((x_api_key, authorization));
+                let body = r#"{"id":"chatcmpl-test","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// 同一个上游下，不同模型必须使用各自的密钥；`modelMap` 解析后的
+    /// 真实模型名也必须命中对应密钥（不能用请求名查表）。
+    #[test]
+    fn chat_uses_per_model_keys_for_same_upstream() {
+        let dir =
+            std::env::temp_dir().join(format!("mg-proxy-model-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_a = dir.join("a.json");
+        let key_b = dir.join("b.json");
+        std::fs::write(&key_a, r#"{"apiKey":"key-a"}"#).unwrap();
+        std::fs::write(&key_b, r#"{"apiKey":"key-b"}"#).unwrap();
+
+        let (url, rx) = spawn_key_capture_server(3);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {
+                "u": {
+                    "protocol": "openai",
+                    "baseUrl": url,
+                    "models": ["real-a", "model-b"],
+                    "modelMap": {"alias-a": "real-a"},
+                    "compat": {"auth": {"scheme": "x-api-key"}},
+                    "modelKeys": {
+                        "real-a": {"apiKeyFile": key_a.to_string_lossy()},
+                        "model-b": {"apiKeyFile": key_b.to_string_lossy()}
+                    }
+                }
+            }
+        }));
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+        let runtime = rt();
+
+        for model in ["real-a", "alias-a", "model-b"] {
+            let body = Bytes::from(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            );
+            let resp = runtime.block_on(chat_inner(state.clone(), None, HeaderMap::new(), body));
+            assert_eq!(resp.status(), StatusCode::OK, "模型 {model} 应转发成功");
+        }
+
+        let first = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("第一个请求未到达上游");
+        let second = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("第二个请求未到达上游");
+        let third = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("第三个请求未到达上游");
+        assert_eq!(first.0.as_deref(), Some("key-a"));
+        assert_eq!(
+            second.0.as_deref(),
+            Some("key-a"),
+            "modelMap 别名必须按真实模型 real-a 选 key"
+        );
+        assert_eq!(third.0.as_deref(), Some("key-b"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn state_with_prompt_capture() -> Arc<AppState> {
         let cfg = crate::config::Config::from_value(json!({
             "promptCapture": true,
@@ -2256,9 +2352,11 @@ mod tests {
             elapsed
         );
 
+        // 直接查记录，不用 prompt_count_and_size：后者有 5 秒统计缓存，
+        // 会让本测试等到缓存过期，正好压在超时边缘。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if state.db.prompt_count_and_size()["records"].as_i64() == Some(1) {
+            if state.db.get_prompt("req-async").is_some() {
                 break;
             }
             assert!(
@@ -2612,6 +2710,39 @@ mod tests {
         headers.insert("x-session-id", "   ".parse().unwrap());
         headers.insert("x-conversation-id", "conv-1".parse().unwrap());
         assert_eq!(resolve_session(&headers, &payload), "conv-1");
+    }
+}
+
+/// 按上游声明的鉴权方式写入一个密钥。
+///
+/// 逐模型密钥（`modelKeys`）与上游级密钥共用这一条路径，保证：
+/// - `x-api-key` / `both` / 自定义头 / bearer 的行为与旧实现一致；
+/// - 空 key 或 `compat.auth.scheme=none` 时不发送任何鉴权头；
+/// - 同一请求只发一种凭据头的值（`both` 除外，按配置双写相同值）。
+pub(crate) fn apply_auth_headers(
+    headers: &mut reqwest::header::HeaderMap,
+    up: &Upstream,
+    key: &str,
+) {
+    if key.is_empty() || up.compat.auth_scheme == "none" {
+        return;
+    }
+    let bearer = key_with_prefix(&up.compat.auth_prefix, key);
+    match up.compat.auth_scheme.as_str() {
+        "x-api-key" => insert_header(headers, "x-api-key", key),
+        "both" => {
+            insert_header(headers, "authorization", &format!("Bearer {key}"));
+            insert_header(headers, "x-api-key", key);
+        }
+        "header" => {
+            let name = if up.compat.auth_header.is_empty() {
+                "authorization"
+            } else {
+                &up.compat.auth_header
+            };
+            insert_header(headers, name, &bearer);
+        }
+        _ => insert_header(headers, "authorization", &bearer),
     }
 }
 

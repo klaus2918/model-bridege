@@ -351,6 +351,12 @@ async function main() {
   await cdp.send("Page.enable");
   await cdp.send("Log.enable");
 
+  // 面板有未保存改动时刷新会触发浏览器原生 beforeunload 确认；
+  // 冒烟里等价于用户点「离开」，自动接受，避免 Page.navigate 被对话框卡住。
+  cdp.on("Page.javascriptDialogOpening", () => {
+    cdp.send("Page.handleJavaScriptDialog", { accept: true }).catch(() => {});
+  });
+
   const loadEvent = new Promise((resolve) => cdp.once("Page.loadEventFired", resolve));
   if (!loaded) {
     await cdp.send("Page.navigate", { url: pageUrl });
@@ -874,7 +880,21 @@ async function main() {
       })()`,
     );
     if (!hasDeepseek) throw new Error("模板未把峰谷条目写入 JSON");
-    return `模板 ${count} 个，DeepSeek 峰谷条目已并入`;
+    // 模板插入属于未保存改动：必须有标记，且切走再回来不能被服务端旧数据覆盖
+    if (!(await evaluate(`document.querySelector("#pricing-dirty")?.hidden === false`))) {
+      throw new Error("模板插入后未标记「未保存」");
+    }
+    await click('[data-tab="overview"]');
+    await click('[data-tab="model"]');
+    await waitFor(
+      () => evaluate(`document.querySelector("#pricing-json").value.includes("deepseek")`),
+      3000,
+      "切换页签后模板草稿保留",
+    );
+    if (!(await evaluate(`document.querySelector("#pricing-dirty")?.hidden === false`))) {
+      throw new Error("切回单价表后「未保存」标记消失");
+    }
+    return `模板 ${count} 个，DeepSeek 峰谷条目已并入且草稿未丢`;
   });
 
   await check("免费来源页默认隐藏，配置开启后可见", async () => {
@@ -902,6 +922,29 @@ async function main() {
     await click('[data-tab="free"]');
     await waitFor(() => isVisible("#free-sources"), 3000, "免费来源列表");
     return "开启后 free-sources 可见";
+  });
+
+  await check("免费来源探测时间按本地时区显示", async () => {
+    const result = await evaluate(`(() => {
+      const iso = "2026-10-27T01:23:45+00:00";
+      state.free.models = [{ id: "probe-time-check", name: "probe-time-check" }];
+      state.free.results = {
+        "probe-time-check": { state: "available", probedAt: iso, latencyMs: 120 },
+      };
+      state.free.filter = "";
+      renderFreeModelTable();
+      return {
+        text: document.querySelector("#free-model-table tbody").textContent,
+        expected: fmtTime(null, iso),
+      };
+    })()`);
+    if (result.text.includes("2026-10-27T01:23:45")) {
+      throw new Error("探测时间仍显示 UTC 原始串");
+    }
+    if (!result.text.includes(`探测于 ${result.expected}`)) {
+      throw new Error(`探测时间未按本地时区显示：${result.text}`);
+    }
+    return `探测时间显示为 ${result.expected}`;
   });
 
   await check("提示词页最终无 JS 异常", async () => {

@@ -25,7 +25,8 @@ const state = {
   // 自定义时间区间（datetime-local 值）；为空时使用 range 预设
   custom: { from: "", to: "" },
   options: { upstreams: [], models: [], sessions: [] },
-  pricing: { currency: "CNY", configured: false, fx: { USD: 7.2 }, entries: 0, pricing: {} },
+  pricing: { currency: "CNY", configured: false, fx: { USD: 7.2 }, entries: 0, pricing: {},
+             rows: [], dirty: false },
   catalog: { page: 1, pageSize: 25, total: 0, q: "", upstream: "", currency: "CNY",
              price: "", source: "", sort: "model", order: "asc" },
   usage: {
@@ -319,9 +320,17 @@ function fmtUptime(seconds) {
   if (m > 0) return `${m} 分 ${Math.floor(s % 60)} 秒`;
   return Math.floor(s) + " 秒";
 }
+/* 时间统一按**本机时区**展示（中国 = UTC+8）。
+   `ts` 是权威的 Unix 秒；`created_at` 只作兜底：历史库里它带偏移（如 +08:00），
+   也可能来自旧版本/导入数据而带 `Z`（UTC）——直接截字符串会整体差 8 小时，
+   所以这里先交给 Date 解析，再按本地时区格式化。 */
 function fmtTime(ts, createdAt) {
-  if (createdAt) return String(createdAt).replace("T", " ").slice(0, 19);
-  const d = new Date(Number(ts) * 1000);
+  const epoch = Number(ts);
+  let d = Number.isFinite(epoch) && epoch > 0 ? new Date(epoch * 1000) : null;
+  if (!d && createdAt) d = new Date(createdAt);
+  if (!d || Number.isNaN(d.getTime())) {
+    return createdAt ? String(createdAt).replace("T", " ").slice(0, 19) : "—";
+  }
   const p = (x) => String(x).padStart(2, "0");
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
          `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
@@ -526,13 +535,22 @@ const UPSTREAM_SORT_LABELS = {
   name: "名称", protocol: "协议", models: "模型数", plan: "套餐", key: "密钥", default: "默认",
 };
 
+/* `/api/upstreams` 的 models 是配置的模型数组（modelsAll 同义），
+   不是数字；旧代码直接 Number() 会得到 NaN。统一在这里取数量。 */
+function upstreamModelCount(u) {
+  if (Array.isArray(u && u.models)) return u.models.length;
+  if (Array.isArray(u && u.modelsAll)) return u.modelsAll.length;
+  const n = Number(u && u.models);
+  return Number.isFinite(n) ? n : 0;
+}
+
 /* 上游列表是一次性完整数据（没有分页），因此排序在前端完成是正确的；
    反例是分页表格 —— 那里必须由后端在完整结果集上排序。 */
 function sortedUpstreams() {
   const key = state.overview.sortKey;
   const dir = state.overview.sortDir === "asc" ? 1 : -1;
   const weight = (u) => {
-    if (key === "models") return Number(u.models) || 0;
+    if (key === "models") return upstreamModelCount(u);
     if (key === "plan") return (u.plan || (u.planError ? "~" : "zz")).toLowerCase();
     if (key === "key") return u.keyConfigured ? 1 : 0;
     if (key === "default") return u.default ? 1 : 0;
@@ -564,11 +582,16 @@ function renderUpstreamSortMarks() {
 /* 上游详情：Base URL、密钥来源、模型清单、套餐限制都在展开行里，表格保持八列 */
 function upstreamDetailRow(u) {
   const models = (u.modelsAll || []).slice(0, 24).join(", ");
+  const modelKeys = Array.isArray(u.modelKeys) && u.modelKeys.length
+    ? u.modelKeys.map((mk) => `${mk.model} → ${mk.env || mk.source || "未配置"}${
+        mk.configured === false ? "（未读到）" : ""}`).join("；")
+    : "";
   const items = [
     ["Base URL", u.baseUrl],
     ["密钥来源", u.keyConfigured ? (u.keySource || "已配置") : "未配置"],
     ["密钥变量", u.apiKeyEnv || u.apiKeyFile],
-    ["白名单模型", `${u.models} 个`],
+    ["逐模型密钥", modelKeys],
+    ["白名单模型", `${upstreamModelCount(u)} 个`],
     ["全部模型", `${u.modelsAll ? u.modelsAll.length : 0} 个${models ? "：" + models : ""}`],
     ["套餐", u.plan || (u.planError ? `未知（${u.planError}）` : "无门槛信息")],
     ["会话头", u.sessionHeader ? "已开启" : "未开启"],
@@ -605,16 +628,20 @@ function renderUpstreamTable() {
             health.status ? "HTTP " + health.status : "不可达"}</span>
            <button type="button" class="ghost btn-test-up" data-name="${esc(u.name)}">重测</button>`;
     }
+    const modelKeyMissing = Array.isArray(u.modelKeys)
+      ? u.modelKeys.filter((mk) => mk && mk.configured === false).length : 0;
     const keyHint = !u.keyConfigured
       ? `<span class="badge bad" title="未配置真实密钥，上游会返回 401">未配置</span>`
-      : `<span class="badge">${esc(u.keySource)}</span>`;
+      : `<span class="badge">${esc(u.keySource)}</span>${modelKeyMissing
+          ? ` <span class="badge bad" title="${modelKeyMissing} 个模型密钥未读到，会回落到上游级密钥">${modelKeyMissing} 缺</span>`
+          : ""}`;
     const open = state.overview.expanded === u.name;
     const main = `<tr data-up="${esc(u.name)}" class="usage-row${open ? " open" : ""}${
       u.keyConfigured ? "" : " row-bad"}">
       <td><div class="up-name">${esc(u.name)}</div></td>
       <td><span class="badge">${esc(u.protocol)}</span></td>
       <td class="mono">${esc(u.baseUrl)}</td>
-      <td class="num">${fmtInt(u.models)}<span style="color:var(--text-3)"> / ${fmtInt(u.modelsAll ? u.modelsAll.length : 0)}</span></td>
+      <td class="num">${fmtInt(upstreamModelCount(u))}<span style="color:var(--text-3)"> / ${fmtInt(u.modelsAll ? u.modelsAll.length : 0)}</span></td>
       <td>${plan}</td>
       <td>${keyHint}</td>
       <td>${u.default ? '<span class="badge brand">默认</span>' : "—"}</td>
@@ -790,12 +817,15 @@ async function saveUpstreamSecret(name, secret, input, opts) {
   const filePath = (o.filePath || "").trim();
   const fileFormat = (o.fileFormat || "json").trim();
   const field = (o.field || "").trim();
+  const model = (o.model || "").trim();
   const where = isFile
     ? `${filePath}\n格式：${fileFormat === "env" ? ".env 文本" : "JSON"}${field ? ` · 字段/变量名：${field}` : ""}`
-    : `Windows 用户变量 HKCU\\Environment → ${envName}`;
+    : model
+      ? `模型「${model}」在 modelKeys 里配置的环境变量`
+      : `Windows 用户变量 HKCU\\Environment → ${envName}`;
   const ok = await confirmModal({
-    title: isFile ? "写入指定文件" : "写入用户环境变量",
-    text: `对象：${name}\n写入位置：${where}\n说明：${isFile
+    title: isFile ? "写入指定文件" : (model ? "写入逐模型密钥" : "写入用户环境变量"),
+    text: `对象：${name}${model ? `\n模型：${model}` : ""}\n写入位置：${where}\n说明：${isFile
       ? "只写你手动指定的这个文件；配置文件里只保存路径引用，不保存密钥；不回显密钥。"
       : "只写用户环境变量、不写 bridge.config.json；当前进程立即生效，新进程自动继承；不回显密钥。"}`,
     confirmLabel: "写入",
@@ -809,7 +839,9 @@ async function saveUpstreamSecret(name, secret, input, opts) {
       body.fileFormat = fileFormat;
       if (field) body.field = field;
     } else {
-      body.envName = envName;
+      // 逐模型写入由服务端按 modelKeys 决定变量名；此时不需要手填 envName。
+      if (model) body.model = model;
+      else body.envName = envName;
     }
     const data = await postJson("/api/upstreams/secret", body);
     if (isFile) {
@@ -1164,6 +1196,8 @@ function renderUpstreamEditor() {
       ? (compat.environmentHeader || "-") : "";
     const cOverrides = u.modelOverrides && Object.keys(u.modelOverrides).length
       ? JSON.stringify(u.modelOverrides, null, 2) : "";
+    const cModelKeys = u.modelKeys && Object.keys(u.modelKeys).length
+      ? JSON.stringify(u.modelKeys, null, 2) : "";
     const keyConfigured = u._keyConfigured;
     const keyMode = (u.apiKeyEnv || "").trim()
       ? "env"
@@ -1209,7 +1243,8 @@ function renderUpstreamEditor() {
       <summary>
         <span class="up-preview">${esc(u.protocol || "anthropic")}${u.transport ? ` / ${esc(u.transport)}` : ""} · ${esc(u.baseUrl || "未填 Base URL")} · ${
           (u.models || []).length} 个模型${keyMode === "env" && u.apiKeyEnv ? ` · 环境变量 ${esc(u.apiKeyEnv)}` : ""}${
-          keyMode === "file" && (u.apiKeyFile || u.apiKeyAgentPath) ? ` · 凭据文件 ${esc(u.apiKeyFile || u.apiKeyAgentPath)}` : ""}</span>
+          keyMode === "file" && (u.apiKeyFile || u.apiKeyAgentPath) ? ` · 凭据文件 ${esc(u.apiKeyFile || u.apiKeyAgentPath)}` : ""}${
+          u.modelKeys && Object.keys(u.modelKeys).length ? ` · 逐模型密钥 ${Object.keys(u.modelKeys).length}` : ""}</span>
         <button type="button" class="ghost" data-act="edit">编辑</button>
       </summary>
       <div class="grid grid-2">
@@ -1311,7 +1346,7 @@ function renderUpstreamEditor() {
           <div class="hint">支持 JSON 根字段 apiKey/key、JSON 点路径、.env 变量；路径必须手动指定，没有内置默认位置。</div>
         </div>
         <div class="span-2 key-source-group" data-key-group="none">
-          <div class="hint">未配置密钥：需要鉴权的上游会返回 401；免鉴权上游可以保持这一项。</div>
+          <div class="hint">未配置上游级密钥：需要鉴权的模型会返回 401；免鉴权上游可以保持这一项。逐模型密钥请在下方「4. 逐模型密钥」配置。</div>
         </div>
           </div>
         </section>
@@ -1335,6 +1370,21 @@ function renderUpstreamEditor() {
         ${isCC ? `
         <label class="check"><input type="checkbox" data-field="pauseTurn" ${u.pauseTurn !== false ? "checked" : ""}>pause_turn 自动续跑</label>
         <label class="check"><input type="checkbox" data-field="cmdZdr" ${u.cmdZdr !== false ? "checked" : ""}>ZDR 安全头 x-cmd-zdr: 1</label>` : ""}
+          </div>
+        </section>
+        <section class="form-section span-2">
+          <div class="section-title">4. 逐模型密钥（可选）</div>
+          <div class="grid grid-2">
+        <label class="span-2">modelKeys（JSON 对象，留空 = 全部用上游级密钥）
+          <textarea data-field="modelKeys" rows="3" placeholder='{"MiniMax-M3":"MINIMAX_API_KEY","mimo-*":{"apiKeyEnv":"XIAOMI_MIMO_API_KEY"}}'>${esc(cModelKeys)}</textarea>
+        </label>
+        <div class="span-2 key-row">
+          <input type="text" data-field="modelKeyWriteModel" placeholder="模型 id（modelKeys 的键），如 MiniMax-M3">
+          <input type="password" data-field="modelKeyWriteValue" placeholder="该模型的 API Key（只用于本次写入）">
+          <button type="button" class="ghost" data-act="save-model-key"
+            title="写入该模型在 modelKeys 里配置的环境变量；不写配置文件">写入逐模型密钥</button>
+        </div>
+        <div class="span-2 hint">键为上游实际模型 id（modelMap 解析后），支持单个 * 通配；值可以是环境变量名或 {"apiKeyEnv":"..."} 对象。配置文件只保存变量名/路径，不保存密钥；未读到值的模型会回落到上游级密钥。写入逐模型密钥前请先保存一次配置（服务端按已保存的 modelKeys 找变量名）。</div>
           </div>
         </section>
         <div class="span-2 hint">兼容能力（compat）：留空 = 跟随 provider 预设；这里只覆盖需要差异化的部分，保存时不会丢失。</div>
@@ -1461,6 +1511,22 @@ function bindUpstreamCardActions(cardEl) {
         });
         return;
       }
+      if (btn.dataset.act === "save-model-key") {
+        const modelEl = cardEl.querySelector('[data-field="modelKeyWriteModel"]');
+        const model = ((modelEl && modelEl.value) || "").trim();
+        if (!model) {
+          toast("请先填写模型 id（modelKeys 的键）", true);
+          return;
+        }
+        const input = cardEl.querySelector('[data-field="modelKeyWriteValue"]');
+        const secret = ((input && input.value) || "").trim();
+        if (!secret) {
+          toast("请先填入该模型的 API Key", true);
+          return;
+        }
+        saveUpstreamSecret(key, secret, input, { target: "env", model });
+        return;
+      }
       if (btn.dataset.act === "query-models") {
         ev.preventDefault();
         ev.stopPropagation();
@@ -1517,6 +1583,12 @@ function refreshUpstreamCardSummary(card) {
   const parts = [`${protocol}${transport ? ` / ${transport}` : ""}`, baseUrl, `${models.length} 个模型`];
   if (keyMode === "env" && env) parts.push(`环境变量 ${env}`);
   if (keyMode === "file" && file) parts.push(`凭据文件 ${file}`);
+  try {
+    const modelKeyCount = Object.keys(JSON.parse(get("modelKeys") || "{}")).length;
+    if (modelKeyCount) parts.push(`逐模型密钥 ${modelKeyCount}`);
+  } catch {
+    /* 非法 JSON 由保存前校验处理 */
+  }
   const preview = card.querySelector(".up-preview");
   if (preview) preview.textContent = parts.join(" · ");
 }
@@ -1948,6 +2020,44 @@ const _readUpstreamEditor = () => {
         } catch (err) {
           state.compatErrors.push(
             `上游「${name}」的模型级覆盖不是合法配置：${err.message}`);
+        }
+      }
+    }
+
+    // ── 逐模型密钥：JSON 编辑；键=模型 id（支持单个 *），值=环境变量名或来源对象 ──
+    const modelKeysText = text("modelKeys");
+    if (modelKeysText !== null) {
+      if (!modelKeysText) {
+        delete entry.modelKeys;
+      } else {
+        try {
+          const parsed = JSON.parse(modelKeysText);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("必须是 JSON 对象");
+          }
+          Object.entries(parsed).forEach(([key, value]) => {
+            if (!String(key).trim()) throw new Error("模型键不能为空");
+            if (String(key).split("*").length > 2) {
+              throw new Error(`键「${key}」包含多个 *，只支持一个通配符`);
+            }
+            if (typeof value === "string") {
+              if (!value.trim()) throw new Error(`「${key}」的环境变量名不能为空`);
+              return;
+            }
+            if (!value || typeof value !== "object" || Array.isArray(value)) {
+              throw new Error(`「${key}」必须是环境变量名字符串或对象`);
+            }
+            if (value.apiKey) {
+              throw new Error(`「${key}」不允许写明文 apiKey，请用 apiKeyEnv / apiKeyFile`);
+            }
+            if (!value.apiKeyEnv && !value.apiKeyFile && !value.apiKeyAgentPath) {
+              throw new Error(`「${key}」至少需要 apiKeyEnv / apiKeyFile / apiKeyAgentPath`);
+            }
+          });
+          entry.modelKeys = parsed;
+        } catch (err) {
+          state.compatErrors.push(
+            `上游「${name}」的逐模型密钥不是合法配置：${err.message}`);
         }
       }
     }
@@ -2605,7 +2715,8 @@ function initConfigActions() {
   if (restore) restore.addEventListener("click", restoreConfigBackup);
   // 有未保存改动时离开页面给一次提醒（不做二次确认弹窗，避免打断）
   window.addEventListener("beforeunload", (ev) => {
-    if (!state.configDirty) return;
+    const pricingDirty = !!(state.pricing && state.pricing.dirty);
+    if (!state.configDirty && !pricingDirty) return;
     ev.preventDefault();
     ev.returnValue = "";
   });
@@ -3892,8 +4003,10 @@ function renderFullEvolution() {
         <span class="prompt-timeline-no">#${i + 1}</span>
         <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
         <span class="ev-model">${esc(r.requested_model || "—")}</span>
-        ${badges}
-        <span class="hint">${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符</span>
+        <span class="ev-full-round-meta">
+          ${badges}
+          <span class="hint">${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符</span>
+        </span>
         <span class="prompt-timeline-detail" data-evolution-detail="${esc(r.id)}" title="查看完整提示词（含元数据）">详情</span>
       </div>
       ${body}
@@ -3920,6 +4033,9 @@ function renderEvolutionTimeline() {
   const timeline = $("#evolution-timeline");
   if (!timeline) return;
   const ev = state.prompt.evolution;
+  // 全貌模式：时间轴独占整行、隐藏对比区（连续阅读时右侧差异面板只会挤压正文）
+  const view = $("#prompt-evolution-view");
+  if (view) view.classList.toggle("full-mode", ev.mode === "full");
   const count = $("#evolution-count");
   if (count) count.textContent = ev.rows.length ? `${ev.rows.length} 条` : "—";
   renderEvolutionCompareBar();
@@ -5309,8 +5425,9 @@ function initModelControls() {
   const save = $("#save-pricing");
   if (save) save.addEventListener("click", savePricing);
 
-  // 官方单价模板：点击把条目并入 JSON（去重），保存仍由「保存单价表」触发
+  // 官方单价模板：点击把条目并入结构化编辑器（去重），保存仍由「保存单价表」触发
   renderPricingTemplates();
+  initPricingEditor();
   const templates = $("#pricing-templates");
   if (templates) templates.addEventListener("click", (ev) => {
     const btn = ev.target.closest("button[data-template]");
@@ -5456,8 +5573,8 @@ function describePeak(peak) {
   return `${scope} ${windows} 为峰时，${off}`;
 }
 
-function renderCatalogRate(row) {
-  const rate = row.costHint;
+/* 单条报价：金额统一按当前显示币种折算（报价本身已按条目币种换算成人民币）。 */
+function renderQuote(rate) {
   if (!rate) return '<span class="hint">未配置</span>';
   if (rate.type === "quota") {
     return `<span class="badge" title="${esc(rate.plan || "额度/订阅制，不计费")}">额度制</span>` +
@@ -5479,6 +5596,18 @@ function renderCatalogRate(row) {
   return (rate.peak ? '<span class="badge warn">峰谷</span> ' : "") +
     `<span class="mono" title="命中「${esc(rate.label || "单价")}」；单位：${sym}/百万 token（${
       esc(displayCurrency())}显示）${esc(peakTip)}">${esc(parts.join(" / "))}</span>`;
+}
+
+/* 目录里的单价列：同一模型在不同上游各有各的报价，逐行展示，别只取第一个上游。 */
+function renderCatalogRate(row) {
+  const hints = Array.isArray(row.costHints) && row.costHints.length
+    ? row.costHints
+    : (row.costHint ? [{ upstream: "", quote: row.costHint }] : []);
+  if (!hints.length) return '<span class="hint">未配置</span>';
+  if (hints.length === 1 && !hints[0].upstream) return renderQuote(hints[0].quote);
+  return `<div class="rate-multi">${hints.map((hint) =>
+    `<div class="rate-line"><span class="up-tag mono">${esc(hint.upstream || "任意上游")}</span>` +
+    `${renderQuote(hint.quote)}</div>`).join("")}</div>`;
 }
 
 function renderCatalog(rows) {
@@ -5578,15 +5707,15 @@ async function setDefaultModel(model) {
 }
 
 /* ── 单价表 / 保留策略 ─────────────────────────────────── */
-/* 官方单价模板：点击即把该厂商的 entries 追加进单价表 JSON。
+/* 官方单价模板：点击即把该厂商的 entries 加进结构化编辑器。
    价格为官方页公开的每百万 token 单价（asOf 标注采集时间，随官方调价请以来源页为准）。
-   DeepSeek 峰谷口径：工作日 UTC 01:00-04:00 / 06:00-10:00 为峰时（北京 09-12 / 14-18 点），
-   其余时间与周末节假日为谷价（五折）。 */
+   DeepSeek 峰谷口径：工作日北京时间 09:00-12:00 / 14:00-18:00 为峰时，
+   其余时间与周末节假日为谷价（五折）。模板里的窗口一律用北京时间填写。 */
 const PRICING_TEMPLATES = [
   {
     id: "deepseek", name: "DeepSeek（峰谷）", currency: "USD", fx: 7.1,
     asOf: "2026-10", source: "https://api-docs.deepseek.com/quick_start/pricing",
-    note: "峰时=工作日 UTC 01-04/06-10 点；谷时半价（周末/节假日全天谷价）",
+    note: "峰时=工作日北京时间 09-12/14-18 点；谷时半价（周末/节假日全天谷价）",
     entries: [
       {
         model: "deepseek-flash", label: "DeepSeek Flash", type: "per-token", currency: "USD",
@@ -5672,12 +5801,12 @@ const PRICING_TEMPLATES = [
   },
 ];
 
-/* DeepSeek 官方峰谷窗口（UTC）：模板内多处复用 */
+/* DeepSeek 官方峰谷窗口（北京时间，模板内多处复用） */
 function DEEPSEEK_PEAK() {
   return {
-    tzOffsetMinutes: 0,
+    tzOffsetMinutes: 480,
     weekdaysOnly: true,
-    windows: [ { start: "01:00", end: "04:00" }, { start: "06:00", end: "10:00" } ],
+    windows: [ { start: "09:00", end: "12:00" }, { start: "14:00", end: "18:00" } ],
     offPeak: { multiplier: 0.5 },
   };
 }
@@ -5693,34 +5822,346 @@ function renderPricingTemplates() {
       `${esc(tpl.name)}</button>`).join("");
 }
 
-/* 把模板条目并入当前单价表 JSON：同 model+upstream 视为同一条目跳过 */
+/* ── 单价结构化编辑器 ───────────────────────────────────
+   数据模型：`state.pricing.rows` 是配置 `pricing.entries` 的可编辑副本。
+   - 每条规则 = 一个「上游 + 模型」组合；上游留空表示任意上游；
+   - 同名模型在不同上游可以各写一条（匹配时上游固定优先，见 pricing.rs）；
+   - 峰谷窗口一律按北京时间（tzOffsetMinutes=480）填写，避免 UTC/本地混用；
+   - 保存时序列化回 `pricing.entries`，未知的顶层字段原样保留。 */
+function pricingNum(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/* 允许 0 与 "0"，只把空串/null/非数字视为「未填」 */
+function pricingHasValue(value) {
+  return value !== "" && value !== null && value !== undefined && Number.isFinite(Number(value));
+}
+
+function pricingTzLabel(minutes) {
+  const m = pricingNum(minutes, 480);
+  if (m === 480) return "北京时间 UTC+8";
+  const sign = m >= 0 ? "+" : "−";
+  const abs = Math.abs(m);
+  const h = Math.floor(abs / 60);
+  const mm = abs % 60;
+  return `UTC${sign}${h}${mm ? ":" + String(mm).padStart(2, "0") : ""}`;
+}
+
+function pricingTzOptions(selected) {
+  const values = [480, 0, 540, 420, -480, -420];
+  const current = pricingNum(selected, 480);
+  if (!values.includes(current)) values.push(current);
+  values.sort((a, b) => b - a);
+  return values.map((v) =>
+    `<option value="${v}"${v === current ? " selected" : ""}>${esc(pricingTzLabel(v))}</option>`).join("");
+}
+
+function normalizePricingRow(raw) {
+  const row = raw && typeof raw === "object" ? JSON.parse(JSON.stringify(raw)) : {};
+  row.type = String(row.type || "per-token").toLowerCase() === "quota" ? "quota" : "per-token";
+  row.model = String(row.model || "");
+  row.upstream = String(row.upstream || "");
+  row.label = String(row.label || "");
+  if (row.type === "quota") {
+    row.plan = String(row.plan || "额度/订阅");
+    return row;
+  }
+  row.currency = String(row.currency || "CNY").toUpperCase() === "USD" ? "USD" : "CNY";
+  row.input = pricingNum(row.input, 0);
+  row.output = pricingNum(row.output, 0);
+  row.cacheRead = pricingHasValue(row.cacheRead) ? Number(row.cacheRead) : "";
+  row.cacheWrite = pricingHasValue(row.cacheWrite) ? Number(row.cacheWrite) : "";
+  if (row.peak && typeof row.peak === "object") {
+    const peak = row.peak;
+    peak.tzOffsetMinutes = pricingNum(peak.tzOffsetMinutes, 480);
+    peak.weekdaysOnly = !!peak.weekdaysOnly;
+    peak.windows = Array.isArray(peak.windows) && peak.windows.length
+      ? peak.windows.map((w) => ({ start: String(w.start || "09:00"), end: String(w.end || "12:00") }))
+      : [{ start: "09:00", end: "12:00" }];
+    const off = peak.offPeak && typeof peak.offPeak === "object" ? peak.offPeak : { multiplier: 0.5 };
+    if (pricingHasValue(off.multiplier)) {
+      peak.offPeak = { multiplier: Number(off.multiplier) };
+    } else {
+      peak.offPeak = {
+        input: pricingNum(off.input, 0),
+        output: pricingNum(off.output, 0),
+        cacheRead: pricingHasValue(off.cacheRead) ? Number(off.cacheRead) : "",
+        cacheWrite: pricingHasValue(off.cacheWrite) ? Number(off.cacheWrite) : "",
+      };
+    }
+    row.peak = peak;
+  }
+  return row;
+}
+
+function serializePricingRow(row) {
+  const out = {};
+  if (row.upstream) out.upstream = row.upstream;
+  out.model = row.model || "*";
+  if (row.label) out.label = row.label;
+  if (row.type === "quota") {
+    out.type = "quota";
+    out.plan = row.plan || "额度/订阅";
+    return out;
+  }
+  out.type = "per-token";
+  out.currency = row.currency === "USD" ? "USD" : "CNY";
+  out.input = pricingNum(row.input, 0);
+  out.output = pricingNum(row.output, 0);
+  if (pricingHasValue(row.cacheRead)) out.cacheRead = Number(row.cacheRead);
+  if (pricingHasValue(row.cacheWrite)) out.cacheWrite = Number(row.cacheWrite);
+  if (row.peak && typeof row.peak === "object") {
+    const peak = {
+      tzOffsetMinutes: pricingNum(row.peak.tzOffsetMinutes, 480),
+      windows: (row.peak.windows || []).map((w) => ({ start: w.start, end: w.end })),
+    };
+    if (row.peak.weekdaysOnly) peak.weekdaysOnly = true;
+    const off = row.peak.offPeak || {};
+    if (pricingHasValue(off.multiplier)) {
+      peak.offPeak = { multiplier: Number(off.multiplier) };
+    } else {
+      peak.offPeak = { input: pricingNum(off.input, 0), output: pricingNum(off.output, 0) };
+      if (pricingHasValue(off.cacheRead)) peak.offPeak.cacheRead = Number(off.cacheRead);
+      if (pricingHasValue(off.cacheWrite)) peak.offPeak.cacheWrite = Number(off.cacheWrite);
+    }
+    out.peak = peak;
+  }
+  return out;
+}
+
+function pricingDocFromRows() {
+  const fxInput = $("#pricing-fx");
+  const fx = Number(fxInput && fxInput.value);
+  const base = state.pricing && state.pricing.pricing && typeof state.pricing.pricing === "object"
+    ? JSON.parse(JSON.stringify(state.pricing.pricing)) : {};
+  base.version = base.version || 1;
+  base.fx = Object.assign({}, base.fx, { USD: fx > 0 ? fx : 7.2 });
+  base.entries = (state.pricing.rows || []).map(serializePricingRow);
+  return base;
+}
+
+function pricingUpstreamOptions(selected) {
+  const names = (state.upstreams || []).map((u) => u.name).filter(Boolean);
+  if (selected && !names.includes(selected)) names.unshift(selected);
+  return '<option value="">任意上游</option>' + names.map((name) =>
+    `<option value="${esc(name)}"${name === selected ? " selected" : ""}>${esc(name)}</option>`).join("");
+}
+
+function renderPricingPeak(peak) {
+  if (!peak || typeof peak !== "object") {
+    return `<div class="pricing-peak">
+      <label class="check"><input type="checkbox" data-pricing-peak-toggle> 启用峰谷价（窗口内基础价，窗口外谷价）</label>
+    </div>`;
+  }
+  const tz = pricingNum(peak.tzOffsetMinutes, 480);
+  const windows = (peak.windows || []).map((w, wi) => `<span class="pricing-window">
+      <input type="time" data-pricing-window="${wi}" data-pricing-window-part="start" value="${esc(w.start)}">
+      <span class="hint">–</span>
+      <input type="time" data-pricing-window="${wi}" data-pricing-window-part="end" value="${esc(w.end)}">
+      <button type="button" class="ghost tiny" data-pricing-window-remove="${wi}" title="删除该窗口">×</button>
+    </span>`).join("");
+  const off = peak.offPeak && typeof peak.offPeak === "object" ? peak.offPeak : { multiplier: 0.5 };
+  const multiplierMode = pricingHasValue(off.multiplier);
+  const offRates = `<span class="pricing-peak-rates">
+      ${[["input", "谷时输入"], ["output", "谷时输出"], ["cacheRead", "谷时缓存读"], ["cacheWrite", "谷时缓存写"]]
+        .map(([field, label]) => `<label>${label}
+          <input type="number" min="0" step="0.000001" data-pricing-peak-rate="${field}"
+            value="${pricingHasValue(off[field]) ? esc(off[field]) : ""}"
+            placeholder="${field.startsWith("cache") ? "留空 = 按输入价" : "0"}">
+        </label>`).join("")}
+    </span>`;
+  return `<div class="pricing-peak">
+    <label class="check"><input type="checkbox" data-pricing-peak-toggle checked> 启用峰谷价</label>
+    <div class="pricing-peak-row">
+      <span class="pricing-note">峰时窗口（${esc(pricingTzLabel(tz))}）</span>
+      ${windows}
+      <button type="button" class="ghost tiny" data-pricing-window-add>+ 窗口</button>
+      <label class="inline-field">时区
+        <select data-pricing-peak-field="tzOffsetMinutes">${pricingTzOptions(tz)}</select>
+      </label>
+      <label class="check"><input type="checkbox" data-pricing-peak-field="weekdaysOnly"${peak.weekdaysOnly ? " checked" : ""}> 仅工作日为峰时（周末全天谷价）</label>
+    </div>
+    <div class="pricing-peak-row">
+      <label class="inline-field">谷时计价
+        <select data-pricing-off-mode>
+          <option value="multiplier"${multiplierMode ? " selected" : ""}>按比例折扣</option>
+          <option value="rates"${multiplierMode ? "" : " selected"}>按绝对单价</option>
+        </select>
+      </label>
+      ${multiplierMode
+        ? `<label class="inline-field">折扣
+             <input type="number" min="0" max="1" step="0.01" data-pricing-peak-multiplier
+               value="${pricingHasValue(off.multiplier) ? esc(off.multiplier) : 0.5}">
+           </label>
+           <span class="pricing-note">窗口外 = 基础价 × 折扣（0.5 = 半价）</span>`
+        : offRates}
+    </div>
+    <div class="pricing-note">窗口内按基础价，窗口外按谷价；跨午夜窗口可写两段，或让结束时间早于开始时间。</div>
+  </div>`;
+}
+
+function renderPricingRow(row, index) {
+  const isQuota = row.type === "quota";
+  const sym = row.currency === "USD" ? "$" : "¥";
+  const scope = row.upstream || "任意上游";
+  const head = `<div class="pricing-card-head">
+      <span class="pricing-order">#${index + 1}</span>
+      <span class="pricing-scope">${esc(scope)}</span>
+      <label class="inline-field">上游
+        <select data-pricing-field="upstream">${pricingUpstreamOptions(row.upstream)}</select>
+      </label>
+      <label class="inline-field">模型
+        <input class="filter-input" data-pricing-field="model" list="pricing-model-options"
+          value="${esc(row.model)}" placeholder="精确模型名，或 deepseek-* 通配">
+      </label>
+      <label class="inline-field">类型
+        <select data-pricing-field="type">
+          <option value="per-token"${isQuota ? "" : " selected"}>按量计费</option>
+          <option value="quota"${isQuota ? " selected" : ""}>额度制</option>
+        </select>
+      </label>
+      <span class="pricing-card-actions">
+        <button type="button" class="ghost tiny" data-pricing-move="-1" title="上移（同级先匹配）"${index === 0 ? " disabled" : ""}>↑</button>
+        <button type="button" class="ghost tiny" data-pricing-move="1" title="下移"${index === state.pricing.rows.length - 1 ? " disabled" : ""}>↓</button>
+        <button type="button" class="ghost tiny" data-pricing-remove title="删除该条">删除</button>
+      </span>
+    </div>`;
+  if (isQuota) {
+    return `<div class="pricing-card" data-pricing-row="${index}">${head}
+      <div class="pricing-card-body">
+        <label>套餐 / 额度名
+          <input type="text" data-pricing-field="plan" value="${esc(row.plan || "")}" placeholder="Go 订阅 / 免费池">
+        </label>
+        <label>标签（可选）
+          <input type="text" data-pricing-field="label" value="${esc(row.label || "")}" placeholder="展示用">
+        </label>
+        <span class="pricing-note">额度制只标记来源，不按 token 计费（费用列显示「额度制」）。</span>
+      </div>
+    </div>`;
+  }
+  const rateField = (field, label) => `<label>${label}
+      <span class="unit">${sym} / 百万 token</span>
+      <input type="number" min="0" step="0.000001" data-pricing-field="${field}"
+        value="${pricingHasValue(row[field]) ? esc(row[field]) : ""}"
+        placeholder="${field.startsWith("cache") ? "留空 = 按输入价" : "0"}">
+    </label>`;
+  return `<div class="pricing-card" data-pricing-row="${index}">${head}
+    <div class="pricing-card-body">
+      <label>币种
+        <select class="pricing-currency" data-pricing-field="currency">
+          <option value="CNY"${row.currency === "CNY" ? " selected" : ""}>CNY ¥</option>
+          <option value="USD"${row.currency === "USD" ? " selected" : ""}>USD $</option>
+        </select>
+      </label>
+      ${rateField("input", "输入")}
+      ${rateField("output", "输出")}
+      ${rateField("cacheRead", "缓存读")}
+      ${rateField("cacheWrite", "缓存写")}
+      <label>标签（可选）
+        <input type="text" data-pricing-field="label" value="${esc(row.label || "")}" placeholder="DeepSeek 官方">
+      </label>
+    </div>
+    ${renderPricingPeak(row.peak)}
+  </div>`;
+}
+
+function renderPricingModelOptions() {
+  const datalist = $("#pricing-model-options");
+  if (!datalist) return;
+  const models = new Set();
+  (state.upstreams || []).forEach((u) => {
+    [u.models, u.modelsAll].forEach((list) => {
+      if (Array.isArray(list)) list.forEach((m) => models.add(String(m)));
+    });
+  });
+  (state.pricing.rows || []).forEach((row) => {
+    if (row.model && !row.model.includes("*")) models.add(row.model);
+  });
+  datalist.innerHTML = [...models].sort().map((m) => `<option value="${esc(m)}"></option>`).join("");
+}
+
+function renderPricingJsonPreview() {
+  const ta = $("#pricing-json");
+  if (!ta || document.activeElement === ta) return;
+  ta.value = JSON.stringify(pricingDocFromRows(), null, 2);
+}
+
+function renderPricingEditor() {
+  const box = $("#pricing-editor");
+  if (!box) return;
+  if (!Array.isArray(state.pricing.rows)) state.pricing.rows = [];
+  box.innerHTML = state.pricing.rows.map((row, i) => renderPricingRow(row, i)).join("");
+  const empty = $("#pricing-empty");
+  if (empty) empty.hidden = state.pricing.rows.length > 0;
+  const addUpstream = $("#pricing-add-upstream");
+  if (addUpstream) addUpstream.innerHTML = pricingUpstreamOptions(addUpstream.value);
+  renderPricingModelOptions();
+  renderPricingJsonPreview();
+  syncPricingDirty();
+}
+
+function pricingRowFromElement(el) {
+  const card = el && el.closest ? el.closest("[data-pricing-row]") : null;
+  if (!card) return null;
+  const index = Number(card.dataset.pricingRow);
+  const row = (state.pricing.rows || [])[index];
+  return row ? { index, row } : null;
+}
+
+/* 校验：后端会再校验一次，这里先拦住最常见的输入错误并把提示写清楚 */
+function validatePricingRows() {
+  const errors = [];
+  (state.pricing.rows || []).forEach((row, i) => {
+    const tag = `第 ${i + 1} 条`;
+    if (!String(row.model || "").trim()) errors.push(`${tag}：模型不能为空（任意模型请填 *）`);
+    if (row.type !== "per-token") return;
+    ["input", "output", "cacheRead", "cacheWrite"].forEach((field) => {
+      if (pricingHasValue(row[field]) && Number(row[field]) < 0) {
+        errors.push(`${tag}：单价不能为负数`);
+      }
+    });
+    if (!row.peak) return;
+    const windows = row.peak.windows || [];
+    if (!windows.length) errors.push(`${tag}：峰谷至少需要一个窗口`);
+    windows.forEach((w, wi) => {
+      if (!w.start || !w.end) errors.push(`${tag}：窗口 ${wi + 1} 缺少起止时间`);
+      else if (w.start === w.end) errors.push(`${tag}：窗口 ${wi + 1} 起止相同（会变成全天峰时）`);
+    });
+    const off = row.peak.offPeak || {};
+    if (pricingHasValue(off.multiplier)) {
+      const m = Number(off.multiplier);
+      if (!(m >= 0 && m <= 1)) errors.push(`${tag}：谷时折扣需在 0 与 1 之间`);
+    } else if (!pricingHasValue(off.input) || !pricingHasValue(off.output)) {
+      errors.push(`${tag}：谷时绝对单价需要填写输入与输出`);
+    }
+  });
+  return [...new Set(errors)];
+}
+
+/* 把模板条目并入编辑器：同上游+同模型+同类型视为已存在；新条目插到最前，
+   避免被先前添加的兜底条目压住（匹配时同级才看顺序）。 */
 function applyPricingTemplate(tplId) {
   const tpl = PRICING_TEMPLATES.find((t) => t.id === tplId);
-  const ta = $("#pricing-json");
-  if (!tpl || !ta) return;
-  let parsed;
-  try {
-    parsed = JSON.parse(ta.value || "{}");
-  } catch (err) {
-    toast(`当前 JSON 不是合法格式，请先修正：${err.message}`, true);
-    return;
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {};
-  const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
-  const key = (e) => `${e.model || "*"}|${e.upstream || ""}`;
-  const existing = new Set(entries.map(key));
-  let added = 0, skipped = 0;
+  if (!tpl) return;
+  if (!Array.isArray(state.pricing.rows)) state.pricing.rows = [];
+  const key = (row) => `${row.upstream || ""}|${row.model || "*"}|${row.type || "per-token"}`;
+  const existing = new Set(state.pricing.rows.map(key));
+  const fresh = [];
+  let skipped = 0;
   for (const entry of tpl.entries) {
-    if (existing.has(key(entry))) { skipped += 1; continue; }
-    entries.push(JSON.parse(JSON.stringify(entry)));
-    existing.add(key(entry));
-    added += 1;
+    const row = normalizePricingRow(entry);
+    if (existing.has(key(row))) { skipped += 1; continue; }
+    existing.add(key(row));
+    fresh.push(row);
   }
-  parsed.version = parsed.version || 1;
-  if (tpl.fx && !parsed.fx) parsed.fx = { USD: tpl.fx };
-  parsed.entries = entries;
-  ta.value = JSON.stringify(parsed, null, 2);
-  toast(`模板「${tpl.name}」已追加 ${added} 条${skipped ? `（${skipped} 条已存在）` : ""}，记得保存`);
+  state.pricing.rows.unshift(...fresh);
+  const fx = $("#pricing-fx");
+  let changed = fresh.length > 0;
+  if (fx && !fx.value && tpl.fx) { fx.value = tpl.fx; changed = true; }
+  if (changed) markPricingDirty();
+  renderPricingEditor();
+  toast(`模板「${tpl.name}」已加入 ${fresh.length} 条${skipped ? `（${skipped} 条已存在）` : ""}，记得保存`);
 }
 
 function renderPricingIssues(issues) {
@@ -5732,25 +6173,237 @@ function renderPricingIssues(issues) {
     `<div>⚠ ${esc(d.message || "")} <span class="hint">${esc(d.path || "")}</span></div>`).join("");
 }
 
+/* 单价表的「未保存」标记与 dirty 状态必须同源：
+   模板插入、新增条目、应用 JSON、删除/移动、字段编辑都走这里，
+   这样切页签时 loadPricing 能保住草稿，页面上也能看到未保存提示。 */
+function syncPricingDirty() {
+  const flag = $("#pricing-dirty");
+  if (flag) flag.hidden = !(state.pricing && state.pricing.dirty);
+}
+
+function markPricingDirty() {
+  if (state.pricing) state.pricing.dirty = true;
+  syncPricingDirty();
+  renderPricingJsonPreview();
+}
+
+/* 单价编辑器事件：文本/数字输入只改 state（不重渲染，避免丢焦点）；
+   类型、币种、峰谷开关等结构性变化才重渲染。 */
+function initPricingEditor() {
+  const box = $("#pricing-editor");
+  const addUpstream = $("#pricing-add-upstream");
+  const addModel = $("#pricing-add-model");
+  const addType = $("#pricing-add-type");
+  if (addUpstream) addUpstream.innerHTML = pricingUpstreamOptions(addUpstream.value || "");
+
+  const add = $("#pricing-add");
+  if (add) add.addEventListener("click", () => {
+    if (!Array.isArray(state.pricing.rows)) state.pricing.rows = [];
+    const model = String((addModel && addModel.value) || "").trim();
+    if (!model) { toast("请填写模型名（任意模型填 *）", true); return; }
+    const type = addType && addType.value === "quota" ? "quota" : "per-token";
+    const row = normalizePricingRow({
+      upstream: (addUpstream && addUpstream.value) || "",
+      model,
+      type,
+      currency: "CNY",
+      input: 0,
+      output: 0,
+    });
+    // 新条目插到最前：同级里先匹配，便于立刻覆盖已有的兜底条目。
+    state.pricing.rows.unshift(row);
+    state.pricing.dirty = true;
+    if (addModel) addModel.value = "";
+    renderPricingEditor();
+    toast(`已添加「${row.upstream || "任意上游"} / ${model}」，保存后生效`);
+  });
+
+  const fxInput = $("#pricing-fx");
+  if (fxInput) fxInput.addEventListener("input", markPricingDirty);
+
+  const applyJson = $("#pricing-json-apply");
+  if (applyJson) applyJson.addEventListener("click", () => {
+    const ta = $("#pricing-json");
+    let parsed;
+    try {
+      parsed = JSON.parse((ta && ta.value) || "{}");
+    } catch (err) {
+      toast(`JSON 不合法：${err.message}`, true);
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      toast("JSON 顶层必须是对象（含 fx 与 entries）", true);
+      return;
+    }
+    state.pricing.rows = (Array.isArray(parsed.entries) ? parsed.entries : []).map(normalizePricingRow);
+    state.pricing.pricing = parsed;
+    const fx = Number(parsed.fx && parsed.fx.USD);
+    if (fx > 0 && fxInput) fxInput.value = fx;
+    state.pricing.dirty = true;
+    renderPricingEditor();
+    toast(`已应用 ${state.pricing.rows.length} 条单价条目`);
+  });
+
+  if (!box) return;
+  box.addEventListener("input", (ev) => {
+    const el = ev.target;
+    const ctx = pricingRowFromElement(el);
+    if (!ctx) return;
+    const { row } = ctx;
+    if (el.dataset.pricingWindowPart && row.peak) {
+      const wi = Number(el.dataset.pricingWindow);
+      if (row.peak.windows[wi]) row.peak.windows[wi][el.dataset.pricingWindowPart] = el.value;
+      markPricingDirty();
+      return;
+    }
+    if (el.dataset.pricingPeakRate && row.peak && row.peak.offPeak) {
+      row.peak.offPeak[el.dataset.pricingPeakRate] = el.value;
+      markPricingDirty();
+      return;
+    }
+    if (el.matches("[data-pricing-peak-multiplier]") && row.peak && row.peak.offPeak) {
+      row.peak.offPeak.multiplier = el.value;
+      markPricingDirty();
+      return;
+    }
+    if (el.dataset.pricingField) {
+      row[el.dataset.pricingField] = el.value;
+      markPricingDirty();
+    }
+  });
+
+  box.addEventListener("change", (ev) => {
+    const el = ev.target;
+    const ctx = pricingRowFromElement(el);
+    if (!ctx) return;
+    const { row } = ctx;
+    if (el.matches("[data-pricing-peak-toggle]")) {
+      if (el.checked) {
+        row.peak = {
+          tzOffsetMinutes: 480,
+          weekdaysOnly: false,
+          windows: [{ start: "09:00", end: "12:00" }],
+          offPeak: { multiplier: 0.5 },
+        };
+      } else {
+        delete row.peak;
+      }
+      markPricingDirty();
+      renderPricingEditor();
+      return;
+    }
+    if (el.matches("[data-pricing-peak-field]")) {
+      const key = el.dataset.pricingPeakField;
+      if (key === "tzOffsetMinutes") row.peak.tzOffsetMinutes = Number(el.value) || 0;
+      if (key === "weekdaysOnly") row.peak.weekdaysOnly = !!el.checked;
+      markPricingDirty();
+      if (key === "tzOffsetMinutes") renderPricingEditor();
+      return;
+    }
+    if (el.matches("[data-pricing-off-mode]")) {
+      if (el.value === "rates") {
+        // 先用基础价预填谷价，用户再改；避免一上来全是 0。
+        row.peak.offPeak = {
+          input: row.input, output: row.output,
+          cacheRead: row.cacheRead, cacheWrite: row.cacheWrite,
+        };
+      } else {
+        row.peak.offPeak = { multiplier: 0.5 };
+      }
+      markPricingDirty();
+      renderPricingEditor();
+      return;
+    }
+    if (el.matches("[data-pricing-peak-multiplier]") && row.peak) {
+      row.peak.offPeak = { multiplier: el.value };
+      markPricingDirty();
+      return;
+    }
+    const field = el.dataset.pricingField;
+    if (!field) return;
+    if (field === "type") {
+      row.type = el.value === "quota" ? "quota" : "per-token";
+      if (row.type === "quota") row.plan = row.plan || "额度/订阅";
+      markPricingDirty();
+      renderPricingEditor();
+      return;
+    }
+    if (field === "currency" || field === "upstream") {
+      row[field] = el.value;
+      markPricingDirty();
+      renderPricingEditor();
+      return;
+    }
+    row[field] = el.value;
+    markPricingDirty();
+  });
+
+  box.addEventListener("click", (ev) => {
+    const ctx = pricingRowFromElement(ev.target);
+    if (!ctx) return;
+    const { index, row } = ctx;
+    const rows = state.pricing.rows;
+    if (ev.target.closest("[data-pricing-remove]")) {
+      rows.splice(index, 1);
+      state.pricing.dirty = true;
+      renderPricingEditor();
+      return;
+    }
+    const move = ev.target.closest("[data-pricing-move]");
+    if (move) {
+      const to = index + Number(move.dataset.pricingMove);
+      if (to >= 0 && to < rows.length) {
+        const [item] = rows.splice(index, 1);
+        rows.splice(to, 0, item);
+        state.pricing.dirty = true;
+        renderPricingEditor();
+      }
+      return;
+    }
+    if (ev.target.closest("[data-pricing-window-add]") && row.peak) {
+      row.peak.windows = row.peak.windows || [];
+      row.peak.windows.push({ start: "09:00", end: "12:00" });
+      markPricingDirty();
+      renderPricingEditor();
+      return;
+    }
+    const removeWindow = ev.target.closest("[data-pricing-window-remove]");
+    if (removeWindow && row.peak) {
+      if ((row.peak.windows || []).length <= 1) {
+        toast("至少保留一个峰时窗口；不区分峰谷请直接关闭峰谷价", true);
+        return;
+      }
+      row.peak.windows.splice(Number(removeWindow.dataset.pricingWindowRemove), 1);
+      markPricingDirty();
+      renderPricingEditor();
+    }
+  });
+}
+
 async function loadPricing() {
   try {
     const data = await api("/api/pricing");
-    state.pricing = data;
+    const pricing = data.pricing && typeof data.pricing === "object" && !Array.isArray(data.pricing)
+      ? data.pricing : {};
+    const rows = (Array.isArray(pricing.entries) ? pricing.entries : []).map(normalizePricingRow);
+    // 面板里已有未保存的编辑时，不要用服务端旧数据覆盖它（切页签回来常见）。
+    const keepDraft = state.pricing && state.pricing.dirty && Array.isArray(state.pricing.rows);
+    state.pricing = {
+      currency: data.currency || "CNY",
+      configured: !!data.configured,
+      entries: Number(data.entries) || 0,
+      fx: (pricing.fx && typeof pricing.fx === "object") ? pricing.fx : (data.fx || { USD: 7.2 }),
+      pricing,
+      rows: keepDraft ? state.pricing.rows : rows,
+      dirty: keepDraft ? true : false,
+    };
     state.pricingLoaded = true;
-    const ta = $("#pricing-json");
-    if (ta && document.activeElement !== ta) {
-      const pricing = data.pricing && typeof data.pricing === "object" ? data.pricing : {};
-      ta.value = JSON.stringify({
-        version: pricing.version || 1,
-        fx: pricing.fx || data.fx || { USD: 7.2 },
-        entries: pricing.entries || [],
-      }, null, 2);
-    }
     const fx = $("#pricing-fx");
-    if (fx && document.activeElement !== fx) {
-      const usd = (data.pricing && data.pricing.fx && data.pricing.fx.USD) || (data.fx && data.fx.USD);
+    if (fx && document.activeElement !== fx && !keepDraft) {
+      const usd = (pricing.fx && pricing.fx.USD) || (data.fx && data.fx.USD);
       if (usd) fx.value = usd;
     }
+    if (!keepDraft) renderPricingEditor();
     const hint = $("#pricing-hint");
     if (hint) {
       hint.textContent = data.configured
@@ -5758,6 +6411,7 @@ async function loadPricing() {
         : "未配置单价：费用列显示「—」，不代表免费；点上方模板快速起步";
     }
     renderPricingIssues(data.diagnostics || []);
+    syncPricingDirty();
     const days = $("#retention-days");
     if (days && document.activeElement !== days) days.value = data.retention_days || 0;
     const retentionHint = $("#retention-hint");
@@ -5772,21 +6426,13 @@ async function loadPricing() {
 }
 
 async function savePricing() {
-  const ta = $("#pricing-json");
-  let parsed;
-  try {
-    parsed = JSON.parse((ta && ta.value) || "{}");
-  } catch (err) {
-    toast(`单价表不是合法 JSON：${err.message}`, true);
+  const errors = validatePricingRows();
+  if (errors.length) {
+    renderPricingIssues(errors.map((message) => ({ message, path: "编辑器" })));
+    toast(errors[0], true);
     return;
   }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {};
-  // 汇率输入框优先：有值就同步进 JSON（fx.USD）
-  const fxInput = $("#pricing-fx");
-  if (fxInput && fxInput.value !== "") {
-    const fx = Number(fxInput.value);
-    if (fx > 0) parsed.fx = Object.assign({}, parsed.fx, { USD: fx });
-  }
+  const parsed = pricingDocFromRows();
   const recompute = !!($("#pricing-recompute") || {}).checked;
   if (recompute) {
     const ok = await confirmModal({
@@ -5810,7 +6456,10 @@ async function savePricing() {
       entries: data.entries || 0,
       fx: (parsed && parsed.fx) || { USD: 7.2 },
       pricing: parsed,
+      rows: (parsed.entries || []).map(normalizePricingRow),
+      dirty: false,
     };
+    renderPricingEditor();
     renderPricingIssues(data.diagnostics || []);
     const hint = $("#pricing-hint");
     if (hint) {
@@ -6139,6 +6788,23 @@ function classifyLogLine(text) {
   return "";
 }
 
+/* 日志行首时间戳按本机时区显示。
+   新版本日志写入时已带 +08:00；旧版本与轮转前的历史行是 `Z` 结尾的 UTC，
+   原样展示会让同一份日志里同时出现两种时间（整体差 8 小时）。 */
+const LOG_TS_RE = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})?/;
+function formatLogLine(text) {
+  const raw = String(text || "");
+  const m = raw.match(LOG_TS_RE);
+  if (!m || !m[4]) return raw;
+  const [, date, time, frac, zone] = m;
+  const d = new Date(`${date}T${time}${frac ? "." + frac.slice(0, 3) : ""}${zone}`);
+  if (Number.isNaN(d.getTime())) return raw;
+  const p = (x) => String(x).padStart(2, "0");
+  const local = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  return local + (frac ? "." + frac.slice(0, 3) : "") + raw.slice(m[0].length);
+}
+
 async function loadLogs() {
   const viewer = $("#log-viewer");
   if (!viewer) return;
@@ -6152,9 +6818,10 @@ async function loadLogs() {
     const atBottom = viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 40;
     viewer.innerHTML = rows.length
       ? rows.map((l, i) => {
-          const cls = classifyLogLine(l.text || "");
+          const text = formatLogLine(l.text || "");
+          const cls = classifyLogLine(text);
           return `<span class="ln ${cls}" data-line="${i}" title="点击复制本行"><span class="no">${l.no}</span><span class="txt">${
-            highlightLog(l.text || "", state.logs.q)}</span><button type="button" class="ln-copy" tabindex="-1">复制</button></span>`;
+            highlightLog(text, state.logs.q)}</span><button type="button" class="ln-copy" tabindex="-1">复制</button></span>`;
         }).join("\n")
       : `<span class="ln">（没有匹配的日志）</span>`;
     const meta = $("#log-meta");

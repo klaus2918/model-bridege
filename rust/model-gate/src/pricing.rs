@@ -1,12 +1,13 @@
 //! 单价表：按「上游 + 模型」匹配的每百万 token 单价，支持峰谷双价与美元/人民币换算。
 //!
 //! 设计要点（与面板「单价表（费用估算）」编辑器对齐）：
-//! - `pricing` 是配置里的一个顶层 JSON 对象；`entries` 为**有序数组，先匹配先用**，
-//!   支持模型通配（`deepseek-*`）与上游限定，从而覆盖「不同上游同模型价不同」的场景；
+//! - `pricing` 是配置里的一个顶层 JSON 对象；`entries` 是有序数组。匹配时不只看顺序：
+//!   上游固定的条目优先于任意上游，同上游内精确模型优先于通配；同级才按数组顺序先匹配先用。
+//!   因此「不同上游的同名模型各自定价」可以直接用 `upstream` + `model` 组合表达；
 //! - `type: "per-token"` 按量计费；`type: "quota"` 只标记额度/订阅制（如 Go 订阅、
 //!   zen 免费池、CommandCode 套餐），不产生费用但让面板显示「额度制」而不是「未配置单价」；
 //! - 单价可用 USD 或 CNY 填写，落库成本**统一换算为 CNY**（`fx.USD` 为 1 USD 兑人民币）；
-//! - 峰谷：`peak.windows` 为谷/峰窗口（本地时区分钟），窗口内用基础价，
+//! - 峰谷：`peak.windows` 为峰时窗口（本地时区分钟，默认 +08:00 北京时间），窗口内用基础价，
 //!   窗口外按 `offPeak.multiplier` 或绝对价折算。
 //!
 //! 解析永不失败：非法条目被跳过并记入 `issues`（面板诊断以 warn 展示），
@@ -124,6 +125,36 @@ impl PricingEntry {
     fn upstream_matches(&self, upstream: &str) -> bool {
         self.upstream.is_empty() || self.upstream.eq_ignore_ascii_case(upstream)
     }
+
+    /// 匹配优先级；不匹配返回 `None`。
+    ///
+    /// 之所以不只看「数组顺序」：不同上游的同名模型价格可能完全不同，
+    /// 用户新增一条 `upstream=go` 的规则时，不应该被前面更早写入的通配条目永久压住。
+    /// 计分规则（越大越优先）：
+    /// - 上游固定 +4，任意上游 +0；
+    /// - 同上游内：精确模型 +2、通配模型 +1、`model` 留空（任意模型）+0。
+    ///
+    /// 因此「上游固定」永远压过「任意上游」，同级再按数组顺序（先写的先用）。
+    fn match_score(&self, upstream: &str, requested: &str, target: &str) -> Option<i32> {
+        if !self.upstream_matches(upstream) {
+            return None;
+        }
+        let model_rank = [requested, target]
+            .into_iter()
+            .filter_map(|model| {
+                if self.model.is_empty() {
+                    Some(0)
+                } else if !self.model.contains('*') && self.model.eq_ignore_ascii_case(model) {
+                    Some(2)
+                } else if self.model_matches(model) {
+                    Some(1)
+                } else {
+                    None
+                }
+            })
+            .max()?;
+        Some(if self.upstream.is_empty() { 0 } else { 4 } + model_rank)
+    }
 }
 
 /// 极简通配符匹配：`*` 匹配任意字符序列，其余按大小写不敏感全等。
@@ -235,12 +266,23 @@ impl PricingTable {
         }));
     }
 
-    /// 按「上游 + 模型」解析条目：有序数组先匹配先用。
+    /// 按「上游 + 模型」解析条目。
+    ///
+    /// 先按 `match_score` 取最具体的一条（上游固定 > 任意上游；同上游内
+    /// 精确模型 > 通配模型 > 任意模型），同级再按数组顺序先匹配先用。
     /// 请求名与上游实际模型名都参与匹配（别名/映射也能命中）。
     pub fn resolve(&self, upstream: &str, requested: &str, target: &str) -> Option<&PricingEntry> {
-        self.entries.iter().find(|e| {
-            e.upstream_matches(upstream) && (e.model_matches(requested) || e.model_matches(target))
-        })
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                entry
+                    .match_score(upstream, requested, target)
+                    .map(|score| (score, index, entry))
+            })
+            // Reverse(index)：同分时保留数组里更靠前的一条。
+            .max_by_key(|(score, index, _)| (*score, std::cmp::Reverse(*index)))
+            .map(|(_, _, entry)| entry)
     }
 
     /// 面板「单价表」展示用：某模型（任一上游）的报价概要。
@@ -593,6 +635,64 @@ mod tests {
         assert!(t.resolve("zen", "whatever", "whatever").is_some());
         // 上游模型名（映射后的目标）也能命中
         assert!(t.resolve("cch", "alias-name", "deepseek-chat").is_some());
+    }
+
+    #[test]
+    fn upstream_specificity_wins_over_entry_order() {
+        let t = table(json!({
+            "entries": [
+                // 通用兜底写在最前面，仍然是优先级最低的
+                { "model": "deepseek-*", "input": 1.0, "output": 2.0 },
+                // 订阅额度制虽然排第二，但上游固定 → 压过通用按量条目
+                { "model": "*", "upstream": "go", "type": "quota", "plan": "Go 订阅" },
+                // 精确 + 上游固定排最后，但优先级最高
+                { "model": "deepseek-v4.1-flash", "upstream": "cch", "input": 3.0, "output": 4.0 }
+            ]
+        }));
+        // Go：上游固定的额度制条目生效（不会退化成通用按量价）
+        assert!(matches!(
+            t.resolve("go", "deepseek-v4.1-flash", "deepseek-v4.1-flash")
+                .unwrap()
+                .kind,
+            EntryKind::Quota { .. }
+        ));
+        // cch：精确 + 上游固定虽然排最后，仍优先
+        let cost = t.cost_for(
+            "cch",
+            "deepseek-v4.1-flash",
+            "deepseek-v4.1-flash",
+            0,
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        assert!((cost - 3.0).abs() < 1e-9);
+        // 其他上游：命中通用通配条目
+        let generic = t.cost_for(
+            "zen",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash",
+            0,
+            1_000_000,
+            0,
+            0,
+            0,
+        );
+        assert!((generic - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn same_specificity_keeps_array_order() {
+        let t = table(json!({
+            "entries": [
+                { "model": "glm-*", "upstream": "go", "input": 1.0, "output": 1.0 },
+                { "model": "glm-4.6*", "upstream": "go", "input": 2.0, "output": 2.0 }
+            ]
+        }));
+        // 两条都是「上游固定 + 通配」，同级 → 先写的先命中
+        let cost = t.cost_for("go", "glm-4.6", "glm-4.6", 0, 1_000_000, 0, 0, 0);
+        assert!((cost - 1.0).abs() < 1e-9);
     }
 
     #[test]

@@ -917,17 +917,36 @@ pub async fn models_catalog(State(state): State<Arc<AppState>>, uri: Uri) -> Res
             }
         }
     }
-    // 单价提示：按「该模型的第一个上游 + 模型名」解析单价表；
-    // 未命中（额度制条目会返回 type=quota，按量条目返回本位币单价）。
+    // 单价提示：按「每个上游 + 模型名」分别解析单价表。
+    // 同名模型在不同上游可能完全不同的价格，因此不能只取第一个上游。
     for row in rows.iter_mut() {
         let model = row["model"].as_str().unwrap_or("").to_string();
-        let upstream = row["upstreams"]
+        let upstreams: Vec<String> = row["upstreams"]
             .as_array()
-            .and_then(|list| list.first())
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        row["costHint"] = pricing.quote(&upstream, &model).unwrap_or(Value::Null);
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut hints: Vec<Value> = Vec::new();
+        for upstream in &upstreams {
+            if let Some(quote) = pricing.quote(upstream, &model) {
+                hints.push(json!({"upstream": upstream, "quote": quote}));
+            }
+        }
+        // 兜底显示：没有任何上游命中时，再看「任意上游」条目的报价。
+        if hints.is_empty() {
+            if let Some(quote) = pricing.quote("", &model) {
+                hints.push(json!({"upstream": "", "quote": quote}));
+            }
+        }
+        row["costHints"] = json!(hints);
+        row["costHint"] = hints
+            .first()
+            .map(|hint| hint["quote"].clone())
+            .unwrap_or(Value::Null);
     }
     // 「单价」胶囊筛选：已配置 = 命中任何单价条目（按量或额度制）
     let price_filter = query.get("price").cloned().unwrap_or_default();
@@ -1247,6 +1266,77 @@ mod tests {
         (status, value)
     }
 
+    /// 逐模型密钥写入的拒绝路径：未知模型、非 env 来源、file 目标。
+    #[test]
+    fn upstream_secret_model_key_rejects_invalid_targets() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "u": {
+                    "protocol": "openai",
+                    "baseUrl": "https://example.invalid/v1",
+                    "apiKeyEnv": "UPSTREAM_FALLBACK_ENV",
+                    "modelKeys": {
+                        "model-a": "MODEL_A_ENV",
+                        "model-b": {"apiKeyFile": "D:/keys/b.json"}
+                    }
+                }
+            }
+        }));
+        let dir = temp_dir("secret-model");
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+        let runtime = rt();
+
+        let (status, body) = runtime.block_on(async {
+            body_json(
+                upstream_secret(
+                    State(state.clone()),
+                    Json(json!({
+                        "name": "u", "apiKey": "k-test",
+                        "target": "env", "model": "missing"
+                    })),
+                )
+                .await,
+            )
+            .await
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], json!("unknown_model_key"));
+
+        let (status, body) = runtime.block_on(async {
+            body_json(
+                upstream_secret(
+                    State(state.clone()),
+                    Json(json!({
+                        "name": "u", "apiKey": "k-test",
+                        "target": "env", "model": "model-b"
+                    })),
+                )
+                .await,
+            )
+            .await
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], json!("model_key_missing_env"));
+
+        let (status, body) = runtime.block_on(async {
+            body_json(
+                upstream_secret(
+                    State(state.clone()),
+                    Json(json!({
+                        "name": "u", "apiKey": "k-test",
+                        "target": "file", "model": "model-a",
+                        "filePath": "D:/keys/a.json"
+                    })),
+                )
+                .await,
+            )
+            .await
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], json!("unsupported_model_key_target"));
+    }
+
     fn uri_with(path: &str, query: &str) -> Uri {
         if query.is_empty() {
             path.parse().unwrap()
@@ -1507,7 +1597,7 @@ pub async fn upstreams_health(State(state): State<Arc<AppState>>, uri: Uri) -> R
     let cfg = state.cfg();
     let mut rows = Vec::new();
     for up in &cfg.upstreams {
-        rows.push(probe(&state, up, timeout).await);
+        rows.push(probe(&state, up, timeout, "").await);
     }
     Json(json!({"checked_at": now(), "rows": rows})).into_response()
 }
@@ -1522,12 +1612,19 @@ pub async fn upstream_probe(
         .and_then(Value::as_f64)
         .unwrap_or(6.0)
         .clamp(2.0, 20.0);
+    // 可选 model：用该模型的逐模型密钥探测；缺省用上游级密钥。
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let up = {
         let cfg = state.cfg();
         cfg.upstream(name).cloned()
     };
     match up {
-        Some(up) => Json(json!({"row": probe(&state, &up, timeout).await})).into_response(),
+        Some(up) => Json(json!({"row": probe(&state, &up, timeout, &model).await})).into_response(),
         None => error_json(
             StatusCode::NOT_FOUND,
             format!("未知上游 {name}"),
@@ -1537,15 +1634,22 @@ pub async fn upstream_probe(
     }
 }
 
-async fn probe(state: &AppState, up: &crate::config::Upstream, timeout: f64) -> Value {
+async fn probe(state: &AppState, up: &crate::config::Upstream, timeout: f64, model: &str) -> Value {
     let url = format!("{}/v1/models", up.base_url.trim_end_matches('/'));
-    let mut req = state
+    // 与 chat 共用鉴权头构造：x-api-key / bearer / both / header 都按上游 compat 走。
+    // 指定 model 时用该模型的密钥，否则用上游级密钥。
+    let selection = if model.is_empty() {
+        up.upstream_key()
+    } else {
+        up.key_for_model(model)
+    };
+    let mut headers = reqwest::header::HeaderMap::new();
+    crate::proxy::apply_auth_headers(&mut headers, up, &selection.key);
+    let req = state
         .client
         .get(&url)
-        .timeout(std::time::Duration::from_secs_f64(timeout));
-    if !up.api_key.is_empty() {
-        req = req.header("authorization", format!("Bearer {}", up.api_key));
-    }
+        .timeout(std::time::Duration::from_secs_f64(timeout))
+        .headers(headers);
     match req.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
@@ -1553,6 +1657,14 @@ async fn probe(state: &AppState, up: &crate::config::Upstream, timeout: f64) -> 
                 "name": up.name,
                 "ok": resp.status().is_success(),
                 "status": status,
+                "model": if model.is_empty() { Value::Null } else { json!(model) },
+                "keySource": selection.source,
+                "keyFrom": selection.from,
+                "modelKeys": up.model_keys.iter().map(|mk| json!({
+                    "model": mk.pattern,
+                    "env": mk.env_name,
+                    "configured": mk.missing.is_none(),
+                })).collect::<Vec<_>>(),
                 "message": if resp.status().is_success() { "模型列表可访问".to_string() }
                            else { format!("HTTP {status}") },
                 "hint": if resp.status().is_success() { "" }
@@ -1563,6 +1675,9 @@ async fn probe(state: &AppState, up: &crate::config::Upstream, timeout: f64) -> 
             "name": up.name,
             "ok": false,
             "status": 0,
+            "model": if model.is_empty() { Value::Null } else { json!(model) },
+            "keySource": selection.source,
+            "keyFrom": selection.from,
             "message": err.to_string(),
             "hint": "检查 baseUrl 是否可达、端口是否监听、本机代理是否拦截",
         }),
@@ -1641,6 +1756,21 @@ pub async fn upstream_secret(
         .cloned()
         .unwrap_or(Value::Null);
 
+    // 逐模型密钥写入：v1 只支持环境变量目标（凭据文件请直接编辑）。
+    let has_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if target == "file" && has_model {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "逐模型密钥暂只支持写入环境变量（target=env）；凭据文件请直接编辑对应文件",
+            "invalid_request_error",
+            "unsupported_model_key_target",
+        );
+    }
     if target == "file" {
         return write_secret_to_file(&state, cfg, &upstream, &raw_up, &body, key);
     }
@@ -1655,20 +1785,56 @@ fn write_secret_to_user_env(
     body: &Value,
     key: &str,
 ) -> Response {
-    let env_name = body
-        .get("envName")
+    // 逐模型写入：由 modelKeys 条目决定变量名；未指定 model 时沿用上游级逻辑。
+    let model = body
+        .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            upstream
-                .api_key_env
-                .clone()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_default();
+        .map(str::to_string);
+    let env_name = if let Some(model) = model.as_deref() {
+        let Some(entry) = upstream.model_keys.iter().find(|mk| mk.pattern == model) else {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "模型「{model}」不在上游「{}」的 modelKeys 中",
+                    upstream.name
+                ),
+                "invalid_request_error",
+                "unknown_model_key",
+            );
+        };
+        let Some(env) = entry
+            .env_name
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "模型「{model}」没有配置 apiKeyEnv，无法写入环境变量；请先把该条目改为字符串或 {{\"apiKeyEnv\":\"...\"}}"
+                ),
+                "invalid_request_error",
+                "model_key_missing_env",
+            );
+        };
+        env
+    } else {
+        body.get("envName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                upstream
+                    .api_key_env
+                    .clone()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default()
+    };
     if env_name.is_empty() {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -1701,7 +1867,20 @@ fn write_secret_to_user_env(
 
     // 热更新运行态：让本次会话立即按新密钥工作。
     for up in cfg.upstreams.iter_mut() {
-        if up.name == upstream.name {
+        if up.name != upstream.name {
+            continue;
+        }
+        // 同一变量可能被多个模型共用：全部更新，避免只改中一个。
+        for mk in up.model_keys.iter_mut() {
+            if mk.env_name.as_deref() == Some(env_name.as_str()) {
+                mk.api_key = key.to_string();
+                mk.source = "user-env".into();
+                mk.missing = None;
+            }
+        }
+        // 只有「写入的正是上游级变量」或「未指定 model」时才动上游级密钥；
+        // 否则会把某厂商的 key 误当成上游兜底 key。
+        if model.is_none() || up.api_key_env.as_deref() == Some(env_name.as_str()) {
             up.api_key = key.to_string();
             up.key_source = "user-env".into();
         }
@@ -1711,6 +1890,7 @@ fn write_secret_to_user_env(
         "ok": true,
         "name": upstream.name,
         "target": "env",
+        "model": model,
         "envName": env_name,
         "scope": "user",
         "keySource": "user-env",

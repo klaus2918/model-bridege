@@ -110,17 +110,28 @@ pub fn strip_secrets(value: &mut Value) {
     if let Some(upstreams) = obj.get_mut("upstreams").and_then(Value::as_object_mut) {
         for (_, upstream) in upstreams.iter_mut() {
             if let Some(entry) = upstream.as_object_mut() {
-                entry.remove("apiKey");
-                entry.remove("_keyConfigured");
-                entry.remove("_keySource");
+                strip_upstream_secrets(entry);
             }
         }
     }
     // 旧版：upstream 是单个上游对象。
     if let Some(entry) = obj.get_mut("upstream").and_then(Value::as_object_mut) {
-        entry.remove("apiKey");
-        entry.remove("_keyConfigured");
-        entry.remove("_keySource");
+        strip_upstream_secrets(entry);
+    }
+}
+
+/// 清掉单个上游对象里的明文密钥与面板只读字段。
+fn strip_upstream_secrets(entry: &mut Map<String, Value>) {
+    entry.remove("apiKey");
+    entry.remove("_keyConfigured");
+    entry.remove("_keySource");
+    // 逐模型密钥同样只允许变量名/路径引用。
+    if let Some(model_keys) = entry.get_mut("modelKeys").and_then(Value::as_object_mut) {
+        for (_, spec) in model_keys.iter_mut() {
+            if let Some(spec) = spec.as_object_mut() {
+                spec.remove("apiKey");
+            }
+        }
     }
 }
 
@@ -399,6 +410,26 @@ mod tests {
         let up = &v["upstreams"]["a"];
         assert!(up.get("apiKey").is_none(), "明文密钥不得留在落盘内容里");
         assert_eq!(up["apiKeyEnv"], json!("MY_ENV"), "密钥引用应保留");
+    }
+
+    #[test]
+    fn strip_secrets_removes_literal_keys_inside_model_keys() {
+        let mut v = json!({
+            "upstreams": {
+                "a": {
+                    "modelKeys": {
+                        "model-a": {"apiKey": "secret-a", "apiKeyEnv": "A_KEY"},
+                        "model-b": {"apiKey": "secret-b", "apiKeyFile": "D:/keys/b.json"}
+                    }
+                }
+            }
+        });
+        strip_secrets(&mut v);
+        let keys = &v["upstreams"]["a"]["modelKeys"];
+        assert!(keys["model-a"].get("apiKey").is_none());
+        assert!(keys["model-b"].get("apiKey").is_none());
+        assert_eq!(keys["model-a"]["apiKeyEnv"], json!("A_KEY"));
+        assert_eq!(keys["model-b"]["apiKeyFile"], json!("D:/keys/b.json"));
     }
 
     #[test]

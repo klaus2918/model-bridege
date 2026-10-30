@@ -134,9 +134,9 @@
     <details class="box fold" id="pricing-fold" data-fold="pricing">
       <summary>
         <span class="fold-title">单价表（费用估算）</span>
-        <span class="hint">单位：金额 / 百万 token；本位币人民币，美元单价按汇率折算入账；峰谷窗口外按谷价计费</span>
+        <span class="hint">按「上游 + 模型」逐条定价；单位：金额 / 百万 token；峰谷窗口按北京时间；美元按汇率折算入账</span>
       </summary>
-      <div class="grid">
+      <div class="grid grid-3">
         <label title="1 美元兑人民币的换算汇率；USD 单价按它折算成人民币落库">USD→CNY 汇率
           <input id="pricing-fx" type="number" step="0.0001" min="0" placeholder="7.2">
         </label>
@@ -147,16 +147,46 @@
       </div>
       <div class="chips" id="pricing-templates">
         <span class="chip-label">官方模板</span>
-        <span class="hint" id="pricing-templates-hint">点击模板把该厂商的单价条目追加到下方 JSON（同名条目自动去重）</span>
+        <span class="hint" id="pricing-templates-hint">点击模板把该厂商的单价条目加入下方编辑器（同上游+同模型自动去重）</span>
       </div>
-      <label class="span-2">单价表（JSON：fx 汇率 + entries 条目，先匹配先用；type=per-token 按量计费 / quota 额度制）
-        <textarea id="pricing-json" rows="14" spellcheck="false"
-          placeholder='{"version":1,"fx":{"USD":7.2},"entries":[{"model":"deepseek-*","upstream":"cch","label":"DeepSeek 官方","type":"per-token","currency":"USD","input":0.30,"output":1.20,"cacheRead":0.006,"peak":{"tzOffsetMinutes":0,"weekdaysOnly":true,"windows":[{"start":"01:00","end":"04:00"},{"start":"06:00","end":"10:00"}],"offPeak":{"multiplier":0.5}}},{"model":"*","upstream":"zen","type":"quota","plan":"OpenCode Zen 免费池"}]}'></textarea>
-      </label>
+      <div class="pricing-add">
+        <span class="chip-label">新增条目</span>
+        <label class="inline-field">上游
+          <select id="pricing-add-upstream" class="filter-select"></select>
+        </label>
+        <label class="inline-field">模型
+          <input id="pricing-add-model" class="filter-input" list="pricing-model-options" placeholder="精确模型名，或 deepseek-* 通配">
+        </label>
+        <datalist id="pricing-model-options"></datalist>
+        <label class="inline-field">类型
+          <select id="pricing-add-type">
+            <option value="per-token">按量计费</option>
+            <option value="quota">额度制（订阅/免费池）</option>
+          </select>
+        </label>
+        <button type="button" class="primary" id="pricing-add">添加到最前</button>
+        <span class="hint" id="pricing-order-hint">匹配优先级：上游固定 &gt; 任意上游；同上游内精确模型 &gt; 通配；同级按列表顺序（上方先匹配）</span>
+      </div>
+      <div id="pricing-editor" class="pricing-editor"></div>
+      <div class="hint" id="pricing-empty" hidden>还没有单价条目：点上方官方模板，或用「新增条目」按上游 + 模型添加。</div>
+      <details class="fold" id="pricing-advanced">
+        <summary>
+          <span class="fold-title">高级：直接编辑 JSON</span>
+          <span class="hint">保存以编辑器为准；改完 JSON 需要点「应用 JSON」同步回编辑器</span>
+        </summary>
+        <label class="span-2">单价表 JSON（fx 汇率 + entries 条目）
+          <textarea id="pricing-json" rows="10" spellcheck="false"
+            placeholder='{"version":1,"fx":{"USD":7.2},"entries":[{"model":"deepseek-*","upstream":"cch","label":"DeepSeek 官方","type":"per-token","currency":"USD","input":0.30,"output":1.20,"cacheRead":0.006,"peak":{"tzOffsetMinutes":480,"weekdaysOnly":true,"windows":[{"start":"09:00","end":"12:00"},{"start":"14:00","end":"18:00"}],"offPeak":{"multiplier":0.5}}},{"model":"*","upstream":"zen","type":"quota","plan":"OpenCode Zen 免费池"}]}'></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" class="ghost" id="pricing-json-apply">应用 JSON 到编辑器</button>
+          <button type="button" class="ghost" id="pricing-format">格式化 JSON</button>
+        </div>
+      </details>
       <div class="hint" id="pricing-issues" hidden></div>
       <div class="actions">
-        <button type="button" class="ghost" id="pricing-format">格式化 JSON</button>
         <button type="button" class="primary" id="save-pricing">保存单价表</button>
+        <span class="badge warn" id="pricing-dirty" hidden>未保存</span>
         <span class="hint" id="pricing-hint"></span>
       </div>
     </details>
@@ -682,7 +712,7 @@
           <button data-evmode="rounds" class="active">轮次</button>
           <button data-evmode="full">全貌</button>
         </div>
-        <span class="hint" id="evolution-hint">默认折叠、可逐条展开看完整消息；「全貌」连续铺开整个会话；点「基准 / 对比」任选两条记录做差异，全部为本地算法</span>
+        <span class="hint" id="evolution-hint">轮次：逐轮时间轴 + 差异对比；全貌：整行连续铺开整个会话，按请求逐条展开完整消息（此时右侧差异面板自动收起）</span>
       </div>
       <div class="ev-compare-bar" id="evolution-compare-bar">
         <div class="ev-compare-main">
@@ -705,7 +735,7 @@
           <div id="evolution-timeline" class="prompt-timeline"></div>
           <div class="hint" style="margin-top: 8px;">点行展开消息序列 · 每行可设为「基准 / 对比」· 行间徽标显示与上一轮的差异</div>
         </div>
-        <div class="box">
+        <div class="box" id="evolution-diff-box">
           <div class="box-head">
             <h2>差异分析</h2>
             <div class="section-actions">

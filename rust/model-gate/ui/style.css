@@ -196,7 +196,7 @@ button.danger-ghost:hover { background: color-mix(in srgb, var(--danger) 12%, tr
 
 /* ══ 工具条 / 表单 ══ */
 .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.filter-select, select, input[type="text"], input[type="number"],
+.filter-select, select, input[type="text"], input[type="number"], input[type="time"],
 input[type="search"], input[type="password"], textarea {
   background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
   border-radius: var(--radius-sm); padding: 6px 9px; font-size: 12.5px;
@@ -218,6 +218,72 @@ input[type="checkbox"] { accent-color: var(--brand); width: 14px; height: 14px; 
   background: linear-gradient(to top, var(--bg) 62%, transparent);
 }
 #pricing-json { width: 100%; font-family: var(--mono); font-size: 12px; resize: vertical; }
+
+/* ── 单价结构化编辑器：按「上游 + 模型」逐条卡片 ──────────── */
+.pricing-add {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 4px 0 12px; padding: 8px 10px;
+  border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.pricing-add .filter-input { min-width: 210px; }
+.pricing-editor { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.pricing-card {
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface); overflow: hidden;
+}
+.pricing-card.invalid { border-color: var(--danger); box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 35%, transparent); }
+.pricing-card-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; background: var(--surface-2);
+  border-bottom: 1px dashed var(--border);
+}
+.pricing-order { font-family: var(--mono); font-weight: 600; color: var(--brand); min-width: 24px; }
+.pricing-card-head .filter-input { min-width: 190px; }
+.pricing-card-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; }
+.pricing-card-body {
+  display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap;
+  padding: 10px;
+}
+.pricing-card-body label {
+  display: flex; flex-direction: column; gap: 3px;
+  color: var(--text-3); font-size: 11px;
+}
+.pricing-card-body input[type="number"] { width: 104px; font-family: var(--mono); }
+.pricing-card-body input[type="text"] { width: 150px; }
+.pricing-card-body .unit { font-size: 10.5px; color: var(--text-3); }
+.pricing-peak {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px; border-top: 1px dashed var(--border);
+  background: var(--surface-2);
+}
+.pricing-peak-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pricing-window {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 6px; border: 1px solid var(--border);
+  border-radius: 999px; background: var(--surface-3);
+}
+.pricing-window input[type="time"] { width: 104px; padding: 3px 6px; }
+.pricing-peak-rates { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+.pricing-peak-rates label {
+  display: flex; flex-direction: column; gap: 3px;
+  color: var(--text-3); font-size: 11px;
+}
+.pricing-peak-rates input { width: 104px; font-family: var(--mono); }
+.pricing-note { color: var(--text-3); font-size: 11.5px; }
+.pricing-card-body .pricing-currency { width: 84px; }
+.pricing-scope {
+  font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+}
+
+/* 目录单价列：同一模型在不同上游各报各的价 */
+.rate-multi { display: flex; flex-direction: column; gap: 3px; }
+.rate-line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.up-tag {
+  font-size: 10.5px; color: var(--text-3);
+  border: 1px solid var(--border); border-radius: 999px; padding: 0 6px;
+}
 
 /* ══ 表格 ══ */
 .table-wrap { overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
@@ -1207,9 +1273,9 @@ details.fold > .actions.sticky-actions { padding: 10px 0 6px; }
   margin-bottom: 2px;
 }
 .ev-transcript .prompt-msg { margin: 0; }
-.ev-transcript .prompt-msg summary { cursor: pointer; }
+.ev-transcript .prompt-msg summary { cursor: pointer; flex-wrap: wrap; row-gap: 4px; }
 .ev-transcript .prompt-msg summary .ev-msg-preview {
-  display: inline-block; max-width: 60%; overflow: hidden;
+  flex: 1 1 220px; min-width: 0; max-width: 100%; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
   color: var(--text-3); font-size: 11.5px;
 }
@@ -1223,8 +1289,25 @@ details.fold > .actions.sticky-actions { padding: 10px 0 6px; }
   padding: 8px 12px; background: var(--surface-2);
   border-bottom: 1px dashed var(--border);
 }
-.ev-full-round .ev-full-round-head .prompt-timeline-detail { margin-left: auto; }
+.ev-full-round-meta {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-left: auto; min-width: 0;
+}
+.ev-full-round .ev-full-round-head .prompt-timeline-detail { margin-left: 2px; }
 .ev-full-round .ev-transcript { padding: 8px 12px 12px; }
+/* 时间轴/全貌卡片必须「内容多高就多高」：父级是 flex + max-height 滚动容器，
+   子项默认 flex-shrink:1 会被压扁，再被 overflow:hidden 裁掉正文
+   （全貌曾整块只剩标题条）。 */
+.prompt-timeline > * { flex: 0 0 auto; }
+
+/* 全貌模式独占整行连续阅读：右侧差异面板与对比条只会挤压正文 */
+#prompt-evolution-view.full-mode .ev-split { grid-template-columns: minmax(0, 1fr); }
+#prompt-evolution-view.full-mode #evolution-diff-box { display: none; }
+#prompt-evolution-view.full-mode .ev-compare-bar { display: none; }
+#prompt-evolution-view.full-mode #evolution-timeline {
+  max-height: none; overflow: visible; padding-left: 0;
+}
+#prompt-evolution-view.full-mode #evolution-timeline::before { display: none; }
 
 /* 顶部常驻对比条：滚动到任何位置都能看到当前对比对象与总增量 */
 .ev-compare-bar {

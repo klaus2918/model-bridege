@@ -193,7 +193,7 @@ function renderFreeModelTable() {
       const reason = r.reasonCode
         ? `<div><b>${esc(r.reasonLabel || r.reasonCode)}</b>：${esc(r.advice || "")}</div>
            <div class="hint">${esc((r.raw || "").slice(0, 160))}</div>`
-        : `<span class="hint">${esc(r.probedAt ? "探测于 " + r.probedAt : "未探测")}</span>`;
+        : `<span class="hint">${esc(r.probedAt ? "探测于 " + fmtTime(null, r.probedAt) : "未探测")}</span>`;
       const globalBtn = `<button class="ghost tiny" data-free-act="globalize"
         data-model="${esc(m.id)}" title="把这个模型加入对外模型清单（会写进顶层 models）">加入全局清单</button>`;
       const probeBtn = `<button class="ghost tiny" data-free-act="probe-one"
