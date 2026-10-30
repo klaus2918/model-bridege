@@ -134,6 +134,7 @@ jobs:
           body: |
             Model-Gate Rust 桌面版：托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
 
+            - **ZCode 账号池（新）**：本机导入/OAuth/粘贴 JWT、DPAPI 加密、验证码池、Start Plan 自动领取；`transport=zcode` 经本机 ZCode app-server 走 GLM-5.3-Flash / GLM-5.3，账号池轮询与失败换号。
             - 安装包：`Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe`（安装时可选安装目录）
             - 便携版：`Model-Gate-rust.exe`（单文件，免安装）
             - 校验：`SHA256SUMS`

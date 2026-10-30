@@ -75,11 +75,14 @@ pub async fn free_sources(State(state): State<Arc<AppState>>) -> Response {
         rows.push(json!({
             "id": source.id,
             "label": source.label,
+            "kind": source.kind,
             "upstream": source.upstream,
             "baseUrl": source.base_url,
             "protocol": source.protocol,
             "transport": source.transport,
-            "auth": source.auth_scheme(),
+            "auth": source.display_auth(),
+            "quota": { "mode": source.quota_mode },
+            "models": source.fixed_ids,
             "configured": configured,
             "declaredModels": declared_models,
             "transportActive": upstream.map(|u| u.transport == source.transport).unwrap_or(false),
@@ -107,6 +110,14 @@ pub async fn free_sources(State(state): State<Arc<AppState>>) -> Response {
 /// Zen 免密层的 `/models` 同样需要客户端指纹与匿名 key（实测：裸请求拿不到可用目录），
 /// 因此走 `transport=opencode` 的来源必须带上同样的头，不能只对 chat 请求带。
 async fn fetch_catalog(source: &fs::FreeSource) -> Result<Vec<(String, Value)>, String> {
+    // 账号型/固定目录来源不访问远端：模型清单来自注册表（如 ZCode GLM 池）。
+    if source.kind == "account" || source.catalog_shape == "fixed" {
+        return Ok(source
+            .fixed_ids
+            .iter()
+            .map(|id| (id.clone(), json!({"id": id})))
+            .collect());
+    }
     let raw_url = format!("{}{}", source.normalized_base_url(), source.catalog_path);
     // 与 chat 路径保持一致：`transport=opencode` 的来源要把 `/zen/...` 改写成
     // `/inference/...`（OpenCode 免密层自 2026-10-14 起迁到新端点；

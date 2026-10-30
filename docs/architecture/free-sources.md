@@ -8,14 +8,16 @@
 
 ---
 
-## 1. 两条免密来源
+## 1. 免密来源与账号型来源
 
 | 来源 id | 名称 | 端点 | 鉴权 | 传输层 | 隐私级别 |
 |---------|------|------|------|--------|----------|
 | `zen-free` | OpenCode Zen 免密池 | `https://opencode.ai/zen/v1` | 匿名 `Bearer public` + 客户端指纹 | `transport: opencode` | warn |
 | `kilo-free` | Kilo 免密免费池 | `https://api.kilo.ai/api/openrouter` | **完全不发送鉴权头** | 标准 OpenAI 兼容 | **danger** |
+| `zcode` | ZCode Start Plan（GLM 账号池） | `https://zcode.z.ai/api/v1/zcode-plan/anthropic` | 账号 JWT，由本机插件注入 | `transport: zcode`（app-server） | warn |
 
-两者都**不写 `apiKey`、不写 `apiKeyEnv`**，一键接入后配置里没有任何凭据。
+前两者都**不写 `apiKey`、不写 `apiKeyEnv`**，一键接入后配置里没有任何凭据。`zcode` 是账号型来源，
+配置同样不写凭据；JWT 只存 Model-Gate 本机加密库，运行时由账号池按请求注入。
 
 - Zen 侧的传输层（指纹头、`ses_`/`msg_` ID、`/zen→/inference` 重写、强制流式、`bash`/`read` 注入）
   由 `upstream-compat` 的 R8 契约实现，本模块只做**启用与呈现**，不重复实现。
@@ -199,3 +201,48 @@
 - **不做**：账号登录/OAuth、Go/付费模型、额度绕过、Anthropic Messages / Responses 端点、
   参考仓库的 75 家聚合注册表、省 Token 压缩、combo 降级链、局域网中继、公告中心、应用内升级。
 - **不自动进全局**：见 §3。
+
+---
+
+## 9. ZCode 账号型来源（v2.28.0）
+
+ZCode 不是免密来源，而是 **账号池型免费额度**：账号、领取、验证码、传输都在 Model-Gate 内部，
+没有第二套网关/账号库/UI。
+
+### 9.1 数据流
+
+```
+ZCode 页签 / 免费来源卡
+  → 导入本机凭据 / OAuth / 粘贴 JWT
+  → zcode_accounts（SQLite，密文 + SHA-256 指纹去重）
+  → billing/preview + billing/claim（验证码池）
+  → zcode_claims（业务码/冷却/额度）
+  → transport=zcode：账号池轮询 → 本机 ZCode app-server（JSON-RPC）
+  → GLM-5.3-Flash / GLM-5.3（OpenAI 兼容响应）
+```
+
+### 9.2 关键实现
+
+| 模块 | 职责 |
+|------|------|
+| `src/zcode/store.rs` | `zcode_accounts` / `zcode_claims`、状态机、最久未用轮询 |
+| `src/zcode/credentials.rs` | 本机 `credentials.json` AES-256-GCM 解密；账号 home 加密写入 |
+| `src/zcode/captcha.rs` | 无头 Chrome/Edge + 阿里云官方 SDK；池上限 2、TTL 95s、3007 整池失效 |
+| `src/zcode/claim.rs` | preview/claim、1005 退避、3007 失效验证码、401 invalid、自动领取调度 |
+| `src/zcode/appserver.rs` | `provider/updateAccountConfig` → `session/create` → `session/setModel` → `session/send`；权限/浏览器一律 deny |
+| `src/zcode/transport.rs` | `transport=zcode`、账号轮换、错误冷却、OpenAI/SSE 响应 |
+
+### 9.3 安全边界
+
+- JWT 只在本机导入/粘贴请求中出现一次；落库用 Windows DPAPI，UI 只显示掩码。
+- 不写 `bridge.config.json`、不写日志、不回显 token。
+- app-server 的 `interaction/requestProviderRuntimeHeaders` 按当前账号注入 JWT；子进程继承的
+  环境变量不包含其他上游密钥。
+- 验证码求解使用真实浏览器加载官方 SDK，不做验证码绕过。
+
+### 9.4 已知限制
+
+- `backend=direct` 实测 405/3012，仅保留实验开关，不默认启用、不自动回退。
+- 首期只支持纯文本/流式；工具调用不保证，app-server 权限一律 deny。
+- 账号无可领套餐时 claim 只记录「当前没有可领取的套餐」；成功路径依赖上游实际放量。
+- ZCode CLI/app-server 版本升级可能改变内部协议；`cliPath` / `nodePath` / `dataDir` 均可在面板覆盖。

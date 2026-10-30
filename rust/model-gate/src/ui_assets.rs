@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
 const FREE_JS: &str = include_str!("../ui/free_sources.js");
+const ZCODE_JS: &str = include_str!("../ui/zcode.js");
 const STYLE_CSS: &str = include_str!("../ui/style.css");
 const PROXY_RS: &str = include_str!("proxy.rs");
 
@@ -92,7 +93,7 @@ fn tabs_match_panels() {
     }
     assert_eq!(tabs, panels, "页签与面板必须一一对应");
     for expected in [
-        "overview", "model", "config", "usage", "prompts", "free", "logs",
+        "overview", "model", "config", "usage", "prompts", "free", "zcode", "logs",
     ] {
         assert!(tabs.contains(expected), "缺少页签 {expected}");
     }
@@ -104,6 +105,7 @@ fn js_ids_resolve_in_html() {
     let mut missing: Vec<String> = js_ids(APP_JS)
         .into_iter()
         .chain(js_ids(FREE_JS))
+        .chain(js_ids(ZCODE_JS))
         // 既有例外：更新弹窗容器由 JS 运行时插入，且调用处显式做了
         // `if (!host) return;` 存在性保护，静态 HTML 里没有该节点。
         .filter(|id| id != "update-modal")
@@ -144,6 +146,39 @@ fn free_source_routes_are_registered_in_backend() {
         assert!(
             PROXY_RS.contains(path.as_str()),
             "前端调用了未注册的路由 {path}"
+        );
+    }
+}
+
+#[test]
+fn zcode_ids_exist_in_html() {
+    let ids = html_ids();
+    for required in [
+        "panel-zcode",
+        "zcode-status",
+        "zcode-account-table",
+        "zcode-claim-table",
+        "zcode-import-local",
+        "zcode-add-manual",
+        "zcode-oauth-start",
+        "zcode-claim-now",
+        "zcode-claim-preview",
+        "zcode-attach",
+        "zcode-captcha-test",
+        "zcode-refresh",
+    ] {
+        assert!(ids.contains(required), "ZCode 页缺少元素 {required}");
+    }
+}
+
+#[test]
+fn zcode_routes_are_registered_in_backend() {
+    let paths = js_api_paths(ZCODE_JS);
+    assert!(!paths.is_empty(), "ZCode 脚本未调用任何后端接口");
+    for path in &paths {
+        assert!(
+            PROXY_RS.contains(path.as_str()),
+            "ZCode 前端调用了未注册的路由 {path}"
         );
     }
 }

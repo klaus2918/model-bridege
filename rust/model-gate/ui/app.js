@@ -3328,6 +3328,7 @@ function switchTab(tab) {
   if (tab === "usage") loadUsage();
   if (tab === "prompts") loadPrompts();
   if (tab === "free") loadFreeSources();
+  if (tab === "zcode") loadZcode();
   if (tab === "logs") loadLogs();
 }
 

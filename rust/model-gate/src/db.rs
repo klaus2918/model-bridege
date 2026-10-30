@@ -63,6 +63,40 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS zcode_accounts (
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    provider         TEXT NOT NULL DEFAULT 'zai',
+    mode             TEXT NOT NULL,
+    secret_enc       BLOB NOT NULL,
+    secret_fp        TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'active',
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    quota_json       TEXT,
+    plan_json        TEXT,
+    fingerprint_json TEXT,
+    created_at       INTEGER NOT NULL,
+    last_checked_at  INTEGER,
+    last_used_at     INTEGER,
+    cooling_until    INTEGER,
+    last_error       TEXT,
+    use_count        INTEGER NOT NULL DEFAULT 0,
+    fail_count       INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_zcode_accounts_fp     ON zcode_accounts(secret_fp);
+CREATE INDEX IF NOT EXISTS idx_zcode_accounts_status       ON zcode_accounts(status);
+CREATE TABLE IF NOT EXISTS zcode_claims (
+    id          TEXT PRIMARY KEY,
+    account_id  TEXT NOT NULL,
+    plan_id     TEXT,
+    plan_name   TEXT,
+    code        INTEGER,
+    ok          INTEGER NOT NULL,
+    next_at     INTEGER,
+    message     TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_zcode_claims_account ON zcode_claims(account_id, created_at DESC);
 "#;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -201,6 +235,16 @@ impl Db {
         // 轮转使用只读连接；两条连接足够覆盖面板的并发统计请求。
         let idx = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.readers.len();
         self.readers[idx].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// ZCode 账号存储专用写连接（同库同事务域，避免再开一条 SQLite 连接）。
+    pub(crate) fn write_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.write.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// ZCode 账号读取连接（只读，轮转）。
+    pub(crate) fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.reader()
     }
 
     /// 把 WAL 日志落盘并截断：退出前调用，确保用量数据真正写进主库文件。

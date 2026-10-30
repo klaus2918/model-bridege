@@ -16,8 +16,14 @@
 > 或**写入你手动指定的文件**（JSON / `.env`，只写你填的那个路径，配置文件里仅存路径引用）。
 > **不再内置**任何厂商客户端凭据路径。`apiKeyFile` / `apiKeyAgentPath` 仅在你自己显式填写路径时读取。
 > 分享配置用 `bridge.config.example.json`（零明文）。`bridge.config.json` 已在 `.gitignore` 中，不会进版本库。
+>
+> **ZCode 账号池（v2.28.0）**：新增「ZCode」页签，支持从本机 ZCode 导入、OAuth 登录、粘贴 JWT/API Key；
+> JWT 只存本机加密库（Windows DPAPI），不写配置文件、不回显。插件内置无头浏览器验证码池，
+> 可预览/领取 Start Plan、维护额度与冷却状态；`transport=zcode` 通过本机 ZCode app-server
+> 走 `GLM-5.3-Flash` / `GLM-5.3`，请求在账号池内轮询、失败自动换号。旧的 OpenAI/Anthropic/
+> CommandCode/opencode 上游与配置保持兼容。
 
-一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**四条上游**，并自动处理各上游的协议差异。
+一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**多条上游**，并自动处理各上游的协议差异。
 
 ```
 Agent（OpenAI 格式）
@@ -27,6 +33,7 @@ model-bridge
    ├─ cch         (Anthropic 协议)   → 127.0.0.1:15721 → CCH → DeepSeek
    ├─ go          (OpenAI 协议)      → opencode.ai/zen/go/v1  ← Go 订阅套餐
    ├─ zen         (OpenAI + opencode) → opencode.ai/zen/v1     ← 免费模型
+   ├─ zcode       (Anthropic 协议)   → 本机 ZCode app-server   ← Start Plan GLM 账号池
    └─ commandcode (CommandCode 协议) → api.commandcode.ai/alpha/generate ← CommandCode 订阅
 ```
 
@@ -255,14 +262,16 @@ set OPENAI_API_KEY=any-key
 
 不登录、不注册、不填 API Key，就能用上免费模型——并且**看清此刻到底哪个模型真能用**。
 
-面板新增第 6 页「**免费来源**」，提供两条免密通道：
+面板新增第 6 页「**免费来源**」，提供两条免密通道，以及一个账号型来源：
 
 | 来源 | 端点 | 鉴权 | 隐私级别 |
 |------|------|------|----------|
 | OpenCode Zen 免密池 | `https://opencode.ai/zen/v1` | 匿名 `Bearer public` + 客户端指纹 | warn |
 | Kilo 免密免费池 | `https://api.kilo.ai/api/openrouter` | **完全不发送鉴权头** | **danger** |
+| ZCode Start Plan | `https://zcode.z.ai/api/v1/zcode-plan/anthropic` | 账号 JWT，由本机插件注入 | warn |
 
-一键接入后配置里**没有任何凭据**（不写 `apiKey` / `apiKeyEnv`）。
+前两者一键接入后配置里**没有任何凭据**（不写 `apiKey` / `apiKeyEnv`）；ZCode 的 JWT 只存本机加密库，
+配置文件同样不写凭据，运行时由账号池注入。
 
 ```json
 "kilo": {
@@ -789,6 +798,11 @@ cch 已显式关掉两者：
 |------|------|------|
 | `/v1/chat/completions` | POST | 对话主接口，支持流式与工具调用 |
 | `/v1/models` | GET | 模型列表 |
+| `/api/zcode/status` | GET | ZCode 插件/账号池/验证码池/最近领取状态 |
+| `/api/zcode/accounts` | GET/POST/DELETE | 账号列表、粘贴入池、批量删除 |
+| `/api/zcode/claim/preview` | GET | 只读预览可领 Start Plan 套餐 |
+| `/api/zcode/claim` | POST | 立即领取（可指定账号） |
+| `/api/zcode/attach` | POST | 接入 GLM 上游（写 `upstreams.zcode`） |
 | `/health` | GET | 健康检查，列出各上游状态 |
 | `/api/prompts` | GET | 提示词列表（range/from/to/model/session/q/limit/offset） |
 | `/api/prompts/{id}` | GET | 单条提示词详情（messages 数组） |
@@ -926,7 +940,7 @@ KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示
 ## 十二、运行前提
 
 - **桌面版 / 安装版**：Windows 10/11，直接运行 `dist\Model-Gate.exe`，无需 Python/Node。
-- **应用内更新**：安装版需要能访问 `api.github.com` 与 `github.com`（下载 Release 资产）；企业代理/私有网络下检查会失败，可手动下载安装包。
+- **应用内更新**：安装版需要能访问 `github.com`（读取 Release 列表、下载安装包与 `SHA256SUMS`）；检查更新走 `releases/latest` 跳转与 `releases.atom`，不消耗 `api.github.com` 的匿名配额。企业代理/私有网络下检查会失败，可手动下载安装包。
 - **源码构建**：Rust stable + MSVC 工具链；生成安装包另需 Inno Setup 6（`build-installer.ps1` 会自动查找，缺失时可运行 `scripts\get_innosetup.ps1`）。
 - **cch 上游**：需本地代理在 `127.0.0.1:15721` 运行。
 - **go 上游**：配置里写的是 `apiKeyEnv: OPENCODE_API_KEY`。但 2026-10-08 实测本机 Process / User / Machine 三处都没有这个变量，go 的模型照样全部返回 200；若哪天开始 401，在面板把 `OPENCODE_API_KEY` 用「写入密钥」写入用户环境变量（或写入你指定的凭据文件），或由启动进程注入。
@@ -1014,9 +1028,9 @@ powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1
 也可以直接调用 ISCC：
 
 ```bat
-iscc /DMyAppVersion=2.21.0 ^
+iscc /DMyAppVersion=2.28.0 ^
      /DMyAppSourceExe=dist\Model-Gate-rust.exe ^
-     /DMyOutputBaseFilename=Model-Gate-v2.21.0-rust-setup ^
+     /DMyOutputBaseFilename=Model-Gate-v2.28.0-rust-setup ^
      ModelGate.iss
 ```
 
@@ -1059,9 +1073,9 @@ iscc /DMyAppVersion=2.21.0 ^
 
 ### 发布
 
-1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `2.21.0`）。
+1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `2.28.0`）。
 2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1` 与 `scripts\ui_smoke.js`。
-3. 打 tag 并推送：`git tag v2.21.0`、`git push origin v2.21.0`（Git 写操作需人工确认）。
+3. 打 tag 并推送：`git tag v2.28.0`、`git push origin v2.28.0`（Git 写操作需人工确认）。
 4. `.github/workflows/release-rust.yml` 构建并上传：
    - `Model-Gate-v<版本>-rust-setup.exe`
    - `Model-Gate-rust.exe`（便携版）

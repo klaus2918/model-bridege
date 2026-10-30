@@ -81,6 +81,8 @@ pub struct AppState {
     /// 更快耗尽本机 IP 的免费额度（Kilo 匿名 200 次/小时）。命中退避期的
     /// 模型直接跳过探测并回填上次的拒因。
     pub free_probe_cache: std::sync::Mutex<crate::free_sources::ProbeCache>,
+    /// ZCode 插件的配置与 OAuth 临时状态；账号事实源在 `db`。
+    pub zcode: Arc<crate::zcode::service::ZcodeService>,
     /// 服务线程的 Tokio 句柄；托盘「刷新模型目录」用它触发异步刷新。
     pub runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     /// 关闭协调器：更新流程用它触发「停服务 → 落盘 → 退出」。
@@ -137,6 +139,7 @@ impl AppState {
         {
             tracing::warn!("提示词后台线程启动失败（记录将不可用）：{err}");
         }
+        let zcode = Arc::new(crate::zcode::service::ZcodeService::new(&config_path));
         Self {
             cfg: ArcSwap::from_pointee(cfg),
             db,
@@ -149,6 +152,7 @@ impl AppState {
             models_cache: tokio::sync::RwLock::new(ModelsCache::default()),
             update,
             free_probe_cache: std::sync::Mutex::new(crate::free_sources::ProbeCache::default()),
+            zcode,
             runtime: std::sync::OnceLock::new(),
             shutdown,
         }
@@ -417,7 +421,7 @@ impl AppState {
 }
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
-    use axum::routing::{get, post};
+    use axum::routing::{delete, get, post, put};
     axum::Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -538,6 +542,47 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/api/free-sources/attach",
             post(crate::free_sources_api::free_sources_attach),
+        )
+        .route("/api/zcode/status", get(crate::zcode::api::status))
+        .route(
+            "/api/zcode/config",
+            get(crate::zcode::api::get_config).put(crate::zcode::api::put_config),
+        )
+        .route("/api/zcode/accounts", get(crate::zcode::api::list_accounts))
+        .route(
+            "/api/zcode/accounts/import/local",
+            post(crate::zcode::api::import_local_info),
+        )
+        .route(
+            "/api/zcode/accounts/import",
+            post(crate::zcode::api::import_local),
+        )
+        .route(
+            "/api/zcode/accounts",
+            post(crate::zcode::api::add).delete(crate::zcode::api::delete),
+        )
+        .route("/api/zcode/accounts/{id}", put(crate::zcode::api::update))
+        .route(
+            "/api/zcode/accounts/{id}/refresh",
+            post(crate::zcode::api::refresh_account),
+        )
+        .route(
+            "/api/zcode/claim/preview",
+            get(crate::zcode::api::claim_preview),
+        )
+        .route("/api/zcode/claim", post(crate::zcode::api::claim_now))
+        .route("/api/zcode/attach", post(crate::zcode::api::attach))
+        .route(
+            "/api/zcode/captcha/test",
+            post(crate::zcode::api::captcha_test),
+        )
+        .route(
+            "/api/zcode/oauth/start",
+            post(crate::zcode::api::oauth_start),
+        )
+        .route(
+            "/api/zcode/oauth/poll/{flow_id}",
+            get(crate::zcode::api::oauth_poll),
         )
         .route("/api/usage/totals", get(api_usage_totals))
         .route("/api/usage/summary", get(api_usage_summary))
@@ -734,6 +779,20 @@ async fn chat_inner(
                           "invalid_request_error", "model_not_free");
     }
     let stream = client_stream || is_opencode;
+    // ZCode 原生插件：不走 HTTP 上游，直接交给账号池 + 本机 CLI worker。
+    if upstream.transport == "zcode" {
+        return crate::zcode::transport::chat(
+            &state,
+            &upstream,
+            &payload,
+            &requested_model,
+            &target_model,
+            &ctx,
+            started,
+            stream,
+        )
+        .await;
+    }
     let base = upstream.base_url.trim_end_matches('/');
     // 上游/模型声明的最大输出：超过时收敛，避免上游直接拒绝或截断。
     let model_limit = upstream.model_max_output_tokens(&target_model);
@@ -1402,7 +1461,7 @@ fn record(
     );
 }
 
-fn record_ex(
+pub(crate) fn record_ex(
     state: &AppState,
     up: &Upstream,
     requested: &str,
@@ -1729,7 +1788,8 @@ async fn ui_index() -> impl IntoResponse {
         .replace(
             "src=\"free_sources.js\"",
             &format!("src=\"free_sources.js?v={version}\""),
-        );
+        )
+        .replace("src=\"zcode.js\"", &format!("src=\"zcode.js?v={version}\""));
     (
         [
             ("content-type", "text/html; charset=utf-8"),
@@ -1749,6 +1809,10 @@ async fn ui_asset(Path(path): Path<String>) -> Response {
         "free_sources.js" => (
             "application/javascript; charset=utf-8",
             include_str!("../ui/free_sources.js"),
+        ),
+        "zcode.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/zcode.js"),
         ),
         "style.css" => ("text/css; charset=utf-8", include_str!("../ui/style.css")),
         _ => {

@@ -26,6 +26,7 @@ powershell -ExecutionPolicy Bypass -File build-installer.ps1
 | 统计口径（totals/summary/list/models/upstreams，SQL 窗口分位） | `db.rs` 单元测试 |
 | 面板全量 `/api/*`（config 保存/热重载、pricing、catalog、logs、export、清空、保留策略、健康探测、密钥写入） | `scripts\panel_api_smoke.ps1` |
 | OpenAI / Anthropic / CommandCode（请求转换、非流式、SSE/NDJSON、tool/thinking、usage、**pause_turn 续跑**） | `cargo test` |
+| **ZCode 账号池**：本机导入/OAuth/粘贴、DPAPI 加密、验证码池、claim 调度、`transport=zcode` 账号轮询 + GLM | `cargo test` + 真机 smoke |
 | 面板静态资源（自有副本 `rust/model-gate/ui/`，编译期内嵌） | `/ui/` 正常 |
 | 桌面壳：托盘常驻 + 系统浏览器面板（打开面板、复制地址、数据目录、退出、今日指标） | `scripts\rust_shell_acceptance.ps1` |
 | 单实例（签名互斥）/ 端口降级 / 请求调用日志（5 MB×3 轮转）、崩溃落盘 | 启动路径验证 |
@@ -45,7 +46,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ..\..\scripts\panel_api_smok
 
 ## 应用内更新与网络环境
 
-更新模块访问 `https://api.github.com/repos/klaus2918/model-bridege/releases/latest`。
+更新模块访问 `https://github.com/klaus2918/model-bridege/releases/latest`（302 取最新 tag）
+与 `https://github.com/klaus2918/model-bridege/releases.atom`（更新说明），安装包按 tag 从
+`releases/download/<tag>/...` 直接下载。检查更新不调用 `api.github.com`，因此不受匿名
+REST API 配额（60 次/小时/IP）影响。
 客户端**同时信任系统根证书与 webpki 内置根证书**，因此在装有本地加速器
 （Steam++ / Watt Toolkit 等，通过 hosts 把 GitHub 劫持到 `127.0.0.1` 并用自签 CA
 做 HTTPS 中间人）的机器上也能正常握手。

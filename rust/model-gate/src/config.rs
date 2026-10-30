@@ -1086,13 +1086,13 @@ impl Config {
                     "可用 openai / anthropic / commandcode",
                 );
             }
-            if !up.transport.is_empty() && up.transport != "opencode" {
+            if !up.transport.is_empty() && up.transport != "opencode" && up.transport != "zcode" {
                 push(
                     "error",
                     "invalid_transport",
                     &format!("{prefix}.transport"),
                     format!("transport「{}」未实现", up.transport),
-                    "当前只支持 opencode",
+                    "当前只支持 opencode / zcode",
                 );
             } else if up.transport == "opencode" && up.protocol != "openai" {
                 push(
@@ -1101,6 +1101,19 @@ impl Config {
                     &format!("{prefix}.transport"),
                     format!(
                         "transport=opencode 只适用于 protocol=openai，当前为 {}",
+                        up.protocol
+                    ),
+                    "",
+                );
+            } else if up.transport == "zcode"
+                && !matches!(up.protocol.as_str(), "openai" | "anthropic")
+            {
+                push(
+                    "error",
+                    "transport_protocol_mismatch",
+                    &format!("{prefix}.transport"),
+                    format!(
+                        "transport=zcode 只适用于 protocol=openai/anthropic，当前为 {}",
                         up.protocol
                     ),
                     "",

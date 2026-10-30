@@ -20,12 +20,16 @@ use crate::db::Db;
 use crate::proxy::{error_json, AppState};
 use crate::update_paths;
 
-const REPO_OWNER: &str = "klaus2918";
-const REPO_NAME: &str = "model-bridege";
-const API_LATEST: &str = "https://api.github.com/repos/klaus2918/model-bridege/releases/latest";
+/// 仓库网页地址（非 API）。
+const REPO_URL: &str = "https://github.com/klaus2918/model-bridege";
+/// `releases/latest` 会 302 到最新正式版的 tag 页，不占用 REST API 配额。
+const LATEST_RELEASE_URL: &str = "https://github.com/klaus2918/model-bridege/releases/latest";
+/// Atom feed 是 GitHub 公开的 Release 列表，不占用 REST API 配额。
+const RELEASES_ATOM_URL: &str = "https://github.com/klaus2918/model-bridege/releases.atom";
 const AUTO_CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_SUMS_BYTES: u64 = 1024 * 1024;
+const MAX_FEED_BYTES: u64 = 2 * 1024 * 1024;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TEMP_PREFIX: &str = "model-gate-update-";
@@ -93,10 +97,10 @@ fn phase_name(phase: Phase) -> &'static str {
 /// 会因「未知颁发机构」直接握手失败，表现为「无法连接 GitHub」。
 ///
 /// 同时保留 webpki 根作为兜底：系统根为空或加载失败时仍可直连 GitHub。
-fn build_client() -> reqwest::Client {
+fn build_client_with(redirect: reqwest::redirect::Policy) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(redirect)
         .user_agent(format!("Model-Gate/{}", env!("CARGO_PKG_VERSION")))
         // 系统根 + webpki 根都要加载，任一可用即可握手。
         .tls_built_in_native_certs(true)
@@ -112,6 +116,19 @@ fn build_client() -> reqwest::Client {
         tracing::warn!("更新客户端创建失败，回退到默认客户端：{err}");
         reqwest::Client::new()
     })
+}
+
+/// 下载用客户端：跟随 GitHub → CDN 的 302 跳转。
+fn build_client() -> reqwest::Client {
+    build_client_with(reqwest::redirect::Policy::limited(5))
+}
+
+/// 检查更新用客户端：不自动跟随 302，直接读 `Location` 里的 tag。
+///
+/// 这样只需一个响应头就能拿到最新版本，不必下载整个 tag 页面，
+/// 也不会触发 `api.github.com` 的匿名配额。
+fn build_check_client() -> reqwest::Client {
+    build_client_with(reqwest::redirect::Policy::none())
 }
 
 /// 读取环境变量中的代理设置（`HTTPS_PROXY` > `HTTP_PROXY` > `ALL_PROXY`）。
@@ -202,6 +219,17 @@ fn classify_detail(detail: &str) -> DetailKind {
         return DetailKind::Proxy;
     }
     DetailKind::Network
+}
+
+/// Atom feed 中的一条 Release 记录。
+///
+/// Atom 是 GitHub 公开的订阅源，不占用 REST API 配额；它提供 tag、
+/// 更新时间和 Release 说明（HTML 转义后的内容），足以驱动检查更新。
+#[derive(Clone, Debug)]
+struct AtomEntry {
+    tag: String,
+    notes: String,
+    published_at: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +340,8 @@ struct UpdateState {
 pub struct UpdateService {
     current: Version,
     client: reqwest::Client,
+    /// 检查更新专用：不跟随 302，只读 `Location`。
+    check_client: reqwest::Client,
     state: Mutex<UpdateState>,
     db: Arc<Db>,
     install_dir: PathBuf,
@@ -334,11 +364,13 @@ impl UpdateService {
     ) -> Self {
         cleanup_stale_temp();
         let client = build_client();
+        let check_client = build_check_client();
         let exe_path = std::env::current_exe().ok();
         let registered_install_dir = update_paths::registered_install_dir();
         Self {
             current,
             client,
+            check_client,
             state: Mutex::new(UpdateState::default()),
             db,
             install_dir,
@@ -704,11 +736,94 @@ impl UpdateService {
     }
 
     async fn fetch_latest(&self) -> Result<ReleaseInfo, UpdateError> {
+        // 两条请求都走 github.com 网页/CDN，不占 REST API 配额：
+        // 1) releases/latest 的 302 Location 给出最新正式版 tag；
+        // 2) releases.atom 给出更新说明与发布时间。
+        let (tag_result, feed_result) =
+            tokio::join!(self.fetch_latest_tag(), self.fetch_atom_feed());
+        let feed = feed_result.unwrap_or_default();
+
+        let tag = match tag_result {
+            Ok(tag) => tag,
+            // 重定向失败时退回 Atom 的第一条：Atom 本身也是公开源。
+            Err(err) => match feed.first() {
+                Some(entry) => entry.tag.clone(),
+                None => return Err(err),
+            },
+        };
+
+        let version_text = tag
+            .strip_prefix('v')
+            .or_else(|| tag.strip_prefix('V'))
+            .unwrap_or(&tag);
+        let version = Version::parse(version_text)
+            .map_err(|err| UpdateError::bad_release(format!("版本号无效：{err}")))?;
+
+        let entry = feed
+            .iter()
+            .find(|entry| entry.tag == tag)
+            .or_else(|| feed.first());
+        let notes = entry.map(|entry| entry.notes.clone()).unwrap_or_default();
+        let published_at = entry.and_then(|entry| entry.published_at.clone());
+
+        // 资产地址是 GitHub Release 的固定路径，不需要 API 列举；
+        // 用 HEAD 确认文件存在并顺便拿到大小（失败时保留链接，让下载阶段报真实错误）。
+        let setup_name = format!("Model-Gate-{tag}-rust-setup.exe");
+        let sums_name = "SHA256SUMS".to_string();
+        let (setup, sums) = tokio::join!(
+            self.probe_asset(setup_name.clone(), release_asset_url(&tag, &setup_name)),
+            self.probe_asset(sums_name.clone(), release_asset_url(&tag, &sums_name)),
+        );
+
+        Ok(ReleaseInfo {
+            version,
+            tag: tag.clone(),
+            notes,
+            release_url: format!("{REPO_URL}/releases/tag/{tag}"),
+            published_at,
+            setup,
+            sums,
+        })
+    }
+
+    /// 读取 `releases/latest` 的 302 `Location`，从中取出最新 tag。
+    async fn fetch_latest_tag(&self) -> Result<String, UpdateError> {
+        let response = self
+            .check_client
+            .get(LATEST_RELEASE_URL)
+            .header("Accept", "text/html")
+            .header("User-Agent", format!("Model-Gate/{}", self.current))
+            .timeout(CHECK_TIMEOUT)
+            .send()
+            .await
+            .map_err(|err| classify_send_error(&err))?;
+
+        let status = response.status();
+        if status.is_redirection() {
+            if let Some(tag) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(tag_from_location)
+            {
+                return Ok(tag);
+            }
+        }
+        if matches!(status.as_u16(), 403 | 429) {
+            return Err(UpdateError::rate_limited());
+        }
+        Err(UpdateError::network(format!(
+            "GitHub 返回 HTTP {}",
+            status.as_u16()
+        )))
+    }
+
+    /// 拉取并解析公开的 Release Atom feed。
+    async fn fetch_atom_feed(&self) -> Result<Vec<AtomEntry>, UpdateError> {
         let response = self
             .client
-            .get(API_LATEST)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .get(RELEASES_ATOM_URL)
+            .header("Accept", "application/atom+xml")
             .header("User-Agent", format!("Model-Gate/{}", self.current))
             .timeout(CHECK_TIMEOUT)
             .send()
@@ -716,24 +831,53 @@ impl UpdateService {
             .map_err(|err| classify_send_error(&err))?;
 
         let status = response.status().as_u16();
-        if status == 403 || status == 429 {
-            let remaining = response
-                .headers()
-                .get("x-ratelimit-remaining")
-                .and_then(|value| value.to_str().ok());
-            if remaining == Some("0") {
-                return Err(UpdateError::rate_limited());
-            }
+        if matches!(status, 403 | 429) {
+            return Err(UpdateError::rate_limited());
         }
         if !response.status().is_success() {
             return Err(UpdateError::network(format!("GitHub 返回 HTTP {status}")));
         }
-
-        let body: Value = response
-            .json()
+        if response
+            .content_length()
+            .map(|size| size > MAX_FEED_BYTES)
+            .unwrap_or(false)
+        {
+            return Err(UpdateError::bad_release("Release 列表超过大小上限"));
+        }
+        let bytes = response
+            .bytes()
             .await
-            .map_err(|err| UpdateError::bad_release(format!("版本信息解析失败：{err}")))?;
-        parse_release(&body)
+            .map_err(|err| UpdateError::network(format!("读取 Release 列表失败：{err}")))?;
+        if bytes.len() as u64 > MAX_FEED_BYTES {
+            return Err(UpdateError::bad_release("Release 列表超过大小上限"));
+        }
+        let text = String::from_utf8(bytes.to_vec())
+            .map_err(|_| UpdateError::bad_release("Release 列表不是 UTF-8 文本"))?;
+        Ok(parse_atom_feed(&text))
+    }
+
+    /// 用 HEAD 确认 Release 资产是否存在；成功时返回大小。
+    ///
+    /// 404/410 视为该资产缺失；网络抖动或 5xx 不做否定判断，
+    /// 保留资产链接，避免因为一次探测失败而误报“没有安装包”。
+    async fn probe_asset(&self, name: String, url: String) -> Option<Asset> {
+        let response = self.client.head(&url).timeout(CHECK_TIMEOUT).send().await;
+        match response {
+            Ok(response) if response.status().is_success() => Some(Asset {
+                name,
+                // HEAD 响应里 reqwest 的 `content_length()` 可能返回 0，
+                // 直接读头才能拿到真实大小。
+                size: response
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0),
+                url,
+            }),
+            Ok(response) if matches!(response.status().as_u16(), 404 | 410) => None,
+            _ => Some(Asset { name, size: 0, url }),
+        }
     }
 
     async fn fetch_text(&self, url: &str, limit: u64) -> Result<String, UpdateError> {
@@ -1110,67 +1254,164 @@ fn error_response(err: UpdateError) -> Response {
     error_json(status, err.message, "upstream_error", &err.code)
 }
 
-fn parse_release(body: &Value) -> Result<ReleaseInfo, UpdateError> {
-    let tag = body
-        .get("tag_name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| UpdateError::bad_release("缺少 tag_name"))?;
-    let version_text = tag
-        .strip_prefix('v')
-        .or_else(|| tag.strip_prefix('V'))
-        .unwrap_or(tag);
-    let version = Version::parse(version_text)
-        .map_err(|err| UpdateError::bad_release(format!("版本号无效：{err}")))?;
-    let assets = body
-        .get("assets")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let setup_name = format!("Model-Gate-v{version}-rust-setup.exe");
-    let setup = find_asset(&assets, &setup_name);
-    let sums = find_asset(&assets, "SHA256SUMS");
-    let release_url = body
-        .get("html_url")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/tag/{tag}")
-        });
+/// Release 资产的固定下载地址（不经过 API）。
+fn release_asset_url(tag: &str, name: &str) -> String {
+    format!("{REPO_URL}/releases/download/{tag}/{name}")
+}
 
-    Ok(ReleaseInfo {
-        version,
-        tag: tag.to_string(),
-        notes: body
-            .get("body")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        release_url,
-        published_at: body
-            .get("published_at")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        setup,
-        sums,
+/// 从 `releases/tag/<tag>` 形式的 URL / Location 中取出 tag。
+fn tag_from_location(location: &str) -> Option<String> {
+    let (_, tail) = location.split_once("/releases/tag/")?;
+    let tag = tail
+        .split(|ch| ch == '?' || ch == '#')
+        .next()?
+        .trim_end_matches('/');
+    if tag.is_empty() {
+        return None;
+    }
+    percent_encoding::percent_decode_str(tag)
+        .decode_utf8()
+        .ok()
+        .map(|value| value.into_owned())
+}
+
+/// 解析 Atom feed，按出现顺序返回各条 Release。
+fn parse_atom_feed(xml: &str) -> Vec<AtomEntry> {
+    let mut entries = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<entry>") {
+        let after = &rest[start + "<entry>".len()..];
+        let Some(end) = after.find("</entry>") else {
+            break;
+        };
+        if let Some(entry) = parse_atom_entry(&after[..end]) {
+            entries.push(entry);
+        }
+        rest = &after[end + "</entry>".len()..];
+    }
+    entries
+}
+
+fn parse_atom_entry(block: &str) -> Option<AtomEntry> {
+    let href = link_href(block)?;
+    let tag = tag_from_location(&href)?;
+    let notes = element_text(block, "content")
+        .map(|html| html_to_text(&unescape_xml(html)))
+        .unwrap_or_default();
+    let published_at = element_text(block, "updated")
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    Some(AtomEntry {
+        tag,
+        notes,
+        published_at,
     })
 }
 
-fn find_asset(assets: &[Value], name: &str) -> Option<Asset> {
-    assets.iter().find_map(|asset| {
-        let asset_name = asset.get("name").and_then(Value::as_str)?;
-        if asset_name != name {
-            return None;
+fn link_href(block: &str) -> Option<String> {
+    let mut rest = block;
+    while let Some(start) = rest.find("<link") {
+        let after = &rest[start..];
+        let end = after.find('>')?;
+        let tag_text = &after[..end];
+        if tag_text.contains("rel=\"alternate\"") {
+            if let Some(href) = attr_value(tag_text, "href") {
+                return Some(href);
+            }
         }
-        let url = asset.get("browser_download_url").and_then(Value::as_str)?;
-        if !url.starts_with("https://") {
-            return None;
+        rest = &after[end + 1..];
+    }
+    None
+}
+
+fn attr_value(tag_text: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag_text.find(&needle)? + needle.len();
+    let rest = &tag_text[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn element_text<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}");
+    let start = block.find(&open)?;
+    let after_open = &block[start..];
+    let content_start = after_open.find('>')? + 1;
+    let rest = &after_open[content_start..];
+    let close = format!("</{name}>");
+    let end = rest.find(&close)?;
+    Some(&rest[..end])
+}
+
+/// 反转义 XML 文本节点中的实体。
+fn unescape_xml(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
+/// 把 Atom 里的 HTML 说明转成面板 `<pre>` 适合展示的纯文本。
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut tag = String::new();
+
+    for ch in html.chars() {
+        if in_tag {
+            if ch == '>' {
+                in_tag = false;
+                let name = tag
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_ascii_lowercase();
+                match name.as_str() {
+                    "br" => out.push('\n'),
+                    "p" | "/p" | "div" | "/div" | "ul" | "/ul" | "ol" | "/ol" | "h1" | "/h1"
+                    | "h2" | "/h2" | "h3" | "/h3" | "h4" | "/h4" | "h5" | "/h5" | "h6" | "/h6" => {
+                        out.push('\n')
+                    }
+                    "li" => {
+                        out.push('\n');
+                        out.push_str("- ");
+                    }
+                    _ => {}
+                }
+                tag.clear();
+            } else {
+                tag.push(ch);
+            }
+            continue;
         }
-        Some(Asset {
-            name: asset_name.to_string(),
-            size: asset.get("size").and_then(Value::as_u64).unwrap_or(0),
-            url: url.to_string(),
-        })
-    })
+        if ch == '<' {
+            in_tag = true;
+            tag.clear();
+        } else {
+            out.push(ch);
+        }
+    }
+
+    // 合并连续空行，避免 HTML 结构留下大片空白。
+    let mut text = String::with_capacity(out.len());
+    let mut blank_lines = 0;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            blank_lines += 1;
+            if blank_lines > 1 {
+                continue;
+            }
+        } else {
+            blank_lines = 0;
+        }
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text.trim().to_string()
 }
 
 fn parse_sha256sums(text: &str, file_name: &str) -> Result<String, UpdateError> {
@@ -1272,54 +1513,64 @@ mod tests {
     }
 
     #[test]
-    fn parses_release_assets_by_exact_name() {
-        let body = json!({
-            "tag_name": "v2.21.0",
-            "body": "notes",
-            "html_url": "https://github.com/klaus2918/model-bridege/releases/tag/v2.21.0",
-            "published_at": "2026-10-20T12:00:00Z",
-            "assets": [
-                {
-                    "name": "Model-Gate-v2.21.0-rust-setup.exe",
-                    "size": 4200000,
-                    "browser_download_url": "https://github.com/x/y/releases/download/v2.21.0/Model-Gate-v2.21.0-rust-setup.exe"
-                },
-                {
-                    "name": "SHA256SUMS",
-                    "size": 120,
-                    "browser_download_url": "https://github.com/x/y/releases/download/v2.21.0/SHA256SUMS"
-                }
-            ]
-        });
-        let release = parse_release(&body).expect("release");
-        assert_eq!(release.version, version("2.21.0"));
+    fn extracts_tag_from_release_location() {
         assert_eq!(
-            release.setup.expect("setup").name,
-            "Model-Gate-v2.21.0-rust-setup.exe"
+            tag_from_location("https://github.com/klaus2918/model-bridege/releases/tag/v2.27.0")
+                .as_deref(),
+            Some("v2.27.0")
         );
-        assert_eq!(release.sums.expect("sums").name, "SHA256SUMS");
+        assert_eq!(
+            tag_from_location("https://github.com/klaus2918/model-bridege/releases/tag/v2.27.0/")
+                .as_deref(),
+            Some("v2.27.0")
+        );
+        assert_eq!(
+            tag_from_location("https://github.com/klaus2918/model-bridege/releases"),
+            None
+        );
     }
 
     #[test]
-    fn rejects_non_https_asset_urls() {
-        let body = json!({
-            "tag_name": "v2.21.0",
-            "assets": [
-                {
-                    "name": "Model-Gate-v2.21.0-rust-setup.exe",
-                    "size": 1,
-                    "browser_download_url": "http://example.com/setup.exe"
-                },
-                {
-                    "name": "SHA256SUMS",
-                    "size": 1,
-                    "browser_download_url": "https://example.com/SHA256SUMS"
-                }
-            ]
-        });
-        let release = parse_release(&body).expect("release");
-        assert!(release.setup.is_none());
-        assert!(release.sums.is_some());
+    fn parses_atom_feed_into_release_entries() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <updated>2026-10-30T14:33:16Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/klaus2918/model-bridege/releases/tag/v2.27.0"/>
+    <title>Model-Gate v2.27.0 (Rust)</title>
+    <content type="html">&lt;p&gt;本次更新&lt;/p&gt;&lt;ul&gt;&lt;li&gt;修复问题&lt;/li&gt;&lt;/ul&gt;</content>
+  </entry>
+  <entry>
+    <updated>2026-10-30T00:28:45Z</updated>
+    <link rel="alternate" type="text/html" href="https://github.com/klaus2918/model-bridege/releases/tag/v2.26.0"/>
+    <title>Model-Gate v2.26.0 (Rust)</title>
+    <content type="html">&lt;p&gt;旧版本&lt;/p&gt;</content>
+  </entry>
+</feed>"#;
+
+        let entries = parse_atom_feed(xml);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tag, "v2.27.0");
+        assert_eq!(
+            entries[0].published_at.as_deref(),
+            Some("2026-10-30T14:33:16Z")
+        );
+        assert!(entries[0].notes.contains("本次更新"));
+        assert!(entries[0].notes.contains("- 修复问题"));
+        assert!(!entries[0].notes.contains('<'));
+    }
+
+    #[test]
+    fn builds_asset_urls_from_tag() {
+        let setup = "Model-Gate-v2.27.0-rust-setup.exe";
+        assert_eq!(
+            release_asset_url("v2.27.0", setup),
+            "https://github.com/klaus2918/model-bridege/releases/download/v2.27.0/Model-Gate-v2.27.0-rust-setup.exe"
+        );
+        assert_eq!(
+            release_asset_url("v2.27.0", "SHA256SUMS"),
+            "https://github.com/klaus2918/model-bridege/releases/download/v2.27.0/SHA256SUMS"
+        );
     }
 
     #[test]
@@ -1370,7 +1621,9 @@ mod tests {
         // 若未来有人改回只带 webpki 根，在装有本地加速器 CA 的机器上
         // 会出现「无法连接 GitHub」，这条断言配合真实探针守住回归。
         let client = build_client();
-        assert!(client.get(API_LATEST).build().is_ok());
+        assert!(client.get(LATEST_RELEASE_URL).build().is_ok());
+        let check_client = build_check_client();
+        assert!(check_client.get(LATEST_RELEASE_URL).build().is_ok());
     }
 
     #[test]

@@ -20,6 +20,7 @@
     <button class="tab-btn" data-tab="usage">用量</button>
     <button class="tab-btn" data-tab="prompts">提示词</button>
     <button class="tab-btn" data-tab="free">免费来源</button>
+    <button class="tab-btn" data-tab="zcode">ZCode</button>
     <button class="tab-btn" data-tab="logs">日志</button>
   </nav>
   <div class="conn" id="conn">连接中…</div>
@@ -842,6 +843,111 @@
     </div>
   </section>
 
+  <!-- ══════════ ZCode 账号池 ══════════ -->
+  <section class="panel" id="panel-zcode">
+    <div class="toolbar">
+      <span class="hint" id="zcode-hint">ZCode 原生插件：账号池、自动领取 Start Plan、GLM 请求按账号轮询。JWT 只存本机加密库，不显示原文。</span>
+      <button class="ghost" id="zcode-refresh">刷新</button>
+    </div>
+
+    <div class="ev-stat-chips" id="zcode-status"></div>
+
+    <div class="box">
+      <div class="box-head">
+        <h2>插件设置</h2>
+        <span class="hint" id="zcode-save-hint">修改后点「保存设置」；路径留空时自动探测。</span>
+      </div>
+      <form id="zcode-config-form" autocomplete="off">
+        <div class="grid grid-3">
+          <label class="check"><input type="checkbox" id="zcode-enabled"> 启用 ZCode 插件</label>
+          <label>backend
+            <select id="zcode-backend" class="filter-select">
+              <option value="appserver">appserver（推荐，本机 CLI）</option>
+              <option value="direct">direct（实验，已实测 405/3012）</option>
+            </select>
+          </label>
+          <label>领取间隔（秒，0=关）
+            <input id="zcode-claim-interval" type="number" min="0" step="60">
+          </label>
+          <label>单请求账号尝试数
+            <input id="zcode-concurrency" type="number" min="1" max="4">
+          </label>
+          <label>浏览器路径（Chrome/Edge）
+            <input id="zcode-browser-path" type="text" spellcheck="false">
+          </label>
+          <label>ZCode CLI 路径
+            <input id="zcode-cli-path" type="text" spellcheck="false">
+          </label>
+          <label>Node 路径
+            <input id="zcode-node-path" type="text" spellcheck="false">
+          </label>
+          <label>ZCode 数据目录
+            <input id="zcode-data-dir" type="text" spellcheck="false">
+          </label>
+          <label>验证码 SceneId
+            <input id="zcode-captcha-scene" type="text" spellcheck="false">
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" id="zcode-save">保存设置</button>
+          <button type="button" class="ghost" id="zcode-captcha-test">验证码自检</button>
+          <span class="hint" id="zcode-captcha-hint"></span>
+        </div>
+      </form>
+    </div>
+
+    <div class="box">
+      <div class="box-head">
+        <h2>账号池</h2>
+        <span class="hint" id="zcode-pool-hint">—</span>
+      </div>
+      <div class="toolbar">
+        <button class="primary" id="zcode-import-local">从本机 ZCode 导入</button>
+        <button class="ghost" id="zcode-add-manual">粘贴 JWT / API Key</button>
+        <button class="ghost" id="zcode-oauth-start">OAuth 登录</button>
+        <button class="ghost" id="zcode-claim-preview">预览可领</button>
+        <button class="ghost" id="zcode-claim-now">立即领取</button>
+        <span class="hint" id="zcode-action-hint"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="sortable-table">
+          <thead>
+            <tr>
+              <th>名称</th><th>模式</th><th>状态</th><th>套餐 / 额度</th>
+              <th class="num">调用 / 失败</th><th>最近错误</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="zcode-account-table"></tbody>
+        </table>
+      </div>
+      <div class="hint" id="zcode-account-hint">—</div>
+    </div>
+
+    <div class="box">
+      <div class="box-head">
+        <h2>GLM 提供商池</h2>
+        <span class="hint" id="zcode-glm-hint">接入后写入 upstreams.zcode；请求由账号池轮询，backend=appserver。</span>
+      </div>
+      <div class="toolbar">
+        <span class="hint">模型：GLM-5.3-Flash / GLM-5.3</span>
+        <button class="primary" id="zcode-attach">接入 GLM</button>
+      </div>
+    </div>
+
+    <div class="box">
+      <div class="box-head">
+        <h2>最近领取</h2>
+        <span class="hint" id="zcode-claims-hint">只记录业务码/结果，不记录凭据。</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>时间</th><th>账号</th><th>套餐</th><th>结果</th><th>下次检查</th></tr></thead>
+          <tbody id="zcode-claim-table"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <!-- ══════════ 日志 ══════════ -->
   <section class="panel" id="panel-logs">
     <div class="toolbar">
@@ -887,5 +993,6 @@
 <div id="modal-root" class="modal-root" hidden></div>
 <script src="app.js"></script>
 <script src="free_sources.js"></script>
+<script src="zcode.js"></script>
 </body>
 </html>

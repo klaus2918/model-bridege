@@ -23,6 +23,7 @@ mod ui_assets;
 mod update;
 mod update_paths;
 mod user_env;
+mod zcode;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -315,6 +316,11 @@ fn spawn_server(
         let update = state.update.clone();
         runtime.spawn(async move {
             crate::update::auto_check(update).await;
+        });
+        // ZCode 自动领取：插件关闭或间隔为 0 时调度器自己跳过。
+        let zcode_state = state.clone();
+        runtime.spawn(async move {
+            crate::zcode::claim::scheduler_loop(zcode_state).await;
         });
         // 优雅退出：Ctrl+C 或关闭请求（更新流程 / 外部 WM_CLOSE）。
         // 服务停下来 = 监听套接字释放 = 端口可被新版本立刻绑定。
