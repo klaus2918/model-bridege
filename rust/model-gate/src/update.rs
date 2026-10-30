@@ -304,6 +304,9 @@ struct UpdateState {
     installer_path: Option<PathBuf>,
     installer_sha256: Option<String>,
     installer_size: Option<u64>,
+    /// 一次性标记：本次下载完成后自动触发安装（「下载并安装」按钮）。
+    /// 与持久化的 `update.auto_install` 设置无关，只影响下一次下载。
+    install_after_download: bool,
 }
 
 pub struct UpdateService {
@@ -463,10 +466,32 @@ impl UpdateService {
 
         let service = self.clone();
         tokio::spawn(async move {
-            if let Err(err) = service.run_download(setup, sums).await {
-                let mut state = service.state.lock().await;
-                state.phase = Phase::Error;
-                state.error = Some(err);
+            match service.run_download(setup, sums).await {
+                Ok(()) => {
+                    // 「下载并安装」一次性标记 / 「自动安装」设置：
+                    // 下载校验通过后直接走静默安装（便携版无法自覆盖，只记日志）。
+                    let one_shot = {
+                        let mut st = service.state.lock().await;
+                        std::mem::take(&mut st.install_after_download)
+                    };
+                    if one_shot || service.auto_install_enabled() {
+                        if service.install_supported() {
+                            match service.install().await {
+                                Ok(_) => tracing::info!("下载完成后已触发安装"),
+                                Err(err) => {
+                                    tracing::warn!("下载后自动安装失败：{}", err.message)
+                                }
+                            }
+                        } else {
+                            tracing::info!("当前为便携版：安装包已就绪，请在面板里启动安装");
+                        }
+                    }
+                }
+                Err(err) => {
+                    let mut state = service.state.lock().await;
+                    state.phase = Phase::Error;
+                    state.error = Some(err);
+                }
             }
         });
 
@@ -492,7 +517,22 @@ impl UpdateService {
         };
 
         if !self.install_supported() {
-            return Err(UpdateError::not_installed());
+            // 便携版：没有 Inno 卸载器，无法静默自覆盖；但可以直接把下载好的
+            // 安装包拉起来——Inno 安装器自带界面与「关闭应用」提示，会引导
+            // 用户完成安装并替换当前 exe。哈希照常校验，防止文件被替换。
+            if !path.exists() {
+                return Err(UpdateError::install_failed("安装包已被删除，请重新下载"));
+            }
+            let actual = hash_file(&path).await?;
+            if actual != expected_sha {
+                return Err(UpdateError::checksum_mismatch());
+            }
+            update_paths::open_in_explorer(&path, false).map_err(UpdateError::install_failed)?;
+            let mut state = self.state.lock().await;
+            state.error = None;
+            let mut status = self.status_json(&state);
+            status["launched"] = json!(true);
+            return Ok(status);
         }
         if !path.exists() {
             return Err(UpdateError::install_failed("安装包已被删除，请重新下载"));
@@ -775,6 +815,10 @@ impl UpdateService {
             })),
             "checked_at": state.checked_at.as_ref().map(|value| value.to_rfc3339()),
             "install_supported": self.install_supported(),
+            // 便捷字段：面板用它区分「安装版可静默升级」与「便携版需手动跑安装包」
+            "portable": !self.install_supported(),
+            "auto_download": self.auto_download_enabled(),
+            "auto_install": self.auto_install_enabled(),
             "installer_ready": state.installer_path.is_some(),
             "installer_size": state.installer_size,
             // ── 路径事实：让用户看得见「下到哪」「装到哪」 ──
@@ -824,7 +868,29 @@ impl UpdateService {
             .get_setting("update.last_check_at")
             .and_then(|value| value.parse::<i64>().ok())
     }
+
+    /// 数据库布尔设置（"1"/"0"）；缺省按关闭处理。
+    fn bool_setting(&self, key: &str) -> bool {
+        self.db
+            .get_setting(key)
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// 「发现新版后自动在后台下载」设置（仍不自动安装）。
+    pub fn auto_download_enabled(&self) -> bool {
+        self.bool_setting(AUTO_DOWNLOAD_SETTING)
+    }
+
+    /// 「下载完成后自动静默安装」设置（仅安装版生效；便携版仍需手动启动安装包）。
+    pub fn auto_install_enabled(&self) -> bool {
+        self.bool_setting(AUTO_INSTALL_SETTING)
+    }
 }
+
+/// 持久化在数据库设置里的更新行为开关。
+const AUTO_DOWNLOAD_SETTING: &str = "update.auto_download";
+const AUTO_INSTALL_SETTING: &str = "update.auto_install";
 
 pub async fn auto_check(service: Arc<UpdateService>) {
     tokio::time::sleep(Duration::from_secs(15)).await;
@@ -843,6 +909,14 @@ pub async fn auto_check(service: Arc<UpdateService>) {
                         .and_then(|v| v.as_str())
                         .unwrap_or("?")
                 );
+                // 「自动下载新版本」开关（面板更新弹窗里可改）：发现新版后
+                // 直接在后台下载并校验；安装仍需用户在面板里点一次（或开自动安装）。
+                if service.auto_download_enabled() {
+                    match service.download().await {
+                        Ok(_) => tracing::info!("已按设置自动下载新版本"),
+                        Err(err) => tracing::warn!("自动下载失败：{}", err.message),
+                    }
+                }
             }
         }
         Err(err) => tracing::warn!("自动检查更新失败：{}", err.message),
@@ -880,6 +954,40 @@ pub async fn api_update_install(State(state): State<Arc<AppState>>) -> Response 
         Ok(status) => Json(status).into_response(),
         Err(err) => error_response(err),
     }
+}
+
+/// 「下载并安装」：一次性设置 install_after_download 标记后立即开始下载。
+/// 下载校验通过后自动走静默安装（安装版）；便携版下载完成后在面板里手动启动。
+pub async fn api_update_download_install(State(state): State<Arc<AppState>>) -> Response {
+    {
+        let mut st = state.update.state.lock().await;
+        st.install_after_download = true;
+    }
+    match state.update.download().await {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => error_response(err),
+    }
+}
+
+/// 更新行为设置（保存在数据库设置，即时生效）：
+/// `{ "autoDownload": bool, "autoInstall": bool }`，字段可省略 = 不修改。
+pub async fn api_update_settings(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(flag) = body.get("autoDownload").and_then(Value::as_bool) {
+        state
+            .update
+            .db
+            .set_setting(AUTO_DOWNLOAD_SETTING, if flag { "1" } else { "0" });
+    }
+    if let Some(flag) = body.get("autoInstall").and_then(Value::as_bool) {
+        state
+            .update
+            .db
+            .set_setting(AUTO_INSTALL_SETTING, if flag { "1" } else { "0" });
+    }
+    Json(state.update.status().await).into_response()
 }
 
 /// 「打开位置」支持的目标。

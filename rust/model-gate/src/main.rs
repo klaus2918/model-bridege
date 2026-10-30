@@ -14,6 +14,7 @@ mod gui;
 mod key_file;
 mod lifecycle;
 mod opencode_transport;
+mod pricing;
 mod prompt;
 mod provider_profiles;
 mod proxy;

@@ -17,9 +17,7 @@ const state = {
   upstreams: [],
   health: {},
   range: "today",
-  group: "day",
   trendMetric: "total_tokens",
-  pieKind: "model",
   page: 0,
   pageSize: 50,
   listTotal: 0,
@@ -27,10 +25,14 @@ const state = {
   // 自定义时间区间（datetime-local 值）；为空时使用 range 预设
   custom: { from: "", to: "" },
   options: { upstreams: [], models: [], sessions: [] },
-  pricing: { currency: "CNY", configured: false, pricing: { default: {}, rules: {} } },
+  pricing: { currency: "CNY", configured: false, fx: { USD: 7.2 }, entries: 0, pricing: {} },
   catalog: { page: 1, pageSize: 25, total: 0, q: "", upstream: "", currency: "CNY",
              price: "", source: "", sort: "model", order: "asc" },
   usage: {
+    // 费用显示币种（落库本位币是人民币；USD 按单价表汇率折算），记住上次选择
+    currency: localStorage.getItem("mg-currency") === "USD" ? "USD" : "CNY",
+    // 占比分布：维度自动跟随筛选（pieDimension()），数据由 loadPieSummary() 拉取
+    pie: null,
     totals: null,
     previous: null,
     models: [],
@@ -68,7 +70,13 @@ const state = {
     stats: { records: 0, bytes: 0 },
     facets: { models: [], sessions: [] },
     expanded: "",
-    evolution: { session: "", role: "", onlyDiff: true, rows: [], base: "", target: "", diff: null, expanded: {}, diffNav: null },
+    evolution: {
+      session: "", role: "", onlyDiff: true, rows: [], base: "", target: "", diff: null,
+      expanded: {}, diffNav: null,
+      // rounds = 逐轮时间轴（默认）；full = 全貌（整个会话逐条消息连续铺开）。
+      // details 缓存每条记录的完整 messages（/api/prompts/{id}），展开时懒加载。
+      mode: "rounds", details: {}, detailLoading: {},
+    },
   },
   // 概览页的上游表：完整数据、无分页，排序与展开都在前端即可
   overview: { sortKey: "name", sortDir: "asc", expanded: "" },
@@ -329,17 +337,34 @@ function kpi(id, label, value, extra, tone) {
          `<div class="v">${value}${extra ? `<small>${esc(extra)}</small>` : ""}</div></div>`;
 }
 
-/* 费用格式化：未配置单价时显示「—」，避免把「0 元」误读成「免费」 */
+/* 费用格式化：未配置单价时显示「—」，避免把「0 元」误读成「免费」。
+   落库本位币是人民币；显示币种可在用量页切换（USD 按单价表汇率折算）。 */
+function pricingFx() {
+  const v = Number(state.pricing && state.pricing.fx && state.pricing.fx.USD);
+  return v > 0 ? v : 7.2;
+}
+
+function displayCurrency() {
+  return (state.usage && state.usage.currency) || "CNY";
+}
+
+/* 人民币金额 → 当前显示币种的字符串（¥ / $ 自适应精度） */
+function fmtMoney(cny, digits) {
+  const cur = displayCurrency();
+  const v = cur === "USD" ? (Number(cny) || 0) / pricingFx() : Number(cny) || 0;
+  const d = digits !== undefined ? digits : Math.abs(v) >= 1 ? 2 : 4;
+  return `${cur === "USD" ? "$" : "¥"}${v.toFixed(d)}`;
+}
+
 function fmtCost(value, pricing) {
   const ready = !!(pricing && pricing.configured);
   if (!ready) return "—";
-  const v = Number(value || 0);
-  return v.toFixed(v >= 1 ? 2 : 4);
+  return fmtMoney(value);
 }
 
 function costExtra(pricing) {
   if (!pricing || !pricing.configured) return "未配置单价";
-  return `${pricing.currency || "CNY"} · 本地口径估算`;
+  return `${displayCurrency()} · 按单价表估算（峰谷已计）`;
 }
 
 function copyText(text) {
@@ -2830,22 +2855,35 @@ function bindRangeDropdown(opts) {
 }
 
 function initUsageControls() {
-  const bind = (sel, key) => {
-    const root = $(sel);
-    if (!root) return;
-    root.addEventListener("click", (ev) => {
-      const btn = ev.target.closest("button[data-" + key + "]");
+  // 趋势图的指标切换（总 token / 请求数 / 错误）：纯展示维度，与筛选无关。
+  // 时间粒度（小时/天）与占比维度都自动跟随上方筛选条件，不再单独提供按钮。
+  const trendSeg = $("#trend-metric-seg");
+  if (trendSeg) trendSeg.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-metric]");
+    if (!btn) return;
+    $$("#trend-metric-seg button").forEach((b) => b.classList.toggle("active", b === btn));
+    state.trendMetric = btn.dataset.metric;
+    renderTrend();
+  });
+
+  // 币种切换：只改显示单位（落库本位币是人民币），重渲染已加载的费用数字即可
+  const currencySeg = $("#currency-seg");
+  if (currencySeg) {
+    $$("#currency-seg button").forEach((btn) =>
+      btn.classList.toggle("active", btn.dataset.currency === displayCurrency()));
+    currencySeg.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button[data-currency]");
       if (!btn) return;
-      $$("button[data-" + key + "]", root).forEach((b) => b.classList.toggle("active", b === btn));
-      if (key === "group") { state.group = btn.dataset.group; }
-      if (key === "metric") { state.trendMetric = btn.dataset.metric; renderTrend(); }
-      if (key === "pie") { state.pieKind = btn.dataset.pie; renderPie(); }
-      if (key === "group") loadUsage();
+      $$("#currency-seg button").forEach((b) => b.classList.toggle("active", b === btn));
+      state.usage.currency = btn.dataset.currency === "USD" ? "USD" : "CNY";
+      localStorage.setItem("mg-currency", state.usage.currency);
+      renderKpis(state.usage.totals || {});
+      renderUsageTable(state.usage.lastRows || []);
+      renderModelUsage();
+      renderUpstreamUsage();
+      loadCatalog();
     });
-  };
-  bind("#group-seg", "group");
-  bind("#trend-metric-seg", "metric");
-  bind("#pie-seg", "pie");
+  }
 
   const usageRange = bindRangeDropdown({
     select: "#scope-range", trigger: "#scope-range-btn",
@@ -3533,7 +3571,7 @@ async function showPromptDetail(id) {
       ["总 token", usage.total_tokens],
       ["耗时", usage.duration_ms !== null && usage.duration_ms !== undefined ? `${fmtInt(usage.duration_ms)} ms` : null],
       ["首字延迟", usage.ttft_ms !== null && usage.ttft_ms !== undefined ? `${fmtInt(usage.ttft_ms)} ms` : null],
-      ["成本", usage.cost !== null && usage.cost !== undefined ? String(usage.cost) : null],
+      ["成本", usage.cost !== null && usage.cost !== undefined ? fmtMoney(usage.cost, 6) : null],
       ["状态", usage.status !== null && usage.status !== undefined ? String(usage.status) : (data.status === null || data.status === undefined ? null : String(data.status))],
       ["流式", usage.stream === null || usage.stream === undefined ? null : (usage.stream ? "是" : "否")],
       ["错误", usage.error],
@@ -3677,6 +3715,9 @@ async function loadEvolution(session) {
     const data = await api(`/api/prompts/evolution?session=${encodeURIComponent(selected)}&limit=20`);
     ev.rows = data.rows || [];
     ev.expanded = {};
+    // 会话数据整体换新：完整消息缓存一并作废，避免串会话
+    ev.details = {};
+    ev.detailLoading = {};
     ev.diffNav = null;
     // 默认对比最近两轮；上一次选中的记录不属于本会话时重置
     const ids = ev.rows.map((r) => r.id);
@@ -3732,15 +3773,160 @@ function evPreviewLine(p) {
   </div>`;
 }
 
+/* ── 会话演进 · 完整消息（懒加载 + 逐条可展开） ─────────────────
+   预览行最多只有 160 字、超 80 条还会抽稀；要看「执行过程全貌」必须
+   拿到落库的完整 messages。这里按记录懒加载 /api/prompts/{id}，把每条
+   消息渲染成可独立展开的折叠块：默认只露一行摘要，展开后是完整正文。 */
+
+function evolutionTruncationInfo(truncation, messageCount) {
+  const t = truncation && typeof truncation === "object" ? truncation : null;
+  return {
+    headCount: t ? Number(t.head_messages || messageCount) : messageCount,
+    tailStart: t ? Number(t.tail_start_index || messageCount) : messageCount,
+    dropped: t ? Number(t.dropped_messages || 0) : 0,
+    droppedChars: t ? Number(t.dropped_chars || 0) : 0,
+    cutIndices: new Set(
+      t && Array.isArray(t.cuts) ? t.cuts.map((c) => Number(c.original_index)) : [],
+    ),
+    t,
+  };
+}
+
+async function loadEvolutionDetail(id) {
+  const ev = state.prompt.evolution;
+  if (ev.details[id]) return ev.details[id];
+  if (ev.detailLoading[id]) return ev.detailLoading[id];
+  const p = (async () => {
+    try {
+      const data = await api(`/api/prompts/${encodeURIComponent(id)}`);
+      ev.details[id] = data;
+      return data;
+    } catch (err) {
+      toast(`加载完整消息失败：${err.message}`, true);
+      return null;
+    } finally {
+      delete ev.detailLoading[id];
+    }
+  })();
+  ev.detailLoading[id] = p;
+  return p;
+}
+
+/* 单条消息的折叠块：summary 一行摘要（角色/工具/字符数/首行预览），
+   展开后是落库全文（JSON 自动格式化，与详情弹窗同口径）。 */
+function evMessageBlock(m, i, info) {
+  const role = m && m.role ? String(m.role) : "unknown";
+  const formatted = formatJsonText(promptContentText(m));
+  const text = formatted.text;
+  let originalIndex = i;
+  if (info.t && i >= info.headCount) originalIndex = info.tailStart + (i - info.headCount);
+  const isCut = info.cutIndices.has(originalIndex);
+  const oneLine = String(text).replace(/\s+/g, " ").slice(0, 120);
+  const divider = info.t && i === info.headCount - 1 && info.dropped > 0
+    ? `<div class="prompt-truncation">中间省略 ${fmtInt(info.dropped)} 条消息 / ${fmtInt(info.droppedChars)} 字符（原 ${fmtInt(info.t.original_chars)} 字符，保留 ${fmtInt(info.t.kept_chars)} 字符）</div>`
+    : "";
+  return `<details class="prompt-msg prompt-transcript-msg role-${esc(role)}">
+    <summary><span class="badge">${esc(role)}</span> #${i + 1}
+      ${formatted.formatted ? '<span class="badge info">JSON 已格式化</span>' : ""}
+      <span class="hint">${fmtInt(text.length)} 字符${isCut ? " · 已部分截断" : ""}</span>
+      <span class="ev-msg-preview">${esc(oneLine)}${text.length > 120 ? "…" : ""}</span>
+    </summary>
+    <pre>${esc(text)}</pre>
+  </details>${divider}`;
+}
+
+/* 一条记录的完整消息时间线（展开区/全貌共用） */
+function renderEvolutionTranscript(data) {
+  const messages = Array.isArray(data.messages) ? data.messages : [];
+  if (!messages.length) return '<div class="empty">该记录没有 messages</div>';
+  const info = evolutionTruncationInfo(data.truncation, messages.length);
+  return `<div class="ev-transcript">
+    <div class="ev-transcript-bar">
+      <span class="hint">完整消息 ${fmtInt(messages.length)} 条（落库已脱敏；不含模型响应）</span>
+      <button type="button" class="ghost tiny" data-ev-expand-all>全部展开</button>
+      <button type="button" class="ghost tiny" data-ev-collapse-all>全部收起</button>
+    </div>
+    ${messages.map((m, i) => evMessageBlock(m, i, info)).join("")}
+  </div>`;
+}
+
+function bindTranscriptButtons(root) {
+  root.querySelectorAll("[data-ev-expand-all]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const scope = btn.closest(".ev-transcript") || root;
+      scope.querySelectorAll(".prompt-msg").forEach((el) => el.setAttribute("open", ""));
+    });
+  });
+  root.querySelectorAll("[data-ev-collapse-all]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const scope = btn.closest(".ev-transcript") || root;
+      scope.querySelectorAll(".prompt-msg").forEach((el) => el.removeAttribute("open"));
+    });
+  });
+}
+
+/* 全貌模式：整个会话按顺序连续铺开每一轮的完整消息；默认逐条折叠 */
+function renderFullEvolution() {
+  const timeline = $("#evolution-timeline");
+  if (!timeline) return;
+  const ev = state.prompt.evolution;
+  if (!ev.rows.length) {
+    timeline.innerHTML = '<div class="empty">该会话暂无提示词记录</div>';
+    return;
+  }
+  timeline.innerHTML = ev.rows.map((r, i) => {
+    const cc = r.call_chain || {};
+    const statusBadge = r.status !== null && r.status !== undefined && Number(r.status) >= 400
+      ? `<span class="badge bad">状态 ${esc(String(r.status))}</span>` : "";
+    const badges = [
+      r.truncated ? '<span class="badge warn">截断</span>' : "",
+      Number(cc.tool_call_count || 0) > 0 ? `<span class="badge">工具 ${fmtInt(cc.tool_call_count)}</span>` : "",
+      statusBadge,
+    ].filter(Boolean).join("");
+    const detail = ev.details[r.id];
+    const body = detail
+      ? renderEvolutionTranscript(detail)
+      : `<div class="ev-loading" data-ev-round-body="${esc(r.id)}">正在加载第 ${i + 1} 轮的完整消息…</div>`;
+    return `<div class="ev-full-round" data-evolution-id="${esc(r.id)}">
+      <div class="ev-full-round-head">
+        <span class="prompt-timeline-no">#${i + 1}</span>
+        <span class="mono">${esc(fmtTime(r.ts, r.created_at))}</span>
+        <span class="ev-model">${esc(r.requested_model || "—")}</span>
+        ${badges}
+        <span class="hint">${fmtInt(r.message_count)} 条消息 · ${fmtInt(r.size_bytes)} 字符</span>
+        <span class="prompt-timeline-detail" data-evolution-detail="${esc(r.id)}" title="查看完整提示词（含元数据）">详情</span>
+      </div>
+      ${body}
+    </div>`;
+  }).join("");
+  bindTranscriptButtons(timeline);
+  // 逐轮懒加载：拿到一条就替换那轮的占位，不阻塞其它轮
+  ev.rows.forEach((r) => {
+    if (ev.details[r.id]) return;
+    loadEvolutionDetail(r.id).then((data) => {
+      if (ev.mode !== "full") return;
+      const body = timeline.querySelector(`[data-ev-round-body="${r.id}"]`);
+      if (!body) return;
+      body.classList.remove("ev-loading");
+      body.removeAttribute("data-ev-round-body");
+      body.innerHTML = data ? renderEvolutionTranscript(data)
+        : '<div class="empty">加载失败：请点顶部「刷新」重试</div>';
+      bindTranscriptButtons(body);
+    });
+  });
+}
+
 function renderEvolutionTimeline() {
   const timeline = $("#evolution-timeline");
   if (!timeline) return;
   const ev = state.prompt.evolution;
   const count = $("#evolution-count");
   if (count) count.textContent = ev.rows.length ? `${ev.rows.length} 条` : "—";
+  renderEvolutionCompareBar();
+  // 全貌模式：连续铺开整个会话的完整消息（每条仍可折叠），diff 面板继续可用
+  if (ev.mode === "full") { renderFullEvolution(); return; }
   if (!ev.rows.length) {
     timeline.innerHTML = '<div class="empty">该会话暂无提示词记录</div>';
-    renderEvolutionCompareBar();
     return;
   }
   const maxSize = Math.max(...ev.rows.map((r) => Number(r.size_bytes) || 0), 1);
@@ -3792,9 +3978,15 @@ function renderEvolutionTimeline() {
     const durationText = usage.duration_ms !== null && usage.duration_ms !== undefined
       ? ` · ${fmtInt(usage.duration_ms)} ms` : "";
     const previews = Array.isArray(cc.message_previews) ? cc.message_previews : [];
-    const seq = `<div class="ev-row-seq">${previews.length
-      ? previews.map(evPreviewLine).join("")
-      : '<div class="hint">（无消息预览）</div>'}</div>`;
+    // 展开的轮次：优先渲染完整消息（懒加载，拿到前先显示预览序列）；未展开只给摘要
+    const seq = ev.expanded[r.id]
+      ? (ev.details[r.id]
+        ? `<div class="ev-row-seq">${renderEvolutionTranscript(ev.details[r.id])}</div>`
+        : `<div class="ev-row-seq">${previews.map(evPreviewLine).join("") || '<div class="hint">（无消息预览）</div>'}</div>
+           <div class="ev-loading">正在加载完整消息（预览仅有 160 字摘要与抽稀样本）…</div>`)
+      : `<div class="ev-row-seq">${previews.length
+          ? previews.map(evPreviewLine).join("")
+          : '<div class="hint">（无消息预览；点击展开加载完整消息）</div>'}</div>`;
     return `<div class="${classes.join(" ")}" data-evolution-id="${esc(r.id)}" role="button" tabindex="0" aria-expanded="${ev.expanded[r.id] ? "true" : "false"}" title="点击展开/收起该轮消息序列">
       <span class="prompt-timeline-no">#${i + 1}</span>
       <span class="prompt-timeline-main">
@@ -3817,7 +4009,16 @@ function renderEvolutionTimeline() {
       </span>
     </div>`;
   }).join("");
+  bindTranscriptButtons(timeline);
   renderEvolutionCompareBar();
+  // 展开但详情未到的行：懒加载完成后重渲染（详情有缓存，不会循环）
+  timeline.querySelectorAll(".prompt-timeline-row.expanded").forEach((rowEl) => {
+    const id = rowEl.dataset.evolutionId;
+    if (!id || ev.details[id]) return;
+    loadEvolutionDetail(id).then((data) => {
+      if (data && ev.expanded[id] && ev.mode === "rounds") renderEvolutionTimeline();
+    });
+  });
 }
 
 /* 顶部常驻对比条：不管滚到哪里都知道当前在比哪两轮、差多少 */
@@ -4469,7 +4670,11 @@ function initPromptControls() {
   });
   const timeline = $("#evolution-timeline");
   if (timeline) {
-    // 行内三类点击：详情弹窗、基准/对比槽位、其余区域整行展开/收起
+    // 行内三类点击：详情弹窗、基准/对比槽位、其余区域整行展开/收起。
+    // 展开后的完整消息正文里（.ev-transcript / .ev-loading）点击不折叠整行，
+    // 折叠/展开消息交给 <details> 本身与「全部展开/收起」按钮。
+    const inTranscript = (target) =>
+      !!target.closest(".ev-transcript, .ev-loading, [data-ev-round-body]");
     timeline.addEventListener("click", (ev) => {
       const detail = ev.target.closest("[data-evolution-detail]");
       if (detail) {
@@ -4482,8 +4687,9 @@ function initPromptControls() {
         if (row) setEvolutionSlot(slot.dataset.evolutionSlot, row.dataset.evolutionId);
         return;
       }
+      if (ev.target.closest("[data-ev-expand-all], [data-ev-collapse-all]")) return;
       const row = ev.target.closest("[data-evolution-id]");
-      if (!row) return;
+      if (!row || inTranscript(ev.target)) return;
       const e = state.prompt.evolution;
       e.expanded[row.dataset.evolutionId] = !e.expanded[row.dataset.evolutionId];
       renderEvolutionTimeline();
@@ -4498,13 +4704,23 @@ function initPromptControls() {
         return;
       }
       const row = ev.target.closest("[data-evolution-id]");
-      if (!row) return;
+      if (!row || inTranscript(ev.target)) return;
       ev.preventDefault();
       const e = state.prompt.evolution;
       e.expanded[row.dataset.evolutionId] = !e.expanded[row.dataset.evolutionId];
       renderEvolutionTimeline();
     });
   }
+
+  // 视图模式：轮次（时间轴 + 对比） / 全貌（完整消息连续铺开）
+  const modeSeg = $("#evolution-mode-seg");
+  if (modeSeg) modeSeg.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-evmode]");
+    if (!btn) return;
+    $$("#evolution-mode-seg button").forEach((b) => b.classList.toggle("active", b === btn));
+    state.prompt.evolution.mode = btn.dataset.evmode === "full" ? "full" : "rounds";
+    renderEvolutionTimeline();
+  });
 }
 
 async function applyRetention() {
@@ -4535,9 +4751,39 @@ async function loadUsage() {
   } catch (err) {
     $("#usage-kpis").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
-  await Promise.all([loadSummary("day"), loadSummary(state.group),
+  await Promise.all([loadSummary(trendGroup()), loadPieSummary(),
                      loadUsageList(), loadSessionUsage(), loadModelUsage(), loadUpstreamUsage()]);
   markFresh();
+}
+
+/* 趋势时间粒度自适应区间：短区间看小时、长区间看天，用户不用自己选 */
+function trendGroup() {
+  if (state.range === "today" || state.range === "24h" || state.range === "yesterday") {
+    return "hour";
+  }
+  if (state.range === "custom" && state.custom.from && state.custom.to) {
+    const from = Date.parse(state.custom.from);
+    const to = Date.parse(state.custom.to);
+    if (isFinite(from) && isFinite(to) && to - from <= 48 * 3600 * 1000) return "hour";
+  }
+  return "day";
+}
+
+/* 占比分布的维度自动跟随筛选条件（维度自身不再重复出现）：
+   选了模型 → 看它的上游分布；选了上游（或会话）→ 看其中的模型分布；
+   什么都没选 → 看全量的上游分布。 */
+function pieDimension() {
+  const f = state.filters;
+  if (f.model) {
+    return { dim: "upstream", label: "按上游", reason: `模型 ${f.model} 的上游分布` };
+  }
+  if (f.upstream) {
+    return { dim: "model", label: "按模型", reason: `上游 ${f.upstream} 内的模型分布` };
+  }
+  if (f.session) {
+    return { dim: "model", label: "按模型", reason: "该会话内的模型分布" };
+  }
+  return { dim: "upstream", label: "按上游", reason: "全量上游分布；用上方「上游/模型」筛选可切换视角" };
 }
 
 /* 数据新鲜度：告诉用户「这份数字是什么时候的」——自动刷新时尤其重要 */
@@ -4710,13 +4956,24 @@ async function loadSummary(group) {
     const data = await api(`/api/usage/summary?group_by=${group}&${usageScopeQuery()}`);
     window.__summary = window.__summary || {};
     window.__summary[group] = data.rows || [];
-    if (group === state.group) renderTrend();
-    renderPie();
+    renderTrend(group);
   } catch (err) {
-    if (group === state.group) {
-      $("#usage-trend").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
-    }
+    $("#usage-trend").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
+}
+
+/* 占比分布取数：维度由筛选条件推导，且维度自身不参与筛选（否则永远只有一根切片） */
+async function loadPieSummary() {
+  const pie = pieDimension();
+  try {
+    const q = usageScopeQuery();
+    q.delete(pie.dim);
+    const data = await api(`/api/usage/summary?group_by=${pie.dim}&${q.toString()}`);
+    state.usage.pie = { ...pie, rows: data.rows || [] };
+  } catch (err) {
+    state.usage.pie = { ...pie, rows: [], error: err.message };
+  }
+  renderPie();
 }
 
 /* 趋势图：SVG 柱状 + Y 轴刻度 + 均值线；每根柱子自带原生 tooltip */
@@ -4732,10 +4989,11 @@ function trendMetricInfo(metric) {
   return { field: "total_tokens", unit: " token", fmt: fmtCn, color: "var(--in)" };
 }
 
-function renderTrend() {
+function renderTrend(group) {
   const box = $("#usage-trend");
   if (!box) return;
-  const rows = (window.__summary || {})[state.group] || [];
+  const g = group || trendGroup();
+  const rows = (window.__summary || {})[g] || [];
   if (!rows.length) {
     box.innerHTML = '<div class="empty">该区间暂无数据</div>';
     return;
@@ -4768,7 +5026,7 @@ function renderTrend() {
     const bx = left + step * i + (step - barW) / 2;
     const by = yOf(v);
     const bh = Math.max(v > 0 ? 2 : 0, top + ph - by);
-    const tip = `${fmtBucket(r.bucket, state.group)} · ${info.fmt(v)}${info.unit}`;
+    const tip = `${fmtBucket(r.bucket, g)} · ${info.fmt(v)}${info.unit}`;
     bars += `<g class="bar"><title>${esc(tip)}</title>`
       + `<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" `
       + `height="${bh.toFixed(1)}" rx="2" fill="${info.color}"/>`
@@ -4779,7 +5037,7 @@ function renderTrend() {
       + "</g>";
     if (i % labelEvery === 0) {
       bars += `<text x="${(bx + barW / 2).toFixed(1)}" y="${h - 10}" class="axis-label" `
-        + `text-anchor="middle">${esc(fmtBucket(r.bucket, state.group))}</text>`;
+        + `text-anchor="middle">${esc(fmtBucket(r.bucket, g))}</text>`;
     }
   });
 
@@ -4788,9 +5046,7 @@ function renderTrend() {
     + `<text x="${w - right}" y="${(avgY - 5).toFixed(1)}" class="axis-label" text-anchor="end">均值 ${
       esc(info.fmt(avg))}</text>`;
 
-  $("#trend-title").textContent = state.group === "day" ? "按天趋势"
-    : state.group === "hour" ? "按小时趋势"
-    : "按 " + (state.group === "model" ? "模型" : "上游") + " 趋势";
+  $("#trend-title").textContent = g === "hour" ? "按小时趋势" : "按天趋势";
 
   box.innerHTML = `<svg class="trend-svg" viewBox="0 0 ${w} ${h}" role="img" aria-label="用量趋势">`
     + grid + bars + avgLine + "</svg>";
@@ -4803,10 +5059,12 @@ const PIE_COLORS = ["var(--in)", "var(--out)", "var(--cache)", "var(--brand)",
 function renderPie() {
   const box = $("#usage-pie");
   if (!box) return;
-  const group = state.pieKind;
-  const rows = ((window.__summary || {})[group] || []).slice();
+  const pie = state.usage.pie || { dim: "upstream", label: "按上游", reason: "", rows: [] };
+  const hint = $("#pie-hint");
+  if (hint) hint.textContent = `${pie.label} · ${pie.reason}`;
+  const rows = (pie.rows || []).slice();
   if (!rows.length) {
-    box.innerHTML = '<div class="empty">该区间暂无数据</div>';
+    box.innerHTML = `<div class="empty">${esc(pie.error || "该区间暂无数据")}</div>`;
     return;
   }
   rows.sort((a, b) => (Number(b.total_tokens) || 0) - (Number(a.total_tokens) || 0));
@@ -4926,7 +5184,7 @@ function usageDetailRow(r) {
     ["完整会话", r.session],
     ["缓存写入", fmtInt(r.cache_write_tokens)],
     ["命中率", fmtRate(r.cache_read_tokens, r.prompt_tokens)],
-    ["费用", pricingReady ? Number(r.cost || 0).toFixed(6) : "未配置单价"],
+    ["费用", pricingReady ? `${fmtMoney(r.cost, 6)}（本位币 ¥${Number(r.cost || 0).toFixed(6)}）` : "未配置单价"],
     ["错误", r.error || "无"],
   ];
   return `<tr class="detail-row"><td colspan="10"><div class="detail-grid">${
@@ -4953,7 +5211,7 @@ function renderUsageTable(rows) {
   tbody.innerHTML = rows.map((r) => {
     const ok = Number(r.status) < 400;
     const slow = Number(r.duration_ms) >= SLOW_MS;
-    const cost = pricingReady && Number(r.cost) ? Number(r.cost).toFixed(6) : "—";
+    const cost = fmtCost(r.cost, state.pricing);
     const open = state.usage.expanded === r.id;
     const main = `<tr data-id="${esc(r.id)}" class="usage-row${open ? " open" : ""}${ok ? "" : " row-bad"}">
       <td class="mono">${esc(fmtTime(r.ts, r.created_at))}</td>
@@ -5050,6 +5308,25 @@ function initModelControls() {
 
   const save = $("#save-pricing");
   if (save) save.addEventListener("click", savePricing);
+
+  // 官方单价模板：点击把条目并入 JSON（去重），保存仍由「保存单价表」触发
+  renderPricingTemplates();
+  const templates = $("#pricing-templates");
+  if (templates) templates.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-template]");
+    if (btn) applyPricingTemplate(btn.dataset.template);
+  });
+  const formatBtn = $("#pricing-format");
+  if (formatBtn) formatBtn.addEventListener("click", () => {
+    const ta = $("#pricing-json");
+    if (!ta) return;
+    try {
+      ta.value = JSON.stringify(JSON.parse(ta.value || "{}"), null, 2);
+      toast("已格式化");
+    } catch (err) {
+      toast(`不是合法 JSON：${err.message}`, true);
+    }
+  });
 
   const list = $("#model-table");
   if (list) list.addEventListener("click", (ev) => {
@@ -5168,17 +5445,40 @@ function renderModelKpis(data) {
   }
 }
 
+/* 峰谷窗口的人类可读描述（模板与单价提示共用） */
+function describePeak(peak) {
+  if (!peak) return "";
+  const windows = (peak.windows || []).map((w) => `${w.start}-${w.end}`).join("、");
+  const scope = peak.weekdaysOnly ? "工作日" : "每天";
+  const off = peak.offPeakRates
+    ? "谷时按独立谷价"
+    : `窗口外 ×${peak.offPeakMultiplier !== null && peak.offPeakMultiplier !== undefined ? peak.offPeakMultiplier : 0.5}`;
+  return `${scope} ${windows} 为峰时，${off}`;
+}
+
 function renderCatalogRate(row) {
   const rate = row.costHint;
   if (!rate) return '<span class="hint">未配置</span>';
+  if (rate.type === "quota") {
+    return `<span class="badge" title="${esc(rate.plan || "额度/订阅制，不计费")}">额度制</span>` +
+      ` <span class="hint">${esc(rate.plan || rate.label || "")}</span>`;
+  }
+  const sym = displayCurrency() === "USD" ? "$" : "¥";
+  const factor = displayCurrency() === "USD" ? 1 / pricingFx() : 1;
+  const fin = (v) => {
+    const n = Number(v) * factor;
+    return Math.abs(n) >= 100 ? n.toFixed(0) : Math.abs(n) >= 1 ? n.toFixed(2) : n.toFixed(3);
+  };
   const parts = [];
-  if (rate.input) parts.push(`入${rate.input}`);
-  if (rate.output) parts.push(`出${rate.output}`);
-  if (rate.cacheRead) parts.push(`读${rate.cacheRead}`);
-  if (rate.cacheWrite) parts.push(`写${rate.cacheWrite}`);
+  if (rate.input) parts.push(`入${sym}${fin(rate.input)}`);
+  if (rate.output) parts.push(`出${sym}${fin(rate.output)}`);
+  if (rate.cacheRead) parts.push(`读${sym}${fin(rate.cacheRead)}`);
+  if (rate.cacheWrite) parts.push(`写${sym}${fin(rate.cacheWrite)}`);
   if (!parts.length) return '<span class="hint">未配置</span>';
-  return `<span class="mono" title="命中规则 ${esc(row.costRule || "default")}；单位：${
-    esc(state.catalog.currency)}/百万 token">${esc(parts.join(" / "))}</span>`;
+  const peakTip = rate.peak ? `；${describePeak(rate.peak)}` : "";
+  return (rate.peak ? '<span class="badge warn">峰谷</span> ' : "") +
+    `<span class="mono" title="命中「${esc(rate.label || "单价")}」；单位：${sym}/百万 token（${
+      esc(displayCurrency())}显示）${esc(peakTip)}">${esc(parts.join(" / "))}</span>`;
 }
 
 function renderCatalog(rows) {
@@ -5278,6 +5578,160 @@ async function setDefaultModel(model) {
 }
 
 /* ── 单价表 / 保留策略 ─────────────────────────────────── */
+/* 官方单价模板：点击即把该厂商的 entries 追加进单价表 JSON。
+   价格为官方页公开的每百万 token 单价（asOf 标注采集时间，随官方调价请以来源页为准）。
+   DeepSeek 峰谷口径：工作日 UTC 01:00-04:00 / 06:00-10:00 为峰时（北京 09-12 / 14-18 点），
+   其余时间与周末节假日为谷价（五折）。 */
+const PRICING_TEMPLATES = [
+  {
+    id: "deepseek", name: "DeepSeek（峰谷）", currency: "USD", fx: 7.1,
+    asOf: "2026-10", source: "https://api-docs.deepseek.com/quick_start/pricing",
+    note: "峰时=工作日 UTC 01-04/06-10 点；谷时半价（周末/节假日全天谷价）",
+    entries: [
+      {
+        model: "deepseek-flash", label: "DeepSeek Flash", type: "per-token", currency: "USD",
+        input: 0.30, output: 1.20, cacheRead: 0.006,
+        peak: DEEPSEEK_PEAK(),
+      },
+      {
+        model: "deepseek-v4-pro", label: "DeepSeek V4 Pro", type: "per-token", currency: "USD",
+        input: 1.32, output: 3.96, cacheRead: 0.044,
+        peak: DEEPSEEK_PEAK(),
+      },
+      {
+        model: "deepseek-*", label: "DeepSeek 兜底（按 Flash 价）", type: "per-token", currency: "USD",
+        input: 0.30, output: 1.20, cacheRead: 0.006,
+        peak: DEEPSEEK_PEAK(),
+      },
+    ],
+  },
+  {
+    id: "zhipu", name: "智谱 GLM", currency: "CNY",
+    asOf: "2026-10", source: "https://docs.bigmodel.cn/cn/guide/start/pricing",
+    note: "人民币直报；新版本上线后价格会调整，请以官方页为准",
+    entries: [
+      { model: "glm-5", label: "GLM-5", type: "per-token", currency: "CNY", input: 4, output: 18 },
+      { model: "glm-4.6", label: "GLM-4.6", type: "per-token", currency: "CNY", input: 2, output: 8 },
+      { model: "glm-4.5", label: "GLM-4.5", type: "per-token", currency: "CNY", input: 0.8, output: 2 },
+    ],
+  },
+  {
+    id: "kimi", name: "Kimi（月之暗面）", currency: "CNY",
+    asOf: "2026-10", source: "https://platform.kimi.com/docs/pricing/chat",
+    note: "K3 系列按输入（缓存命中/未命中）与输出计费；K2 系列已停止新用户接入",
+    entries: [
+      { model: "kimi-k3.1-pro", label: "Kimi K3.1 Pro 高速版", type: "per-token", currency: "CNY", input: 26, output: 136 },
+    ],
+  },
+  {
+    id: "qwen", name: "阿里 Qwen（百炼）", currency: "CNY",
+    asOf: "2026-10", source: "https://help.aliyun.com/zh/model-studio/model-pricing",
+    note: "百炼按输入长度阶梯计价，此处为 0-32K 档；Batch 调用五折",
+    entries: [
+      { model: "qwen3.7-max", label: "Qwen3.7-Max", type: "per-token", currency: "CNY", input: 12, output: 36 },
+      { model: "qwen3.7-plus", label: "Qwen3.7-Plus（低档）", type: "per-token", currency: "CNY", input: 2, output: 6 },
+    ],
+  },
+  {
+    id: "minimax", name: "MiniMax", currency: "USD",
+    asOf: "2026-10", source: "https://platform.minimaxi.com",
+    note: "约 ¥2.1 / ¥8.4 每百万 token",
+    entries: [
+      { model: "MiniMax-M2*", label: "MiniMax M2 系列", type: "per-token", currency: "USD", input: 0.30, output: 1.20 },
+    ],
+  },
+  {
+    id: "openai", name: "OpenAI", currency: "USD",
+    asOf: "2026-10", source: "https://developers.openai.com/api/docs/pricing",
+    note: "缓存输入约为一成价；Pro 档 21/168",
+    entries: [
+      { model: "gpt-5.2", label: "GPT-5.2", type: "per-token", currency: "USD", input: 1.75, output: 14, cacheRead: 0.175 },
+      { model: "gpt-5.2-pro", label: "GPT-5.2 Pro", type: "per-token", currency: "USD", input: 21, output: 168 },
+    ],
+  },
+  {
+    id: "anthropic", name: "Anthropic Claude", currency: "USD",
+    asOf: "2026-10", source: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+    note: "缓存读为一成价、缓存写为 1.25 倍（模板已按此折算）",
+    entries: [
+      { model: "claude-opus-4-6", label: "Opus 4.6", type: "per-token", currency: "USD", input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+      { model: "claude-sonnet-4-5", label: "Sonnet 4.5", type: "per-token", currency: "USD", input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+      { model: "claude-haiku-4-5", label: "Haiku 4.5", type: "per-token", currency: "USD", input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+    ],
+  },
+  {
+    id: "quota", name: "额度制（订阅/免费池）", currency: "CNY",
+    asOf: "2026-10",
+    note: "本仓库四条上游的订阅/额度来源：只标记不计费，费用列显示「额度制」而非「未配置」",
+    entries: [
+      { model: "*", upstream: "zen", label: "OpenCode Zen 免费池", type: "quota", plan: "免费额度（免密匿名池）" },
+      { model: "*", upstream: "go", label: "OpenCode Go 订阅", type: "quota", plan: "Go 订阅套餐" },
+      { model: "*", upstream: "commandcode", label: "CommandCode 订阅", type: "quota", plan: "订阅（GOAT/Max/Pro）" },
+      { model: "*:free", upstream: "kilo", label: "Kilo 免费模型", type: "quota", plan: "免费额度（200 请求/小时/IP）" },
+    ],
+  },
+];
+
+/* DeepSeek 官方峰谷窗口（UTC）：模板内多处复用 */
+function DEEPSEEK_PEAK() {
+  return {
+    tzOffsetMinutes: 0,
+    weekdaysOnly: true,
+    windows: [ { start: "01:00", end: "04:00" }, { start: "06:00", end: "10:00" } ],
+    offPeak: { multiplier: 0.5 },
+  };
+}
+
+function renderPricingTemplates() {
+  const box = $("#pricing-templates");
+  if (!box) return;
+  const chips = box.querySelector(".chip-label");
+  box.innerHTML = (chips ? chips.outerHTML : '<span class="chip-label">官方模板</span>') +
+    PRICING_TEMPLATES.map((tpl) =>
+      `<button type="button" class="chip" data-template="${esc(tpl.id)}" ` +
+      `title="${esc(tpl.note || "")}\n来源：${esc(tpl.source || "无")}（${esc(tpl.asOf || "")} 采集）">` +
+      `${esc(tpl.name)}</button>`).join("");
+}
+
+/* 把模板条目并入当前单价表 JSON：同 model+upstream 视为同一条目跳过 */
+function applyPricingTemplate(tplId) {
+  const tpl = PRICING_TEMPLATES.find((t) => t.id === tplId);
+  const ta = $("#pricing-json");
+  if (!tpl || !ta) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(ta.value || "{}");
+  } catch (err) {
+    toast(`当前 JSON 不是合法格式，请先修正：${err.message}`, true);
+    return;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {};
+  const entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+  const key = (e) => `${e.model || "*"}|${e.upstream || ""}`;
+  const existing = new Set(entries.map(key));
+  let added = 0, skipped = 0;
+  for (const entry of tpl.entries) {
+    if (existing.has(key(entry))) { skipped += 1; continue; }
+    entries.push(JSON.parse(JSON.stringify(entry)));
+    existing.add(key(entry));
+    added += 1;
+  }
+  parsed.version = parsed.version || 1;
+  if (tpl.fx && !parsed.fx) parsed.fx = { USD: tpl.fx };
+  parsed.entries = entries;
+  ta.value = JSON.stringify(parsed, null, 2);
+  toast(`模板「${tpl.name}」已追加 ${added} 条${skipped ? `（${skipped} 条已存在）` : ""}，记得保存`);
+}
+
+function renderPricingIssues(issues) {
+  const box = $("#pricing-issues");
+  if (!box) return;
+  if (!issues || !issues.length) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML = issues.map((d) =>
+    `<div>⚠ ${esc(d.message || "")} <span class="hint">${esc(d.path || "")}</span></div>`).join("");
+}
+
 async function loadPricing() {
   try {
     const data = await api("/api/pricing");
@@ -5285,20 +5739,25 @@ async function loadPricing() {
     state.pricingLoaded = true;
     const ta = $("#pricing-json");
     if (ta && document.activeElement !== ta) {
+      const pricing = data.pricing && typeof data.pricing === "object" ? data.pricing : {};
       ta.value = JSON.stringify({
-        currency: data.currency,
-        default: data.pricing.default,
-        rules: data.pricing.rules,
+        version: pricing.version || 1,
+        fx: pricing.fx || data.fx || { USD: 7.2 },
+        entries: pricing.entries || [],
       }, null, 2);
     }
-    const currency = $("#pricing-currency");
-    if (currency && document.activeElement !== currency) currency.value = data.currency || "CNY";
+    const fx = $("#pricing-fx");
+    if (fx && document.activeElement !== fx) {
+      const usd = (data.pricing && data.pricing.fx && data.pricing.fx.USD) || (data.fx && data.fx.USD);
+      if (usd) fx.value = usd;
+    }
     const hint = $("#pricing-hint");
     if (hint) {
       hint.textContent = data.configured
-        ? `已配置单价（${data.currency}），费用按本地口径估算`
-        : "未配置单价：费用列显示「—」，不代表免费";
+        ? `已配置 ${data.entries} 条单价（本位币 CNY，峰谷与汇率自动折算）`
+        : "未配置单价：费用列显示「—」，不代表免费；点上方模板快速起步";
     }
+    renderPricingIssues(data.diagnostics || []);
     const days = $("#retention-days");
     if (days && document.activeElement !== days) days.value = data.retention_days || 0;
     const retentionHint = $("#retention-hint");
@@ -5321,30 +5780,44 @@ async function savePricing() {
     toast(`单价表不是合法 JSON：${err.message}`, true);
     return;
   }
-  if (!parsed || typeof parsed !== "object") parsed = {};
-  const currency = (($("#pricing-currency") || {}).value || "CNY").trim() || "CNY";
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {};
+  // 汇率输入框优先：有值就同步进 JSON（fx.USD）
+  const fxInput = $("#pricing-fx");
+  if (fxInput && fxInput.value !== "") {
+    const fx = Number(fxInput.value);
+    if (fx > 0) parsed.fx = Object.assign({}, parsed.fx, { USD: fx });
+  }
   const recompute = !!($("#pricing-recompute") || {}).checked;
   if (recompute) {
     const ok = await confirmModal({
       title: "保存单价表并重算历史费用",
-      text: "保存后会按新单价重算全部历史明细的费用字段，耗时取决于明细条数；代理转发不受影响。",
+      text: "保存后会按新单价重算全部历史明细的费用字段（含峰谷与汇率口径），耗时取决于明细条数；代理转发不受影响。",
       confirmLabel: "保存并重算",
     });
     if (!ok) return;
   }
   try {
     const backup = !!($("#pricing-backup-toggle") || {}).checked;
-    const data = await postJson("/api/pricing", {
-      pricing: Object.assign({}, parsed, { currency }),
-      recompute,
-      backup,
-    });
+    const data = await postJson("/api/pricing", { pricing: parsed, recompute, backup });
     const bk = data.backup || {};
     const backupNote = bk.created
       ? `，已备份到 ${bk.path || "配置文件旁的 .bak"}`
       : (backup ? "" : "，未生成备份（备份开关已关闭）");
     toast(`单价表已保存${data.recomputed ? `，重算 ${data.recomputed} 条历史` : ""}${backupNote}`);
-    state.pricing = { currency: data.currency, configured: data.configured, pricing: data.pricing };
+    state.pricing = {
+      currency: "CNY",
+      configured: !!data.configured,
+      entries: data.entries || 0,
+      fx: (parsed && parsed.fx) || { USD: 7.2 },
+      pricing: parsed,
+    };
+    renderPricingIssues(data.diagnostics || []);
+    const hint = $("#pricing-hint");
+    if (hint) {
+      hint.textContent = data.configured
+        ? `已配置 ${data.entries} 条单价（本位币 CNY，峰谷与汇率自动折算）`
+        : "单价表为空：费用列显示「—」";
+    }
     const totalsData = await api(`/api/usage/totals?${usageScopeQuery({ compare: 1 })}`);
     state.usage.previous = totalsData.previous || null;
     renderKpis(totalsData.totals || {});
@@ -5459,7 +5932,7 @@ function renderUpstreamUsage() {
       <td class="num">${okRate}</td>
       <td class="num">${fmtMs(r.avg_duration_ms)}</td>
       <td class="num">${Number(r.p95_duration_ms) ? fmtMs(r.p95_duration_ms) : "—"}</td>
-      <td class="num">${pricingReady && Number(r.cost) ? Number(r.cost).toFixed(4) : "—"}
+      <td class="num">${fmtCost(r.cost, state.pricing)}
         <button class="ghost tiny" data-only-upstream="${esc(r.upstream)}"
           title="把页面作用域切到该上游">只看此上游</button></td>
     </tr>`;
@@ -5538,6 +6011,8 @@ function renderModelUsage() {
   tbody.innerHTML = rows.map((r) => {
     const okRate = Number(r.requests)
       ? (Number(r.success_rate) * 100).toFixed(1).replace(/\.0$/, "") + "%" : "—";
+    const quota = r.pricing && r.pricing.type === "quota"
+      ? `<span class="badge" title="${esc(r.pricing.plan || r.pricing.label || "额度/订阅制")}">额度制</span>` : "";
     return `<tr>
       <td class="mono">${esc(r.model || "—")}</td>
       <td class="num" title="${esc(fmtRate(r.cache_read_tokens, r.prompt_tokens))}">${esc(fmtRate(r.cache_read_tokens, r.prompt_tokens))}</td>
@@ -5546,7 +6021,7 @@ function renderModelUsage() {
       <td class="num">${fmtTok(r.completion_tokens)}</td>
       <td class="num">${fmtTok(r.total_tokens)}</td>
       <td class="num">${fmtTok(r.cache_read_tokens)}</td>
-      <td class="num">${pricingReady && Number(r.cost) ? Number(r.cost).toFixed(4) : "—"}</td>
+      <td class="num">${quota || fmtCost(r.cost, state.pricing)}</td>
       <td class="num">${Number(r.errors) ? `<span class="badge warn">${okRate}</span>` : okRate}</td>
       <td class="num">${fmtMs(r.avg_duration_ms)}</td>
       <td class="num">${Number(r.p95_duration_ms) ? fmtMs(r.p95_duration_ms) : "—"}</td>
@@ -5768,7 +6243,7 @@ function updateModalHtml(status) {
   const phase = s.phase || "idle";
   const latest = s.latest ? `v${esc(s.latest)}` : "—";
   const portable = s.install_supported === false;
-  const portableHint = `<p class="hint">当前为便携版：下载完成后请手动运行安装包，应用不会自动覆盖当前 exe。</p>`;
+  const portableHint = `<p class="hint">当前为便携版：下载完成并通过校验后，点「启动安装包」会直接拉起安装向导（会先请求关闭本应用）；也可以自己到下载目录运行安装包。</p>`;
   const asset = s.asset
     ? `${esc(s.asset.name)} · ${fmtBytes(s.asset.size)}`
     : "—";
@@ -5806,13 +6281,19 @@ function updateModalHtml(status) {
     const message = s.error && s.error.message ? s.error.message : "检查更新失败";
     body = `<p class="update-error">${esc(message)}</p>`;
   } else if (phase === "ready") {
-    body = `<p class="update-status">安装包已下载并通过 SHA256 校验。</p>${portable ? portableHint : ""}`;
+    body = `<p class="update-status">安装包已下载并通过 SHA256 校验。</p>${
+      portable
+        ? portableHint
+        : (s.auto_install ? '<p class="hint">已开启「自动安装」：下载完成后会自动开始安装；也可手动点下面的按钮。</p>' : "")
+    }`;
   } else if (phase === "available" && s.available) {
     body = `<p class="update-status">发现新版本 ${latest}。</p>${
       s.installable
         ? ""
         : `<p class="update-error">该版本缺少可用的安装包或 SHA256SUMS，请前往 Release 页面手动下载。</p>`
-    }${portable ? portableHint : ""}`;
+    }${portable ? portableHint : ""}${
+      s.auto_download ? '<p class="hint">已开启「自动下载」：发现新版本后会在后台自动下载并校验。</p>' : ""
+    }`;
   } else if (s.checked_at) {
     body = `<p class="update-status">已是最新版本 ${latest}。</p>`;
   } else {
@@ -5825,11 +6306,15 @@ function updateModalHtml(status) {
       s.checked_at ? "重新检查" : "检查更新"}</button>`);
   }
   if (phase === "available" && s.installable && !s.installer_ready) {
-    // 按钮文案必须与实际动作一致：这个按钮只下载，不安装。
-    actions.push(`<button type="button" class="primary" data-update-action="download">下载安装包</button>`);
+    if (!portable) {
+      // 一键链路：下载 → 校验 → 自动进入安装（仍会弹确认，不会不打招呼就重启）
+      actions.push(`<button type="button" class="primary" data-update-action="download-install">下载并安装</button>`);
+    }
+    actions.push(`<button type="button" class="ghost" data-update-action="download">仅下载安装包</button>`);
   }
-  if (phase === "ready" && !portable) {
-    actions.push(`<button type="button" class="primary" data-update-action="install">安装并重启</button>`);
+  if (phase === "ready") {
+    actions.push(`<button type="button" class="primary" data-update-action="install">${
+      portable ? "启动安装包" : "安装并重启"}</button>`);
   }
   if (s.release_url) {
     actions.push(`<button type="button" class="ghost" data-update-action="release">打开 Release 页面</button>`);
@@ -5872,19 +6357,30 @@ function updateModalHtml(status) {
 
   // 分步说明：把「下载 → 关闭 → 安装 → 重启」讲清楚
   const steps = `<ol class="update-steps">
-      <li>点「下载安装包」：安装包保存到上面的下载目录（点「打开下载位置」可直接查看）。</li>
-      <li>下载完成并通过 SHA256 校验后，点「安装并重启」。</li>
-      <li>应用会先关闭服务再退出，安装器把新版本写入上面的安装位置（默认就是原本的安装目录），覆盖旧的 <code>Model-Gate.exe</code>，然后自动重启应用。</li>
+      <li>点「下载并安装」一键完成；或点「仅下载安装包」分步来：安装包保存到上面的下载目录。</li>
+      <li>安装版下载完成并通过 SHA256 校验后点「安装并重启」；便携版点「启动安装包」走安装向导。</li>
+      <li>安装版会先关闭服务再退出，安装器把新版本写入上面的安装位置（默认就是原本的安装目录），覆盖旧的 <code>Model-Gate.exe</code>，然后自动重启应用。</li>
     </ol>`;
+
+  // 自动化开关：自动下载（发现新版就后台下载）/ 自动安装（下载完直接装，安装版）
+  const settings = `<div class="update-settings">
+      <label class="check"><input type="checkbox" data-update-setting="autoDownload"${
+        s.auto_download ? " checked" : ""}> 发现新版本后自动在后台下载</label>
+      <label class="check"${portable ? ' title="便携版无法静默自覆盖，此开关不生效"' : ""}>
+        <input type="checkbox" data-update-setting="autoInstall"${
+          s.auto_install ? " checked" : ""} ${portable ? "disabled" : ""}> 下载完成后自动安装</label>
+    </div>`;
 
   // 安装二次确认：放在更新弹窗内部，不能用 confirmModal
   // （confirmModal 会重建整个弹窗根节点，取消后更新弹窗会被清空）
   const confirmPanel = state.update.confirmInstall
     ? `<div class="update-confirm">
-        <p class="update-status">确认现在安装并重启？</p>
-        <p class="hint">应用将先关闭服务再退出，安装器会覆盖 <code>${esc(installDir || "—")}</code> 下的 Model-Gate.exe，安装完成后自动重启。</p>
+        <p class="update-status">${portable ? "确认启动安装包向导？" : "确认现在安装并重启？"}</p>
+        <p class="hint">${portable
+          ? "将打开安装向导；安装器可能会先请求关闭正在运行的 Model-Gate，完成后再启动新版本。"
+          : `应用将先关闭服务再退出，安装器会覆盖 <code>${esc(installDir || "—")}</code> 下的 Model-Gate.exe，安装完成后自动重启。`}</p>
         <div class="update-actions">
-          <button type="button" class="primary" data-update-action="install-confirm">确认安装并重启</button>
+          <button type="button" class="primary" data-update-action="install-confirm">${portable ? "启动安装包" : "确认安装并重启"}</button>
           <button type="button" class="ghost" data-update-action="install-cancel">取消</button>
         </div>
       </div>`
@@ -5899,6 +6395,7 @@ function updateModalHtml(status) {
     ${body}
     ${paths}
     ${dirEditor}
+    ${settings}
     ${steps}
     ${notes}
     ${confirmPanel || `<div class="update-actions">${actions.join("")}</div>`}`;
@@ -5979,6 +6476,24 @@ async function runUpdateCheck() {
   }
 }
 
+/* 更新弹窗里的自动化开关：即时保存到数据库设置 */
+async function handleUpdateSetting(name, checked) {
+  try {
+    const body = name === "autoDownload"
+      ? { autoDownload: checked }
+      : { autoInstall: checked };
+    const status = await postJson("/api/update/settings", body);
+    state.update.status = status;
+    refreshUpdateButton(status);
+    renderUpdateModal(status);
+    toast(name === "autoDownload"
+      ? (checked ? "已开启：发现新版本后自动在后台下载" : "已关闭自动下载")
+      : (checked ? "已开启：下载完成后自动安装（仅安装版）" : "已关闭自动安装"));
+  } catch (err) {
+    toast(`保存设置失败：${err.message}`, true);
+  }
+}
+
 async function handleUpdateAction(action) {
   try {
     if (action === "check") {
@@ -5993,6 +6508,24 @@ async function handleUpdateAction(action) {
       refreshUpdateButton(status);
       renderUpdateModal(status);
       startUpdatePolling();
+      return;
+    }
+    if (action === "download-install") {
+      // 一键链路：下载 → SHA256 校验 → 自动进入安装（安装版）；
+      // 便携版下载完仍需点「启动安装包」。
+      state.update.confirmInstall = false;
+      const status = await postJson("/api/update/download-install", {});
+      state.update.status = status;
+      refreshUpdateButton(status);
+      renderUpdateModal(status);
+      startUpdatePolling();
+      toast(status.portable
+        ? "已开始下载；便携版下载完成后请点「启动安装包」"
+        : "已开始下载，校验通过后会自动开始安装");
+      return;
+    }
+    if (action === "toggle-settings") {
+      // 占位：真正的处理在 change 事件（checkbox），这里只为防御未知 action
       return;
     }
     if (action === "save-download-dir" || action === "reset-download-dir") {
@@ -6034,7 +6567,10 @@ async function handleUpdateAction(action) {
       const status = await postJson("/api/update/install", {});
       state.update.status = status;
       renderUpdateModal(status);
-      toast("安装程序已启动，应用即将退出…");
+      // 安装版：看护脚本接管，应用即将退出；便携版：只是拉起安装向导，应用继续运行
+      toast(status.launched
+        ? "已启动安装包向导：按提示完成安装（会先请求关闭本应用）"
+        : "安装程序已启动，应用即将退出…");
       return;
     }
     if (action === "release") {
@@ -6057,7 +6593,7 @@ async function handleUpdateAction(action) {
 function openUpdateModal(forceCheck = false) {
   const root = openModal({
     title: "应用更新",
-    hint: "安装版支持下载、校验与静默升级；便携版请手动运行安装包。",
+    hint: "安装版支持一键「下载并安装」（静默升级）；便携版下载后可一键启动安装向导。",
     body: `<div id="update-modal" class="update-modal"><p class="update-status">正在读取更新状态…</p></div>`,
     actions: [{ label: "关闭", className: "ghost" }],
   });
@@ -6067,6 +6603,10 @@ function openUpdateModal(forceCheck = false) {
     root.addEventListener("click", (ev) => {
       const button = ev.target.closest("[data-update-action]");
       if (button) handleUpdateAction(button.dataset.updateAction);
+    });
+    root.addEventListener("change", (ev) => {
+      const checkbox = ev.target.closest("[data-update-setting]");
+      if (checkbox) handleUpdateSetting(checkbox.dataset.updateSetting, checkbox.checked);
     });
   }
   const status = state.update.status;

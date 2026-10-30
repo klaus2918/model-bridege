@@ -153,6 +153,19 @@ pub struct PromptFilters {
     pub q: Option<String>,
 }
 
+/// 重算历史费用所需的最小字段快照（`recompute_costs` 的输入）。
+pub struct CostRow {
+    pub id: String,
+    pub ts: i64,
+    pub upstream: String,
+    pub requested_model: String,
+    pub upstream_model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+}
+
 pub struct Db {
     pub path: PathBuf,
     write: Mutex<Connection>,
@@ -699,6 +712,72 @@ impl Db {
             |r| r.get::<_, i64>(0),
         )
         .unwrap_or(0)
+    }
+
+    /// 用回调重算全部历史记录的费用并单事务批量 UPDATE。
+    ///
+    /// 保存单价表后的「重算历史费用」入口：读取阶段失败返回 0；
+    /// 写入阶段失败记日志（费用字段为辅助信息，绝不因此丢记录）。
+    pub fn recompute_costs(&self, compute: impl Fn(&CostRow) -> f64) -> usize {
+        let rows: Vec<CostRow> = {
+            let conn = self.reader();
+            let sql = "SELECT id, ts, upstream, requested_model, upstream_model, \
+                       prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens \
+                       FROM usage_records";
+            let mut stmt = match conn.prepare(sql) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!("重算费用读取失败: {err}");
+                    return 0;
+                }
+            };
+            let mapped = stmt.query_map([], |row| {
+                Ok(CostRow {
+                    id: row.get("id")?,
+                    ts: row.get("ts")?,
+                    upstream: row
+                        .get::<_, Option<String>>("upstream")?
+                        .unwrap_or_default(),
+                    requested_model: row
+                        .get::<_, Option<String>>("requested_model")?
+                        .unwrap_or_default(),
+                    upstream_model: row
+                        .get::<_, Option<String>>("upstream_model")?
+                        .unwrap_or_default(),
+                    prompt_tokens: row.get("prompt_tokens")?,
+                    completion_tokens: row.get("completion_tokens")?,
+                    cache_read_tokens: row.get("cache_read_tokens")?,
+                    cache_write_tokens: row.get("cache_write_tokens")?,
+                })
+            });
+            match mapped {
+                Ok(iter) => iter.filter_map(Result::ok).collect(),
+                Err(err) => {
+                    tracing::warn!("重算费用遍历失败: {err}");
+                    return 0;
+                }
+            }
+        };
+        let updates: Vec<(f64, &str)> = rows
+            .iter()
+            .map(|row| (compute(row), row.id.as_str()))
+            .collect();
+        let mut conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut updated = 0usize;
+        let result = (|| -> rusqlite::Result<()> {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare("UPDATE usage_records SET cost = ?1 WHERE id = ?2")?;
+                for (cost, id) in &updates {
+                    updated += stmt.execute(rusqlite::params![cost, id])?;
+                }
+            }
+            tx.commit()
+        })();
+        if let Err(err) = result {
+            tracing::warn!("重算费用写入失败: {err}");
+        }
+        updated
     }
 
     pub fn list_usage(
@@ -1458,6 +1537,36 @@ mod tests {
         let stats = db.today_stats();
         assert_eq!(stats["requests"].as_i64(), Some(0));
         assert!(stats["cache_hit_rate"].is_null());
+    }
+
+    #[test]
+    fn recompute_costs_rewrites_every_row_with_callback() {
+        let db = temp_db();
+        for prompt in [1_000_000i64, 500_000] {
+            db.record_usage(&UsageRecord {
+                upstream: "cch".into(),
+                requested_model: "deepseek-chat".into(),
+                upstream_model: "deepseek-chat".into(),
+                prompt_tokens: prompt,
+                completion_tokens: 100_000,
+                status: 200,
+                ..Default::default()
+            });
+        }
+        let updated = db.recompute_costs(|row| {
+            // 每 100 万输入 token 计 1 元、输出计 2 元（人民币）
+            (row.prompt_tokens as f64 * 1.0 + row.completion_tokens as f64 * 2.0) / 1_000_000.0
+        });
+        assert_eq!(updated, 2);
+        let f = Filters::default();
+        let rows = db.list_usage(&f, 10, 0, "ts", "asc");
+        let mut costs: Vec<f64> = rows
+            .iter()
+            .map(|r| r["cost"].as_f64().unwrap_or(-1.0))
+            .collect();
+        costs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((costs[0] - 0.7).abs() < 1e-9);
+        assert!((costs[1] - 1.2).abs() < 1e-9);
     }
 
     #[test]

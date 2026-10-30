@@ -618,19 +618,26 @@ async function main() {
       for (const label of ["首条 user：", "字符", "基准", "对比", "详情"]) {
         if (!timelineText.includes(label)) throw new Error(`时间轴缺少关键信息：${label}`);
       }
-      // 点行展开消息序列（原「会话流程」面板已合并进行内展开）
+      // 点行展开消息序列：懒加载完整落库消息（不再只是 160 字预览）
       const ids = await evaluate(
         `Array.from(document.querySelectorAll("#evolution-timeline [data-evolution-id]")).map((e) => e.dataset.evolutionId)`,
       );
       await click(`[data-evolution-id="${ids[0]}"]`);
       await waitFor(
-        () => evaluate(`document.querySelectorAll("#evolution-timeline .expanded .prompt-transcript-msg").length >= 5`),
-        5000,
-        "行内消息序列",
+        () => evaluate(`document.querySelectorAll("#evolution-timeline .expanded .ev-transcript .prompt-msg").length >= 5`),
+        8000,
+        "行内完整消息（懒加载）",
       );
       const expanded = await evaluate(
-        `document.querySelectorAll("#evolution-timeline .expanded .prompt-transcript-msg").length`,
+        `document.querySelectorAll("#evolution-timeline .expanded .ev-transcript .prompt-msg").length`,
       );
+      const systemText = await evaluate(
+        `Array.from(document.querySelectorAll("#evolution-timeline .expanded .ev-transcript .prompt-msg pre"))
+           .map((p) => p.textContent).join("\\n")`,
+      );
+      if (!systemText.includes("UI smoke assistant")) {
+        throw new Error("展开后未看到完整落库消息正文（system 内容缺失）");
+      }
       // 槽位切换：把第一轮设为对比对象，差异应按新基准/对比刷新
       await click(`[data-evolution-id="${ids[0]}"] [data-evolution-slot="target"]`);
       await waitFor(
@@ -671,6 +678,40 @@ async function main() {
       }
       return "时间轴提供详情入口";
     });
+
+    await check("会话演进全貌模式", async () => {
+      // 全貌：整个会话按顺序连续铺开，每轮懒加载完整消息，逐条可展开
+      await click('#evolution-mode-seg [data-evmode="full"]');
+      await waitFor(
+        () => evaluate(`document.querySelectorAll("#evolution-timeline .ev-full-round").length >= 2`),
+        8000,
+        "全貌轮次容器",
+      );
+      await waitFor(
+        () => evaluate(`document.querySelectorAll("#evolution-timeline .ev-full-round .ev-transcript").length >= 1`),
+        10000,
+        "全貌完整消息懒加载",
+      );
+      // 全部展开最后一轮（长上下文记录），应能看到落库的长文本正文
+      await click(`#evolution-timeline .ev-full-round:last-child [data-ev-expand-all]`);
+      await waitFor(
+        () => evaluate(`Array.from(document.querySelectorAll("#evolution-timeline .ev-full-round:last-child .prompt-msg[open] pre"))
+          .some((p) => p.textContent.includes("LONG-CONTEXT-START"))`),
+        5000,
+        "全貌展开长文本正文",
+      );
+      const openCount = await evaluate(
+        `document.querySelectorAll("#evolution-timeline .ev-full-round:last-child .prompt-msg[open]").length`,
+      );
+      // 切回轮次模式：时间轴行恢复
+      await click('#evolution-mode-seg [data-evmode="rounds"]');
+      await waitFor(
+        () => evaluate(`document.querySelectorAll("#evolution-timeline .prompt-timeline-row").length >= 2`),
+        5000,
+        "切回轮次时间轴",
+      );
+      return `全貌展开 ${openCount} 条消息`;
+    });
   }
 
   await check("日志页基础元素", async () => {
@@ -700,6 +741,140 @@ async function main() {
     await click('[data-tab="usage"]');
     await waitFor(() => isVisible("#usage-table"), 3000, "用量表格");
     return "usage-table 可见";
+  });
+
+  await check("占比分布自动跟随筛选", async () => {
+    // 默认（无筛选）：按上游分布，且必须真的有数据（旧的默认态是「暂无数据」）
+    await waitFor(
+      () => evaluate(`document.querySelectorAll("#usage-pie .pie-row").length >= 1`),
+      8000,
+      "默认占比图（按上游）",
+    );
+    const hint0 = await evaluate(`document.querySelector("#pie-hint").textContent`);
+    if (!hint0.includes("按上游")) throw new Error(`默认维度应为按上游：${hint0}`);
+    // 选一个上游 → 占比自动切到「按模型」（该上游内的模型分布）
+    const picked = await evaluate(`(() => {
+      const sel = document.querySelector("#scope-upstream");
+      const opt = Array.from(sel.options).find((o) => o.value);
+      if (!opt) return "";
+      sel.value = opt.value;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      return opt.value;
+    })()`);
+    if (!picked) throw new Error("没有可用的上游筛选选项");
+    await waitFor(
+      () => evaluate(`document.querySelector("#pie-hint").textContent.includes("按模型")`),
+      8000,
+      "筛选上游后占比切到按模型",
+    );
+    await waitFor(
+      () => evaluate(`document.querySelectorAll("#usage-pie .pie-row").length >= 1`),
+      8000,
+      "按模型占比有数据",
+    );
+    // 趋势图标题为时间粒度，不再出现「按 模型/上游 趋势」
+    const trendTitle = await evaluate(`document.querySelector("#trend-title").textContent`);
+    if (!/按(小时|天)趋势/.test(trendTitle)) {
+      throw new Error(`趋势标题应为时间粒度：${trendTitle}`);
+    }
+    // 旧的两套维度选择器不应再存在
+    const legacy = await evaluate(
+      `!!document.querySelector("#pie-seg") || !!document.querySelector("#group-seg")`,
+    );
+    if (legacy) throw new Error("旧的 pie-seg / group-seg 不应再存在");
+    // 清除筛选：恢复全量按上游
+    await click("#scope-clear");
+    await waitFor(
+      () => evaluate(`document.querySelector("#pie-hint").textContent.includes("按上游")`),
+      8000,
+      "清除筛选恢复按上游",
+    );
+    return `上游 ${picked} → 按模型；清除后 → 按上游`;
+  });
+
+  await check("单价表保存与费用估算激活", async () => {
+    // 落一份 USD 单价（按量条目），保存并重算历史；随后费用 KPI 必须脱离「—」
+    await evaluate(`(async () => {
+      const res = await fetch("/api/pricing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pricing: {
+            version: 1,
+            fx: { USD: 7.0 },
+            entries: [{
+              model: "m", label: "ui-smoke", type: "per-token", currency: "USD",
+              input: 1, output: 2,
+              peak: { tzOffsetMinutes: 480, weekdaysOnly: true,
+                      windows: [{ start: "09:00", end: "18:00" }], offPeak: { multiplier: 0.5 } },
+            }],
+          },
+          recompute: true,
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok || !data.configured || !data.entries) {
+        throw new Error("pricing 保存失败：" + JSON.stringify(data));
+      }
+      if (!data.recomputed && data.recomputed !== 0) throw new Error("缺少重算结果");
+    })()`);
+    const meta = await evaluate(`(async () => {
+      const res = await fetch("/api/pricing");
+      const data = await res.json();
+      return { configured: data.configured, entries: data.entries, fx: data.fx && data.fx.USD };
+    })()`);
+    if (!meta.configured || meta.entries < 1) throw new Error("保存后 configured 仍为 false");
+    if (meta.fx !== 7.0) throw new Error(`汇率未生效：${meta.fx}`);
+    // 面板状态刷新：模型页会重新拉 /api/pricing（与用户实际路径一致），再回用量页看 KPI
+    await click('[data-tab="model"]');
+    await waitFor(
+      () => evaluate(`document.querySelector("#pricing-hint").textContent.includes("已配置 1 条")`),
+      8000,
+      "单价表提示刷新",
+    );
+    // KPI 费用组：从「未配置单价」变为按单价表估算（种子请求上游失败，token=0，费用为 ¥0 但不再显示 —）
+    await click('[data-tab="usage"]');
+    await waitFor(
+      () => evaluate(`document.querySelector("#usage-kpis").textContent.includes("按单价表估算")`),
+      8000,
+      "费用 KPI 激活",
+    );
+    // 双币种切换：USD 显示 $ 符号且说明币种
+    await click('#currency-seg [data-currency="USD"]');
+    await waitFor(
+      () => evaluate(`document.querySelector("#usage-kpis").textContent.includes("USD · 按单价表估算")`),
+      3000,
+      "币种切换为 USD",
+    );
+    await click('#currency-seg [data-currency="CNY"]');
+    return "费用 KPI 已按单价表激活，币种可切换";
+  });
+
+  await check("单价表官方模板快选", async () => {
+    await click('[data-tab="model"]');
+    await waitFor(() => isVisible("#pricing-fold"), 3000, "单价表折叠区");
+    await evaluate(`document.querySelector("#pricing-fold").setAttribute("open", "")`);
+    await waitFor(
+      () => evaluate(`document.querySelectorAll("#pricing-templates .chip[data-template]").length >= 6`),
+      3000,
+      "官方模板 chips",
+    );
+    const count = await evaluate(
+      `document.querySelectorAll("#pricing-templates .chip[data-template]").length`,
+    );
+    // 点击 DeepSeek 模板：JSON 应出现 deepseek 条目（含峰谷窗口）
+    await click('#pricing-templates [data-template="deepseek"]');
+    const hasDeepseek = await evaluate(
+      `(() => {
+        const value = document.querySelector("#pricing-json").value;
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed.entries)
+          && parsed.entries.some((e) => String(e.model).startsWith("deepseek"))
+          && parsed.entries.some((e) => e.peak && Array.isArray(e.peak.windows) && e.peak.windows.length >= 2);
+      })()`,
+    );
+    if (!hasDeepseek) throw new Error("模板未把峰谷条目写入 JSON");
+    return `模板 ${count} 个，DeepSeek 峰谷条目已并入`;
   });
 
   await check("免费来源页默认隐藏，配置开启后可见", async () => {

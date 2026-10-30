@@ -442,6 +442,8 @@ pub struct Config {
     pub prompt_max_chars: u64,
     pub aliases: HashMap<String, String>,
     pub upstreams: Vec<Upstream>,
+    /// 单价表（解析后的 `pricing` 配置）：非法条目被跳过并记入 issues。
+    pub pricing: crate::pricing::PricingTable,
 }
 
 impl Config {
@@ -528,6 +530,9 @@ impl Config {
             }
         }
 
+        let pricing =
+            crate::pricing::PricingTable::from_value(obj.get("pricing").unwrap_or(&Value::Null));
+
         Self {
             raw,
             host,
@@ -544,6 +549,7 @@ impl Config {
             prompt_max_chars,
             aliases,
             upstreams,
+            pricing,
         }
     }
 
@@ -789,6 +795,30 @@ impl Config {
             });
         };
         let raw_obj = self.raw.as_object();
+
+        // ── 单价表诊断 ────────────────────────────────────────────
+        for issue in &self.pricing.issues {
+            push(
+                issue.get("level").and_then(Value::as_str).unwrap_or("warn"),
+                issue
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pricing_entry_skipped"),
+                issue
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pricing"),
+                issue
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                issue
+                    .get("hint")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+        }
 
         // ── 顶层字段 ────────────────────────────────────────────────
         if let Some(obj) = raw_obj {

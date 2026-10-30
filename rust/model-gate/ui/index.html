@@ -134,22 +134,28 @@
     <details class="box fold" id="pricing-fold" data-fold="pricing">
       <summary>
         <span class="fold-title">单价表（费用估算）</span>
-        <span class="hint">单位：金额 / 百万 token；未配置时费用显示「未配置」，不影响代理转发</span>
+        <span class="hint">单位：金额 / 百万 token；本位币人民币，美元单价按汇率折算入账；峰谷窗口外按谷价计费</span>
       </summary>
       <div class="grid">
-        <label>币种
-          <input id="pricing-currency" type="text" placeholder="CNY">
+        <label title="1 美元兑人民币的换算汇率；USD 单价按它折算成人民币落库">USD→CNY 汇率
+          <input id="pricing-fx" type="number" step="0.0001" min="0" placeholder="7.2">
         </label>
         <label class="check"><input type="checkbox" id="pricing-recompute"> 保存后重算历史费用</label>
         <label class="check" title="默认开启；关闭后保存单价不再生成新备份，已有备份不会被删除">
           <input type="checkbox" id="pricing-backup-toggle" checked> 保存前备份
         </label>
       </div>
-      <label class="span-2">单价表（JSON，含 default 与 rules）
-        <textarea id="pricing-json" rows="10" spellcheck="false"
-          placeholder='{"currency":"CNY","default":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"rules":{"go/glm-5.3-flash":{"input":0.6,"output":2.4}}}'></textarea>
+      <div class="chips" id="pricing-templates">
+        <span class="chip-label">官方模板</span>
+        <span class="hint" id="pricing-templates-hint">点击模板把该厂商的单价条目追加到下方 JSON（同名条目自动去重）</span>
+      </div>
+      <label class="span-2">单价表（JSON：fx 汇率 + entries 条目，先匹配先用；type=per-token 按量计费 / quota 额度制）
+        <textarea id="pricing-json" rows="14" spellcheck="false"
+          placeholder='{"version":1,"fx":{"USD":7.2},"entries":[{"model":"deepseek-*","upstream":"cch","label":"DeepSeek 官方","type":"per-token","currency":"USD","input":0.30,"output":1.20,"cacheRead":0.006,"peak":{"tzOffsetMinutes":0,"weekdaysOnly":true,"windows":[{"start":"01:00","end":"04:00"},{"start":"06:00","end":"10:00"}],"offPeak":{"multiplier":0.5}}},{"model":"*","upstream":"zen","type":"quota","plan":"OpenCode Zen 免费池"}]}'></textarea>
       </label>
+      <div class="hint" id="pricing-issues" hidden></div>
       <div class="actions">
+        <button type="button" class="ghost" id="pricing-format">格式化 JSON</button>
         <button type="button" class="primary" id="save-pricing">保存单价表</button>
         <span class="hint" id="pricing-hint"></span>
       </div>
@@ -349,11 +355,9 @@
       </label>
       <button class="ghost" id="scope-clear" title="清除上游/模型/自定义时间">清除筛选</button>
       <span class="hint" id="scope-hint">KPI / 趋势 / 分布 / 明细统一跟随此作用域</span>
-      <div class="seg" id="group-seg">
-        <button data-group="day" class="active">按天</button>
-        <button data-group="model">按模型</button>
-        <button data-group="upstream">按上游</button>
-        <button data-group="session">按会话</button>
+      <div class="seg" id="currency-seg" title="费用列的显示币种；落库本位币为人民币，美元按单价表汇率折算">
+        <button data-currency="CNY" class="active">¥ CNY</button>
+        <button data-currency="USD">$ USD</button>
       </div>
       <label class="inline-field">自动刷新
         <select id="usage-auto" class="filter-select" title="自动刷新间隔（不影响代理，仅重新拉取统计）">
@@ -410,10 +414,7 @@
       <div class="box">
         <div class="box-head">
           <h2>占比分布</h2>
-          <div class="seg small" id="pie-seg">
-            <button data-pie="model" class="active">按模型</button>
-            <button data-pie="upstream">按上游</button>
-          </div>
+          <span class="hint" id="pie-hint" title="占比维度自动跟随上方筛选：选了模型看上游分布，选了上游看模型分布，未选时看全量上游分布">跟随筛选条件自动切换维度</span>
         </div>
         <div id="usage-pie" class="chart legend"></div>
       </div>
@@ -677,7 +678,11 @@
           <select id="evolution-session" class="filter-select"></select>
         </label>
         <button class="ghost" id="evolution-refresh">刷新</button>
-        <span class="hint" id="evolution-hint">默认对比最近两轮；点行展开该轮消息序列，点「基准 / 对比」任选两条记录；全部为本地算法，不调用任何模型</span>
+        <div class="seg" id="evolution-mode-seg" title="轮次：逐轮时间轴 + 差异对比；全貌：整个会话按顺序连续铺开，每条消息可展开看完整内容">
+          <button data-evmode="rounds" class="active">轮次</button>
+          <button data-evmode="full">全貌</button>
+        </div>
+        <span class="hint" id="evolution-hint">默认折叠、可逐条展开看完整消息；「全貌」连续铺开整个会话；点「基准 / 对比」任选两条记录做差异，全部为本地算法</span>
       </div>
       <div class="ev-compare-bar" id="evolution-compare-bar">
         <div class="ev-compare-main">

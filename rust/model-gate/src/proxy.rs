@@ -451,8 +451,16 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             post(crate::update::api_update_download),
         )
         .route(
+            "/api/update/download-install",
+            post(crate::update::api_update_download_install),
+        )
+        .route(
             "/api/update/install",
             post(crate::update::api_update_install),
+        )
+        .route(
+            "/api/update/settings",
+            post(crate::update::api_update_settings),
         )
         .route(
             "/api/update/open-location",
@@ -1453,29 +1461,44 @@ fn record_ex(
     paused: bool,
 ) {
     let usage = usage.cloned().unwrap_or(Value::Null);
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cache_read_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_i64)
+        .or_else(|| usage.get("cacheReadTokens").and_then(Value::as_i64))
+        .unwrap_or(0);
+    let cache_write_tokens = usage
+        .get("cacheWriteTokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    // 费用按单价表即时估算（人民币落库）；峰谷判定用当前时间。
+    let cost = state.cfg().pricing.cost_for(
+        &up.name,
+        requested,
+        target,
+        chrono::Utc::now().timestamp(),
+        prompt_tokens,
+        completion_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    );
     let rec = UsageRecord {
         id: ctx.id.clone(),
         upstream: up.name.clone(),
         protocol: up.protocol.clone(),
         requested_model: requested.to_string(),
         upstream_model: target.to_string(),
-        prompt_tokens: usage
-            .get("prompt_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        completion_tokens: usage
-            .get("completion_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        cache_read_tokens: usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .and_then(Value::as_i64)
-            .or_else(|| usage.get("cacheReadTokens").and_then(Value::as_i64))
-            .unwrap_or(0),
-        cache_write_tokens: usage
-            .get("cacheWriteTokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
+        prompt_tokens,
+        completion_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         duration_ms: started.elapsed().as_millis() as i64,
         ttft_ms,
         status: status as i64,
@@ -1483,7 +1506,7 @@ fn record_ex(
         truncated,
         paused,
         error,
-        cost: 0.0,
+        cost,
         session: ctx.session.clone(),
     };
     state.db.record_usage(&rec);
@@ -1987,8 +2010,12 @@ async fn api_pricing(State(state): State<Arc<AppState>>) -> Response {
         .unwrap_or(0);
     Json(json!({
         "pricing": pricing,
+        // 落库本位币固定人民币；美元单价按 fx.USD 换算成人民币入账。
         "currency": "CNY",
-        "configured": false,
+        "configured": cfg.pricing.configured(),
+        "fx": { "USD": cfg.pricing.fx_usd },
+        "entries": cfg.pricing.entries.len(),
+        "diagnostics": cfg.pricing.issues,
         "retention_days": retention,
     }))
     .into_response()
@@ -2693,12 +2720,29 @@ async fn api_usage_models(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
         .clamp(1, 500);
     let f = scoped_filters(&uri);
     let rows = state.db.model_usage(&f, limit);
+    let pricing = state.cfg().pricing.clone();
+    // 附带该模型的单价信息：额度制条目让面板显示「额度制」而不是 ¥0
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .map(|mut row| {
+            let model = row
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(quote) = pricing.quote("", &model) {
+                row["pricing"] = quote;
+            }
+            row
+        })
+        .collect();
     Json(json!({
         "rows": rows,
         "range": params.get("range").cloned().unwrap_or_else(|| "24h".into()),
         "filters": {},
         "currency": "CNY",
-        "pricing_configured": false,
+        "pricing_configured": pricing.configured(),
+        "fx": { "USD": pricing.fx_usd },
     }))
     .into_response()
 }

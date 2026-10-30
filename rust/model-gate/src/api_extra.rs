@@ -713,6 +713,14 @@ pub async fn logs_clear(State(state): State<Arc<AppState>>) -> Response {
 pub async fn pricing_save(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let cfg: crate::config::Config = (**state.cfg()).clone();
     let pricing = body.get("pricing").cloned().unwrap_or_else(|| json!({}));
+    if !pricing.is_null() && !pricing.is_object() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "pricing 必须是 JSON 对象",
+            "invalid_request_error",
+            "invalid_pricing",
+        );
+    }
     // 与 /api/config 共用同一套落盘路径：合并式 + 备份 + 原子写。
     // 之前这里直接整文件覆盖，绕过了备份与回读校验（config-as-json 任务 3）。
     let policy =
@@ -746,7 +754,35 @@ pub async fn pricing_save(State(state): State<Arc<AppState>>, Json(body): Json<V
     // 走 replace_config：它会把运行态的端口/主机回填到 raw，
     // 避免端口降级场景把文件里的旧端口写回（与 /api/config 同一口径）。
     state.replace_config(new_cfg);
+    // 「保存后重算历史费用」：按新单价表把 usage_records.cost 全部重刷一遍。
+    // 之前该参数只是 UI 空壳，后端直接忽略。
+    let recomputed = if body
+        .get("recompute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let table = state.cfg().pricing.clone();
+        state.db.recompute_costs(|row| {
+            table.cost_for(
+                &row.upstream,
+                &row.requested_model,
+                &row.upstream_model,
+                row.ts,
+                row.prompt_tokens,
+                row.completion_tokens,
+                row.cache_read_tokens,
+                row.cache_write_tokens,
+            )
+        })
+    } else {
+        0
+    };
+    let table = &state.cfg().pricing;
     Json(json!({"ok": true, "pricing": pricing, "currency": "CNY",
+    "configured": table.configured(),
+    "entries": table.entries.len(),
+    "diagnostics": table.issues,
+    "recomputed": recomputed,
     "config_path": state.config_path.display().to_string(),
     "backup": {
         "created": backup.created,
@@ -813,12 +849,13 @@ pub async fn backups_restore(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn models_catalog(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let query = params(&uri);
-    let (upstreams, aliases, default_model) = {
+    let (upstreams, aliases, default_model, pricing) = {
         let cfg = state.cfg();
         (
             cfg.upstreams.clone(),
             cfg.aliases.clone(),
             cfg.default_model.clone(),
+            cfg.pricing.clone(),
         )
     };
     let cache = state.refresh_models_cache(false).await;
@@ -880,6 +917,25 @@ pub async fn models_catalog(State(state): State<Arc<AppState>>, uri: Uri) -> Res
             }
         }
     }
+    // 单价提示：按「该模型的第一个上游 + 模型名」解析单价表；
+    // 未命中（额度制条目会返回 type=quota，按量条目返回本位币单价）。
+    for row in rows.iter_mut() {
+        let model = row["model"].as_str().unwrap_or("").to_string();
+        let upstream = row["upstreams"]
+            .as_array()
+            .and_then(|list| list.first())
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        row["costHint"] = pricing.quote(&upstream, &model).unwrap_or(Value::Null);
+    }
+    // 「单价」胶囊筛选：已配置 = 命中任何单价条目（按量或额度制）
+    let price_filter = query.get("price").cloned().unwrap_or_default();
+    if price_filter == "priced" {
+        rows.retain(|r| !r["costHint"].is_null());
+    } else if price_filter == "missing" {
+        rows.retain(|r| r["costHint"].is_null());
+    }
     let keyword = query.get("q").cloned().unwrap_or_default().to_lowercase();
     let upstream_filter = query.get("upstream").cloned().unwrap_or_default();
     if !keyword.is_empty() {
@@ -940,7 +996,8 @@ pub async fn models_catalog(State(state): State<Arc<AppState>>, uri: Uri) -> Res
         "sort": query.get("sort").cloned().unwrap_or_else(|| "model".into()),
         "order": query.get("order").cloned().unwrap_or_else(|| "asc".into()),
         "currency": "CNY",
-        "pricing_configured": false,
+        "fx": { "USD": pricing.fx_usd },
+        "pricing_configured": pricing.configured(),
         "upstreams": upstreams.iter().map(|u| json!({
             "name": u.name, "protocol": u.protocol, "models": u.models.len(),
         })).collect::<Vec<_>>(),

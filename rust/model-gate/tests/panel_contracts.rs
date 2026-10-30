@@ -168,6 +168,25 @@ fn config_endpoints_are_registered() {
     }
 }
 
+/// 更新链路：一键「下载并安装」与自动化设置接口必须注册，
+/// 否则面板按钮点了就是 404（面板所有 api() 调用都依赖这份守卫）。
+#[test]
+fn update_endpoints_are_registered() {
+    let routes = rust_routes();
+    for path in [
+        "/api/update/status",
+        "/api/update/check",
+        "/api/update/download",
+        "/api/update/download-install",
+        "/api/update/install",
+        "/api/update/settings",
+        "/api/update/open-location",
+        "/api/update/download-dir",
+    ] {
+        assert!(routes.contains(path), "Rust 未注册 {path}");
+    }
+}
+
 #[test]
 fn prompt_endpoints_are_registered() {
     let routes = rust_routes();
