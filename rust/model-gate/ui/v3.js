@@ -33,6 +33,8 @@
     needs_secret: "待补密钥",
   };
 
+  const externalViews = new Map();
+
   const state = {
     view: "overview",
     access: [],
@@ -272,8 +274,12 @@
       "credentials",
       "plugins",
       "traffic",
-      "observe",
+      "prompts",
+      "logs",
+      "free",
+      "zcode",
       "settings",
+      ...externalViews.keys(),
     ];
     const value = new URLSearchParams(location.search).get("view");
     return allowed.includes(value) ? value : "overview";
@@ -324,14 +330,32 @@
         await refreshObserve();
       },
       settings: async () => {
-        await Promise.all([refreshConfig(), refreshTemplates(), refreshAISettings()]);
+        await Promise.all([refreshConfig(), refreshTemplates(), refreshAISettings(), refreshAccess()]);
         renderSettings();
       },
     };
-    const loader = loaders[view];
+    const loader = externalViews.get(view) || loaders[view];
     if (loader) {
-      loader().catch((error) => toast(error.message, "error"));
+      Promise.resolve(loader()).catch((error) => toast(error.message, "error"));
     }
+  }
+
+  function registerView(name, loader) {
+    externalViews.set(name, loader);
+  }
+
+  function openModal(title, sub, html) {
+    $("#modal-title").textContent = title || "";
+    $("#modal-sub").textContent = sub || "";
+    $("#modal-body").innerHTML = html || "";
+    $("#modal").hidden = false;
+    $("#scrim").hidden = false;
+  }
+
+  function updateModal(title, sub, html) {
+    $("#modal-title").textContent = title || "";
+    $("#modal-sub").textContent = sub || "";
+    $("#modal-body").innerHTML = html || "";
   }
 
   function initTheme() {
@@ -576,9 +600,16 @@
     if (state.drawerTab === "connection") body.innerHTML = drawerConnection(item);
     else if (state.drawerTab === "credential") body.innerHTML = drawerCredential(item);
     else if (state.drawerTab === "models") body.innerHTML = drawerModels(item);
+    else if (state.drawerTab === "advanced") body.innerHTML = drawerAdvanced(item);
     else if (state.drawerTab === "diagnostics") body.innerHTML = drawerDiagnostics(item);
     else body.innerHTML = drawerOverview(item);
     bindDrawerActions(item);
+  }
+
+  function rawAccessConfig(item) {
+    const upstreams = state.config && state.config.upstreams;
+    const raw = upstreams && upstreams[item.id];
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   }
 
   function drawerOverview(item) {
@@ -609,7 +640,14 @@
       </label>
       <label class="field"><span>传输</span><input class="input" id="edit-transport" value="${esc(item.transport || "")}" placeholder="留空 = 按协议"></label>
       <label class="field span-2"><span>请求地址</span><input class="input mono" id="edit-baseurl" value="${esc(item.baseUrl || "")}"></label>
-      <label class="check span-2"><input type="checkbox" id="edit-zdr" ${item.privacy && item.privacy.zdr ? "checked" : ""}> 请求零数据保留（ZDR）</label>
+      <label class="check"><input type="checkbox" id="edit-zdr" ${item.privacy && item.privacy.zdr ? "checked" : ""}> 请求零数据保留（ZDR）</label>
+      <label class="field"><span>训练数据策略</span>
+        <select class="input" id="edit-training">
+          <option value="inherit"${!item.privacy || item.privacy.training === "inherit" ? " selected" : ""}>跟随模板</option>
+          <option value="deny"${item.privacy && item.privacy.training === "deny" ? " selected" : ""}>禁止训练</option>
+          <option value="allow"${item.privacy && item.privacy.training === "allow" ? " selected" : ""}>允许训练</option>
+        </select>
+      </label>
       <div class="inline-note span-2">${esc(privacyText(item.privacy))}。不支持请求级开关的厂商只会记录意图，不会宣称已保护。</div>
     </div>
     <div class="modal-actions"><button class="btn primary sm" id="save-connection">保存连接</button></div>`;
@@ -647,15 +685,41 @@
   }
 
   function drawerModels(item) {
-    return `<div class="section-title">声明模型</div>
-      <div class="tagline">${
-        item.models && item.models.declared
-          ? `<span class="pill">${item.models.declared} 个</span><span class="pill">${item.models.aliases} 个别名</span>`
-          : `<span class="muted">未声明；保存后可由上游目录自动拉取。</span>`
-      }</div>
-      <div class="section-title">说明</div>
-      <div class="callout">模型目录与别名在「模型目录」页统一查看；编辑高级字段可打开经典面板的接入编辑。</div>
-      <div class="modal-actions"><button class="btn ghost sm" id="edit-advanced">打开经典面板</button></div>`;
+    const raw = rawAccessConfig(item);
+    const models = Array.isArray(raw.models) ? raw.models.join("\n") : "";
+    const aliases = raw.modelMap && typeof raw.modelMap === "object" ? raw.modelMap : {};
+    const overrides = raw.modelOverrides && typeof raw.modelOverrides === "object" ? raw.modelOverrides : {};
+    return `<div class="section-title">模型声明</div>
+      <div class="inline-note">每行一个模型 id；留空时由上游目录自动拉取。这里的声明会参与 /v1/models 与路由匹配。</div>
+      <label class="field"><span>模型列表</span><textarea class="input code-area" id="edit-models" rows="5" spellcheck="false" placeholder="deepseek-chat&#10;deepseek-reasoner">${esc(models)}</textarea></label>
+      <div class="form-grid">
+        <label class="field"><span>模型别名映射（JSON）</span><textarea class="input code-area" id="edit-model-map" rows="5" spellcheck="false" placeholder='{"gpt-4o-mini":"deepseek-chat"}'>${esc(Object.keys(aliases).length ? JSON.stringify(aliases, null, 2) : "")}</textarea></label>
+        <label class="field"><span>模型级覆盖（JSON）</span><textarea class="input code-area" id="edit-model-overrides" rows="5" spellcheck="false" placeholder='{"deepseek-*":{"limits":{"maxOutputTokens":65536}}}'>${esc(Object.keys(overrides).length ? JSON.stringify(overrides, null, 2) : "")}</textarea></label>
+      </div>
+      <div class="section-title">目录行为</div>
+      <div class="check-grid">
+        <label class="check"><input type="checkbox" id="edit-fetch-models" ${raw.fetchModels === true ? "checked" : ""}> 从上游拉取模型目录</label>
+        <label class="check"><input type="checkbox" id="edit-auto-models" ${raw.autoModels === true ? "checked" : ""}> 自动合并拉取结果</label>
+        <label class="check"><input type="checkbox" id="edit-pause-turn" ${raw.pauseTurn === true ? "checked" : ""}> 暂停轮次兼容</label>
+        <label class="check"><input type="checkbox" id="edit-default" ${raw.default === true ? "checked" : ""}> 设为默认接入</label>
+      </div>
+      <div class="inline-note">别名和覆盖必须是 JSON 对象；留空会清除该项。密钥与模型级密钥请在「凭据」页或凭据池维护。</div>
+      <div class="modal-actions"><button class="btn primary sm" id="save-models">保存模型与目录</button></div>`;
+  }
+
+  function drawerAdvanced(item) {
+    const raw = rawAccessConfig(item);
+    const compat = raw.compat && typeof raw.compat === "object" ? raw.compat : {};
+    const timeout = raw.timeoutSeconds == null ? "" : raw.timeoutSeconds;
+    return `<div class="section-title">兼容配置</div>
+      <div class="inline-note">高级项按 JSON 覆盖 upstream.compat；留空表示跟随模板预设。修改前请确认上游协议；错误配置会直接保存到 bridge.config.json（保存时自动备份）。</div>
+      <label class="field"><span>compat JSON</span><textarea class="input code-area" id="edit-compat" rows="16" spellcheck="false">${esc(Object.keys(compat).length ? JSON.stringify(compat, null, 2) : "")}</textarea></label>
+      <div class="form-grid">
+        <label class="field"><span>上游超时（秒，留空跟随全局）</span><input class="input" id="edit-timeout" type="number" min="1" value="${esc(timeout)}"></label>
+        <label class="check" style="align-self:end"><input type="checkbox" id="edit-session-header" ${raw.sessionHeader === true ? "checked" : ""}> 注入会话头（如上游支持）</label>
+      </div>
+      <div class="callout warn">请勿在 compat.headers 中粘贴长期密钥；密钥应写入「凭据」页的本机加密库。此页只编辑非敏感兼容参数。</div>
+      <div class="modal-actions"><button class="btn primary sm" id="save-advanced">保存高级配置</button></div>`;
   }
 
   function drawerDiagnostics(item) {
@@ -693,7 +757,7 @@
               protocol: $("#edit-protocol").value,
               transport: $("#edit-transport").value.trim(),
               baseUrl: $("#edit-baseurl").value.trim(),
-              privacy: { zdr: $("#edit-zdr").checked },
+              privacy: { zdr: $("#edit-zdr").checked, training: $("#edit-training").value },
             }),
           });
           toast("连接已保存", "ok");
@@ -749,10 +813,89 @@
         }
       });
     }
-    const advanced = $("#edit-advanced");
-    if (advanced) {
-      advanced.addEventListener("click", () => {
-        window.open("/ui/classic", "_blank");
+    const saveModels = $("#save-models");
+    if (saveModels) {
+      saveModels.addEventListener("click", async () => {
+        const parseObject = (selector, label) => {
+          const text = $(selector).value.trim();
+          if (!text) return {};
+          try {
+            const parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+              throw new Error(`${label}必须是 JSON 对象`);
+            }
+            return parsed;
+          } catch (error) {
+            throw new Error(`${label}：${error.message}`);
+          }
+        };
+        try {
+          const models = $("#edit-models")
+            .value.split(/[\n,，]+/)
+            .map((model) => model.trim())
+            .filter(Boolean);
+          const modelMap = parseObject("#edit-model-map", "模型别名映射");
+          const modelOverrides = parseObject("#edit-model-overrides", "模型级覆盖");
+          await api(`/api/access/${encodeURIComponent(item.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              models,
+              modelMap,
+              modelOverrides,
+              fetchModels: $("#edit-fetch-models").checked,
+              autoModels: $("#edit-auto-models").checked,
+              pauseTurn: $("#edit-pause-turn").checked,
+              default: $("#edit-default").checked,
+            }),
+          });
+          await Promise.all([refreshAccess(), refreshConfig()]);
+          renderDrawer();
+          renderAccess();
+          toast("模型与目录设置已保存", "ok");
+        } catch (error) {
+          toast(error.message, "error");
+        }
+      });
+    }
+    const saveAdvanced = $("#save-advanced");
+    if (saveAdvanced) {
+      saveAdvanced.addEventListener("click", async () => {
+        const text = $("#edit-compat").value.trim();
+        let compat = null;
+        if (text) {
+          try {
+            compat = JSON.parse(text);
+          } catch (error) {
+            toast(`compat JSON 解析失败：${error.message}`, "error");
+            return;
+          }
+          if (!compat || typeof compat !== "object" || Array.isArray(compat)) {
+            toast("compat 必须是 JSON 对象", "error");
+            return;
+          }
+        }
+        const timeoutText = $("#edit-timeout").value.trim();
+        const timeoutSeconds = timeoutText ? Number(timeoutText) : null;
+        if (timeoutText && (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1)) {
+          toast("上游超时必须是正整数", "error");
+          return;
+        }
+        try {
+          await api(`/api/access/${encodeURIComponent(item.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({
+              compat,
+              timeoutSeconds,
+              sessionHeader: $("#edit-session-header").checked,
+            }),
+          });
+          await Promise.all([refreshAccess(), refreshConfig()]);
+          renderDrawer();
+          renderAccess();
+          toast("高级兼容配置已保存", "ok");
+        } catch (error) {
+          toast(error.message, "error");
+        }
       });
     }
   }
@@ -768,7 +911,7 @@
           <td>${esc(item.protocol)}</td>
           <td>${item.models ? item.models.declared : 0}</td>
           <td>${item.models ? item.models.aliases : 0}</td>
-          <td class="muted tiny">${esc((item.models && item.models.sample) || "在经典面板查看完整清单")}</td>
+          <td class="muted tiny">${esc((item.models && item.models.sample) || "在「模型与定价」页查看完整清单")}</td>
           <td class="right"><button class="btn ghost sm" data-open="${esc(item.id)}">查看接入</button></td>
         </tr>`
       )
@@ -799,7 +942,7 @@
             </div>`
           )
           .join("")
-      : `<div class="empty-line">尚未配置路由组。可在经典面板的配置页维护。</div>`;
+      : `<div class="empty-line">尚未配置路由组。可在「设置 → 路由组」维护。</div>`;
     if (groups.length) {
       $("#unified-list").innerHTML += groups
         .map(
@@ -1116,6 +1259,10 @@
   // ───────────────────────── 设置 ─────────────────────────
 
   function renderSettings() {
+    if (window.MG_SETTINGS && typeof window.MG_SETTINGS.render === "function") {
+      window.MG_SETTINGS.render();
+      return;
+    }
     const config = state.config || {};
     $("#set-host").value = config.host || "127.0.0.1";
     $("#set-port").value = config.port || 8900;
@@ -1140,6 +1287,10 @@
   }
 
   async function saveSettings() {
+    if (window.MG_SETTINGS && typeof window.MG_SETTINGS.save === "function") {
+      window.MG_SETTINGS.save();
+      return;
+    }
     const config = state.config || {};
     const next = {
       ...config,
@@ -1721,7 +1872,8 @@
       button.addEventListener("click", () => navigate(button.dataset.go));
     });
     $("#theme-toggle").addEventListener("click", toggleTheme);
-    $("#open-classic").addEventListener("click", () => window.open("/ui/classic", "_blank"));
+    $("#config-help-btn").addEventListener("click", () => window.MG_HELP && window.MG_HELP());
+    $("#update-btn").addEventListener("click", () => window.MG_UPDATE && window.MG_UPDATE());
     $("#quick-add").addEventListener("click", () => openAddModal("official"));
     $("#access-add").addEventListener("click", () => openAddModal("official"));
     $$("[data-add]").forEach((button) => button.addEventListener("click", () => openAddModal(button.dataset.add)));
@@ -1760,10 +1912,6 @@
     $("#access-kind").addEventListener("change", renderAccess);
     $("#access-health").addEventListener("change", renderAccess);
 
-    $("#models-refresh").addEventListener("click", async () => {
-      await refreshAccess();
-      renderModels();
-    });
     $("#routes-refresh").addEventListener("click", async () => {
       await refreshConfig();
       renderRoutes();
@@ -1775,7 +1923,6 @@
       renderPools();
     });
     $("#pool-add").addEventListener("click", openPoolModal);
-    $("#open-zcode").addEventListener("click", () => window.open("/ui/classic#zcode", "_blank"));
 
     $("#plugins-refresh").addEventListener("click", async () => {
       await refreshPlugins();
@@ -1783,27 +1930,7 @@
     });
     $("#plugin-install-open").addEventListener("click", openInstallPluginModal);
 
-    $("#traffic-range").addEventListener("change", async () => {
-      state.trafficDays = Number($("#traffic-range").value) || 1;
-      await refreshTraffic();
-    });
-    $("#traffic-refresh").addEventListener("click", refreshTraffic);
-    $("#logs-clear").addEventListener("click", async () => {
-      if (!confirm("清空请求日志？用量记录不受影响。")) return;
-      try {
-        await api("/api/logs/clear", { method: "POST", body: JSON.stringify({}) });
-        await refreshTraffic();
-        toast("请求日志已清空", "ok");
-      } catch (error) {
-        toast(error.message, "error");
-      }
-    });
-
-    $("#observe-refresh").addEventListener("click", refreshObserve);
-    $("#open-prompts").addEventListener("click", () => window.open("/ui/classic#prompts", "_blank"));
-
     $("#settings-save").addEventListener("click", saveSettings);
-    $("#settings-classic").addEventListener("click", () => window.open("/ui/classic", "_blank"));
     $("#settings-backups").addEventListener("click", showBackups);
     $("#ai-manifest").addEventListener("click", showManifest);
     $("#ai-audit").addEventListener("click", showAudit);
@@ -1857,6 +1984,43 @@
   function isTyping(target) {
     return target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT");
   }
+
+  // 供后续页面模块复用同一套状态、请求、转义和弹窗。
+  window.MG = {
+    $,
+    $$,
+    api,
+    esc,
+    num,
+    compactNum,
+    fmtTime,
+    fmtMs,
+    badge,
+    statusDot,
+    privacyText,
+    authText,
+    toast,
+    state,
+    registerView,
+    navigate,
+    openModal,
+    updateModal,
+    closeModal,
+    setConn,
+    refreshAccess,
+    refreshTemplates,
+    refreshPools,
+    refreshPoolDetails,
+    refreshPlugins,
+    refreshConfig,
+    refreshInfo,
+    refreshAISettings,
+    openAddModal,
+    KIND_LABEL,
+    STRATEGY_LABEL,
+    SUPPORT_LABEL,
+    STATUS_LABEL,
+  };
 
   document.addEventListener("DOMContentLoaded", boot);
 })();

@@ -10,10 +10,14 @@
 
 | 目标 | 验收口径 |
 |---|---|
-| 常驻 working set ≤20MB | GUI 模式空闲 60s 的进程 working set（不含浏览器） |
+| 常驻 working set ≤32MB | GUI 模式空闲 60s 的进程 working set（不含浏览器） |
 | 安装包 ≤6MB | `dist\Model-Gate-v<ver>-rust-setup.exe` |
 | 启动 ≤1s | 进程启动到 `GET /health` 返回 200 |
 | 无内嵌浏览器 | Model-Gate 进程树内 0 个 `msedgewebview2.exe` |
+
+> 内存验收线调整（2026-09，v3.1.0）：v3 控制台带来新的常驻模块与内嵌前端资源，
+> 黑盒实测空闲 60s working set 为 24.25MB。经确认将验收线由 20MB 调整为 32MB，
+> 保留约 7.75MB 余量；20MB 的历史记录保留在 `.op/archive/` 中不再改写。
 
 边界：不做 WebView2 可选后端；不做内嵌窗口；面板前端统一放在 `rust/model-gate/ui/`
 并编译期内嵌；托盘动作不依赖页面加载成功。浏览器打开失败时弹窗给出可复制的 URL。

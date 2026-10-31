@@ -78,16 +78,23 @@ jobs:
           cargo test
           if ($LASTEXITCODE -ne 0) { throw "cargo test failed: $LASTEXITCODE" }
 
-      - name: 面板 UI 冒烟
+      - name: 面板资源语法检查
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          node --check rust/model-gate/ui/app.js
-          if ($LASTEXITCODE -ne 0) { throw "app.js syntax check failed" }
-          node --check scripts/ui_smoke.js
-          if ($LASTEXITCODE -ne 0) { throw "ui_smoke.js syntax check failed" }
-          node scripts/ui_smoke.js --exe dist/Model-Gate-rust.exe --port 18942 --debug-port 19222 --ui-path /ui/classic
-          if ($LASTEXITCODE -ne 0) { throw "Classic UI smoke failed: $LASTEXITCODE" }
+          Get-ChildItem "rust/model-gate/ui/v3*.js" | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "syntax check failed: $($_.Name)" }
+          }
+          node --check scripts/ui_smoke_v3.js
+          if ($LASTEXITCODE -ne 0) { throw "ui_smoke_v3.js syntax check failed" }
+
+      - name: 面板 API 冒烟
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/panel_api_smoke.ps1 -Exe dist/Model-Gate-rust.exe -Port 18941
+          if ($LASTEXITCODE -ne 0) { throw "panel API smoke failed: $LASTEXITCODE" }
 
       - name: 面板 v3 冒烟
         shell: pwsh
@@ -153,16 +160,14 @@ jobs:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.meta.outputs.version) }}
           name: Model-Gate v${{ steps.meta.outputs.version }} (Rust)
           body: |
-            Model-Gate v3：接入控制台重构 + 凭据池 + 插件 + AI 配置接口。
+            Model-Gate v3.1：v3 成为唯一控制台，旧面板功能全量并入 12 个子视图。
             Rust 桌面版：托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
 
-            - **v3 控制台（默认 `/ui/`）**：7 个功能域 / 5 个侧栏分区 / 9 个子视图；经典面板完整保留在 `/ui/classic`。
-            - **快速添加**：官方厂商选模板 → 填 Key 两步完成；自定义厂商只填标识、厂商、地址、协议、Key 五项。
-            - **隐私**：新增接入默认勾选 ZDR，可随时修改；按厂商能力如实显示「请求级 / 账户级 / 不支持请求级」。
-            - **凭据池**：priority / round_robin / weighted / least_used 四种策略，冷却、熔断、配额与成员级故障转移；密钥只存本机 DPAPI。
-            - **插件**：manifest `auth.mode=pool`、安装只登记、attach 幂等建池；卸载默认保留上游与凭据。
-            - **AI 配置接口**：`/api/ai/manifest`、`schema`、`templates`、`inspect`、`plan`、`apply`、`audit`、`/llms.txt`；默认只读 + 草案，密钥/账号/Cookie 永不返回。
-            - 兼容：`bridge.config.json` 仍为唯一事实源；`/v1`、`/{upstream}/v1`、`/unified/v1` 与旧配置读取全部保留。
+            - **唯一控制台**：`/ui/` 即 v3 控制台；`/ui/classic` 仅做 308 永久跳转，旧面板资源从仓库与运行时移除。
+            - **12 个子视图 / 5 个分区**：总览、全部接入、模型与定价、路由组、凭据池、插件、免费来源、ZCode、用量分析、提示词、运行日志、设置。
+            - **全功能并入**：模型目录与定价、路由组、用量与请求明细、提示词演进与差异、免费来源、ZCode 账号池、运行日志、备份恢复、配置说明与更新检查。
+            - **高级编辑**：接入详情抽屉支持模型/别名/覆盖、`compat`、`timeoutSeconds`、`sessionHeader` 等字段，`null` 可清除可选字段。
+            - **兼容承诺**：`bridge.config.json` 仍是唯一事实源；`/v1`、`/{upstream}/v1`、`/unified/v1`、`/unified/{group}/v1` 与旧配置读取全部保留；SQLite 只追加新表。
             - 安装包：`Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe`（安装时可选安装目录）
             - 便携版：`Model-Gate-rust.exe`（单文件，免安装）
             - 校验：`SHA256SUMS`

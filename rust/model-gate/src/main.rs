@@ -24,7 +24,6 @@ mod provider_profiles;
 mod proxy;
 mod secret_store;
 mod thinking;
-mod ui_assets;
 mod update;
 mod update_paths;
 mod user_env;

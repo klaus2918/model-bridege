@@ -515,7 +515,7 @@ uninstall(plugin_id, {detach?=false, purge_data?=false}):
 | `src/provider_profiles.rs` | 注册表改读「内置插件 + 已安装插件」，内嵌 JSON 作 fallback | 现有 14 套顺序不变 |
 | `src/main.rs:320` | 调度改由 `runtime.scheduler` 声明 | ZCode 行为不变 |
 | `src/db.rs` | **只在 `SCHEMA` 追加三张表**；`MIGRATIONS` 不动 | G1/G2 守卫 |
-| `src/ui_assets.rs` + `ui/index.html` | 新增「插件市场」tab | 原有 tab 不动 |
+| `ui/v3.html` + `ui/v3.js` | 新增 v3「插件」视图 | 原有 v3 视图不动 |
 | `src/zcode/*` | **不改** | 配置与表结构保持原样 |
 
 ---
@@ -597,11 +597,11 @@ CREATE TABLE IF NOT EXISTS plugin_kv (
 新增「插件市场」tab（放在「配置」之后），三视图：已安装 / 市场 / 更新。
 卡片展示 `kind`、`tier`、版本、三态、权限摘要、配置块路径（如 `data/zcode.json`）。
 
-原有页面**不搬家**：
+v3 视图**不重复建房**：
 
-- 「免费来源」tab 保持常驻（发现免费模型的入口），作为 `modelgate.free.*` 的详情页；
-- 「ZCode」tab 保持未启用时隐藏，作为 `modelgate.account.zcode` 的详情页；
-- 市场卡片只提供「入口 + 状态 + 生命周期按钮」，具体操作仍在原页面。
+- 「免费来源」视图保持常驻（发现免费模型的入口），作为 `modelgate.free.*` 的详情页；
+- 「ZCode」视图保持未启用时隐藏，作为 `modelgate.account.zcode` 的详情页；
+- 插件卡片只提供「入口 + 状态 + 生命周期按钮」，具体操作仍在对应 v3 视图。
 
 ---
 

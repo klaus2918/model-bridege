@@ -20,7 +20,8 @@
     <span id="listen-addr">127.0.0.1:8900</span>
   </div>
   <div class="top-actions">
-    <button class="btn ghost sm" id="open-classic" title="保留原面板的全部高级功能">经典面板</button>
+    <button class="btn ghost sm" id="config-help-btn" title="配置说明与常用写法">配置说明</button>
+    <button class="btn ghost sm" id="update-btn" title="检查 GitHub 新版本" hidden>检查更新</button>
     <button class="btn ghost sm" id="theme-toggle" title="切换深色 / 浅色">主题</button>
     <button class="btn primary sm" id="quick-add">+ 添加接入</button>
   </div>
@@ -36,18 +37,21 @@
       <div class="nav-group">
         <div class="nav-label">接入</div>
         <button class="nav-item" data-view="access"><span class="nav-ico">⇄</span>全部接入</button>
-        <button class="nav-item" data-view="models"><span class="nav-ico">▤</span>模型目录</button>
+        <button class="nav-item" data-view="models"><span class="nav-ico">▤</span>模型与定价</button>
         <button class="nav-item" data-view="routes"><span class="nav-ico">⑃</span>路由组</button>
       </div>
       <div class="nav-group">
         <div class="nav-label">资源</div>
         <button class="nav-item" data-view="credentials"><span class="nav-ico">⚿</span>凭据池</button>
         <button class="nav-item" data-view="plugins"><span class="nav-ico">⬡</span>插件</button>
+        <button class="nav-item" data-view="free"><span class="nav-ico">◇</span>免费来源</button>
+        <button class="nav-item" data-view="zcode"><span class="nav-ico">⌁</span>ZCode</button>
       </div>
       <div class="nav-group">
         <div class="nav-label">观测</div>
-        <button class="nav-item" data-view="traffic"><span class="nav-ico">∿</span>流量</button>
-        <button class="nav-item" data-view="observe"><span class="nav-ico">◎</span>观测</button>
+        <button class="nav-item" data-view="traffic"><span class="nav-ico">∿</span>用量分析</button>
+        <button class="nav-item" data-view="prompts"><span class="nav-ico">◎</span>提示词</button>
+        <button class="nav-item" data-view="logs"><span class="nav-ico">▥</span>运行日志</button>
       </div>
       <div class="nav-group">
         <div class="nav-label">设置</div>
@@ -160,18 +164,88 @@
       </div>
     </section>
 
-    <!-- 模型目录 -->
+    <!-- 模型与定价 -->
     <section class="view" id="view-models">
       <div class="page-head">
-        <div><h1>模型目录</h1><p class="sub">声明模型、别名与上游映射；目录属于接入，不再单独占一级页签。</p></div>
-        <button class="btn ghost sm" id="models-refresh">刷新</button>
+        <div><h1>模型与定价</h1><p class="sub">一个页面完成模型清单、别名、上游映射、单价与费用重算。</p></div>
+        <div class="head-actions">
+          <button class="btn ghost sm" id="models-refresh">刷新</button>
+        </div>
       </div>
-      <div class="card flush">
-        <div class="table-wrap">
-          <table class="table" id="models-table">
-            <thead><tr><th>接入</th><th>协议</th><th>声明</th><th>别名 / 映射</th><th>模型</th><th class="right">操作</th></tr></thead>
+      <div class="seg-tabs" id="model-tabs">
+        <button class="seg-tab active" data-model-tab="catalog">模型清单</button>
+        <button class="seg-tab" data-model-tab="pricing">单价表</button>
+      </div>
+      <div id="model-catalog-panel">
+        <div class="toolbar">
+          <input class="input search" id="model-search" placeholder="搜索模型 / 别名 / 上游">
+          <select class="input select" id="model-upstream"><option value="">全部上游</option></select>
+          <select class="input select" id="model-price-filter">
+            <option value="">全部单价</option>
+            <option value="missing">未配置单价</option>
+            <option value="priced">已配置单价</option>
+          </select>
+          <select class="input select" id="model-source-filter">
+            <option value="">全部来源</option>
+            <option value="explicit">白名单</option>
+            <option value="fetched">目录拉取</option>
+            <option value="catalog">套餐门槛</option>
+          </select>
+          <button class="btn ghost sm" id="model-set-default">设为默认模型</button>
+        </div>
+        <div class="stat-row" id="model-kpis"></div>
+        <div class="card flush">
+          <div class="table-wrap"><table class="table" id="model-catalog-table">
+            <thead><tr><th>模型</th><th>上游</th><th>来源</th><th>别名</th><th>套餐门槛</th><th class="num">单价</th><th class="right">操作</th></tr></thead>
             <tbody></tbody>
-          </table>
+          </table></div>
+          <div class="pager" id="model-pager">
+            <button class="btn ghost sm" data-model-page="first">« 首页</button>
+            <button class="btn ghost sm" data-model-page="prev">上一页</button>
+            <span class="hint" id="model-page-info">—</span>
+            <button class="btn ghost sm" data-model-page="next">下一页</button>
+            <button class="btn ghost sm" data-model-page="last">末页 »</button>
+            <select class="input select" id="model-page-size"><option value="25">25 条/页</option><option value="50">50 条/页</option><option value="100">100 条/页</option></select>
+          </div>
+        </div>
+      </div>
+      <div id="model-pricing-panel" hidden>
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head"><h2>汇率与保存</h2><span class="pill" id="pricing-count">0 条</span></div>
+            <div class="form-grid">
+              <label class="field"><span>USD → CNY 汇率</span><input class="input" id="pricing-fx" type="number" step="0.0001" min="0"></label>
+              <label class="check"><input type="checkbox" id="pricing-recompute"> 保存后重算历史费用</label>
+              <label class="check"><input type="checkbox" id="pricing-backup" checked> 保存前备份</label>
+            </div>
+            <div class="card-actions wrap" style="margin-top:12px">
+              <button class="btn primary sm" id="pricing-save">保存单价表</button>
+              <button class="btn ghost sm" id="pricing-json-open">编辑 JSON</button>
+              <span class="hint" id="pricing-hint">—</span>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>新增条目</h2></div>
+            <div class="form-grid">
+              <label class="field"><span>上游（留空 = 全部）</span><select class="input" id="pricing-add-upstream"><option value="">全部上游</option></select></label>
+              <label class="field"><span>模型（支持 * 通配）</span><input class="input" id="pricing-add-model" placeholder="deepseek-*"></label>
+              <label class="field"><span>计费类型</span><select class="input" id="pricing-add-type"><option value="per-token">按量计费</option><option value="quota">额度制</option></select></label>
+              <label class="field"><span>币种</span><select class="input" id="pricing-add-currency"><option value="USD">USD</option><option value="CNY">CNY</option></select></label>
+              <label class="field"><span>输入 / 百万 token</span><input class="input" id="pricing-add-input" type="number" step="0.0001"></label>
+              <label class="field"><span>输出 / 百万 token</span><input class="input" id="pricing-add-output" type="number" step="0.0001"></label>
+              <label class="field span-2"><span>标签</span><input class="input" id="pricing-add-label" placeholder="便于识别的厂商/套餐名"></label>
+            </div>
+            <div class="card-actions" style="margin-top:12px">
+              <button class="btn ghost sm" id="pricing-add">添加到最前</button>
+            </div>
+          </div>
+        </div>
+        <div class="card flush" style="margin-top:16px">
+          <div class="table-wrap"><table class="table" id="pricing-table">
+            <thead><tr><th>上游</th><th>模型</th><th>类型</th><th>币种</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th><th>标签</th><th class="right">操作</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+          <div class="empty" id="pricing-empty" hidden><div class="empty-mark">¥</div><h3>还没有单价条目</h3><p>用上方表单新增，或点「编辑 JSON」批量导入。</p></div>
         </div>
       </div>
     </section>
@@ -208,8 +282,8 @@
       <div id="pool-list" class="grid two"></div>
       <div class="card" id="zcode-note">
         <div class="card-head"><h2>ZCode 账号池</h2><span class="pill">兼容旧资产</span></div>
-        <p class="hint">ZCode 账号、领取记录与验证码仍由原面板管理；此处只做池状态映射，不复制账号密文。</p>
-        <button class="btn ghost sm" id="open-zcode">打开 ZCode 账号页</button>
+        <p class="hint">账号池映射与成员状态在这里只读展示；账号导入、领取、OAuth 与验证码自检在「ZCode」页面完成。</p>
+        <button class="btn ghost sm" data-go="zcode">打开 ZCode 管理</button>
       </div>
     </section>
 
@@ -226,75 +300,319 @@
       <div id="plugin-list" class="grid three"></div>
     </section>
 
-    <!-- 流量 -->
+    <!-- 用量分析 -->
     <section class="view" id="view-traffic">
       <div class="page-head">
-        <div><h1>流量</h1><p class="sub">用量与请求日志合并；先回答“谁在花、哪里慢、哪里错”。</p></div>
+        <div><h1>用量分析</h1><p class="sub">范围、上游、模型、会话统一作用域；先看趋势与异常，再下钻到每一次请求。</p></div>
         <div class="head-actions">
-          <select class="input select" id="traffic-range">
-            <option value="1">今天</option>
-            <option value="7">近 7 天</option>
-            <option value="30">近 30 天</option>
-          </select>
-          <button class="btn ghost sm" id="traffic-refresh">刷新</button>
+          <button class="btn ghost sm" id="usage-refresh">刷新</button>
         </div>
       </div>
-      <div class="stat-row" id="traffic-stats"></div>
+      <div class="toolbar">
+        <select class="input select" id="usage-range">
+          <option value="today">今日</option><option value="yesterday">昨日</option><option value="24h">24 小时</option>
+          <option value="3d">3 天</option><option value="7d" selected>7 天</option><option value="30d">30 天</option><option value="all">全部</option>
+        </select>
+        <select class="input select" id="usage-upstream"><option value="">全部上游</option></select>
+        <select class="input select" id="usage-model"><option value="">全部模型</option></select>
+        <select class="input select" id="usage-session"><option value="">全部会话</option></select>
+        <select class="input select" id="usage-currency"><option value="CNY">¥ CNY</option><option value="USD">$ USD</option></select>
+        <select class="input select" id="usage-auto"><option value="0">不自动刷新</option><option value="10">10 秒</option><option value="30" selected>30 秒</option><option value="60">1 分钟</option></select>
+        <button class="btn ghost sm" id="usage-clear-filter">清除筛选</button>
+        <button class="btn ghost sm" id="usage-export-csv">导出 CSV</button>
+        <button class="btn ghost sm" id="usage-export-json">导出 JSON</button>
+        <button class="btn ghost sm" id="usage-clear">清空区间</button>
+      </div>
+      <div class="stat-row" id="usage-kpis"></div>
       <div class="grid two">
         <div class="card">
-          <div class="card-head"><h2>上游用量</h2></div>
-          <div class="table-wrap"><table class="table" id="traffic-upstreams"><thead><tr><th>上游</th><th class="num">请求</th><th class="num">Token</th><th class="num">失败</th></tr></thead><tbody></tbody></table></div>
+          <div class="card-head"><h2>Token 构成</h2><span class="hint" id="usage-mix-hint">—</span></div>
+          <div class="mixbar" id="usage-mix"></div>
+          <div class="list compact" id="usage-mix-legend"></div>
         </div>
         <div class="card">
-          <div class="card-head"><h2>请求日志</h2><button class="btn ghost sm" id="logs-clear">清空</button></div>
-          <div class="table-wrap"><table class="table" id="traffic-logs"><thead><tr><th>时间</th><th>上游</th><th>模型</th><th>状态</th><th class="num">耗时</th></tr></thead><tbody></tbody></table></div>
+          <div class="card-head"><h2>耗时分布</h2><span class="hint">均值 / P50 / P95 / 最长</span></div>
+          <div class="list compact" id="usage-latency"></div>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:16px">
+        <div class="card">
+          <div class="card-head"><h2>趋势</h2>
+            <select class="input select" id="usage-trend-metric"><option value="total_tokens">总 Token</option><option value="requests">请求数</option><option value="errors">错误</option></select>
+          </div>
+          <div class="chart" id="usage-trend"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>分布</h2><span class="hint" id="usage-pie-hint">跟随筛选自动切换维度</span></div>
+          <div class="chart legend" id="usage-pie"></div>
+        </div>
+      </div>
+      <div class="card flush" style="margin-top:16px">
+        <div class="card-head"><h2>上游用量</h2><span class="hint" id="usage-upstream-hint"></span></div>
+        <div class="table-wrap"><table class="table" id="usage-upstream-table">
+          <thead><tr><th>上游</th><th class="num">模型</th><th class="num">命中率</th><th class="num">请求</th><th class="num">缓存</th><th class="num">总 Token</th><th class="num">成功率</th><th class="num">均耗</th><th class="num">P95</th><th class="num">费用</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="card flush" style="margin-top:16px">
+        <div class="card-head"><h2>会话统计</h2><span class="hint">点击会话行收窄整页</span></div>
+        <div class="table-wrap"><table class="table" id="usage-session-table">
+          <thead><tr><th>会话</th><th class="num">请求</th><th class="num">错误</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th><th class="num">总 Token</th><th class="num">成功率</th><th class="num">均耗</th><th class="num">P95</th><th>首末活跃</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="card flush" style="margin-top:16px">
+        <div class="card-head"><h2>模型用量</h2><span class="hint" id="usage-model-hint"></span></div>
+        <div class="table-wrap"><table class="table" id="usage-model-table">
+          <thead><tr><th>模型</th><th class="num">命中率</th><th class="num">请求</th><th class="num">输入</th><th class="num">输出</th><th class="num">缓存</th><th class="num">总 Token</th><th class="num">费用</th><th class="num">成功率</th><th class="num">均耗</th><th class="num">P95</th><th class="num">TTFT</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="card flush" style="margin-top:16px">
+        <div class="card-head"><h2>请求明细</h2>
+          <div class="card-actions wrap">
+            <select class="input select" id="usage-only">
+              <option value="">全部</option><option value="error">仅错误</option><option value="slow">慢请求 ≥10s</option><option value="ttft">有首 Token</option><option value="cache">命中缓存</option><option value="truncated">截断</option><option value="paused">未续完</option>
+            </select>
+            <select class="input select" id="usage-page-size"><option value="25">25 条/页</option><option value="50" selected>50 条/页</option><option value="100">100 条/页</option></select>
+          </div>
+        </div>
+        <div class="table-wrap"><table class="table" id="usage-detail-table">
+          <thead><tr><th>时间</th><th>模型</th><th>上游</th><th class="num">入 / 出</th><th class="num">缓存</th><th class="num">费用</th><th class="num">耗时</th><th class="num">TTFT</th><th>状态</th><th>会话</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <div class="pager">
+          <button class="btn ghost sm" data-usage-page="first">« 首页</button>
+          <button class="btn ghost sm" data-usage-page="prev">上一页</button>
+          <span class="hint" id="usage-page-info">—</span>
+          <button class="btn ghost sm" data-usage-page="next">下一页</button>
+          <button class="btn ghost sm" data-usage-page="last">末页 »</button>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-head"><h2>数据保留与清理</h2><span class="hint" id="usage-retention-hint">0 = 永久保留</span></div>
+        <div class="card-actions wrap">
+          <input class="input" id="usage-retention-days" type="number" min="0" style="width:120px">
+          <button class="btn ghost sm" id="usage-retention-apply">立即清理</button>
         </div>
       </div>
     </section>
 
-    <!-- 观测 -->
-    <section class="view" id="view-observe">
+    <!-- 免费来源 -->
+    <section class="view" id="view-free">
       <div class="page-head">
-        <div><h1>观测</h1><p class="sub">统一诊断与提示词审查；默认只看最近 24h 的 error / warn。</p></div>
-        <button class="btn ghost sm" id="observe-refresh">刷新</button>
+        <div><h1>免费来源</h1><p class="sub">一键接入免密上游，按模型探测真实可用性；风险与配额提示直接展示。</p></div>
+        <div class="head-actions"><button class="btn ghost sm" id="free-refresh">刷新</button></div>
       </div>
+      <div class="stat-row" id="free-summary"></div>
+      <div id="free-sources" class="grid two"></div>
+      <div class="card" id="free-models-card" hidden style="margin-top:16px">
+        <div class="card-head"><h2 id="free-models-title">模型</h2><span class="hint" id="free-models-meta">—</span></div>
+        <div class="toolbar">
+          <select class="input select" id="free-model-state"><option value="">全部状态</option><option value="available">可用</option><option value="transient">暂时不可用</option><option value="unavailable">明确不可用</option></select>
+          <button class="btn ghost sm" id="free-probe-all">全部探测</button>
+          <span class="hint" id="free-probe-hint">探测会真实调用上游，消耗免费额度。</span>
+        </div>
+        <div class="table-wrap"><table class="table" id="free-model-table">
+          <thead><tr><th>模型</th><th>状态</th><th class="num">上下文</th><th>思考档位</th><th class="num">延迟</th><th>拒因与建议</th><th class="right">操作</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- ZCode -->
+    <section class="view" id="view-zcode">
+      <div class="page-head">
+        <div><h1>ZCode 账号池</h1><p class="sub">可选账号型上游：配置、导入、OAuth、领取与账号健康都在这里。</p></div>
+        <div class="head-actions">
+          <button class="btn ghost sm" id="zcode-help">配置说明</button>
+          <button class="btn ghost sm" id="zcode-refresh">刷新</button>
+        </div>
+      </div>
+      <div class="stat-row" id="zcode-status"></div>
       <div class="grid two">
         <div class="card">
-          <div class="card-head"><h2>诊断</h2><span class="pill" id="diag-count">0</span></div>
-          <div id="diagnostic-list" class="list compact"></div>
+          <div class="card-head"><h2>基础设置</h2><span class="hint" id="zcode-save-hint">启用只影响聊天请求</span></div>
+          <form id="zcode-config-form" autocomplete="off" class="form-grid">
+            <label class="check span-2"><input type="checkbox" id="zcode-enabled"> 启用 ZCode 插件</label>
+            <label class="field span-2"><span>ZCode CLI 路径</span><input class="input" id="zcode-cli-path" placeholder="留空自动探测"></label>
+            <label class="check"><input type="checkbox" id="zcode-auto-claim"> 每日定时领取</label>
+            <label class="field"><span>领取时间</span><input class="input" id="zcode-claim-time" type="time"></label>
+            <label class="field"><span>失败换号上限</span><input class="input" id="zcode-concurrency" type="number" min="1" max="4"></label>
+            <label class="field"><span>连接方式</span><select class="input" id="zcode-backend"><option value="appserver">本机 CLI（推荐）</option><option value="direct">直连</option></select></label>
+            <label class="field"><span>Node 路径</span><input class="input" id="zcode-node-path"></label>
+            <label class="field"><span>ZCode 数据目录</span><input class="input" id="zcode-data-dir"></label>
+            <label class="field"><span>浏览器路径</span><input class="input" id="zcode-browser-path"></label>
+            <label class="field"><span>验证码场景 ID</span><input class="input" id="zcode-captcha-scene"></label>
+            <div class="span-2 card-actions wrap">
+              <button class="btn primary sm" type="button" id="zcode-save">保存设置</button>
+              <button class="btn ghost sm" type="button" id="zcode-captcha-test">验证码自检</button>
+              <span class="hint" id="zcode-captcha-hint"></span>
+            </div>
+          </form>
         </div>
         <div class="card">
-          <div class="card-head"><h2>提示词记录</h2><button class="btn ghost sm" id="open-prompts">打开完整页</button></div>
-          <div id="prompt-list" class="list compact"></div>
+          <div class="card-head"><h2>账号操作</h2><span class="hint" id="zcode-pool-hint">—</span></div>
+          <div class="card-actions wrap">
+            <button class="btn primary sm" id="zcode-import-local">从本机导入</button>
+            <button class="btn ghost sm" id="zcode-add-manual">批量添加</button>
+            <button class="btn ghost sm" id="zcode-oauth-start">OAuth 登录</button>
+            <button class="btn ghost sm" id="zcode-claim-preview">预览可领</button>
+            <button class="btn ghost sm" id="zcode-claim-now">立即领取</button>
+            <button class="btn ghost sm" id="zcode-attach">接入 GLM 上游</button>
+          </div>
+          <div class="inline-note" id="zcode-action-hint">密钥只保存密文，页面只显示掩码。</div>
         </div>
       </div>
+      <div class="card flush" style="margin-top:16px">
+        <div class="card-head"><h2>账号</h2><span class="hint">调用 / 失败 / 最近错误</span></div>
+        <div class="table-wrap"><table class="table" id="zcode-account-table">
+          <thead><tr><th>名称</th><th>模式</th><th>状态</th><th>套餐 / 额度</th><th class="num">调用 / 失败</th><th>最近错误</th><th class="right">操作</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </div>
+      <div class="card flush" style="margin-top:16px">
+        <div class="card-head"><h2>领取记录</h2><span class="hint">只记录业务码与结果，不记录凭据</span></div>
+        <div class="table-wrap"><table class="table" id="zcode-claim-table">
+          <thead><tr><th>时间</th><th>账号</th><th>套餐</th><th>结果</th><th>下次检查</th></tr></thead><tbody></tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- 提示词 -->
+    <section class="view" id="view-prompts">
+      <div class="page-head">
+        <div><h1>提示词</h1><p class="sub">入站消息审计、会话演进与差异分析；默认脱敏，不记录模型响应。</p></div>
+        <div class="head-actions"><button class="btn ghost sm" id="prompts-refresh">刷新</button></div>
+      </div>
+      <div class="seg-tabs" id="prompt-tabs">
+        <button class="seg-tab active" data-prompt-tab="list">提示词列表</button>
+        <button class="seg-tab" data-prompt-tab="evolution">会话演进</button>
+      </div>
+      <div class="toolbar">
+        <select class="input select" id="prompt-range"><option value="today">今日</option><option value="yesterday">昨日</option><option value="24h">24 小时</option><option value="3d">3 天</option><option value="7d" selected>7 天</option><option value="30d">30 天</option><option value="all">全部</option></select>
+        <select class="input select" id="prompt-model"><option value="">全部模型</option></select>
+        <select class="input select" id="prompt-session"><option value="">全部会话</option></select>
+        <input class="input search" id="prompt-q" placeholder="搜索提示词内容">
+        <button class="btn ghost sm" id="prompt-export">导出 JSONL</button>
+        <button class="btn ghost sm" id="prompt-clear">清空</button>
+        <button class="btn ghost sm" id="prompt-vacuum">回收空间</button>
+        <span class="hint" id="prompt-hint">—</span>
+      </div>
+      <div class="card" id="prompt-disabled" hidden>
+        <div class="card-head"><h2>提示词记录未开启</h2></div>
+        <p class="hint">开启后只记录入站 messages，不记录模型响应；写入前会过滤常见密钥与私钥。</p>
+        <button class="btn primary sm" data-go="settings">去设置开启</button>
+      </div>
+      <div id="prompt-list-view">
+        <div class="card flush">
+          <div class="table-wrap"><table class="table" id="prompt-table">
+            <thead><tr><th>时间</th><th>会话</th><th>模型</th><th class="num">消息数</th><th class="num">字符数</th><th>预览</th><th class="right">操作</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+        </div>
+      </div>
+      <div id="prompt-evolution-view" hidden>
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head"><h2>请求时间轴</h2><span class="hint" id="evolution-count">—</span></div>
+            <div class="toolbar">
+              <select class="input select" id="evolution-session"><option value="">选择会话</option></select>
+              <select class="input select" id="evolution-mode"><option value="rounds">轮次</option><option value="full">全貌</option></select>
+              <button class="btn ghost sm" id="evolution-refresh">刷新</button>
+            </div>
+            <div id="evolution-timeline" class="prompt-timeline"></div>
+          </div>
+          <div class="card" id="evolution-diff-box">
+            <div class="card-head"><h2>差异分析</h2>
+              <div class="card-actions">
+                <select class="input select" id="evolution-role"><option value="">全部角色</option><option value="system">system</option><option value="user">user</option><option value="assistant">assistant</option><option value="tool">tool</option></select>
+                <label class="check"><input type="checkbox" id="evolution-only-diff" checked> 仅看差异</label>
+              </div>
+            </div>
+            <div class="inline-note" id="evolution-compare">选择两轮进行对比</div>
+            <div id="evolution-stats" class="stat-row"></div>
+            <div id="prompt-diff" class="prompt-diff"></div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>工具执行评估</h2><span class="hint" id="evolution-tool-meta">—</span></div>
+          <div class="table-wrap"><table class="table" id="evolution-tool-table">
+            <thead><tr><th>工具</th><th class="num">调用</th><th class="num">未匹配</th><th class="num">重复</th><th class="num">结果消息</th><th class="num">字符合计</th><th class="num">单次最大</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+          <details class="fold"><summary>评估报告（Markdown）</summary><pre id="evolution-tool-report" class="code-block"></pre></details>
+          <button class="btn ghost sm" id="copy-tool-report">复制评估报告</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 运行日志 -->
+    <section class="view" id="view-logs">
+      <div class="page-head">
+        <div><h1>运行日志</h1><p class="sub">从日志文件尾部读取；支持级别过滤、搜索、自动刷新与清空。</p></div>
+        <div class="head-actions"><button class="btn ghost sm" id="runtime-refresh">刷新</button></div>
+      </div>
+      <div class="toolbar">
+        <select class="input select" id="runtime-level"><option value="all">全部</option><option value="error">只看错误</option><option value="warn">注意 / 截断</option></select>
+        <input class="input search" id="runtime-search" placeholder="搜索关键字">
+        <select class="input select" id="runtime-lines"><option value="200">200 行</option><option value="400" selected>400 行</option><option value="800">800 行</option><option value="2000">2000 行</option></select>
+        <select class="input select" id="runtime-auto"><option value="0">不自动刷新</option><option value="4" selected>4 秒</option><option value="10">10 秒</option><option value="30">30 秒</option></select>
+        <button class="btn ghost sm" id="runtime-copy">复制</button>
+        <button class="btn danger sm" id="runtime-clear">清空日志</button>
+        <span class="hint" id="runtime-meta">—</span>
+      </div>
+      <div class="card"><pre id="runtime-viewer" class="log-viewer"></pre></div>
     </section>
 
     <!-- 设置 -->
     <section class="view" id="view-settings">
       <div class="page-head">
-        <div><h1>设置</h1><p class="sub">分组卡片，不再一页长表单；原始 JSON 仍保留在高级入口。</p></div>
-        <button class="btn primary sm" id="settings-save">保存设置</button>
+        <div><h1>设置</h1><p class="sub">服务、全局、提示词、统一接入、路由组与高级维护；保存前统一校验。</p></div>
+        <div class="head-actions">
+          <button class="btn ghost sm" id="settings-reload">从文件重载</button>
+          <button class="btn ghost sm" id="settings-restore">恢复上次备份</button>
+          <button class="btn primary sm" id="settings-save">保存设置</button>
+        </div>
       </div>
+      <div class="notice" id="settings-dirty" hidden>有未保存的改动。保存会写回 bridge.config.json 并立即生效（端口变更需重启）。</div>
       <div class="grid two">
         <div class="card">
-          <div class="card-head"><h2>全局</h2></div>
+          <div class="card-head"><h2>服务与全局</h2><span class="hint" id="settings-service-hint">—</span></div>
           <div class="form-grid">
             <label class="field"><span>监听地址</span><input class="input" id="set-host"></label>
             <label class="field"><span>端口</span><input class="input" id="set-port" type="number" min="1" max="65535"></label>
             <label class="field"><span>默认模型</span><input class="input" id="set-default-model" placeholder="留空 = 按接入顺序"></label>
+            <label class="field"><span>最大输出 token</span><input class="input" id="set-max-tokens" placeholder="8192 / 384K / 30万"></label>
             <label class="field"><span>请求超时（秒）</span><input class="input" id="set-timeout" type="number" min="1"></label>
             <label class="field"><span>模型缓存（秒）</span><input class="input" id="set-models-cache" type="number" min="0"></label>
-            <label class="check"><input type="checkbox" id="set-access-log"> 记录访问日志</label>
-            <label class="check"><input type="checkbox" id="set-prompt-capture"> 记录提示词</label>
+            <label class="field"><span>数据保留（天，0=永久）</span><input class="input" id="set-retention" type="number" min="0"></label>
+            <label class="field"><span>对外模型白名单（每行一个）</span><textarea class="input" id="set-models" rows="3"></textarea></label>
+            <label class="field"><span>别名（每行「别名 = 真实模型」）</span><textarea class="input" id="set-aliases" rows="3"></textarea></label>
+            <div class="card-actions wrap span-2">
+              <label class="check"><input type="checkbox" id="set-access-log"> 访问日志</label>
+              <label class="check"><input type="checkbox" id="set-thinking"> thinking 回传</label>
+              <label class="check"><input type="checkbox" id="set-free-panel"> 显示免费来源</label>
+              <label class="check"><input type="checkbox" id="set-zcode-panel"> 显示 ZCode</label>
+            </div>
           </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>提示词记录</h2><span class="pill">默认关闭</span></div>
+          <div class="form-grid">
+            <label class="check span-2"><input type="checkbox" id="set-prompt-capture"> 记录入站提示词</label>
+            <label class="field"><span>保留天数（0=永久）</span><input class="input" id="set-prompt-retention" type="number" min="0"></label>
+            <label class="field"><span>最多条数（0=不限）</span><input class="input" id="set-prompt-max-records" type="number" min="0"></label>
+            <label class="field"><span>单条最大字符数</span><input class="input" id="set-prompt-max-chars" type="number" min="1000"></label>
+          </div>
+          <div class="inline-note">只记录 messages，不记录响应；写入前过滤常见密钥、JWT、私钥与 URL token。</div>
         </div>
         <div class="card">
           <div class="card-head"><h2>AI 配置接口</h2><span class="pill">只读 + 草案</span></div>
           <div class="form-grid">
             <label class="check"><input type="checkbox" id="set-ai-enabled"> 启用 AI 配置接口</label>
-            <label class="check"><input type="checkbox" id="set-ai-apply"> 允许 AI 应用非敏感计划</label>
-            <label class="check"><input type="checkbox" id="set-ai-pool"> 允许读取池统计（不含成员标签）</label>
+            <label class="check"><input type="checkbox" id="set-ai-apply"> 允许应用非敏感计划</label>
+            <label class="check"><input type="checkbox" id="set-ai-pool"> 允许读取池统计</label>
           </div>
           <div class="inline-note">入口：<code>GET /api/ai/manifest</code> · <code>GET /llms.txt</code> · 密钥永不返回。</div>
           <div class="card-actions wrap">
@@ -303,16 +621,36 @@
           </div>
         </div>
         <div class="card">
+          <div class="card-head"><h2>统一接入可见性</h2><span class="hint">不选 = 全部可见</span></div>
+          <div id="unified-visible-list" class="check-grid"></div>
+          <div class="inline-note">只影响 <code>/unified/v1</code> 暴露范围；<code>/上游/v1</code> 不受影响。</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>统一入口分组</h2><button class="btn ghost sm" id="unified-group-add">+ 新增分组</button></div>
+          <div id="unified-group-list" class="list compact"></div>
+          <div class="inline-note">分组标识用于 <code>/unified/{组}/v1</code>；只允许字母、数字、<code>- _ .</code>。</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>路由组</h2><button class="btn ghost sm" id="route-group-add">+ 新增路由组</button></div>
+          <div id="route-group-settings" class="list compact"></div>
+          <div class="inline-note">请求 <code>model=group/&lt;id&gt;</code> 时按成员顺序切换；401/403/404/普通 400 不切换。</div>
+        </div>
+        <div class="card">
           <div class="card-head"><h2>模板</h2><span class="pill" id="template-count">0</span></div>
           <div id="template-list" class="list compact"></div>
         </div>
         <div class="card">
-          <div class="card-head"><h2>高级</h2></div>
-          <p class="hint">原始 JSON、备份恢复、诊断导出、免费来源、提示词会话演进仍在经典面板。</p>
+          <div class="card-head"><h2>高级维护</h2></div>
+          <p class="hint" id="settings-storage-hint">配置文件是唯一事实源；保存前默认生成备份。</p>
+          <label class="check"><input type="checkbox" id="settings-backup" checked> 保存前生成配置备份</label>
           <div class="card-actions wrap">
-            <button class="btn ghost sm" id="settings-classic">打开经典面板</button>
+            <button class="btn ghost sm" id="settings-validate">校验当前配置</button>
+            <button class="btn ghost sm" id="settings-json">原始 JSON</button>
             <button class="btn ghost sm" id="settings-backups">备份列表</button>
+            <button class="btn ghost sm" id="settings-diagnostics">导出诊断</button>
+            <button class="btn ghost sm" id="settings-update">检查更新</button>
           </div>
+          <div id="settings-issues" class="list compact" style="margin-top:12px"></div>
         </div>
       </div>
     </section>
@@ -333,6 +671,7 @@
     <button class="drawer-tab" data-dtab="connection">连接</button>
     <button class="drawer-tab" data-dtab="credential">凭据</button>
     <button class="drawer-tab" data-dtab="models">模型</button>
+    <button class="drawer-tab" data-dtab="advanced">高级</button>
     <button class="drawer-tab" data-dtab="diagnostics">诊断</button>
   </div>
   <div class="drawer-body" id="drawer-body"></div>
@@ -358,5 +697,10 @@
 
 <div class="toast" id="toast" hidden></div>
 <script src="v3.js"></script>
+<script src="v3-config.js"></script>
+<script src="v3-models.js"></script>
+<script src="v3-usage.js"></script>
+<script src="v3-prompts.js"></script>
+<script src="v3-resources.js"></script>
 </body>
 </html>

@@ -715,7 +715,11 @@ pub(crate) fn next_config_with(state: &AppState, name: &str, entry: Value) -> Va
         Some(existing) => {
             if let Some(entry) = entry.as_object() {
                 for (key, value) in entry {
-                    existing.insert(key.clone(), value.clone());
+                    if value.is_null() {
+                        existing.remove(key);
+                    } else {
+                        existing.insert(key.clone(), value.clone());
+                    }
                 }
             }
         }
@@ -947,7 +951,13 @@ pub async fn update(
             entry.insert(key.to_string(), json!(value));
         }
     }
-    for key in ["fetchModels", "autoModels", "pauseTurn", "default"] {
+    for key in [
+        "fetchModels",
+        "autoModels",
+        "pauseTurn",
+        "default",
+        "sessionHeader",
+    ] {
         if let Some(value) = body.get(key).and_then(Value::as_bool) {
             entry.insert(key.to_string(), json!(value));
         }
@@ -955,6 +965,36 @@ pub async fn update(
     for key in ["models", "modelMap", "modelOverrides"] {
         if let Some(value) = body.get(key) {
             entry.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(value) = body.get("timeoutSeconds") {
+        match value {
+            Value::Null => {
+                entry.insert("timeoutSeconds".into(), Value::Null);
+            }
+            Value::Number(number) if number.as_u64().is_some() => {
+                entry.insert("timeoutSeconds".into(), value.clone());
+            }
+            _ => {
+                return access_error(
+                    StatusCode::BAD_REQUEST,
+                    "timeoutSeconds 必须是正整数或 null",
+                    "invalid_field",
+                );
+            }
+        }
+    }
+    if let Some(value) = body.get("compat") {
+        if value.is_null() {
+            entry.insert("compat".into(), Value::Null);
+        } else if value.is_object() {
+            entry.insert("compat".into(), value.clone());
+        } else {
+            return access_error(
+                StatusCode::BAD_REQUEST,
+                "compat 必须是 JSON 对象或 null",
+                "invalid_field",
+            );
         }
     }
     if body.get("privacy").is_some() {

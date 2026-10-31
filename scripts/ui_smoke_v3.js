@@ -7,8 +7,8 @@
  *   node scripts/ui_smoke_v3.js --base http://127.0.0.1:8912 --screenshot-dir docs/design/refactor-2026/screenshots-v3
  *
  * 前置：base 指向一个已启动、带演示数据的 Model-Gate 实例。
- * 覆盖：页面加载无 JS 异常、九个视图切换、接入详情抽屉、快速添加向导、
- *       凭据池、插件、设置、截图。
+ * 覆盖：页面加载无 JS 异常、十二个视图切换、接入详情抽屉、快速添加向导、
+ *       模型/定价、凭据池、插件、免费来源、ZCode、用量、提示词、运行日志、设置、截图。
  */
 "use strict";
 
@@ -290,7 +290,7 @@ async function main() {
   await cdp.send("Page.navigate", { url: `${base}/ui/` });
   await Promise.race([loaded, sleep(12000).then(() => { throw new Error("页面加载超时"); })]);
   await waitFor(
-    () => evaluate(`document.querySelectorAll(".nav-item").length >= 9 && !!document.querySelector("#view-overview.active")`),
+    () => evaluate(`document.querySelectorAll(".nav-item").length >= 12 && !!document.querySelector("#view-overview.active")`),
     12000,
     "v3 前端初始化",
   );
@@ -301,17 +301,27 @@ async function main() {
     return "0 个错误";
   });
 
-  await check("侧栏 9 个子视图与分组", async () => {
+  await check("侧栏 12 个子视图与分组", async () => {
     const data = await evaluate(`({
       views: Array.from(document.querySelectorAll(".nav-item")).map((b) => b.dataset.view),
       groups: Array.from(document.querySelectorAll(".nav-label")).map((el) => el.textContent.trim()),
     })`);
-    const expected = ["overview", "access", "models", "routes", "credentials", "plugins", "traffic", "observe", "settings"];
+    const expected = ["overview", "access", "models", "routes", "credentials", "plugins", "free", "zcode", "traffic", "prompts", "logs", "settings"];
     for (const view of expected) {
       if (!data.views.includes(view)) throw new Error(`缺少视图 ${view}`);
     }
     if (data.groups.length < 5) throw new Error(`分组不足：${data.groups.join("/")}`);
     return `${data.views.length} 视图 / ${data.groups.length} 分组`;
+  });
+
+  await check("旧经典入口永久跳转 v3", async () => {
+    const response = await fetch(`${base}/ui/classic`, { redirect: "manual" });
+    if (![301, 302, 307, 308].includes(response.status)) {
+      throw new Error(`期望重定向，实际 ${response.status}`);
+    }
+    const location = response.headers.get("location") || "";
+    if (!location.endsWith("/ui/")) throw new Error(`跳转目标异常：${location}`);
+    return `${response.status} -> ${location}`;
   });
 
   await check("总览展示接入健康与统计", async () => {
@@ -347,10 +357,14 @@ async function main() {
     await click("#access-table tbody tr[data-open]");
     await waitFor(() => evaluate(`!document.querySelector("#drawer").hidden`), 3000, "详情抽屉");
     const tabs = await evaluate(`Array.from(document.querySelectorAll(".drawer-tab")).map((b) => b.dataset.dtab)`);
-    if (tabs.length < 5) throw new Error(`抽屉页签不足：${tabs.join("/")}`);
+    if (tabs.length < 6) throw new Error(`抽屉页签不足：${tabs.join("/")}`);
     await click('.drawer-tab[data-dtab="connection"]');
     await waitFor(() => evaluate(`!!document.querySelector("#edit-baseurl")`), 2000, "连接页");
     await screenshot("v3-03-drawer");
+    await click('.drawer-tab[data-dtab="models"]');
+    await waitFor(() => evaluate(`!!document.querySelector("#edit-models") && !!document.querySelector("#save-models")`), 2000, "模型编辑页");
+    await click('.drawer-tab[data-dtab="advanced"]');
+    await waitFor(() => evaluate(`!!document.querySelector("#edit-compat") && !!document.querySelector("#save-advanced")`), 2000, "高级编辑页");
     await click("#drawer-close");
     return tabs.join(" / ");
   });
@@ -395,13 +409,47 @@ async function main() {
     return `${cards} 个插件`;
   });
 
-  await check("流量与观测视图可渲染", async () => {
+  await check("模型清单与单价表", async () => {
+    await navigate("models");
+    await waitFor(() => evaluate(`document.querySelectorAll("#model-kpis .stat").length >= 4`), 6000, "模型 KPI");
+    const models = await evaluate(`document.querySelectorAll("#model-catalog-table tbody tr").length`);
+    await screenshot("v3-07-models");
+    await click('#model-tabs [data-model-tab="pricing"]');
+    await waitFor(() => evaluate(`!document.querySelector("#model-pricing-panel").hidden`), 3000, "单价表");
+    await screenshot("v3-08-pricing");
+    return `${models} 行模型`;
+  });
+
+  await check("免费来源视图", async () => {
+    await navigate("free");
+    await waitFor(() => evaluate(`document.querySelectorAll("#free-sources .card").length >= 1`), 6000, "免费来源卡片");
+    await screenshot("v3-09-free");
+    return `${await evaluate(`document.querySelectorAll("#free-sources .card").length`)} 个来源`;
+  });
+
+  await check("ZCode 账号池视图", async () => {
+    await navigate("zcode");
+    await waitFor(() => evaluate(`document.querySelectorAll("#zcode-status .stat").length >= 4`), 6000, "ZCode 状态");
+    await screenshot("v3-10-zcode");
+    return `${await evaluate(`document.querySelectorAll("#zcode-account-table tr").length`)} 行账号`;
+  });
+
+  await check("用量分析与请求明细", async () => {
     await navigate("traffic");
-    await waitFor(() => evaluate(`document.querySelectorAll("#traffic-stats .stat").length >= 4`), 6000, "流量统计");
-    await screenshot("v3-07-traffic");
-    await navigate("observe");
-    await waitFor(() => evaluate(`!!document.querySelector("#diagnostic-list")`), 4000, "诊断列表");
-    return "流量 / 观测已渲染";
+    await waitFor(() => evaluate(`document.querySelectorAll("#usage-kpis .stat").length >= 4`), 8000, "用量统计");
+    const rows = await evaluate(`document.querySelectorAll("#usage-detail-table tbody tr").length`);
+    await screenshot("v3-11-traffic");
+    return `${rows} 行明细`;
+  });
+
+  await check("提示词与运行日志", async () => {
+    await navigate("prompts");
+    await waitFor(() => evaluate(`document.querySelectorAll("#prompt-table tbody tr").length >= 1`), 8000, "提示词列表");
+    await screenshot("v3-12-prompts");
+    await navigate("logs");
+    await waitFor(() => evaluate(`!!document.querySelector("#runtime-meta").textContent && document.querySelector("#runtime-meta").textContent !== "—"`), 5000, "运行日志");
+    await screenshot("v3-13-logs");
+    return "提示词 / 日志已渲染";
   });
 
   await check("设置读取配置与 AI 开关", async () => {
@@ -409,18 +457,24 @@ async function main() {
     await waitFor(() => evaluate(`!!document.querySelector("#set-host").value`), 5000, "设置表单");
     const host = await evaluate(`document.querySelector("#set-host").value`);
     const templates = await evaluate(`document.querySelectorAll("#template-list .row").length`);
-    await screenshot("v3-08-settings");
+    const groups = await evaluate(`document.querySelectorAll("#unified-visible-list .check").length`);
+    const backup = await evaluate(`document.querySelector("#settings-backup")?.checked === true`);
+    if (!backup) throw new Error("保存前备份默认未开启");
+    await click("#settings-validate");
+    await waitFor(
+      () => evaluate(`document.querySelector("#settings-issues").textContent.trim().length > 0`),
+      6000,
+      "配置校验结果",
+    );
+    const issues = await evaluate(`document.querySelector("#settings-issues").textContent.trim()`);
+    await screenshot("v3-14-settings");
     if (!host) throw new Error("监听地址为空");
-    return `${host} / ${templates} 个模板`;
+    return `${host} / ${templates} 个模板 / ${groups} 个可见上游 / 校验 ${issues.slice(0, 20)}`;
   });
 
-  await check("经典面板仍可打开", async () => {
-    const response = await fetch(`${base}/ui/classic`);
-    const text = await response.text();
-    if (response.status !== 200 || !text.includes("data-tab=\"overview\"")) {
-      throw new Error("经典面板未保留");
-    }
-    return "HTTP 200";
+  await check("全流程无 JS 异常", async () => {
+    if (errors.length) throw new Error(errors.slice(0, 5).join(" | "));
+    return "0 个错误";
   });
 
   console.log(`\n结果：${passes.length} 通过，${failures.length} 失败`);

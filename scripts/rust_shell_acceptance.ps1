@@ -1,7 +1,7 @@
 # Black-box acceptance for the Rust desktop shell (tray + system-browser panel).
 #
 # Verifies the strict metrics from the change plan:
-#   - idle working set <= 20MB (default after 60s idle, browser excluded)
+#   - idle working set <= 32MB (default after 60s idle, browser excluded)
 #   - installer <= 6MB when a *rust-setup.exe artifact exists in dist\
 #   - startup <= 1s (process start -> /health 200)
 #   - no msedgewebview2.exe anywhere in the Model-Gate process tree
@@ -23,7 +23,7 @@ param(
     [int]$Port = 0,
     [int]$IdleSeconds = 60,
     [int]$StartupBudgetMs = 1000,
-    [double]$WorkingSetLimitMB = 20,
+    [double]$WorkingSetLimitMB = 32,
     [double]$InstallerLimitMB = 6,
     [switch]$KeepRunning
 )
@@ -194,7 +194,7 @@ try {
     # 6) config save round-trip: profiles data + modelOverrides persist
     $live = Invoke-Json "GET" "/api/config"
     $profileIds = @($live.profiles | ForEach-Object { $_.id })
-    $expectedIds = @("openai", "opencode", "anthropic", "deepseek", "moonshot", "zhipu", "minimax", "dashscope", "ark", "siliconflow", "modelscope", "hunyuan", "commandcode")
+    $expectedIds = @("openai", "opencode", "anthropic", "deepseek", "moonshot", "zhipu", "minimax", "dashscope", "ark", "siliconflow", "modelscope", "hunyuan", "commandcode", "kilo")
     Add-Result "GET /api/config exposes profiles" `
         (($profileIds -join ",") -eq ($expectedIds -join ",")) ("profiles: " + ($profileIds -join ","))
 

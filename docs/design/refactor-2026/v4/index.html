@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model-Gate · 接入控制台 v4 · 设计稿</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="deck.css">
+<script>
+window.addEventListener('error', function(e){
+  document.title = 'ERR: ' + e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || '');
+}, true);
+</script>
+</head>
+<body>
+<nav class="deck-nav">
+  <b>MODEL-GATE · V4</b>
+  <span>Signal Desk / 18 boards</span>
+  <span class="sp"></span>
+  <button id="nav-overview" class="on">全部画板</button>
+  <button id="nav-single">单张审阅</button>
+  <button id="nav-prev">← 上一张</button>
+  <button id="nav-next">下一张 →</button>
+  <button id="nav-theme">◐ 深浅</button>
+</nav>
+<div class="deck" id="deck"></div>
+<script src="deck-core.js"></script>
+<script src="screens-a.js"></script>
+<script src="screens-b.js"></script>
+<script src="screens-c.js"></script>
+<script>
+window.addEventListener('error', e => {
+  const pre = document.createElement('pre');
+  pre.style.cssText = 'position:fixed;left:12px;top:60px;z-index:9999;background:#2a0d0d;color:#ffb4ac;padding:14px;border:1px solid #7a2a24;border-radius:8px;max-width:900px;white-space:pre-wrap;font:12px/1.6 monospace';
+  pre.textContent = 'JS ERROR: ' + e.message + '\n' + (e.filename||'') + ':' + (e.lineno||'');
+  document.body.appendChild(pre);
+});
+const boards = [
+  sCover(), sDesignSystem(), sOverview(), sUsage(), sPrompts(), sAccess(),
+  sAccessDetail(), sAddAccess(), sLogs(), sConfig(), sModels(), sPricing(),
+  sEntryRoutes(), sPools(), sResources(), sSettings(), sStates(), sMobile()
+];
+const deck = document.getElementById('deck');
+deck.innerHTML = boards.join('');
+const nodes = [...deck.querySelectorAll('.board')];
+let index = 0;
+
+const params = new URLSearchParams(location.search);
+const single = params.get('single') === '1';
+if (single) {
+  document.body.classList.add('single');
+  const target = params.get('board');
+  index = Math.max(0, nodes.findIndex(n => n.id === target));
+  if (index < 0) index = 0;
+  nodes.forEach((n,i)=>n.classList.toggle('on', i===index));
+}
+if (params.get('theme') === 'light') document.documentElement.dataset.theme = 'light';
+if (params.get('shot') === '1') document.body.classList.add('shot');
+
+function setMode(isSingle){
+  document.body.classList.toggle('single', isSingle);
+  document.getElementById('nav-overview').classList.toggle('on', !isSingle);
+  document.getElementById('nav-single').classList.toggle('on', isSingle);
+  if (isSingle) nodes.forEach((n,i)=>n.classList.toggle('on', i===index));
+}
+function show(i){
+  index = Math.max(0, Math.min(nodes.length-1, i));
+  nodes.forEach((n,j)=>n.classList.toggle('on', j===index));
+  const url = new URL(location);
+  url.searchParams.set('single','1'); url.searchParams.set('board', nodes[index].id);
+  history.replaceState(null,'',url);
+}
+document.getElementById('nav-overview').onclick = ()=>{ setMode(false); const u=new URL(location); u.searchParams.delete('single'); u.searchParams.delete('board'); history.replaceState(null,'',u); };
+document.getElementById('nav-single').onclick = ()=>{ setMode(true); show(index); };
+document.getElementById('nav-prev').onclick = ()=>{ setMode(true); show(index-1); };
+document.getElementById('nav-next').onclick = ()=>{ setMode(true); show(index+1); };
+document.getElementById('nav-theme').onclick = ()=>{ document.documentElement.dataset.theme = document.documentElement.dataset.theme==='light'?'dark':'light'; };
+document.addEventListener('keydown', e=>{
+  if (e.key==='ArrowLeft'){ setMode(true); show(index-1); }
+  if (e.key==='ArrowRight'){ setMode(true); show(index+1); }
+});
+</script>
+</body>
+</html>

@@ -7,7 +7,7 @@
 | 路径 | 职责 | 是否入库 |
 |---|---|---|
 | `rust/model-gate/` | 唯一产品源码：代理内核、协议适配、配置、SQLite、更新、托盘壳 | 是 |
-| `rust/model-gate/ui/` | 内嵌面板静态资源（`index.html` / `app.js` / `style.css` / `free_sources.js`）——**面板资源只有这一份** | 是 |
+| `rust/model-gate/ui/` | 内嵌 v3 控制台资源（`v3.html` / `v3.css` / `v3.js` / `v3-*.js`）——**面板资源只有这一份** | 是 |
 | `rust/model-gate/tests/` | 集成测试：契约守卫（`user_env_contracts.rs` / `key_file_contracts.rs`）与夹具（含 `legacy_config.json` 兼容样本） | 是 |
 | `rust/model-gate/provider_profiles.json` | Provider 预设注册表（编译期内嵌） | 是 |
 | `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 | 是 |

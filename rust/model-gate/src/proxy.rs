@@ -2669,7 +2669,7 @@ pub(crate) fn error_json(
 
 async fn ui_index() -> impl IntoResponse {
     let version = env!("CARGO_PKG_VERSION");
-    // v3 控制台为默认入口；经典面板保留在 /ui/classic，旧资源与旧接口全部可用。
+    // v3 控制台为唯一入口；/ui/classic 仅做永久跳转，旧 API 保持兼容。
     let html = include_str!("../ui/v3.html")
         .replace("href=\"v3.css\"", &format!("href=\"v3.css?v={version}\""))
         .replace("src=\"v3.js\"", &format!("src=\"v3.js?v={version}\""));
@@ -2683,47 +2683,37 @@ async fn ui_index() -> impl IntoResponse {
 }
 
 async fn ui_classic() -> impl IntoResponse {
-    let version = env!("CARGO_PKG_VERSION");
-    let html = include_str!("../ui/index.html")
-        .replace(
-            "href=\"style.css\"",
-            &format!("href=\"style.css?v={version}\""),
-        )
-        .replace("src=\"app.js\"", &format!("src=\"app.js?v={version}\""))
-        .replace(
-            "src=\"free_sources.js\"",
-            &format!("src=\"free_sources.js?v={version}\""),
-        )
-        .replace("src=\"zcode.js\"", &format!("src=\"zcode.js?v={version}\""));
-    (
-        [
-            ("content-type", "text/html; charset=utf-8"),
-            ("cache-control", "no-store"),
-        ],
-        html,
-    )
+    // 旧面板已由 v3 完整替代；保留路径做永久跳转，避免旧书签 404。
+    axum::response::Redirect::permanent("/ui/")
 }
 
 async fn ui_asset(Path(path): Path<String>) -> Response {
     // 只允许固定文件名，天然挡住路径穿越。
     let (content_type, body): (&str, &'static str) = match path.as_str() {
-        "app.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/app.js"),
-        ),
-        "free_sources.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/free_sources.js"),
-        ),
-        "zcode.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/zcode.js"),
-        ),
-        "style.css" => ("text/css; charset=utf-8", include_str!("../ui/style.css")),
         "v3.css" => ("text/css; charset=utf-8", include_str!("../ui/v3.css")),
         "v3.js" => (
             "application/javascript; charset=utf-8",
             include_str!("../ui/v3.js"),
+        ),
+        "v3-config.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/v3-config.js"),
+        ),
+        "v3-models.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/v3-models.js"),
+        ),
+        "v3-usage.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/v3-usage.js"),
+        ),
+        "v3-prompts.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/v3-prompts.js"),
+        ),
+        "v3-resources.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/v3-resources.js"),
         ),
         _ => {
             return error_json(
@@ -2755,6 +2745,7 @@ async fn api_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "host": state.cfg().host,
         "upstream_count": state.cfg().upstreams.len(),
         "db_path": state.db.path.display().to_string(),
+        "config_path": state.config_path.display().to_string(),
         "thinking": state.thinking.stats(),
         "server_time": chrono::Utc::now().timestamp(),
         "prompt_capture": state.cfg().prompt_capture,

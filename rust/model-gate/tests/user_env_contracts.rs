@@ -129,22 +129,17 @@ fn example_config_has_no_embedded_secret_or_env_file() {
 }
 
 #[test]
-fn panel_exposes_explicit_key_file_path() {
-    let text = fs::read_to_string(crate_root().join("ui/app.js")).expect("read ui/app.js");
+fn v3_panel_uses_encrypted_store_only() {
+    let text = fs::read_to_string(crate_root().join("ui/v3.js")).expect("read ui/v3.js");
     assert!(
-        text.contains("data-field=\"apiKeyAgentPath\""),
-        "面板必须提供「凭据文件路径（apiKeyAgentPath）」输入框，允许用户手动指定文件"
+        text.contains("本机加密库"),
+        "v3 凭据页必须明确写入本机加密库"
     );
     assert!(
-        text.contains("entry.apiKeyAgentPath = path"),
-        "保存配置时必须把凭据文件路径写回，否则面板输入不生效"
-    );
-    assert!(
-        text.contains("delete entry.apiKeyFile"),
-        "保存时必须清理旧 apiKeyFile 字段，避免旧路径继续生效"
+        !text.contains("apiKeyAgentPath"),
+        "旧面板的凭据文件路径不应回到 v3 主流程；兼容字段仍可由配置文件维护"
     );
 }
-
 /// 遍历 JSON，找出所有非空的 `apiKey` 字面量。
 ///
 /// `apiKeyEnv` / `apiKeyFile` / `apiKeyAgent*` 是引用，不是密钥本体，故放行。

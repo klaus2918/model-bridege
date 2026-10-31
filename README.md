@@ -28,11 +28,14 @@
 
 ## v3 接入控制台（默认面板）
 
-`http://127.0.0.1:8900/ui/` 已切换为 **v3 控制台**；原面板完整保留在
-`http://127.0.0.1:8900/ui/classic`（顶栏「经典面板」可随时打开）。
+`http://127.0.0.1:8900/ui/` 是 **唯一控制台**；旧 `/ui/classic` 仅做 308 永久跳转到 v3，
+旧面板资源已从仓库和运行时移除。
 
-- **二级导航收敛为 5 个分区 / 9 个子视图**：工作台（总览）、接入（全部接入 / 模型目录 /
-  路由组）、资源（凭据池 / 插件）、观测（流量 / 观测）、设置。
+- **5 个分区 / 12 个子视图**：工作台（总览）、接入（全部接入 / 模型与定价 / 路由组）、
+  资源（凭据池 / 插件 / 免费来源 / ZCode）、观测（用量分析 / 提示词 / 运行日志）、设置。
+- **全部旧功能已进入 v3**：模型目录与定价、路由组、用量与请求明细、提示词演进与差异、
+  免费来源、ZCode 账号池、运行日志、备份恢复、配置说明与更新检查；接入详情提供
+  模型/别名/覆盖、`compat`、超时等高级编辑，不再跳旧面板。
 - **官方厂商只填 Key**：选择模板 → 粘贴 Key → 完成；协议、地址、鉴权、隐私默认值由模板提供。
 - **自定义厂商只填 5 项**：标识、厂商、请求地址、协议、Key；高级项默认折叠。
 - **隐私默认勾选**：新增接入默认记录 ZDR 意图，可随时修改；面板会如实显示
@@ -1078,7 +1081,7 @@ Model-Gate/
 ├─ README.md                      # 本说明
 ├─ rust/model-gate/               # 唯一产品源码（Rust 代理内核 + 托盘 + 系统浏览器面板）
 │  ├─ src/                        # 代理、协议适配、配置、SQLite、更新、托盘
-│  ├─ ui/                         # 内嵌面板（index.html / app.js / style.css）
+│  ├─ ui/                         # 内嵌 v3 控制台（v3.html / v3.css / v3-*.js）
 │  ├─ tests/fixtures/             # Rust 单测夹具（含 legacy 配置）
 │  ├─ provider_profiles.json      # Provider 预设注册表（编译期内嵌）
 │  ├─ default_config.json         # 默认配置唯一来源（代码内嵌 + 安装包随附）
@@ -1108,13 +1111,13 @@ Rust-only 迁移删除），不要继续堆积在 `scripts/` 根目录。
 | `rust/model-gate/ui/` | 内嵌面板静态资源 |
 | `rust/model-gate/provider_profiles.json` | Provider 预设注册表 |
 | `rust/model-gate/default_config.json` | 默认配置唯一来源（代码内嵌 + 安装包随附为 `bridge.config.json`） |
-| `rust/model-gate/ui/app.js` | 内嵌面板逻辑（含「配置说明」弹窗：JSON 格式 + 常用字段用途与用法） |
+| `rust/model-gate/ui/v3*.js` | v3 控制台逻辑（含配置说明、模型/定价、用量、提示词、免费来源与 ZCode） |
 | `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 |
 | `ModelGate.iss` | Inno Setup 打包定义（固定 AppId，支持静默覆盖升级） |
 | `assets/ModelGate.ico` | 应用与托盘图标 |
 | `docs/` | 架构、兼容性、维护规范与示例配置 |
 | `scripts/panel_api_smoke.ps1` | 面板接口与更新资源冒烟 |
-| `scripts/ui_smoke.js` | 无头浏览器 UI 冒烟（页签、弹窗、提示词详情、展开折叠、会话演进） |
+| `scripts/ui_smoke_v3.js` | v3 无头浏览器冒烟（12 视图、抽屉、快速添加、配置校验、截图） |
 | `scripts/db_migration_smoke.js` | 历史数据库增量迁移冒烟（旧 schema + 旧数据启动、读取与新写入） |
 | `scripts/rust_shell_acceptance.ps1` | Rust 托盘壳黑盒验收 |
 | `scripts/upgrade_and_run.ps1` | 不停机升级辅助 |
@@ -1149,9 +1152,9 @@ powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1
 也可以直接调用 ISCC：
 
 ```bat
-iscc /DMyAppVersion=3.0.0 ^
+iscc /DMyAppVersion=3.1.0 ^
      /DMyAppSourceExe=dist\Model-Gate-rust.exe ^
-     /DMyOutputBaseFilename=Model-Gate-v3.0.0-rust-setup ^
+     /DMyOutputBaseFilename=Model-Gate-v3.1.0-rust-setup ^
      ModelGate.iss
 ```
 
@@ -1194,9 +1197,9 @@ iscc /DMyAppVersion=3.0.0 ^
 
 ### 发布
 
-1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `3.0.0`）。
-2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1`、经典面板 `scripts\ui_smoke.js --ui-path /ui/classic` 与 v3 面板 `scripts\ui_smoke_v3.js`。
-3. 打 tag 并推送：`git tag v3.0.0`、`git push origin v3.0.0`（Git 写操作需人工确认）。
+1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `3.1.0`）。
+2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1` 与 v3 面板 `scripts\ui_smoke_v3.js`。
+3. 打 tag 并推送：`git tag v3.1.0`、`git push origin v3.1.0`（Git 写操作需人工确认）。
 4. `.github/workflows/release-rust.yml` 构建并上传：
    - `Model-Gate-v<版本>-rust-setup.exe`
    - `Model-Gate-rust.exe`（便携版）
@@ -1221,7 +1224,7 @@ cargo fmt --check
 cargo check
 cargo test
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe
-node scripts\ui_smoke.js --exe dist\Model-Gate-rust.exe
+node scripts\ui_smoke_v3.js --base http://127.0.0.1:8912 --screenshot-dir docs\design\refactor-2026\screenshots-v3
 node scripts\db_migration_smoke.js --exe dist\Model-Gate-rust.exe
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\rust_shell_acceptance.ps1 -Exe dist\Model-Gate-rust.exe
 ```

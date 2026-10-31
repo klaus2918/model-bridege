@@ -66,15 +66,27 @@ fn parse_route_literals(text: &str) -> Vec<String> {
 /// 与 [`parse_route_literals`] 同理，JS 侧也可能把调用写成多行
 /// （`api(\n  "/api/x"\n)`），因此同样跨行解析。
 fn panel_api_calls(ui_dir: &Path) -> BTreeSet<String> {
-    let js = fs::read_to_string(ui_dir.join("app.js")).expect("read ui/app.js");
+    let mut js = String::new();
+    for entry in fs::read_dir(ui_dir).expect("read ui dir") {
+        let path = entry.expect("ui entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.starts_with("v3") && name.ends_with(".js") {
+            js.push_str(&fs::read_to_string(&path).expect("read v3 ui module"));
+            js.push('\n');
+        }
+    }
     let mut calls = BTreeSet::new();
-    for quote in ['"', '\''] {
+    for quote in ['"', '\'', '`'] {
         // marker 只到左括号为止：引号由解析器自己跳过空白后读取，
         // 这样 `api(` 与 `postJson(` 两种调用都能统一处理。
         for marker in ["api(", "postJson("] {
             for path in parse_call_literals(&js, marker, quote) {
                 let path = path.split('?').next().unwrap_or(&path);
-                if path.starts_with("/api/") {
+                // 动态拼接的路径由运行时冒烟覆盖；静态路由在这里核对。
+                if path.starts_with("/api/") && !path.contains("${") {
                     calls.insert(path.to_string());
                 }
             }
@@ -218,18 +230,18 @@ fn every_panel_api_call_has_a_registered_route() {
 
 #[test]
 fn panel_backup_controls_exist_in_html() {
-    let html = fs::read_to_string(ui_dir().join("index.html")).expect("read ui/index.html");
+    let html = fs::read_to_string(ui_dir().join("v3.html")).expect("read ui/v3.html");
     for id in [
-        "config-backup-toggle",
-        "config-path-display",
-        "config-backup-hint",
-        "restore-config",
+        "settings-backup",
+        "settings-storage-hint",
+        "settings-restore",
+        "settings-validate",
     ] {
-        assert!(html.contains(id), "面板缺少 #{id}");
+        assert!(html.contains(id), "v3 设置页缺少 #{id}");
     }
     assert!(
         html.contains("从文件重载"),
-        "配置页底部按钮应为「从文件重载」（原名「重新载入」与其实际行为相反）"
+        "v3 设置页应保留「从文件重载」按钮"
     );
 }
 
@@ -240,23 +252,18 @@ fn panel_backup_controls_exist_in_html() {
 /// 修复是加确认框；本守卫钉死它不被回退。
 #[test]
 fn reload_from_file_guards_unsaved_edits() {
-    let js = fs::read_to_string(ui_dir().join("app.js")).expect("read ui/app.js");
+    let js = fs::read_to_string(ui_dir().join("v3-config.js")).expect("read ui/v3-config.js");
     assert!(
-        js.contains("state.configDirty"),
-        "面板未跟踪未保存改动状态 —— 「从文件重载」无法判断是否要先确认"
+        js.contains("settings-dirty"),
+        "v3 设置页未跟踪未保存改动状态 —— 「从文件重载」无法判断是否要先确认"
     );
     assert!(
-        js.contains("放弃改动并重载"),
-        "「从文件重载」缺少确认文案 —— 未保存的改动会被静默覆盖"
+        js.contains("未保存的面板改动会丢失"),
+        "「从文件重载」确认框必须说明未保存改动会丢失"
     );
     assert!(
-        js.contains("这些未保存的改动会丢失"),
-        "确认框必须说明未保存改动会丢失，否则用户无法判断风险"
-    );
-    // 旧名不应复活：它与实际行为相反（听像重读面板，实为重读磁盘覆盖运行态）。
-    assert!(
-        !js.contains("已重新载入配置"),
-        "旧提示「已重新载入配置」不应存在（与「从文件重载」语义混淆）"
+        js.contains("reloadConfig"),
+        "v3 设置页缺少「从文件重载」实现"
     );
 }
 

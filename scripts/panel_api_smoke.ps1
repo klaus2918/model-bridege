@@ -103,16 +103,23 @@ try {
         if ($Body -notmatch 'id="update-btn"') { throw "首页缺少更新入口" }
     }
 
-    Assert-PanelCheck "ui-app" "/ui/app.js" {
+    Assert-PanelCheck "ui-v3-js" "/ui/v3.js" {
         param($Body)
-        foreach ($Marker in @("/api/update/check", "/api/update/download", "/api/update/install")) {
-            if ($Body -notmatch [regex]::Escape($Marker)) { throw "app.js 缺少 $Marker" }
+        foreach ($Marker in @("/api/access", "/api/usage/list", "/api/pools")) {
+            if ($Body -notmatch [regex]::Escape($Marker)) { throw "v3.js 缺少 $Marker" }
         }
     }
 
-    Assert-PanelCheck "ui-style" "/ui/style.css" {
+    Assert-PanelCheck "ui-v3-config" "/ui/v3-config.js" {
         param($Body)
-        if ($Body -notmatch '\.update-progress') { throw "style.css 缺少更新进度样式" }
+        foreach ($Marker in @("/api/config/validate", "/api/update/status", "/api/ai/settings")) {
+            if ($Body -notmatch [regex]::Escape($Marker)) { throw "v3-config.js 缺少 $Marker" }
+        }
+    }
+
+    Assert-PanelCheck "ui-v3-style" "/ui/v3.css" {
+        param($Body)
+        if ($Body -notmatch '\.drawer') { throw "v3.css 缺少抽屉样式" }
     }
 } finally {
     if ($Process -and -not $Process.HasExited) {

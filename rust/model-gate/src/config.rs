@@ -3764,84 +3764,7 @@ mod default_config_tests {
 
 /// 面板内「配置说明」弹窗的内容契约。
 ///
-/// 说明长在面板里（`ui/app.js` 的 `openConfigHelp`），不再随包发一份独立 HTML。
-/// 这里守住三件事：① 弹窗确实存在、由顶栏按钮触发；② 讲清了「配置文件格式」
-/// 与「常用字段的用途/用法」；③ 说明里出现的字段名都是后端真正解析的键，
-/// 避免说明与实现各自漂移。
-#[cfg(test)]
-mod config_help_doc_tests {
-    use super::*;
-
-    const PANEL_APP_JS: &str = include_str!("../ui/app.js");
-
-    #[test]
-    fn config_help_dialog_lives_in_panel() {
-        assert!(
-            PANEL_APP_JS.contains("function openConfigHelp()"),
-            "面板里应有配置说明弹窗"
-        );
-        assert!(
-            PANEL_APP_JS.contains("config-help-btn"),
-            "顶栏应保留「配置说明」按钮"
-        );
-        assert!(
-            !PANEL_APP_JS.contains("/api/config/help"),
-            "不应再依赖脱离软件的独立说明页接口"
-        );
-    }
-
-    /// 说明里出现的字段名必须是后端真正解析的键（防止写出不存在的字段）。
-    #[test]
-    fn config_help_only_documents_real_fields() {
-        for key in [
-            "host",
-            "port",
-            "defaultModel",
-            "models",
-            "maxTokens",
-            "timeoutSeconds",
-            "modelsCacheSeconds",
-            "accessLog",
-            "aliases",
-            "thinking",
-            "upstreams",
-            "protocol",
-            "baseUrl",
-            "apiKeyEnv",
-            "apiKeyFile",
-            "apiKeyAgent",
-            "default",
-            "modelMap",
-            "fetchModels",
-            "sessionHeader",
-            "modelOverrides",
-            "compat",
-        ] {
-            assert!(
-                PANEL_APP_JS.contains(&format!("\"{key}\"")),
-                "配置说明弹窗缺少字段：{key}"
-            );
-        }
-    }
-
-    /// 关键主题不能丢：配置文件名、数据库位置、密钥写环境变量、改完怎么生效。
-    #[test]
-    fn config_help_covers_key_topics() {
-        for needle in [
-            "bridge.config.json",
-            "apiKeyEnv",
-            "modelgate.db",
-            "从文件重载",
-            "保存配置",
-        ] {
-            assert!(
-                PANEL_APP_JS.contains(needle),
-                "配置说明弹窗缺少关键内容：{needle}"
-            );
-        }
-    }
-}
-
+/// v3 的「配置说明」由 `ui/v3-config.js` 的 `help()` 提供；本模块只保留后端字段解析契约。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4749,46 +4672,6 @@ mod tests {
             .collect();
         assert_eq!(over.len(), 1, "应产生一条 maxTokens 超限诊断");
         assert_eq!(over[0].level, "info");
-    }
-
-    /// 提醒区必须位于保存按钮行之前（不占主展示区顶部）。
-    ///
-    /// 这条约束是「配置提醒不干扰填表」的核心：一旦有人把 `#config-issues`
-    /// 挪回表单顶部，页面首屏就又被提醒占满。断言放在 Rust 侧，与实际提供
-    /// 面板资源的宿主同源（面板资源随 rust-only-autoupdate 迁到 ui/）。
-    #[test]
-    fn config_issues_panel_sits_above_save_actions() {
-        const INDEX_HTML: &str = include_str!("../ui/index.html");
-        let issues = INDEX_HTML
-            .find(r#"id="config-issues""#)
-            .expect("index.html 缺少 #config-issues 容器");
-        let save = INDEX_HTML
-            .find(r#"class="actions sticky-actions""#)
-            .expect("index.html 缺少保存按钮行 .sticky-actions");
-        assert!(
-            issues < save,
-            "提醒区必须位于保存按钮行之前（当前 issues={issues} save={save}）"
-        );
-    }
-
-    /// 提醒区的交互控件必须在面板里存在（避免 JS 引用空节点静默失效）。
-    #[test]
-    fn config_issues_controls_exist_in_panel() {
-        const INDEX_HTML: &str = include_str!("../ui/index.html");
-        for id in [
-            "config-issues",
-            "config-issues-toggle",
-            "config-issues-caret",
-            "config-issues-summary",
-            "config-issues-body",
-            "config-issues-check",
-            "config-issues-mute",
-        ] {
-            assert!(
-                INDEX_HTML.contains(&format!(r#"id="{id}""#)),
-                "面板缺少提醒区控件 #{id}"
-            );
-        }
     }
 
     /// 逐模型密钥：字符串简写 + 对象写法 + 精确优先于通配。

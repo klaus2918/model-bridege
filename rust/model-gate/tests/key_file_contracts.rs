@@ -138,55 +138,21 @@ fn file_target_has_no_builtin_default_path() {
 }
 
 #[test]
-fn panel_exposes_mutually_exclusive_key_sources() {
-    let text = read("ui/app.js");
+fn v3_panel_never_persists_plaintext_secret() {
+    let text = read("ui/v3.js");
     assert!(
-        text.contains("keySourceMode"),
-        "面板必须提供密钥来源三选一（环境变量 / 凭据文件 / 暂不配置）"
+        text.contains("type=\"password\""),
+        "v3 凭据页必须使用 password 输入，密钥不回显"
     );
     assert!(
-        text.contains("data-key-group"),
-        "密钥来源选中后必须只展开对应字段组"
+        text.contains("/secret"),
+        "v3 凭据页必须走密钥写入接口，而不是把密钥写进配置对象"
     );
     assert!(
-        !text.contains("keyWriteTarget"),
-        "密钥来源与写入目标不应再是两套下拉，避免同一件事混在一起"
-    );
-    for field in ["apiKeyAgentPath", "keyWriteFormat", "apiKeyAgentProvider"] {
-        assert!(
-            text.contains(field),
-            "凭据文件来源缺少 {field}：需要路径、格式与字段/变量名"
-        );
-    }
-    for field in ["apiKeyEnvValue", "apiKeyFileValue"] {
-        assert!(
-            text.contains(field),
-            "缺少 {field}：环境变量与凭据文件各自需要独立的 API Key 输入"
-        );
-    }
-    assert!(
-        text.contains("fileFormat"),
-        "面板提交文件写入时必须带上 fileFormat（json / env）"
-    );
-    assert!(
-        text.contains("applyKeyFileReference"),
-        "写入成功后必须把路径引用回填到配置字段（apiKeyAgent*）"
+        !text.contains("entry.apiKey =") && !text.contains("config.apiKey ="),
+        "v3 面板不得把明文密钥赋给配置对象"
     );
 }
-
-#[test]
-fn panel_never_persists_plaintext_secret() {
-    let text = read("ui/app.js");
-    assert!(
-        text.contains("delete entry.apiKey;"),
-        "保存配置时必须删除明文 apiKey：配置文件只允许存路径引用"
-    );
-    assert!(
-        !text.contains("entry.apiKey ="),
-        "面板不得把明文密钥写回配置条目（entry.apiKey = ...）"
-    );
-}
-
 #[test]
 fn config_store_strips_plaintext_secret() {
     let text = read("src/config_store.rs");

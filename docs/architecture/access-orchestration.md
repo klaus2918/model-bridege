@@ -155,10 +155,13 @@ manifest（`modelgate.plugin/v1`）关键段：
 
 ## 8. UI
 
-- 默认：`/ui/`（`v3.html + v3.css + v3.js`）；
-- 经典：`/ui/classic`（原 `index.html + app.js`，功能全保留）；
-- 一级导航 7 个功能域，侧栏 5 个分区、9 个子视图；
-- 接入详情使用右侧抽屉，子页签：概览 / 连接 / 凭据 / 模型 / 诊断；
+- 唯一入口：`/ui/`（`v3.html + v3.css + v3.js + v3-*.js`）；
+- `/ui/classic` 仅返回 308 永久跳转到 `/ui/`，旧面板资产已移除；
+- 侧栏 5 个分区、12 个子视图：总览 / 全部接入 / 模型与定价 / 路由组 / 凭据池 /
+  插件 / 免费来源 / ZCode / 用量分析 / 提示词 / 运行日志 / 设置；
+- 接入详情使用右侧抽屉，子页签：概览 / 连接 / 凭据 / 模型 / 高级 / 诊断；
+- 「模型」页可维护模型、别名、模型级覆盖与目录行为；「高级」页可维护 `compat`、
+  上游超时与会话头；设置页提供保存前校验、备份开关与配置/数据库路径；
 - 快速添加为两步向导（官方）或 5 项表单（自定义）；
 - 所有密钥输入为 `type=password`，保存后清空且不回显。
 
@@ -188,8 +191,8 @@ node scripts\ui_smoke_v3.js --base http://127.0.0.1:8912 `
 
 已核对：
 
-- `/ui/` 加载 v3、`/ui/classic` 返回 200；
+- `/ui/` 加载 v3、`/ui/classic` 返回 308 -> `/ui/`；
 - `/api/access/templates` 15 个模板；`/api/pools`、`/api/plugins` 可读；
 - `/api/ai/inspect` 不含 `sk-` / `secretRef` / `secret`；
 - `/v1/models`、`/unified/v1/models`、`/demo/v1/models` 均正常；
-- v3 smoke：11 通过、0 失败。
+- v3 smoke：16 通过、0 失败（含抽屉 6 页签、设置校验、旧路径跳转）。

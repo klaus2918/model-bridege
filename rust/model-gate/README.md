@@ -168,7 +168,7 @@ Windows 托盘不支持常驻鼠标正文字，
 
 **随包默认配置与说明弹窗**：默认配置收敛为单一来源 `default_config.json`——代码用 `include_str!` 内嵌
 （`config::default_config_value()`），安装包把它落为 `{app}\bridge.config.json`；配置说明则**长在面板里**：
-顶栏「配置说明」按钮打开软件内弹窗（`ui/app.js` 的 `openConfigHelp()`），内容讲清 JSON 格式、常用字段
+顶栏「配置说明」按钮打开软件内弹窗（`ui/v3-config.js` 的配置说明视图），内容讲清 JSON 格式、常用字段
 （顶层与 `upstreams` 两条）的用途与用法、密钥怎么写、改完怎么生效，不再随包发独立说明页。随包文件在安装包里是
 `onlyifdoesntexist` + `uninsneveruninstall`：**安装 / 升级 / 静默更新都不覆盖已有配置，
 卸载也不删用户配置与用量库**；便携版目录里没有配置时，首启自动生成与 `default_config.json`
@@ -194,8 +194,7 @@ src/
   thinking.rs    thinking 回传缓存
   update.rs      应用内更新（Release 检查 / 下载 / SHA256 / 静默安装）
   gui.rs         托盘 + Win32 消息循环 + 系统浏览器
-  ui_assets.rs   面板资源契约守卫
-ui/              面板静态资源（index.html / app.js / style.css / free_sources.js）
+ui/              v3 控制台静态资源（v3.html / v3.css / v3-*.js）
 tests/fixtures/  Rust 单测夹具（legacy 配置、golden 快照）
 ```
 
