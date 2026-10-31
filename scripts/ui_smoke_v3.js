@@ -162,41 +162,66 @@ function connectCdp(wsUrl) {
 async function main() {
   const health = await fetchJson(`${base}/health`, 3000).catch(() => ({ status: 0 }));
   if (health.status !== 200) throw new Error(`服务未就绪：${base}/health -> ${health.status}`);
-  if (!fs.existsSync(chromePath)) throw new Error(`找不到 Chrome/Edge：${chromePath}`);
 
-  userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "mg-v3-smoke-"));
-  chrome = spawn(
-    chromePath,
-    [
-      "--headless=new",
-      "--disable-gpu",
-      "--disable-extensions",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--remote-allow-origins=*",
-      `--remote-debugging-port=${debugPort}`,
-      `--user-data-dir=${userDataDir}`,
-      "--window-size=1440,1000",
-      "about:blank",
-    ],
-    { stdio: ["ignore", "ignore", "pipe"], windowsHide: true },
-  );
-  let chromeErr = "";
-  chrome.stderr.on("data", (chunk) => {
-    chromeErr += String(chunk);
-  });
-
-  await waitFor(async () => {
-    try {
-      return (await fetchJson(`http://127.0.0.1:${debugPort}/json/version`, 1000)).status === 200;
-    } catch {
-      return false;
+  const candidates = [];
+  for (const candidate of [chromePath, ...chromeCandidates]) {
+    if (candidate && fs.existsSync(candidate) && !candidates.includes(candidate)) {
+      candidates.push(candidate);
     }
-  }, 12000, "Chrome 调试端口");
-  if (chrome.exitCode !== null) throw new Error(`Chrome 提前退出：${chromeErr.slice(-1200)}`);
+  }
+  if (!candidates.length) throw new Error(`找不到 Chrome/Edge：${chromePath}`);
+
+  const failures = [];
+  let activeDebugPort = debugPort;
+  for (let attempt = 0; attempt < candidates.length; attempt++) {
+    const executable = candidates[attempt];
+    activeDebugPort = debugPort + attempt;
+    userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "mg-v3-smoke-"));
+    chrome = spawn(
+      executable,
+      [
+        "--headless=new",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--remote-allow-origins=*",
+        `--remote-debugging-port=${activeDebugPort}`,
+        `--user-data-dir=${userDataDir}`,
+        "--window-size=1440,1000",
+        "about:blank",
+      ],
+      { stdio: ["ignore", "ignore", "pipe"], windowsHide: true },
+    );
+    let chromeErr = "";
+    chrome.stderr.on("data", (chunk) => {
+      chromeErr += String(chunk);
+    });
+
+    try {
+      await waitFor(async () => {
+        try {
+          return (await fetchJson(`http://127.0.0.1:${activeDebugPort}/json/version`, 1000)).status === 200;
+        } catch {
+          return false;
+        }
+      }, 30000, "Chrome 调试端口");
+      if (chrome.exitCode !== null) throw new Error(`Chrome 提前退出：${chromeErr.slice(-1200)}`);
+      if (attempt > 0) console.log(`[info] 浏览器回退成功：${executable}（端口 ${activeDebugPort}）`);
+      break;
+    } catch (err) {
+      failures.push(`${executable}: ${err.message}${chromeErr ? ` | stderr: ${chromeErr.slice(-600)}` : ""}`);
+      try { chrome.kill(); } catch {}
+      chrome = null;
+      if (attempt === candidates.length - 1) {
+        throw new Error(`Chrome 调试端口未就绪：${failures.join(" || ")}`);
+      }
+      console.log(`[warn] ${executable} 启动失败，尝试下一个浏览器`);
+    }
+  }
 
   const created = await fetch(
-    `http://127.0.0.1:${debugPort}/json/new?${encodeURIComponent("about:blank")}`,
+    `http://127.0.0.1:${activeDebugPort}/json/new?${encodeURIComponent("about:blank")}`,
     { method: "PUT" },
   );
   const target = await created.json();
