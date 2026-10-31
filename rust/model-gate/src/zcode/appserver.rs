@@ -361,6 +361,14 @@ async fn spawn_rpc(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：本应用是 GUI 子系统程序，启动 node 控制台子进程时
+        // 不创建控制台窗口，避免每次请求弹出 zcode-cli 窗口。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
     let mut child = command
         .spawn()
         .map_err(|err| format!("启动 ZCode app-server 失败：{err}"))?;

@@ -9,6 +9,9 @@
 | [`architecture/provider-compat.md`](architecture/provider-compat.md) | Provider 兼容能力、预设与模型级覆盖 | 新增上游或排查协议差异时 |
 | [`architecture/free-sources.md`](architecture/free-sources.md) | 免费来源（免密池）：判定规则、拒因字典、隐私红线、退避策略 | 接入或排查免密免费模型时 |
 | [`architecture/upstream-config-model.md`](architecture/upstream-config-model.md) | 上游配置模型、诊断码与密钥来源契约 | 修改配置 schema、接入凭据时 |
+| [`architecture/plugin-system.md`](architecture/plugin-system.md) | 插件系统与插件市场：插件分级、manifest 契约、三态生命周期、市场渠道与安全边界 | 新增来源、做插件化改造、排查接入状态时 |
+| [`architecture/access-orchestration.md`](architecture/access-orchestration.md) | v3 接入编排：模板/快速添加、AccessObject、凭据池与故障转移、插件 attach、AI 配置接口、新的 UI 入口与验证 | 修改接入保存管线、池策略、AI 接口或 v3 面板时 |
+| [`design/refactor-2026/README.md`](design/refactor-2026/README.md) | v3 重构设计与交互稿索引（含原型、截图、决策点） | 评审设计、对照页面规格时 |
 | [`architecture/tech-stack-selection.md`](architecture/tech-stack-selection.md) | Rust-only 选型与迁移结论（历史背景） | 了解为何移除 Python/Node |
 | [`integration/opencode-go-direct-integration.md`](integration/opencode-go-direct-integration.md) | opencode go 直连（不经代理）的实测结论与前置条件 | 配置直连或排查 400/403 时 |
 | [`kilo-free-models-report.md`](kilo-free-models-report.md) | Kilo 免密池免费模型的完整实测报告（20 模型、限流、隐私条款） | 核对免费模型可用性、隐私红线与拒因时 |

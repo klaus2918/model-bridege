@@ -110,7 +110,8 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
   "modelKeys": {
     "MiniMax-M3": "MINIMAX_API_KEY",
     "mimo-*": { "apiKeyEnv": "XIAOMI_MIMO_API_KEY" },
-    "deepseek-pro": { "apiKeyFile": "D:/secrets/deepseek.json" }
+    "deepseek-pro": { "apiKeyStore": "model:upstream:deepseek-pro" },
+    "legacy-model": { "apiKeyFile": "D:/secrets/deepseek.json" }
   }
 }
 ```
@@ -120,8 +121,10 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 - 键为**路由解析后的模型 id**（`modelMap` 解析后的 `target_model`），
   不是客户端请求里写的名字；写错会静默回落到上游级密钥。
 - 值支持两种写法：环境变量名字符串（简写），或对象
-  `{ "apiKeyEnv" | "apiKeyFile" | "apiKeyAgent" | "apiKeyAgentPath" }`。
-- 匹配优先级：精确命中 > 最长单 `*` 通配 > 上游级 `apiKeyEnv` / `apiKeyFile` / `apiKeyAgent`。
+  `{ "apiKeyEnv" | "apiKeyFile" | "apiKeyAgent" | "apiKeyAgentPath" | "apiKeyStore" }`。
+- `apiKeyStore` 必须是 `upstream:` / `model:` 开头的引用；密钥本体由 Windows DPAPI
+  加密存放在配置文件同目录的 `*.secrets.json`，配置与接口只出现引用。
+- 匹配优先级：精确命中 > 最长单 `*` 通配 > 上游级 `apiKeyEnv` / `apiKeyFile` / `apiKeyAgent` / `apiKeyStore`。
 - 多个 `*` 视为非法，不参与匹配（`multi_wildcard_model_key`）。
 - 条目存在但读不到密钥时，请求**回落到上游级密钥**，同时产生 `model_key_missing` 警告；
   与 model-bridge 的兜底行为一致，避免一个模型配置缺失拖垮整条上游。
@@ -141,11 +144,14 @@ modelOverrides（精确 > 最长 * 通配 > 上游 compat；只覆盖 limits / c
 API/面板：
 
 - `GET /api/upstreams` 与 `GET /api/config` 的 `effective` 新增 `modelKeys`
-  （`model` / `env` / `source` / `configured` / `missing`），**不含密钥值**；
-- `POST /api/upstreams/secret` 新增可选 `model`：按该模型 `modelKeys` 条目的
-  `apiKeyEnv` 写入用户环境变量；未知模型 / 未配置 `apiKeyEnv` 返回 400；
-  逐模型写入暂只支持 `target=env`，`target=file` 返回 `unsupported_model_key_target`；
-- 面板上游编辑器「4. 逐模型密钥」提供 JSON 编辑与「写入逐模型密钥」按钮。
+  （`model` / `env` / `store` / `source` / `configured` / `missing`），**不含密钥值**；
+- `POST /api/upstreams/secret` 新增可选 `model`：
+  - `target=env` 时按该模型 `modelKeys` 条目的 `apiKeyEnv` 写入用户环境变量；
+    未知模型 / 未配置 `apiKeyEnv` 返回 400；
+  - `target=store` 时无需预先保存：直接生成 `model:上游:模型` 引用并写入 `modelKeys`，
+    密钥经 DPAPI 加密保存到本机密钥库；
+  - 逐模型写入不支持 `target=file`（返回 `unsupported_model_key_target`）；
+- 面板上游编辑器「4. 逐模型密钥」提供 JSON 编辑、「本机加密保存 / 环境变量」目标选择与「写入逐模型密钥」按钮。
 
 ## 5. 能力元数据 `capabilities`
 
@@ -165,9 +171,30 @@ API/面板：
 - 无数据库结构变更；`settings.lastPort` 为新增键；
 - 旧版 exe 读取新配置时忽略新字段，可继续运行。
 
-### 6.1 密钥来源契约（`env-only-secrets`）
+### 6.0 v3 可选字段（接入编排 / 凭据池）
 
-密钥**只有一个来源方向**：环境变量优先，其次是用户显式指定的凭据文件。
+以下字段全部可选，旧配置不写也能启动；旧版 exe 读取时按未知字段忽略。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `template` | string | 模板 id；缺省由 `compat.profile` / 域名推导 |
+| `templateVersion` | number | 模板版本，仅用于提示 |
+| `kind` | string | `official/custom/free/account/plugin`，仅展示与筛选 |
+| `label` | string | 展示名，缺省用上游名 |
+| `privacy` | object | `{zdr: bool, training: "allow"\|"deny"}`；优先于 `compat.privacy` |
+| `credentialPool` | string | 凭据池 id；请求期优先于 `apiKeyStore` |
+
+约定：
+
+- 顶层 `privacy` 与 `compat.privacy` 同时保留；前者是 v3 的显式意图，后者供旧读取者解释。
+- `credentialPool` 指向不存在/停用的池时，请求返回 `503 pool_unavailable`，**默认不回落**
+  单 Key；只有池声明 `fallback_to_single` 才回落。
+- `apiKeyStore` 已加入 `UPSTREAM_KEYS`，不再是未知字段。
+- 非 CommandCode 上游不再写 `pauseTurn`，避免 `field_not_applicable` 噪音。
+
+### 6.1 密钥来源契约（`credential-sources`）
+
+密钥来源：环境变量、用户显式指定的凭据文件，或 Model-Gate 本机加密密钥库。
 代码与模板中**没有任何内置厂商凭据路径**（opencode / jcode / commandcode 的默认路径一律移除）。
 
 **读取优先级**（`config.rs::resolve_api_key`，同一上游取第一个非空值）：
@@ -177,7 +204,14 @@ API/面板：
 | 1 | `apiKeyEnv` 指定的变量 | `env` / `user-env` | 取值顺序：进程环境 → 本进程会话缓存 → `HKCU\Environment` |
 | 2 | `apiKeyFile` 指定的文件 | `file` | 读该 JSON 的 `apiKey` 字段（路径由用户手填） |
 | 3 | `apiKeyAgentPath` 指定的文件 | `agent:file/<名>` / `agent:env-file/<名>` | JSON 点路径或 `.env` 变量名（`apiKeyAgent` 内置预设已移除） |
-| 4 | 都没有 | `none` | **不发送鉴权头**，不生成占位密钥 |
+| 4 | `apiKeyStore` 引用 | `store` | 从 `*.secrets.json` 读取 DPAPI 密文并解密；引用为 `upstream:名称` 或 `model:上游:模型` |
+| 5 | 都没有 | `none` | **不发送鉴权头**，不生成占位密钥 |
+
+**一个上游共用一把，还是逐模型不同 key**：
+
+- 上游级 `apiKeyStore: "upstream:<名称>"` = 该上游所有模型共用；
+- `modelKeys.<模型>.apiKeyStore: "model:<上游>:<模型>"` = 该模型单独使用，未单独配置的模型仍回落到上游级；
+- 两条路径都只把引用写进 `bridge.config.json`，密文本体在 `bridge.config.secrets.json`。
 
 **JSON 里的明文 `apiKey` 永不作为凭据**：历史配置中的非空值被忽略，
 由 `diagnostics()` 给出 `legacy_literal_api_key` 迁移提示，且**不回显原值**。
@@ -200,9 +234,11 @@ API/面板：
 |---|---|---|
 | `env`（默认） | `HKCU\Environment` | 写 `apiKeyEnv` 指定的变量名，写后广播 `WM_SETTINGCHANGE`；当前进程靠会话缓存立即生效，新进程由系统继承 |
 | `file` | 用户手填的绝对路径 | JSON（根字段 `apiKey` 或点路径）或 `.env`（变量名）；读-改-写保留其它字段，同目录临时文件 + `rename` 原子替换，**不生成 `.bak`**；写完用运行时同一套读取语义回读校验 |
+| `store` | 配置文件同目录 `*.secrets.json` | Windows DPAPI 加密（绑定当前用户与机器），同时把 `apiKeyStore` 引用原子写入 `bridge.config.json`；配置写失败时回滚本次新增条目 |
 
 写入 Model-Gate 自己的 `bridge.config.json` 会被拒绝；密钥含换行/控制字符会被拒绝；
-错误信息只含路径与原因，**不含密钥**。配置文件里只保存路径引用，不保存密钥本体。
+错误信息只含路径与原因，**不含密钥**。配置文件里只保存路径/密钥库引用，不保存密钥本体。
+`*.secrets.json` 只存 base64(DPAPI blob)，不提供明文导出接口，并已加入 `.gitignore`。
 
 ## 7. 校验与诊断
 
@@ -261,9 +297,9 @@ API/面板：
 |---|---|---|
 | `name` | 是 | 上游名 |
 | `apiKey` | 是 | 明文密钥；为空 → 400 `empty_key`；含换行/控制字符 → 400 `invalid_key` |
-| `target` | 否 | `env`（默认，写用户变量）/ `file`（写用户指定文件）；其它值 → 400 `invalid_target` |
-| `envName` | 否 | 变量名；缺省时用该上游已配置的 `apiKeyEnv`；都没有 → 400 `missing_env_name`；含 `=` → 400 `invalid_env_name` |
-| `model` | 否 | 逐模型写入：模型 id（`modelKeys` 的键）；按该条目的 `apiKeyEnv` 写变量，忽略 `envName`；未知模型 → 400 `unknown_model_key`，条目无 `apiKeyEnv` → 400 `model_key_missing_env`；与 `target=file` 同用 → 400 `unsupported_model_key_target` |
+| `target` | 否 | `env`（默认，写用户变量）/ `file`（写用户指定文件）/ `store`（Windows DPAPI 加密保存到本机密钥库并写 `apiKeyStore` 引用）；其它值 → 400 `invalid_target` |
+| `envName` | 否 | 变量名；缺省时用该上游已配置的 `apiKeyEnv`；都没有 → 400 `missing_env_name`；含 `=` → 400 `invalid_env_name`；`target=store` 时忽略 |
+| `model` | 否 | 逐模型写入：模型 id（`modelKeys` 的键）。`target=env` 按该条目的 `apiKeyEnv` 写变量，忽略 `envName`；未知模型 → 400 `unknown_model_key`，条目无 `apiKeyEnv` → 400 `model_key_missing_env`。`target=store` 生成 `model:上游:模型` 引用并写入 `modelKeys`。与 `target=file` 同用 → 400 `unsupported_model_key_target` |
 | `filePath` | 否 | 凭据文件路径；缺省时回退该上游的 `apiKeyFile` / `apiKeyAgentPath`；都没有 → 400 `missing_file_path`；非绝对路径 → 400 `invalid_file_path` |
 | `fileFormat` | 否 | `json`（默认）/ `env`；其它值 → 400 `invalid_file_format` |
 | `field` | 否 | JSON 点路径（缺省 `apiKey`）/ `.env` 变量名（`.env` 必填） |
@@ -274,30 +310,32 @@ API/面板：
 |---|---|
 | `env` | `ok` / `name` / `target=env` / `envName` / `scope=user` / `keySource=user-env` / `note` |
 | `file` | `ok` / `name` / `target=file` / `scope=file` / `filePath` / `fileFormat` / `field` / `created` / `keySource` / `warning` / `note` |
+| `store` | `ok` / `name` / `target=store` / `scope=upstream|model` / `model` / `keyId`（`upstream:名称` 或 `model:上游:模型`）/ `keySource=store` / `encrypted=true` / `backup` / `note` |
 
 - `file` 目标下 `warning`：该上游已配置 `apiKeyEnv` 时提示「环境变量优先于文件，文件里的密钥暂不生效」；
 - `keySource` 取值：`user-env` / `file` / `agent:file/<名>` / `agent:env-file/<名>`；
 - 写入失败**不降级为「只进内存」**：注册表写入失败 → 500 `write_user_var_failed`；
   文件写入失败 → 400 `write_key_file_failed`（参数不合法：路径/字段/密钥内容）或 500 `write_key_file_failed`（IO 失败）；
   文件写后回读校验失败 → 500 `verify_key_file_failed`；
-- 写入成功后运行态立即更新（`key_source`），**路径引用需用户另存配置**才落盘到 `bridge.config.json`。
+- 写入成功后运行态立即更新（`key_source`）；`env` / `file` 的引用需用户另存配置才落盘到 `bridge.config.json`，`store` 由后端在写密钥库后原子写入配置引用（备份失败 500 `config_backup_failed`，密钥库写失败 500 `store_write_failed`，配置写失败 500 `config_write_failed`）。
 
 ## 9. 面板行为
 
 - 预设下拉改读 `config.profiles`（缺失时回退现有硬编码，兼容旧后端）；当前 `compat.profile` 不在列表时追加显示；
 - 预设选择器前置到新增/编辑流程开头，按 `priority` 排序并展示 `description`；选择后按「只填空字段」自动填充 `protocol` / `baseUrl` / `apiKeyEnv` / `defaultModels`，冲突时保留用户值并提供「套用预设」显式覆盖；
-- 密钥来源改为互斥三选一（环境变量 / 凭据文件 / 暂不配置），只展开选中组；保存时只保留选中来源，避免旧字段继续生效造成「选了却没生效」；
+- 密钥来源改为互斥四选一（本机加密保存 / 环境变量 / 凭据文件 / 暂不配置），只展开选中组；保存时只保留选中来源，避免旧字段继续生效造成「选了却没生效」；
 - 新增只读「当前生效」实时预览（`POST /api/config/preview`，改动 `baseUrl` / `profile` / `protocol` 后防抖刷新），保存后仍以服务端 `effective` 为准；
 - 高级区新增「模型级覆盖（JSON）」文本域，保存前 `JSON.parse` 校验对象结构；非法时阻止保存并提示；
 - 新增只读「能力」徽标与「生效值」摘要（profile、上游 limits、模型覆盖条数）；
 - 保存沿用未知字段保留策略；`modelOverrides` 与既有字段一样参与 `collectConfig`。
 
-### 9.2 密钥写入区（`env-only-secrets`）
+### 9.2 密钥写入区（`credential-sources`）
 
-上游编辑器的 API Key 行有「写入目标」下拉，两档都**没有内置默认路径**：
+上游编辑器的 API Key 行有「写入目标」，所有目标都**没有内置默认路径**：
 
 | 目标 | 面板字段 | 行为 |
 |---|---|---|
+| 加密保存到本机（推荐） | 「API Key」+「加密保存到本机」 | 密钥经 Windows DPAPI 写入配置文件同目录 `*.secrets.json`，并立即把 `apiKeyStore` 引用写进 `bridge.config.json`；确认框写明引用与密文位置 |
 | 写入用户环境变量 | 「密钥环境变量（apiKeyEnv）」 | 变量名为空时**拒绝写入**并提示先填变量名；确认框写明落点为 `HKCU\Environment → <变量名>` |
 | 写入指定文件 | 「凭据文件路径」+「文件格式」+「字段 / 变量名」 | 路径为空 → 拒绝并提示；选 `.env` 文本但字段名为空 → 拒绝并提示；确认框写明落点路径、格式与字段名 |
 
@@ -305,7 +343,11 @@ API/面板：
 - 面板与编辑弹窗共用同一组「写入目标」字段，切换目标时显隐对应输入；
 - 写文件成功后，面板把**路径引用回填到表单字段**（JSON 根字段 `apiKey` → `apiKeyFile`；
   自定义字段 / `.env` 变量名 → `apiKeyAgent=custom` + `apiKeyAgentPath` + `apiKeyAgentProvider`），
-  并标记「有未保存的改动」：**路径要落盘仍需用户点「保存配置」**，配置文件里只有路径引用。
+  并标记「有未保存的改动」：**路径要落盘仍需用户点「保存配置」**，配置文件里只有路径引用；
+- 加密保存成功后，面板把 `apiKeyStore` 引用回填到隐藏字段（上游级）或 `modelKeys` JSON（逐模型）；
+  服务端已把引用原子写入配置，面板只刷新概览并保留其它未保存改动；
+- 「4. 逐模型密钥」的写入目标可选「本机加密保存 / 环境变量」：前者生成
+  `model:上游:模型` 引用，后者沿用该条目已保存的 `apiKeyEnv`。
 
 ### 9.1 提醒区（诊断展示）
 

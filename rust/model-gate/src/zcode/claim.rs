@@ -351,15 +351,62 @@ pub async fn claim_all(
     Ok(reports)
 }
 
-/// 后台自动领取：按 `claimIntervalSeconds` 周期执行；0 或插件关闭时跳过。
+/// 解析每日领取时间（本地时区 `HH:MM`）。
+fn parse_daily_time(value: &str) -> Option<chrono::NaiveTime> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    chrono::NaiveTime::parse_from_str(value, "%H:%M").ok()
+}
+
+/// 后台自动领取：
+/// - `claimDailyTime`（`HH:MM`，本地时区）优先：每天到点执行一次；
+/// - 否则回退到 `claimIntervalSeconds` 间隔模式（0=关闭）。
+/// 领取只依赖账号 JWT + 无头浏览器，不依赖 ZCode CLI 是否安装。
 pub async fn scheduler_loop(state: Arc<AppState>) {
     tokio::time::sleep(SCHEDULER_START_DELAY).await;
+    let mut last_daily_key: Option<String> = None;
     loop {
-        let (enabled, interval) = {
+        let (daily_time, interval) = {
             let cfg = state.zcode.config();
-            (cfg.enabled, cfg.claim_interval_seconds)
+            (cfg.claim_daily_time.clone(), cfg.claim_interval_seconds)
         };
-        if enabled && interval > 0 {
+        if let Some(target) = parse_daily_time(&daily_time) {
+            use chrono::Local;
+            let now = Local::now();
+            let today = now.date_naive();
+            if let Some(target_at) = today.and_time(target).and_local_timezone(Local).single() {
+                let key = format!("{} {}", today, target.format("%H:%M"));
+                if now >= target_at && last_daily_key.as_deref() != Some(key.as_str()) {
+                    // 重启后不重复领取：今日目标时间之后已有领取记录就只记标记。
+                    let target_ms = target_at.timestamp_millis();
+                    let already = state
+                        .db
+                        .zcode_recent_claims(1)
+                        .first()
+                        .map(|c| c.created_at >= target_ms)
+                        .unwrap_or(false);
+                    if !already {
+                        match claim_all(&state, None, true).await {
+                            Ok(reports) if !reports.is_empty() => {
+                                let ok = reports.iter().filter(|r| r.ok).count();
+                                tracing::info!(
+                                    "ZCode 每日领取完成（{}）：{} 个账号，成功 {}，失败 {}",
+                                    target.format("%H:%M"),
+                                    reports.len(),
+                                    ok,
+                                    reports.len() - ok
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!("ZCode 每日领取跳过：{err}"),
+                        }
+                    }
+                    last_daily_key = Some(key);
+                }
+            }
+        } else if interval > 0 {
             match claim_all(&state, None, false).await {
                 Ok(reports) if !reports.is_empty() => {
                     let ok = reports.iter().filter(|r| r.ok).count();
@@ -427,5 +474,14 @@ mod tests {
         assert_eq!(value["code"], 1005);
         assert_eq!(value["nextAt"], 123);
         assert!(value.get("token").is_none());
+    }
+
+    #[test]
+    fn daily_time_accepts_hhmm_only() {
+        assert!(parse_daily_time("08:30").is_some());
+        assert!(parse_daily_time(" 23:59 ").is_some());
+        assert!(parse_daily_time("").is_none());
+        assert!(parse_daily_time("25:00").is_none());
+        assert!(parse_daily_time("abc").is_none());
     }
 }

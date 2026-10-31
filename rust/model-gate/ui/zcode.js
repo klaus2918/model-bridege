@@ -49,7 +49,14 @@ function zcFillConfig(cfg) {
   const enabled = $("#zcode-enabled");
   if (enabled) enabled.checked = !!cfg.enabled;
   zcConfigValue("#zcode-backend", cfg.backend || "appserver");
-  zcConfigValue("#zcode-claim-interval", cfg.claimIntervalSeconds);
+  const daily = String(cfg.claimDailyTime || "").trim();
+  const legacyInterval = Number(cfg.claimIntervalSeconds || 0);
+  const autoClaim = !!daily || legacyInterval > 0;
+  const autoEl = $("#zcode-auto-claim");
+  if (autoEl) autoEl.checked = autoClaim;
+  const intervalRow = $("#zcode-claim-interval-row");
+  if (intervalRow) intervalRow.hidden = !autoClaim;
+  zcConfigValue("#zcode-claim-daily-time", daily || "08:00");
   zcConfigValue("#zcode-concurrency", cfg.accountConcurrency);
   zcConfigValue("#zcode-browser-path", cfg.browserPath);
   zcConfigValue("#zcode-cli-path", cfg.cliPath);
@@ -62,17 +69,15 @@ function zcRenderStatus(status) {
   const host = $("#zcode-status");
   if (!host) return;
   const pool = status.pool || {};
-  const captcha = status.captcha || {};
   const last = status.lastClaim;
   const chips = [
-    zcChip(status.enabled ? "插件已启用" : "插件未启用", status.enabled ? "ok" : "bad"),
-    zcChip(`backend ${status.backend || "—"}`, status.backend === "appserver" ? "ok" : "warn"),
-    zcChip(`账号 ${status.accounts?.total ?? 0} / 活跃 ${status.accounts?.active ?? 0}`, "ok"),
-    zcChip(`池 active ${pool.active ?? 0} · cooling ${pool.cooling ?? 0} · invalid ${pool.invalid ?? 0}`, pool.invalid ? "warn" : ""),
-    zcChip(`浏览器 ${status.browserExists ? "可用" : "缺失"}`, status.browserExists ? "ok" : "bad"),
-    zcChip(`CLI ${status.cliExists ? "可用" : "缺失"}`, status.cliExists ? "ok" : "bad"),
-    zcChip(`验证码池 ${captcha.available ?? 0}`, captcha.available ? "ok" : "warn"),
+    zcChip(status.enabled ? "插件已启用" : "插件未启用（不会启动 CLI）", status.enabled ? "ok" : ""),
+    zcChip(`CLI ${status.cliExists ? "可用" : "缺失"}`, status.cliExists ? "ok" : "warn"),
+    zcChip(`账号 ${status.accounts?.total ?? 0} / 活跃 ${status.accounts?.active ?? 0}`, ""),
   ];
+  if (status.enabled) {
+    chips.push(zcChip(`backend ${status.backend || "—"}`, status.backend === "appserver" ? "ok" : "warn"));
+  }
   if (last) {
     chips.push(zcChip(
       `最近领取 ${last.ok ? "成功" : "失败"}${last.code != null ? ` (${last.code})` : ""} · ${zcTime(last.createdAt)}`,
@@ -87,9 +92,14 @@ function zcRenderStatus(status) {
   const glmHint = $("#zcode-glm-hint");
   if (glmHint) {
     glmHint.textContent = status.enabled
-      ? "接入后写入 upstreams.zcode；请求由账号池轮询，backend=appserver。"
-      : "插件未启用：先在上方启用并保存设置，再接入 GLM。";
+      ? "已启用：接入后写入 upstreams.zcode，请求按账号池轮询。"
+      : "未启用：不会调用 CLI；需要时先在上方勾选「启用」并保存。";
   }
+  // 未启用只影响聊天；领取不依赖 ZCode CLI，保持可用。
+  const claimsBox = $("#zcode-claims-box");
+  if (claimsBox) claimsBox.hidden = false;
+  const attach = $("#zcode-attach");
+  if (attach) attach.disabled = !status.enabled;
 }
 
 function zcPlanText(account) {
@@ -133,7 +143,7 @@ function zcRenderAccounts() {
   if (hint) {
     hint.textContent = ZC.accounts.length
       ? "账号 JWT 只存本机加密库；面板只显示掩码。点「刷新额度」会调用 billing/preview（只读，不领取）。"
-      : "导入后账号进入 SQLite 账号池；自动领取按设置里的间隔执行。";
+      : "导入后账号进入本机账号池；默认不会自动领取，需要时在基础设置里勾选。";
   }
 }
 
@@ -188,6 +198,8 @@ async function loadZcode() {
 
 async function zcSaveConfig() {
   const previous = ZC.config || {};
+  const autoClaim = !!$("#zcode-auto-claim")?.checked;
+  const dailyTime = ($("#zcode-claim-daily-time")?.value || "").trim();
   const next = {
     ...previous,
     enabled: !!$("#zcode-enabled")?.checked,
@@ -197,7 +209,8 @@ async function zcSaveConfig() {
     dataDir: $("#zcode-data-dir")?.value || "",
     browserPath: $("#zcode-browser-path")?.value || "",
     captchaScene: $("#zcode-captcha-scene")?.value || previous.captchaScene || "",
-    claimIntervalSeconds: Number($("#zcode-claim-interval")?.value || 0),
+    claimDailyTime: autoClaim ? (dailyTime || "08:00") : "",
+    claimIntervalSeconds: 0,
     accountConcurrency: Number($("#zcode-concurrency")?.value || 1),
   };
   try {
@@ -251,33 +264,47 @@ async function zcImportLocalInfo() {
 
 function zcAddManual() {
   openModal({
-    title: "粘贴 JWT / API Key",
-    hint: "只提交一次；后端加密入库，面板不回显。",
+    title: "批量添加账号",
+    hint: "每行一个 JWT 或 API Key；支持「名称=JWT」。只提交一次，后端加密入库，面板不回显。",
     body: `<div class="grid">
-      <label>名称<input type="text" data-zc-field="name" placeholder="zcode-account"></label>
-      <label>JWT / API Key<textarea rows="4" data-zc-field="token" spellcheck="false"></textarea></label>
+      <label>账号（每行一个，可写 名称=JWT）
+        <textarea rows="8" data-zc-field="tokens" spellcheck="false" placeholder="账号A=eyJhbGciOi...&#10;eyJhbGciOi..."></textarea>
+      </label>
     </div>`,
     actions: [
       { label: "取消", className: "ghost" },
       {
-        label: "加入账号池",
+        label: "批量加入",
         className: "primary",
         onClick: async (root) => {
-          const name = (root.querySelector('[data-zc-field="name"]')?.value || "").trim();
-          const token = (root.querySelector('[data-zc-field="token"]')?.value || "").trim();
-          if (!token) {
-            toast("请粘贴 JWT 或 API Key", true);
+          const lines = (root.querySelector('[data-zc-field="tokens"]')?.value || "")
+            .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+          if (!lines.length) {
+            toast("请粘贴至少一个 JWT 或 API Key", true);
             return true;
           }
-          try {
-            const result = await postJson("/api/zcode/accounts", { name: name || "zcode-account", token });
-            toast(result.duplicate ? "该账号已在池中" : "账号已加入");
-            await loadZcode();
-            return false;
-          } catch (err) {
-            toast(`加入失败：${err.message}`, true);
-            return true;
+          let added = 0;
+          let duplicate = 0;
+          let failed = 0;
+          for (let i = 0; i < lines.length; i += 1) {
+            let name = `zcode-account-${i + 1}`;
+            let token = lines[i];
+            const eq = token.indexOf("=");
+            if (eq > 0) {
+              name = token.slice(0, eq).trim() || name;
+              token = token.slice(eq + 1).trim();
+            }
+            if (!token) { failed += 1; continue; }
+            try {
+              const result = await postJson("/api/zcode/accounts", { name, token });
+              if (result.duplicate) duplicate += 1; else added += 1;
+            } catch (_) {
+              failed += 1;
+            }
           }
+          toast(`批量导入完成：新增 ${added}，重复 ${duplicate}，失败 ${failed}`);
+          await loadZcode();
+          return false;
         },
       },
     ],
@@ -445,8 +472,32 @@ async function zcAccountAction(action, id) {
   }
 }
 
+function zcShowHelp() {
+  openModal({
+    title: "ZCode 插件配置说明",
+    wide: true,
+    hint: "本说明只针对 ZCode 插件；其他上游和全局配置不受影响。",
+    body: `<div class="grid">
+      <div><strong>启用 ZCode 插件</strong><div class="hint">只影响 /zcode/v1 聊天是否调用本机 ZCode CLI。关闭时不会启动 CLI；账号管理和领取仍可使用。</div></div>
+      <div><strong>ZCode CLI 路径</strong><div class="hint">指向 ZCode 安装目录下的 resources/glm/zcode.cjs。留空时自动探测 Program Files / LocalAppData 下的常见位置；安装在 D 盘等自定义目录时需要手填。</div></div>
+      <div><strong>每日定时领取</strong><div class="hint">默认关闭。勾选后每天在指定时间自动领取 Start Plan；领取只依赖账号 JWT + 无头浏览器，不需要安装 ZCode。</div></div>
+      <div><strong>每日领取时间（本地时区）</strong><div class="hint">按运行 Model-Gate 的电脑时区执行，例如 08:30。关闭勾选或留空即不自动领取；手动「立即领取」不受限制。</div></div>
+      <div><strong>请求失败时最多换几个账号</strong><div class="hint">单次对话在账号池中最多尝试的账号数，失败会自动换下一个；不是并发数。</div></div>
+      <div><strong>高级设置</strong><div class="hint">通常无需修改。连接方式固定用「本机 CLI」；Node 路径、ZCode 数据目录、浏览器路径和验证码场景 ID 只影响本插件的 CLI、导入和验证码求解。</div></div>
+      <div><strong>账号（可选）</strong><div class="hint">支持多个账号：本机导入、批量粘贴（每行一个 JWT/API Key）或 OAuth 登录。JWT 加密保存在本机数据库，面板只显示掩码。领取会自动遍历所有启用的 JWT 账号。</div></div>
+      <div><strong>接入 GLM（可选）</strong><div class="hint">启用后把 GLM-5.3 / GLM-5.3-Flash 写入 upstreams.zcode；不接入也不影响已有上游。</div></div>
+    </div>`,
+    actions: [{ label: "知道了", className: "primary" }],
+  });
+}
+
 function zcBind() {
+  $("#zcode-help")?.addEventListener("click", zcShowHelp);
   $("#zcode-refresh")?.addEventListener("click", loadZcode);
+  $("#zcode-auto-claim")?.addEventListener("change", (ev) => {
+    const row = $("#zcode-claim-interval-row");
+    if (row) row.hidden = !ev.target.checked;
+  });
   $("#zcode-save")?.addEventListener("click", zcSaveConfig);
   $("#zcode-captcha-test")?.addEventListener("click", zcCaptchaTest);
   $("#zcode-import-local")?.addEventListener("click", zcImportLocalInfo);

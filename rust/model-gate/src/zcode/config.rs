@@ -21,6 +21,9 @@ pub struct ZcodeConfig {
     pub captcha_scene: String,
     pub captcha_region: String,
     pub captcha_prefix: String,
+    /// 每日领取时间（本地时区 `HH:MM`；空 = 不定时）。
+    #[serde(default)]
+    pub claim_daily_time: String,
     pub claim_interval_seconds: u64,
     pub account_concurrency: u32,
 }
@@ -38,7 +41,8 @@ impl Default for ZcodeConfig {
             captcha_scene: super::captcha::default_scene(),
             captcha_region: super::captcha::default_region(),
             captcha_prefix: super::captcha::default_prefix(),
-            claim_interval_seconds: 3600,
+            claim_daily_time: String::new(),
+            claim_interval_seconds: 0,
             account_concurrency: 2,
         }
     }
@@ -210,7 +214,7 @@ mod tests {
     fn default_config_has_backend_and_interval() {
         let cfg = ZcodeConfig::default();
         assert_eq!(cfg.backend, "appserver");
-        assert_eq!(cfg.claim_interval_seconds, 3600);
+        assert_eq!(cfg.claim_interval_seconds, 0);
         assert!(!cfg.enabled);
     }
 

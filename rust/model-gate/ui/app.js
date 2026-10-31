@@ -477,6 +477,9 @@ async function loadOverview() {
       <span class="mono-block">模型清单  GET  ${esc(status.endpoint)}/models
 对话补全  POST ${esc(status.endpoint)}/chat/completions
 指定上游  POST http://127.0.0.1:${status.port}/&lt;上游名&gt;/v1/chat/completions
+统一入口  POST http://127.0.0.1:${status.port}/unified/v1/chat/completions（model 用「上游/模型」）
+分组入口  POST http://127.0.0.1:${status.port}/unified/&lt;分组&gt;/v1/chat/completions
+统一清单  GET  http://127.0.0.1:${status.port}/unified/v1/models
 健康检查  GET  http://127.0.0.1:${status.port}/health</span>
     </div>
     <div class="callout warn">
@@ -806,13 +809,16 @@ function addUpstream() {
   if (card) openUpstreamEditor(card);
 }
 
-/* 密钥写入目标二选一（用户确认口径）：
+/* 密钥写入目标三选一：
+ * - store：Windows DPAPI 加密保存到 Model-Gate 本机密钥库（推荐）
  * - env：Windows 用户级环境变量（HKCU\Environment）
  * - file：用户手动指定的凭据文件（JSON / .env），代码里没有任何内置默认路径
- * 两条路径都只写「密钥本体」；配置文件里只保存路径引用，绝不保存明文。 */
+ * 三条路径都只写「密钥本体」；配置文件里只保存引用，绝不保存明文。 */
 async function saveUpstreamSecret(name, secret, input, opts) {
   const o = opts || {};
-  const isFile = o.target === "file";
+  const target = o.target === "file" ? "file" : o.target === "store" ? "store" : "env";
+  const isFile = target === "file";
+  const isStore = target === "store";
   const envName = (o.envName || "").trim();
   const filePath = (o.filePath || "").trim();
   const fileFormat = (o.fileFormat || "json").trim();
@@ -820,39 +826,48 @@ async function saveUpstreamSecret(name, secret, input, opts) {
   const model = (o.model || "").trim();
   const where = isFile
     ? `${filePath}\n格式：${fileFormat === "env" ? ".env 文本" : "JSON"}${field ? ` · 字段/变量名：${field}` : ""}`
-    : model
-      ? `模型「${model}」在 modelKeys 里配置的环境变量`
-      : `Windows 用户变量 HKCU\\Environment → ${envName}`;
+    : isStore
+      ? `Model-Gate 本机加密密钥库（DPAPI）· ${model ? `model:${name}:${model}` : `upstream:${name}`}`
+      : model
+        ? `模型「${model}」在 modelKeys 里配置的环境变量`
+        : `Windows 用户变量 HKCU\\Environment → ${envName}`;
   const ok = await confirmModal({
-    title: isFile ? "写入指定文件" : (model ? "写入逐模型密钥" : "写入用户环境变量"),
+    title: isFile ? "写入指定文件" : isStore ? (model ? "加密保存逐模型密钥" : "加密保存上游密钥") : (model ? "写入逐模型密钥" : "写入用户环境变量"),
     text: `对象：${name}${model ? `\n模型：${model}` : ""}\n写入位置：${where}\n说明：${isFile
       ? "只写你手动指定的这个文件；配置文件里只保存路径引用，不保存密钥；不回显密钥。"
-      : "只写用户环境变量、不写 bridge.config.json；当前进程立即生效，新进程自动继承；不回显密钥。"}`,
-    confirmLabel: "写入",
+      : isStore
+        ? "密钥用 Windows DPAPI 加密后保存在配置文件同目录的独立密钥库；bridge.config.json 只写 apiKeyStore 引用。密文只能由当前 Windows 用户/机器解密，不回显密钥。"
+        : "只写用户环境变量、不写 bridge.config.json；当前进程立即生效，新进程自动继承；不回显密钥。"}`,
+    confirmLabel: isStore ? "加密保存" : "写入",
     danger: false,
   });
   if (!ok) return;
   try {
-    const body = { name, apiKey: secret, target: isFile ? "file" : "env" };
+    const body = { name, apiKey: secret, target };
     if (isFile) {
       body.filePath = filePath;
       body.fileFormat = fileFormat;
       if (field) body.field = field;
     } else {
-      // 逐模型写入由服务端按 modelKeys 决定变量名；此时不需要手填 envName。
+      // 逐模型写入由服务端按 modelKeys 决定变量名；store 目标按模型生成引用。
       if (model) body.model = model;
-      else body.envName = envName;
+      else if (!isStore) body.envName = envName;
     }
     const data = await postJson("/api/upstreams/secret", body);
-    if (isFile) {
+    if (isStore) {
+      toast(model
+        ? `已加密保存模型「${data.model || model}」的密钥；配置里只保留 ${data.keyId || "apiKeyStore"} 引用`
+        : `已加密保存上游「${data.name || name}」的密钥；配置里只保留 ${data.keyId || "apiKeyStore"} 引用`);
+      if (o.onWritten) o.onWritten(data);
+    } else if (isFile) {
       toast(`已写入 ${data.filePath || filePath} 并立即生效`);
       if (o.onWritten) o.onWritten(data);
     } else {
       toast(`已写入用户变量 ${data.envName || envName} 并立即生效`);
     }
     if (input) input.value = "";
-    if (isFile) {
-      // 写文件后只刷新概览：不重载配置（会冲掉用户还没保存的其它改动）。
+    if (isFile || isStore) {
+      // 文件/密钥库的引用已由服务端落盘；只刷新概览，保留用户还没保存的其它表单改动。
       await loadOverview();
     } else {
       await loadConfig();
@@ -892,6 +907,71 @@ function applyKeyFileReference(cardEl, data) {
   setConfigDirty(true);
   syncKeySourceFields(cardEl);
   renderUpstreamCfgTable();
+}
+
+/* 加密保存上游级密钥后，把引用回填到卡片；服务端已把 apiKeyStore 写入配置文件。
+ * 这里不整页重载配置，避免冲掉用户还没保存的其它修改。 */
+function applyKeyStoreReference(cardEl, data) {
+  if (!cardEl) return;
+  const id = String((data && data.keyId) || "").trim();
+  if (!id) return;
+  const ref = cardEl.querySelector('[data-field="apiKeyStoreRef"]');
+  if (ref) ref.value = id;
+  const storeRadio = cardEl.querySelector('[data-field="keySourceMode"][value="store"]');
+  if (storeRadio) storeRadio.checked = true;
+  cardEl.dataset.keyConfigured = "1";
+  cardEl.dataset.keySource = "store";
+  const name = cardEl.dataset.name || "";
+  const up = state.config && state.config.upstreams && state.config.upstreams[name];
+  if (up) {
+    delete up.apiKeyEnv;
+    delete up.apiKeyFile;
+    delete up.apiKeyAgent;
+    delete up.apiKeyAgentPath;
+    delete up.apiKeyAgentProvider;
+    up.apiKeyStore = id;
+    up._keyConfigured = true;
+    up._keySource = "store";
+  }
+  const effRow = (state.effective || []).find((row) => row.name === name);
+  if (effRow) {
+    effRow.keySource = "store";
+    effRow.keyConfigured = true;
+    effRow.apiKeyStore = id;
+  }
+  setConfigDirty(true);
+  syncKeySourceFields(cardEl);
+  renderUpstreamCfgTable();
+}
+
+/* 加密保存逐模型密钥后，把 apiKeyStore 引用写回 modelKeys 文本域与本地配置；
+ * 否则下一次「保存配置」会用旧文本覆盖服务端刚写入的引用。 */
+function applyModelKeyStoreReference(cardEl, data) {
+  if (!cardEl) return;
+  const id = String((data && data.keyId) || "").trim();
+  const model = String((data && data.model) || "").trim();
+  if (!id || !model) return;
+  const el = cardEl.querySelector('[data-field="modelKeys"]');
+  if (el) {
+    let obj = {};
+    try {
+      const parsed = el.value.trim() ? JSON.parse(el.value) : {};
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) obj = parsed;
+    } catch (_) {
+      obj = {};
+    }
+    obj[model] = { apiKeyStore: id };
+    el.value = JSON.stringify(obj, null, 2);
+  }
+  const name = cardEl.dataset.name || "";
+  const up = state.config && state.config.upstreams && state.config.upstreams[name];
+  if (up) {
+    up.modelKeys = up.modelKeys && typeof up.modelKeys === "object" ? up.modelKeys : {};
+    up.modelKeys[model] = { apiKeyStore: id };
+  }
+  setConfigDirty(true);
+  renderUpstreamCfgTable();
+  toast(`已把模型「${model}」的密钥引用写入 modelKeys，记得点「保存配置」`);
 }
 
 /* 密钥来源单选：只显示当前选中组；保存时由 _readUpstreamEditor 清理未选来源。 */
@@ -1061,11 +1141,13 @@ function upstreamDetailRowCfg(card) {
   const models = val("models").split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
   const keyModeEl = card.querySelector('[data-field="keySourceMode"]:checked');
   const keyMode = keyModeEl ? keyModeEl.value : "none";
-  const keySourceText = keyMode === "env"
-    ? `环境变量 ${val("apiKeyEnv") || "未填变量名"}`
-    : keyMode === "file"
-      ? `凭据文件 ${val("apiKeyAgentPath") || "未填路径"}`
-      : "暂不配置";
+  const keySourceText = keyMode === "store"
+    ? `本机加密密钥库 ${val("apiKeyStoreRef") || "未生成引用"}`
+    : keyMode === "env"
+      ? `环境变量 ${val("apiKeyEnv") || "未填变量名"}`
+      : keyMode === "file"
+        ? `凭据文件 ${val("apiKeyAgentPath") || "未填路径"}`
+        : "暂不配置";
   const items = [
     ["模型清单", models.slice(0, 12).join(", ") + (models.length > 12 ? ` …共 ${models.length} 个` : "")],
     ["密钥来源", keySourceText],
@@ -1166,6 +1248,18 @@ function renderUpstreamCfgTable() {
   }
 }
 
+function privacyAdapterLabel(adapter) {
+  if (!adapter || !adapter.kind) return "未声明";
+  switch (adapter.kind) {
+    case "header": return `请求头 ${adapter.name}: ${adapter.value}`;
+    case "body": return `请求体 ${adapter.path} = ${JSON.stringify(adapter.value)}`;
+    case "workspace": return `上游控制台：${adapter.setting}（${adapter.url}）`;
+    case "none": return "无需额外动作";
+    case "unsupported": return `不支持：${adapter.reason || "该上游未声明"}`;
+    default: return String(adapter.kind);
+  }
+}
+
 function renderUpstreamEditor() {
   const host = $("#upstream-editor");
   if (!host) return;
@@ -1189,7 +1283,11 @@ function renderUpstreamEditor() {
     const cDowngrade = compat.toolChoice
       && typeof compat.toolChoice.downgradeForced === "boolean"
       ? (compat.toolChoice.downgradeForced ? "on" : "off") : "";
-    const cZdr = typeof compat.zdr === "boolean" ? (compat.zdr ? "on" : "off") : "";
+    const privacy = compat.privacy && typeof compat.privacy === "object" ? compat.privacy : {};
+    const cZdr = typeof privacy.zdr === "boolean"
+      ? (privacy.zdr ? "on" : "off")
+      : (typeof compat.zdr === "boolean" ? (compat.zdr ? "on" : "off") : "");
+    const cTraining = ["allow", "deny"].includes(privacy.training) ? privacy.training : "";
     const cVersion = Object.prototype.hasOwnProperty.call(compat, "versionHeader")
       ? (compat.versionHeader || "-") : "";
     const cEnvironment = Object.prototype.hasOwnProperty.call(compat, "environmentHeader")
@@ -1198,19 +1296,39 @@ function renderUpstreamEditor() {
       ? JSON.stringify(u.modelOverrides, null, 2) : "";
     const cModelKeys = u.modelKeys && Object.keys(u.modelKeys).length
       ? JSON.stringify(u.modelKeys, null, 2) : "";
+    const eff = ((state.effective || []).find((row) => row.name === name)) || null;
+    const effKeySource = String((eff && eff.keySource) || "");
     const keyConfigured = u._keyConfigured;
-    const keyMode = (u.apiKeyEnv || "").trim()
-      ? "env"
-      : ((u.apiKeyFile || "").trim() || (u.apiKeyAgent || "").trim() || (u.apiKeyAgentPath || "").trim())
-        ? "file"
-        : "none";
+    const storeRef = String(u.apiKeyStore || "").trim();
+    // 以服务端实际生效来源为准；读不到时才按配置字段回退，避免多个来源并存时示错。
+    const keyMode = effKeySource === "store"
+      ? "store"
+      : (effKeySource === "env" || effKeySource === "user-env")
+        ? "env"
+        : (effKeySource === "file" || effKeySource.startsWith("agent:"))
+          ? "file"
+          : storeRef
+            ? "store"
+            : (u.apiKeyEnv || "").trim()
+              ? "env"
+              : ((u.apiKeyFile || "").trim() || (u.apiKeyAgent || "").trim() || (u.apiKeyAgentPath || "").trim())
+                ? "file"
+                : "none";
     const keySourceCount = [
       !!String(u.apiKeyEnv || "").trim(),
       !!(String(u.apiKeyFile || "").trim() || String(u.apiKeyAgent || "").trim() || String(u.apiKeyAgentPath || "").trim()),
+      !!storeRef,
     ].filter(Boolean).length;
-    const eff = ((state.effective || []).find((row) => row.name === name)) || null;
+    const effPrivacy = eff && eff.privacy;
+    const privacyHint = effPrivacy
+      ? `生效方式 — ZDR：${privacyAdapterLabel(effPrivacy.adapters && effPrivacy.adapters.zdr)}；`
+        + `允许训练：${privacyAdapterLabel(effPrivacy.adapters && effPrivacy.adapters.trainingAllow)}；`
+        + `禁止训练：${privacyAdapterLabel(effPrivacy.adapters && effPrivacy.adapters.trainingDeny)}`
+      : "保存后这里会显示该上游的实际生效方式；不支持的策略会给出诊断，不会静默发送无效头。";
     const keyWarn = keyConfigured ? "" :
-      keyMode === "none"
+      keyMode === "store"
+        ? `<div class="hint" style="color:var(--warn)">密钥库引用存在但未读到可用密钥：请重新点「加密保存到本机」；DPAPI 密文只能由写入时的 Windows 用户/机器解密。</div>`
+      : keyMode === "none"
         ? `<div class="hint" style="color:var(--warn)">未配置密钥：需要鉴权的上游会返回 401；免鉴权上游可忽略。</div>`
         : `<div class="hint" style="color:var(--warn)">尚未写入密钥：填好 API Key 后点对应的「写入...」按钮；也可以只保存变量名/路径，稍后再写。</div>`;
     const legacyHints = [];
@@ -1243,6 +1361,7 @@ function renderUpstreamEditor() {
       <summary>
         <span class="up-preview">${esc(u.protocol || "anthropic")}${u.transport ? ` / ${esc(u.transport)}` : ""} · ${esc(u.baseUrl || "未填 Base URL")} · ${
           (u.models || []).length} 个模型${keyMode === "env" && u.apiKeyEnv ? ` · 环境变量 ${esc(u.apiKeyEnv)}` : ""}${
+          keyMode === "store" && storeRef ? ` · 本机加密密钥库 ${esc(storeRef)}` : ""}${
           keyMode === "file" && (u.apiKeyFile || u.apiKeyAgentPath) ? ` · 凭据文件 ${esc(u.apiKeyFile || u.apiKeyAgentPath)}` : ""}${
           u.modelKeys && Object.keys(u.modelKeys).length ? ` · 逐模型密钥 ${Object.keys(u.modelKeys).length}` : ""}</span>
         <button type="button" class="ghost" data-act="edit">编辑</button>
@@ -1291,15 +1410,19 @@ function renderUpstreamEditor() {
           </div>
         </section>
         <section class="form-section span-2">
-          <div class="section-title">2. 密钥来源（三选一）</div>
+          <div class="section-title">2. 密钥来源（四选一）</div>
           <div class="grid grid-2">
         <div class="span-2 hint" data-role="key-source-hint">${keySourceCount > 1
             ? `检测到 ${keySourceCount} 个来源并存；保存后只保留当前选中的来源`
             : (keyConfigured ? `当前生效：${esc((eff && eff.keySource) || "已配置")}` : "当前未配置")}</div>
         <div class="span-2 key-source-radios">
           <label class="check key-source-radio">
+            <input type="radio" name="keySourceMode-${esc(name)}" data-field="keySourceMode" value="store" ${keyMode === "store" ? "checked" : ""}>
+            本机加密保存（DPAPI，推荐）
+          </label>
+          <label class="check key-source-radio">
             <input type="radio" name="keySourceMode-${esc(name)}" data-field="keySourceMode" value="env" ${keyMode === "env" ? "checked" : ""}>
-            环境变量（推荐）
+            环境变量
           </label>
           <label class="check key-source-radio">
             <input type="radio" name="keySourceMode-${esc(name)}" data-field="keySourceMode" value="file" ${keyMode === "file" ? "checked" : ""}>
@@ -1309,6 +1432,17 @@ function renderUpstreamEditor() {
             <input type="radio" name="keySourceMode-${esc(name)}" data-field="keySourceMode" value="none" ${keyMode === "none" ? "checked" : ""}>
             暂不配置
           </label>
+        </div>
+        <input type="hidden" data-field="apiKeyStoreRef" value="${esc(storeRef)}">
+        <div class="span-2 key-source-group" data-key-group="store">
+          <label>API Key（加密保存到本机密钥库）
+            <div class="key-row">
+              <input type="password" data-field="apiKeyStoreValue" value="" placeholder="${keyConfigured && keyMode === "store" ? "已配置 · 留空保持不变" : "未配置"}">
+              <button type="button" class="ghost" data-act="save-store"
+                title="用 Windows DPAPI 加密保存到本机；bridge.config.json 只保存 apiKeyStore 引用">加密保存到本机</button>
+            </div>
+          </label>
+          <div class="hint">密文保存在配置文件同目录的 <code>*.secrets.json</code>，绑定当前 Windows 用户与机器；配置里只保留 <code>${esc(storeRef || "upstream:名称 / model:上游:模型")}</code> 引用。默认一个上游共用一把；不同模型可分别在下方「4. 逐模型密钥」单独保存。</div>
         </div>
         <div class="span-2 key-source-group" data-key-group="env">
           <label>密钥环境变量（apiKeyEnv）
@@ -1381,10 +1515,14 @@ function renderUpstreamEditor() {
         <div class="span-2 key-row">
           <input type="text" data-field="modelKeyWriteModel" placeholder="模型 id（modelKeys 的键），如 MiniMax-M3">
           <input type="password" data-field="modelKeyWriteValue" placeholder="该模型的 API Key（只用于本次写入）">
+          <select data-field="modelKeyWriteTarget" title="逐模型密钥写入位置">
+            <option value="store">本机加密保存</option>
+            <option value="env">环境变量</option>
+          </select>
           <button type="button" class="ghost" data-act="save-model-key"
-            title="写入该模型在 modelKeys 里配置的环境变量；不写配置文件">写入逐模型密钥</button>
+            title="把该模型的密钥保存到本机加密库（或写入 modelKeys 里配置的环境变量）">写入逐模型密钥</button>
         </div>
-        <div class="span-2 hint">键为上游实际模型 id（modelMap 解析后），支持单个 * 通配；值可以是环境变量名或 {"apiKeyEnv":"..."} 对象。配置文件只保存变量名/路径，不保存密钥；未读到值的模型会回落到上游级密钥。写入逐模型密钥前请先保存一次配置（服务端按已保存的 modelKeys 找变量名）。</div>
+        <div class="span-2 hint">键为上游实际模型 id（modelMap 解析后），支持单个 * 通配；值可以是环境变量名或 {"apiKeyEnv":"..."} / {"apiKeyStore":"model:..."} 对象。选「本机加密保存」时配置里只写 apiKeyStore 引用；选「环境变量」时配置文件只保存变量名（需先保存一次 modelKeys，服务端按已保存的条目找变量名）。未读到值的模型会回落到上游级密钥。</div>
           </div>
         </section>
         <div class="span-2 hint">兼容能力（compat）：留空 = 跟随 provider 预设；这里只覆盖需要差异化的部分，保存时不会丢失。</div>
@@ -1424,12 +1562,19 @@ function renderUpstreamEditor() {
               .map(([v, label]) => `<option value="${v}"${cDowngrade === v ? " selected" : ""}>${label}</option>`).join("")}
           </select>
         </label>
-        <label>ZDR 安全头
+        <label>ZDR / 零数据保留
           <select data-field="compatZdr">
-            ${[["", "跟随预设"], ["on", "发送"], ["off", "不发送"]]
+            ${[["", "跟随预设"], ["on", "要求 ZDR"], ["off", "不要求"]]
               .map(([v, label]) => `<option value="${v}"${cZdr === v ? " selected" : ""}>${label}</option>`).join("")}
           </select>
         </label>
+        <label>训练数据策略
+          <select data-field="compatTraining">
+            ${[["", "跟随预设"], ["deny", "禁止训练"], ["allow", "允许训练"]]
+              .map(([v, label]) => `<option value="${v}"${cTraining === v ? " selected" : ""}>${label}</option>`).join("")}
+          </select>
+        </label>
+        <div class="span-2 hint" data-role="privacy-hint">${esc(privacyHint)}</div>
         <label>版本头名
           <input type="text" data-field="compatVersionHeader" value="${esc(cVersion)}" placeholder="跟随预设；填 - 表示不发">
         </label>
@@ -1481,6 +1626,19 @@ function bindUpstreamCardActions(cardEl) {
         saveUpstreamSecret(key, secret, input, { target: "env", envName });
         return;
       }
+      if (btn.dataset.act === "save-store") {
+        const input = cardEl.querySelector('[data-field="apiKeyStoreValue"]');
+        const secret = ((input && input.value) || "").trim();
+        if (!secret) {
+          toast("请先填入 API Key，再加密保存", true);
+          return;
+        }
+        saveUpstreamSecret(key, secret, input, {
+          target: "store",
+          onWritten: (data) => applyKeyStoreReference(cardEl, data),
+        });
+        return;
+      }
       if (btn.dataset.act === "save-file") {
         const input = cardEl.querySelector('[data-field="apiKeyFileValue"]');
         const secret = ((input && input.value) || "").trim();
@@ -1524,7 +1682,13 @@ function bindUpstreamCardActions(cardEl) {
           toast("请先填入该模型的 API Key", true);
           return;
         }
-        saveUpstreamSecret(key, secret, input, { target: "env", model });
+        const targetEl = cardEl.querySelector('[data-field="modelKeyWriteTarget"]');
+        const target = (targetEl && targetEl.value) || "store";
+        saveUpstreamSecret(key, secret, input, {
+          target,
+          model,
+          onWritten: target === "store" ? (data) => applyModelKeyStoreReference(cardEl, data) : undefined,
+        });
         return;
       }
       if (btn.dataset.act === "query-models") {
@@ -1788,6 +1952,123 @@ async function applyModelDiscovery(panel, modelsField, selected) {
   panel.remove();
 }
 
+/* ── 统一接入：可见白名单 + 分组管理 ─────────────────────────── */
+function unifiedConfig() {
+  const raw = (state.config && state.config.unified) || {};
+  return {
+    visibleUpstreams: Array.isArray(raw.visibleUpstreams) ? raw.visibleUpstreams : [],
+    groups: Array.isArray(raw.groups) ? raw.groups : [],
+  };
+}
+
+function renderUnifiedEditor() {
+  const visibleHost = $("#unified-visible-list");
+  const tableBody = $("#unified-group-table") && $("#unified-group-table").querySelector("tbody");
+  if (!visibleHost || !tableBody) return;
+  const names = Object.keys((state.config && state.config.upstreams) || {});
+  const unified = unifiedConfig();
+  const visible = new Set(unified.visibleUpstreams);
+
+  visibleHost.innerHTML = names.length
+    ? names.map((name) => `
+      <label class="check">
+        <input type="checkbox" data-unified-visible="${esc(name)}" ${visible.has(name) ? "checked" : ""}>
+        ${esc(name)}
+      </label>`).join("")
+    : '<div class="hint span-2">还没有上游：先在上方添加上游，再配置统一接入。</div>';
+
+  if (!unified.groups.length) {
+    tableBody.innerHTML =
+      '<tr><td colspan="4" class="hint">还没有分组：点右上角「＋ 新增分组」创建；不建分组时 /unified/v1 仍可用。</td></tr>';
+    return;
+  }
+
+  tableBody.innerHTML = unified.groups.map((group, index) => {
+    const id = String(group.id || "");
+    const label = String(group.label || "");
+    const members = new Set(Array.isArray(group.upstreams) ? group.upstreams : []);
+    const options = names.map((name) =>
+      `<option value="${esc(name)}" ${members.has(name) ? "selected" : ""}>${esc(name)}</option>`);
+    // 保留未知成员，避免配置错误在面板里被静默吞掉。
+    Array.from(members)
+      .filter((name) => !names.includes(name))
+      .forEach((name) => {
+        options.push(`<option value="${esc(name)}" selected>${esc(name)}（未配置）</option>`);
+      });
+    return `<tr data-unified-group-row="${index}">
+      <td><input type="text" data-unified-group-field="id" value="${esc(id)}" placeholder="team-a"></td>
+      <td><input type="text" data-unified-group-field="label" value="${esc(label)}" placeholder="团队 A"></td>
+      <td><select multiple size="4" data-unified-group-field="upstreams">${options.join("")}</select></td>
+      <td class="num"><button type="button" class="ghost tiny danger-ghost" data-unified-group-del="${index}">删除</button></td>
+    </tr>`;
+  }).join("");
+}
+
+function readUnifiedEditor() {
+  const visibleHost = $("#unified-visible-list");
+  if (!visibleHost || !$("#unified-group-table")) {
+    return unifiedConfig();
+  }
+  const visibleUpstreams = $$("input[data-unified-visible]", visibleHost)
+    .filter((el) => el.checked)
+    .map((el) => el.dataset.unifiedVisible);
+  const groups = $$("#unified-group-table tbody tr[data-unified-group-row]").map((row) => {
+    const idEl = row.querySelector('[data-unified-group-field="id"]');
+    const labelEl = row.querySelector('[data-unified-group-field="label"]');
+    const select = row.querySelector('[data-unified-group-field="upstreams"]');
+    return {
+      id: idEl ? idEl.value.trim() : "",
+      label: labelEl ? labelEl.value.trim() : "",
+      upstreams: select
+        ? Array.from(select.selectedOptions || []).map((option) => option.value)
+        : [],
+    };
+  });
+  return { visibleUpstreams, groups };
+}
+
+function syncUnifiedFromDom() {
+  if (!state.config || !$("#unified-group-table")) return;
+  const unified = readUnifiedEditor();
+  if (!unified.visibleUpstreams.length && !unified.groups.length) {
+    delete state.config.unified;
+  } else {
+    state.config.unified = unified;
+  }
+}
+
+function initUnifiedActions() {
+  const add = $("#add-unified-group");
+  if (add) add.addEventListener("click", (ev) => {
+    // 按钮在 summary 里：阻止冒泡，否则点「新增」会把卡片折叠起来。
+    ev.preventDefault();
+    ev.stopPropagation();
+    syncUnifiedFromDom();
+    state.config.unified = state.config.unified || { visibleUpstreams: [], groups: [] };
+    state.config.unified.groups = state.config.unified.groups || [];
+    state.config.unified.groups.push({ id: "", label: "", upstreams: [] });
+    renderUnifiedEditor();
+    setConfigDirty(true);
+  });
+  const table = $("#unified-group-table");
+  if (table) table.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-unified-group-del]");
+    if (!btn) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    syncUnifiedFromDom();
+    if (!state.config || !state.config.unified) return;
+    const index = Number(btn.dataset.unifiedGroupDel);
+    if (!Number.isInteger(index)) return;
+    state.config.unified.groups.splice(index, 1);
+    if (!state.config.unified.groups.length && !state.config.unified.visibleUpstreams.length) {
+      delete state.config.unified;
+    }
+    renderUnifiedEditor();
+    setConfigDirty(true);
+  });
+}
+
 function openUpstreamEditor(cardEl) {
   const name = cardEl.dataset.name || "";
   const grid = cardEl.querySelector(".grid");
@@ -1857,12 +2138,13 @@ const _readUpstreamEditor = () => {
     entry.autoModels = get("autoModels").checked;
     const keyModeEl = cardEl.querySelector('[data-field="keySourceMode"]:checked');
     const keyMode = keyModeEl ? keyModeEl.value : "none";
-    // 三选一：保存时只保留选中来源，避免旧字段继续生效造成“选了却没生效”。
+    // 四选一：保存时只保留选中来源，避免旧字段继续生效造成“选了却没生效”。
     delete entry.apiKeyEnv;
     delete entry.apiKeyFile;
     delete entry.apiKeyAgent;
     delete entry.apiKeyAgentPath;
     delete entry.apiKeyAgentProvider;
+    delete entry.apiKeyStore;
     if (keyMode === "env") {
       const env = get("apiKeyEnv") ? get("apiKeyEnv").value.trim() : "";
       if (env) entry.apiKeyEnv = env;
@@ -1874,6 +2156,10 @@ const _readUpstreamEditor = () => {
         const provider = get("apiKeyAgentProvider") ? get("apiKeyAgentProvider").value.trim() : "";
         if (provider) entry.apiKeyAgentProvider = provider;
       }
+    } else if (keyMode === "store") {
+      // 引用由「加密保存到本机」写入；保存配置时原样带回，避免把引用冲掉。
+      const ref = get("apiKeyStoreRef") ? get("apiKeyStoreRef").value.trim() : "";
+      if (ref) entry.apiKeyStore = ref;
     }
     const ccBox = (f) => {
       const el = cardEl.querySelector(`[data-field="${f}"]`);
@@ -1977,9 +2263,28 @@ const _readUpstreamEditor = () => {
     }
     const zdrSelect = select("compatZdr");
     if (zdrSelect !== null) {
-      if (zdrSelect === "on") compat.zdr = true;
-      else if (zdrSelect === "off") compat.zdr = false;
-      else delete compat.zdr;
+      const privacy = Object.assign({}, oldCompat.privacy);
+      if (zdrSelect === "on") {
+        compat.zdr = true;
+        privacy.zdr = true;
+      } else if (zdrSelect === "off") {
+        compat.zdr = false;
+        privacy.zdr = false;
+      } else {
+        delete compat.zdr;
+        delete privacy.zdr;
+      }
+      if (Object.keys(privacy).length) compat.privacy = privacy;
+      else delete compat.privacy;
+    }
+    const trainingSelect = select("compatTraining");
+    if (trainingSelect !== null) {
+      const privacy = Object.assign({}, oldCompat.privacy);
+      if (trainingSelect === "allow") privacy.training = "allow";
+      else if (trainingSelect === "deny") privacy.training = "deny";
+      else delete privacy.training;
+      if (Object.keys(privacy).length) compat.privacy = privacy;
+      else delete compat.privacy;
     }
     const versionHeader = text("compatVersionHeader");
     if (versionHeader !== null) {
@@ -2048,10 +2353,14 @@ const _readUpstreamEditor = () => {
               throw new Error(`「${key}」必须是环境变量名字符串或对象`);
             }
             if (value.apiKey) {
-              throw new Error(`「${key}」不允许写明文 apiKey，请用 apiKeyEnv / apiKeyFile`);
+              throw new Error(`「${key}」不允许写明文 apiKey，请用 apiKeyEnv / apiKeyFile / apiKeyStore`);
             }
-            if (!value.apiKeyEnv && !value.apiKeyFile && !value.apiKeyAgentPath) {
-              throw new Error(`「${key}」至少需要 apiKeyEnv / apiKeyFile / apiKeyAgentPath`);
+            if (!value.apiKeyEnv && !value.apiKeyFile && !value.apiKeyAgentPath && !value.apiKeyStore) {
+              throw new Error(`「${key}」至少需要 apiKeyEnv / apiKeyFile / apiKeyAgentPath / apiKeyStore`);
+            }
+            if (value.apiKeyStore
+                && !/^(upstream|model):/.test(String(value.apiKeyStore).trim())) {
+              throw new Error(`「${key}」的 apiKeyStore 必须是 upstream: / model: 开头的引用`);
             }
           });
           entry.modelKeys = parsed;
@@ -2087,12 +2396,14 @@ async function loadConfig() {
     f.accessLog.checked = state.config.accessLog !== false;
     f.promptCapture.checked = state.config.promptCapture === true;
     f.freeSourcesPanel.checked = state.config.freeSourcesPanel === true;
+    f.zcodePanel.checked = state.config.zcodePanel === true;
     f.promptRetentionDays.value = state.config.promptRetentionDays ?? 7;
     f.promptMaxRecords.value = state.config.promptMaxRecords ?? 5000;
     f.promptMaxChars.value = state.config.promptMaxChars ?? 100000;
     f.thinkingPassthrough.checked =
       !state.config.thinking || state.config.thinking.passthrough !== false;
     renderUpstreamEditor();
+    renderUnifiedEditor();
     setConfigDirty(false);
     applyPanelVisibility();
     state.autoFixNotes = [];
@@ -2107,13 +2418,17 @@ async function loadConfig() {
   }
 }
 
-/* 面板可见性：免费来源默认隐藏，配置开启（freeSourcesPanel）后导航才显示 */
+/* 面板可见性：免费来源 / ZCode 默认隐藏，配置开启后才在导航显示 */
 function applyPanelVisibility() {
-  const enabled = !!(state.config && state.config.freeSourcesPanel === true);
-  const btn = document.querySelector('.tab-btn[data-tab="free"]');
-  if (btn) btn.hidden = !enabled;
-  // 正停在免费来源页时被关闭：退回概览，避免看着一个被隐藏的页面
-  if (!enabled && document.querySelector(".panel.active")?.id === "panel-free") {
+  const freeEnabled = !!(state.config && state.config.freeSourcesPanel === true);
+  const freeBtn = document.querySelector('.tab-btn[data-tab="free"]');
+  if (freeBtn) freeBtn.hidden = !freeEnabled;
+  const zcodeEnabled = !!(state.config && state.config.zcodePanel === true);
+  const zcodeBtn = document.querySelector('.tab-btn[data-tab="zcode"]');
+  if (zcodeBtn) zcodeBtn.hidden = !zcodeEnabled;
+  // 正停在被关闭的页时退回概览，避免看着一个被隐藏的页面
+  const active = document.querySelector(".panel.active")?.id;
+  if ((!freeEnabled && active === "panel-free") || (!zcodeEnabled && active === "panel-zcode")) {
     switchTab("overview");
   }
 }
@@ -2192,6 +2507,7 @@ function collectConfig() {
   cfg.accessLog = f.accessLog.checked;
   cfg.promptCapture = f.promptCapture.checked;
   cfg.freeSourcesPanel = f.freeSourcesPanel.checked;
+  cfg.zcodePanel = f.zcodePanel.checked;
   cfg.promptRetentionDays = num(f.promptRetentionDays, 7, "提示词保留天数", 0);
   cfg.promptMaxRecords = num(f.promptMaxRecords, 5000, "提示词保留条数", 0);
   cfg.promptMaxChars = num(f.promptMaxChars, 100000, "单条提示词最大字符数", 1000);
@@ -2210,6 +2526,12 @@ function collectConfig() {
     }
   });
   cfg.upstreams = ups;
+  const unified = readUnifiedEditor();
+  if (unified.visibleUpstreams.length || unified.groups.length) {
+    cfg.unified = unified;
+  } else {
+    delete cfg.unified;
+  }
   state.autoFixNotes = notes;
   return cfg;
 }
@@ -2351,6 +2673,41 @@ function validateConfig(cfg) {
       add("warn", `upstream:${i}`,
         `${where} 的最大输出上限为 ${fmtInt(maxOut)}：全局 maxTokens 会被运行时收敛`);
     }
+  });
+
+  const unified = cfg.unified || {};
+  const unifiedVisible = Array.isArray(unified.visibleUpstreams) ? unified.visibleUpstreams : [];
+  const unifiedGroups = Array.isArray(unified.groups) ? unified.groups : [];
+  unifiedVisible.forEach((name) => {
+    if (!names.includes(name)) {
+      add("warn", "", `统一接入可见清单中的上游「${name}」不存在`);
+    }
+  });
+  const seenGroupIds = new Set();
+  unifiedGroups.forEach((group, i) => {
+    const id = String(group.id || "").trim();
+    const where = `统一接入第 ${i + 1} 个分组`;
+    if (!id) {
+      add("error", `unified:${i}`, `${where}缺少分组标识`, "focus-unified");
+    } else if (!/^[A-Za-z0-9._-]{1,64}$/.test(id)) {
+      add("error", `unified:${i}`,
+        `${where}的标识「${id}」不合法：只能包含字母、数字、-、_、.，且不超过 64 字符`, "focus-unified");
+    } else if (seenGroupIds.has(id)) {
+      add("error", `unified:${i}`, `${where}的标识「${id}」重复，每个分组标识必须唯一`, "focus-unified");
+    }
+    seenGroupIds.add(id);
+    const members = Array.isArray(group.upstreams) ? group.upstreams : [];
+    if (!members.length) {
+      add("warn", `unified:${i}`, `${where}（${id || "未命名"}）没有包含任何上游`);
+    }
+    members.forEach((name) => {
+      if (!names.includes(name)) {
+        add("warn", `unified:${i}`, `${where}（${id || "未命名"}）引用的上游「${name}」不存在`);
+      } else if (unifiedVisible.length && !unifiedVisible.includes(name)) {
+        add("warn", `unified:${i}`,
+          `${where}（${id || "未命名"}）包含的上游「${name}」不在可见清单中，不会展示`);
+      }
+    });
   });
 
   const defaultModel = String(cfg.defaultModel || "").trim();
@@ -2519,6 +2876,16 @@ function focusIssueTarget(btn) {
     if (byName.scrollIntoView) byName.scrollIntoView({ block: "center" });
     return;
   }
+  const unified = field.match(/^unified:(\d+)$/);
+  if (unified) {
+    const row = $$("#unified-group-table tbody tr[data-unified-group-row]")[Number(unified[1])];
+    if (row) {
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      const input = row.querySelector('[data-unified-group-field="id"]');
+      if (input) input.focus();
+    }
+    return;
+  }
   const m = field.match(/^upstream:(\d+)$/);
   if (!m) return;
   const card = $$("#upstream-editor .up-card")[Number(m[1])];
@@ -2585,6 +2952,7 @@ async function saveConfig(ev) {
 }
 
 function initConfigActions() {
+  initUnifiedActions();
   const add = $("#add-upstream");
   if (add) add.addEventListener("click", (ev) => {
     // 按钮在 summary 里：阻止冒泡，否则点「新增」会把分组折叠起来
@@ -2678,6 +3046,7 @@ function initConfigActions() {
     f.retentionDays.value = 0;
     f.promptCapture.checked = false;
     f.freeSourcesPanel.checked = false;
+    f.zcodePanel.checked = false;
     f.promptRetentionDays.value = 7;
     f.promptMaxRecords.value = 5000;
     f.promptMaxChars.value = 100000;
@@ -7322,10 +7691,12 @@ const CONFIG_HELP_UPSTREAM_FIELDS = [
   ["protocol", "string", "openai", "wire 协议：openai / anthropic / commandcode；deepseek/opencode 是兼容预设（compat.profile），不是 protocol"],
   ["baseUrl", "string", "—", "上游地址（一般带 /v1 后缀；选择预设会自动填充）"],
   ["apiKeyEnv", "string", "—", "密钥环境变量名（面板「密钥来源」选环境变量时使用；只存变量名）"],
+  ["apiKeyStore", "string", "—", "Model-Gate 加密密钥库引用（upstream:名称 / model:上游:模型）；密文由 Windows DPAPI 保存在同目录 *.secrets.json"],
   ["apiKeyFile", "string", "—", "旧字段：从 JSON 根字段 apiKey 读密钥；面板已归入「凭据文件」来源"],
   ["apiKeyAgent", "string", "—", "旧字段：custom 时配合 apiKeyAgentPath/Provider 读取 JSON 点路径或 .env；面板已归入「凭据文件」来源"],
   ["default", "boolean", "false", "是否兜底上游；都没标时取第一条"],
   ["models", "string[]", "—", "该上游提供的模型清单（面板可「查询清单」自动写入）"],
+  ["modelKeys", "object", "{}", "逐模型密钥来源：键是模型 id（支持单个 *），值是环境变量名或对象（apiKeyEnv / apiKeyStore / apiKeyFile）"],
   ["modelMap", "object", "{}", "模型映射：对外名 → 上游真实名"],
   ["fetchModels", "boolean", "true", "是否按上游拉取模型清单（commandcode 除外）"],
   ["sessionHeader", "boolean", "按协议", "是否注入会话头（x-opencode-session 等）"],
@@ -7392,8 +7763,9 @@ function openConfigHelp() {
       </section>
       <section>
         <h4>密钥怎么写</h4>
-        <p>配置文件里只写<b>环境变量名</b>，不要写明文密钥：<code>"apiKeyEnv": "MY_API_KEY"</code>。明文 <code>apiKey</code> 会被忽略并给出迁移提示。</p>
-        <p>变量值可以在面板「配置」页展开对应上游 → 填好密钥 → 点<b>「写入密钥」</b>（写用户环境变量或你指定的文件，当前进程立即生效）；也可以自己设置：<code>setx MY_API_KEY "sk-xxxx"</code>。</p>
+        <p>配置文件里只写<b>引用</b>，不要写明文密钥：<code>"apiKeyEnv": "MY_API_KEY"</code>，或面板「加密保存到本机」生成的 <code>"apiKeyStore": "upstream:名称"</code>。明文 <code>apiKey</code> 会被忽略并给出迁移提示。</p>
+        <p>推荐在面板「配置」页展开对应上游 → 填好密钥 → 点<b>「加密保存到本机」</b>：密钥经 Windows DPAPI 加密后写入同目录 <code>*.secrets.json</code>，配置文件只留引用，接口不回显密钥；密文绑定当前 Windows 用户与机器。也可以写用户环境变量（<code>setx MY_API_KEY "sk-xxxx"</code>）或你显式指定的凭据文件。</p>
+        <p>一个上游默认共用一把密钥；需要按模型区分时，在「4. 逐模型密钥」填模型 id 后写入，会生成 <code>model:上游:模型</code> 引用。</p>
       </section>
       <section>
         <h4>改完怎么生效 / 会不会被覆盖</h4>

@@ -55,7 +55,9 @@ const screenshotPath = getArg(
   "screenshot",
   path.join(os.tmpdir(), "model-gate-ui-smoke.png"),
 );
-const pageUrl = `${base}/ui/`;
+// 默认测新版 v3；传 --ui-path /ui/classic 可回归经典面板。
+const uiPath = getArg("ui-path", "/ui/");
+const pageUrl = `${base}${uiPath.startsWith("/") ? uiPath : `/${uiPath}`}`;
 
 const failures = [];
 const passes = [];
@@ -922,6 +924,32 @@ async function main() {
     await click('[data-tab="free"]');
     await waitFor(() => isVisible("#free-sources"), 3000, "免费来源列表");
     return "开启后 free-sources 可见";
+  });
+
+  await check("ZCode 页默认隐藏，配置开启后可见", async () => {
+    if (!(await evaluate(`document.querySelector('[data-tab="zcode"]')?.hidden === true`))) {
+      throw new Error("ZCode 页签默认应为隐藏（zcodePanel 未开启）");
+    }
+    await evaluate(`(async () => {
+      const res = await fetch("/api/config");
+      const data = await res.json();
+      const config = { ...(data.config || {}), zcodePanel: true };
+      await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config }),
+      });
+    })()`);
+    await cdp.send("Page.navigate", { url: pageUrl });
+    await sleep(1200);
+    await waitFor(
+      () => evaluate(`document.querySelector('[data-tab="zcode"]')?.hidden === false`),
+      5000,
+      "ZCode 页签出现",
+    );
+    await click('[data-tab="zcode"]');
+    await waitFor(() => isVisible("#zcode-advanced"), 3000, "ZCode 基础设置");
+    return "开启后 ZCode 页可见";
   });
 
   await check("免费来源探测时间按本地时区显示", async () => {

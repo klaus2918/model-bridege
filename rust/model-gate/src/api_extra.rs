@@ -749,7 +749,8 @@ pub async fn pricing_save(State(state): State<Arc<AppState>>, Json(body): Json<V
             "pricing_write_failed",
         );
     }
-    let mut new_cfg = crate::config::Config::from_value(merged);
+    let store = crate::secret_store::SecretStore::load(&state.config_path);
+    let mut new_cfg = crate::config::Config::from_value_with_store(merged, &store);
     new_cfg.raw = to_write;
     // 走 replace_config：它会把运行态的端口/主机回填到 raw，
     // 避免端口降级场景把文件里的旧端口写回（与 /api/config 同一口径）。
@@ -1684,19 +1685,24 @@ async fn probe(state: &AppState, up: &crate::config::Upstream, timeout: f64, mod
     }
 }
 
-/// 写入上游密钥：**只写 Windows 用户级环境变量**（`HKCU\Environment`）或**用户指定文件**。
+/// 写入上游密钥：Windows 用户级环境变量（`HKCU\Environment`）、用户指定文件，
+/// 或 Model-Gate 本机加密密钥库（DPAPI）。
 ///
 /// 入参：
 /// - `name` / `apiKey`：必填。
-/// - `target`：`env`（默认，写用户变量）或 `file`（写用户手填的凭据文件）。
+/// - `target`：`env`（默认，写用户变量）、`file`（写用户手填的凭据文件）或
+///   `store`（用 Windows DPAPI 加密保存到 Model-Gate 密钥库）。
 /// - `envName`：变量名，缺省时用该上游配置的 `apiKeyEnv`。
 /// - `filePath`：文件路径，缺省时用该上游配置的 `apiKeyFile` / `apiKeyAgentPath`。
 /// - `fileFormat`：`json`（默认）或 `env`。
 /// - `field`：JSON 点路径（缺省 `apiKey`）或 `.env` 变量名。
+/// - `model`：逐模型密钥的模型 id；缺省表示上游级默认密钥。
 ///
 /// 约定：
-/// - 写入成功 → 更新运行态并热重载，响应只回变量名/路径与来源，**不回显明文**。
+/// - 写入成功 → 更新运行态并热重载，响应只回变量名/路径/密钥库引用与来源，**不回显明文**。
 /// - 写入失败 → 返回可诊断错误，**不**静默降级为「只进内存」。
+/// - `target=store` 时会把 `apiKeyStore` 引用写入 `bridge.config.json`；密钥本体只
+///   存在于独立的 DPAPI 密钥库文件。
 pub async fn upstream_secret(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -1726,10 +1732,12 @@ pub async fn upstream_secret(
         .filter(|s| !s.is_empty())
         .unwrap_or("env")
         .to_ascii_lowercase();
-    if target != "env" && target != "file" {
+    if target != "env" && target != "file" && target != "store" {
         return error_json(
             StatusCode::BAD_REQUEST,
-            format!("未知写入目标 {target}：只支持 env（用户变量）/ file（指定文件）"),
+            format!(
+                "未知写入目标 {target}：只支持 env（用户变量）/ file（指定文件）/ store（本机加密密钥库）"
+            ),
             "invalid_request_error",
             "invalid_target",
         );
@@ -1771,10 +1779,166 @@ pub async fn upstream_secret(
             "unsupported_model_key_target",
         );
     }
+    if target == "store" {
+        return write_secret_to_store(&state, cfg, &upstream, &body, key);
+    }
     if target == "file" {
         return write_secret_to_file(&state, cfg, &upstream, &raw_up, &body, key);
     }
     write_secret_to_user_env(&state, cfg, &upstream, &body, key)
+}
+
+/// 加密保存到 Model-Gate 本机密钥库，并把 `apiKeyStore` 引用写入配置。
+///
+/// 与 env/file 不同：这里必须同时落配置引用，否则重启后无法判断该用哪把密钥。
+/// 写入顺序是「备份配置 → 写密钥库 → 写配置」；配置写失败时回滚新密钥，避免
+/// 留下无法被引用的密文。
+fn write_secret_to_store(
+    state: &AppState,
+    cfg: crate::config::Config,
+    upstream: &crate::config::Upstream,
+    body: &Value,
+    key: &str,
+) -> Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(model) = model.as_deref() {
+        if model.matches('*').count() > 1 {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("模型键「{model}」包含多个 *，只支持一个通配符"),
+                "invalid_request_error",
+                "invalid_model_key",
+            );
+        }
+    }
+    let store_id = match model.as_deref() {
+        Some(model) => crate::secret_store::model_id(&upstream.name, model),
+        None => crate::secret_store::upstream_id(&upstream.name),
+    };
+    let scope = if model.is_some() { "model" } else { "upstream" };
+
+    // 只改密钥来源相关字段：保留上游的其它配置。
+    let mut raw = cfg.raw.clone();
+    let Some(raw_up) = raw
+        .get_mut("upstreams")
+        .and_then(Value::as_object_mut)
+        .and_then(|ups| ups.get_mut(&upstream.name))
+        .and_then(Value::as_object_mut)
+    else {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("配置里找不到上游「{}」", upstream.name),
+            "server_error",
+            "upstream_not_in_config",
+        );
+    };
+    if let Some(model) = model.as_deref() {
+        // 逐模型条目：对象写法；原来的字符串/文件/环境变量来源被替换为密钥库引用。
+        let model_keys = raw_up.entry("modelKeys").or_insert_with(|| json!({}));
+        if !model_keys.is_object() {
+            *model_keys = json!({});
+        }
+        let entry = model_keys
+            .as_object_mut()
+            .expect("modelKeys 已归一为对象")
+            .entry(model.to_string())
+            .or_insert_with(|| json!({}));
+        if !entry.is_object() {
+            *entry = json!({});
+        }
+        let entry = entry.as_object_mut().expect("逐模型条目已归一为对象");
+        for field in [
+            "apiKey",
+            "apiKeyEnc",
+            "apiKeyEnv",
+            "apiKeyFile",
+            "apiKeyAgent",
+            "apiKeyAgentPath",
+            "apiKeyAgentProvider",
+        ] {
+            entry.remove(field);
+        }
+        entry.insert("apiKeyStore".into(), json!(store_id.clone()));
+    } else {
+        // 上游级默认密钥：一个上游的多个模型共用；逐模型条目仍可覆盖。
+        for field in [
+            "apiKey",
+            "apiKeyEnc",
+            "apiKeyEnv",
+            "apiKeyFile",
+            "apiKeyAgent",
+            "apiKeyAgentPath",
+            "apiKeyAgentProvider",
+        ] {
+            raw_up.remove(field);
+        }
+        raw_up.insert("apiKeyStore".into(), json!(store_id.clone()));
+    }
+    let mut to_write = raw;
+    crate::config_store::strip_secrets(&mut to_write);
+
+    let backup = match crate::config_store::backup_config(
+        &state.config_path,
+        crate::config_store::BackupPolicy::Enabled,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("保存密钥前备份配置失败：{err}"),
+                "server_error",
+                "config_backup_failed",
+            )
+        }
+    };
+
+    let mut store = crate::secret_store::SecretStore::load(&state.config_path);
+    let existed = store.contains(&store_id);
+    if let Err(err) = store.set(&store_id, key) {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("加密保存密钥失败：{err}"),
+            "server_error",
+            "store_write_failed",
+        );
+    }
+    if let Err(err) = crate::config_store::save_atomic(&state.config_path, &to_write) {
+        if !existed {
+            let _ = store.remove(&store_id);
+        }
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("密钥已加密写入，但配置引用保存失败：{err}"),
+            "server_error",
+            "config_write_failed",
+        );
+    }
+
+    // 用刚写入的内存密钥库解析，避免再读一次文件；随后热替换运行态。
+    let new_cfg = crate::config::Config::from_value_with_store(to_write, &store);
+    state.replace_config(new_cfg);
+    Json(json!({
+        "ok": true,
+        "name": upstream.name,
+        "target": "store",
+        "scope": scope,
+        "model": model,
+        "keyId": store_id,
+        "keySource": "store",
+        "encrypted": true,
+        "backup": {
+            "created": backup.created,
+            "forcedFirst": backup.forced_first,
+            "path": backup.path.as_ref().map(|p| p.display().to_string()),
+        },
+        "note": "已用 Windows DPAPI 加密保存到本机密钥库，并把 apiKeyStore 引用写入配置；密钥本体不会出现在 bridge.config.json 或接口响应中",
+    }))
+    .into_response()
 }
 
 /// 写入 Windows 用户级环境变量（`HKCU\Environment`）。

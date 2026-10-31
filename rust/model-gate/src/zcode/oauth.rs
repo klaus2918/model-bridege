@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
@@ -15,7 +15,9 @@ const FLOW_TTL: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone)]
 struct Flow {
     poll_token: String,
-    created: Instant,
+    /// 使用墙上时钟而非 `Instant`：`Instant` 在 Windows 上从系统启动计时，
+    /// 启动不足 TTL 时无法构造“过去时间”，测试会因减法下溢而 panic。
+    created: SystemTime,
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +89,7 @@ impl ZcodeOAuth {
             flow_id.clone(),
             Flow {
                 poll_token: server_poll,
-                created: Instant::now(),
+                created: SystemTime::now(),
             },
         );
         Ok(OAuthStart {
@@ -106,7 +108,12 @@ impl ZcodeOAuth {
             .get(flow_id)
             .cloned()
             .ok_or_else(|| "OAuth 会话不存在或已过期".to_string())?;
-        if flow.created.elapsed() > FLOW_TTL {
+        if flow
+            .created
+            .elapsed()
+            .map(|elapsed| elapsed > FLOW_TTL)
+            .unwrap_or(true)
+        {
             self.remove(flow_id);
             return Ok(json!({"status": "expired"}));
         }
@@ -154,7 +161,13 @@ impl ZcodeOAuth {
 
     fn gc(&self) {
         let mut flows = self.flows.lock().unwrap_or_else(|e| e.into_inner());
-        flows.retain(|_, flow| flow.created.elapsed() <= FLOW_TTL);
+        flows.retain(|_, flow| {
+            flow.created
+                .elapsed()
+                .map(|elapsed| elapsed <= FLOW_TTL)
+                // 系统时钟回拨视为过期，避免留下无法清理的会话。
+                .unwrap_or(false)
+        });
     }
 }
 
@@ -178,7 +191,9 @@ mod tests {
             "old".into(),
             Flow {
                 poll_token: "x".into(),
-                created: Instant::now() - Duration::from_secs(301),
+                created: SystemTime::now()
+                    .checked_sub(Duration::from_secs(301))
+                    .expect("当前系统时钟应晚于 1970-01-01 + 301s"),
             },
         );
         oauth.gc();

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
 
-use crate::config::{Capabilities, Compat};
+use crate::config::{privacy_adapter_from_value, Capabilities, Compat};
 
 static REGISTRY: OnceLock<Option<Value>> = OnceLock::new();
 
@@ -210,6 +210,15 @@ fn compat_from_value(value: &Value) -> Compat {
     c.max_output_tokens = u64_at(&["limits", "maxOutputTokens"]);
     c.max_context_tokens = u64_at(&["limits", "maxContextTokens"]);
     c.zdr = bool_at(&["zdr"]);
+    // profile 只声明“默认是否要求 ZDR”和“怎么落地”；用户意图在 compat 层覆盖。
+    if c.zdr {
+        c.privacy.zdr = Some(true);
+    }
+    c.privacy.zdr_adapter = privacy_adapter_from_value(get(&["privacyAdapters", "zdr"]));
+    c.privacy.training_allow_adapter =
+        privacy_adapter_from_value(get(&["privacyAdapters", "trainingAllow"]));
+    c.privacy.training_deny_adapter =
+        privacy_adapter_from_value(get(&["privacyAdapters", "trainingDeny"]));
     c.version_header = str_at(&["versionHeader"]).to_string();
     c.environment_header = str_at(&["environmentHeader"]).to_string();
     c.catalog_source = str_at(&["catalog", "source"]).to_string();

@@ -45,6 +45,12 @@
     "toolChoice": { "downgradeForced": true },
     "limits": { "maxOutputTokens": 393216, "maxContextTokens": 1048576 },
     "zdr": true,
+    "privacy": { "zdr": true, "training": "deny" },
+    "privacyAdapters": {
+      "zdr": { "kind": "header", "name": "x-cmd-zdr", "value": "1" },
+      "trainingAllow": { "kind": "unsupported", "reason": "上游没有请求级训练授权开关" },
+      "trainingDeny": { "kind": "body", "path": "provider.data_collection", "value": "deny" }
+    },
     "versionHeader": "x-command-code-version",
     "environmentHeader": "x-cli-environment"
   }
@@ -69,13 +75,62 @@
 | `toolChoice.downgradeForced` | bool | 强制 `tool_choice` 是否降级为 `auto` |
 | `limits.maxOutputTokens` | number | 上游最大输出；请求超过时自动收敛 |
 | `limits.maxContextTokens` | number | 上下文窗口，仅用于校验/提示 |
-| `zdr` | bool | 发送 `x-cmd-zdr: 1` |
+| `zdr` | bool | 兼容旧配置：等价于 `privacy.zdr`；**不再直接等于**“发送 `x-cmd-zdr`” |
+| `privacy.zdr` | bool / `"auto"` | 用户意图：是否要求零数据保留；`auto` 表示不覆盖预设 |
+| `privacy.training` | `inherit` / `allow` / `deny` | 用户意图：训练数据策略；`inherit` 表示不声明 |
+| `privacyAdapters.zdr` | object | ZDR 的落地方式，见下方“隐私适配器” |
+| `privacyAdapters.trainingAllow` | object | “允许训练”的落地方式 |
+| `privacyAdapters.trainingDeny` | object | “禁止训练”的落地方式 |
 | `versionHeader` | string | CLI 版本头名，值来自 `cliVersion`（`auto` 时不发） |
 | `environmentHeader` | string | CLI 环境头名，值来自 `cliEnvironment` |
 
 未知字段不会生效，`/api/config/validate` 会返回 `unknown_compat_field` 警告。
 
-### 2.1 预设注册表与模型级覆盖
+### 2.1 隐私适配器（ZDR / 训练数据）
+
+> 完整调研、语义拆分和目标架构见 [`privacy-model.md`](privacy-model.md)。
+
+隐私策略分两层，避免把“用户意图”和“厂商实现”混在一起：
+
+1. **用户意图**：`compat.privacy.zdr` / `compat.privacy.training`；
+2. **落地方式**：`provider_profiles.json` 的 `compat.privacyAdapters.*`，也可在单个上游的
+   `compat.privacyAdapters` 里覆盖。
+
+适配器 `kind`：
+
+| kind | 行为 |
+|---|---|
+| `header` | 写请求头，例如 `{"name":"x-cmd-zdr","value":"1"}` |
+| `body` | 按点分路径写请求体，例如 `{"path":"provider.zdr","value":true}` |
+| `workspace` | 只能去上游控制台设置；Model-Gate 不发送无效头，只给出提示 |
+| `none` | 上游默认行为已满足，无需动作 |
+| `unsupported` | 上游没有该能力；只在用户明确要求时产生诊断 |
+
+内置适配器：
+
+| 上游 | ZDR | 允许训练 | 禁止训练 |
+|---|---|---|---|
+| CommandCode | `x-cmd-zdr: 1` | 不支持请求级 | 不支持请求级 |
+| OpenCode / Go | 不支持请求级 | workspace `Settings › Privacy` | 不支持请求级 |
+| Kilo（OpenRouter 兼容） | body `provider.zdr=true` | `none` | body `provider.data_collection="deny"` |
+| 其他 OpenAI / Anthropic 兼容 | 不支持请求级 | 不支持请求级 | 不支持请求级 |
+
+示例：
+
+```json
+"compat": {
+  "privacy": { "zdr": true, "training": "deny" },
+  "privacyAdapters": {
+    "zdr": { "kind": "body", "path": "provider.zdr", "value": true },
+    "trainingDeny": { "kind": "body", "path": "provider.data_collection", "value": "deny" }
+  }
+}
+```
+
+> 通用的是**配置入口**，不是线上协议：同一个语义，CommandCode 用请求头，OpenRouter 用请求体，
+> OpenCode 只能去 workspace 控制台。`privacyAdapters` 就是这层翻译。
+
+### 2.2 预设注册表与模型级覆盖
 
 预设不再硬编码在 `config.rs`，统一由 `rust/model-gate/provider_profiles.json` 定义
 （Rust 编译期 `include_str!` 嵌入，随 exe 分发）。判定优先级：

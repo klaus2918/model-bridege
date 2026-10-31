@@ -292,11 +292,15 @@ fn upstream_preset_and_key_source_contracts() {
         "新增上游默认 Base URL 不是空"
     );
 
-    // 密钥来源三选一 + 保存时只保留选中来源。
+    // 密钥来源四选一 + 保存时只保留选中来源。
     for marker in [
+        "data-field=\"keySourceMode\" value=\"store\"",
         "data-field=\"keySourceMode\" value=\"env\"",
         "data-field=\"keySourceMode\" value=\"file\"",
         "data-field=\"keySourceMode\" value=\"none\"",
+        "data-field=\"apiKeyStoreRef\"",
+        "data-act=\"save-store\"",
+        "delete entry.apiKeyStore;",
         "delete entry.apiKeyEnv;",
         "delete entry.apiKeyFile;",
         "delete entry.apiKeyAgent;",
@@ -304,6 +308,7 @@ fn upstream_preset_and_key_source_contracts() {
         "delete entry.apiKeyAgentProvider;",
         "if (keyMode === \"env\")",
         "} else if (keyMode === \"file\")",
+        "} else if (keyMode === \"store\")",
     ] {
         assert!(APP_JS.contains(marker), "密钥来源契约缺少 {marker}");
     }
@@ -316,7 +321,7 @@ fn upstream_preset_and_key_source_contracts() {
     );
 
     // 编辑弹窗克隆表单时，单选框必须按 value 配对并同步 checked；
-    // 否则 env/file/none 三个 radio 会依次写进同一个节点，弹窗里丢失选项。
+    // 否则 env/file/store/none 四个 radio 会依次写进同一个节点，弹窗里丢失选项。
     assert!(
         APP_JS.contains("live.type === \"radio\""),
         "编辑弹窗未按 radio 类型同步，密钥来源单选框会被覆盖"
@@ -326,7 +331,7 @@ fn upstream_preset_and_key_source_contracts() {
         "编辑弹窗 radio 未按 value 配对"
     );
 
-    // 布局契约：接入 / 密钥 / 模型三组 + 高级折叠 + 同一行三个来源 radio。
+    // 布局契约：接入 / 密钥 / 模型三组 + 高级折叠 + 同一行四个来源 radio。
     for marker in [
         "form-section span-2",
         "section-title",

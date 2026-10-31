@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic;
 use crate::commandcode;
-use crate::config::{Config, Upstream};
+use crate::config::{Config, Privacy, PrivacyAdapter, TrainingPolicy, Upstream};
 use crate::db::{Db, Filters, PromptRecord, UsageRecord};
 use crate::opencode_transport as opencode;
 use crate::prompt;
@@ -81,6 +81,11 @@ pub struct AppState {
     /// 更快耗尽本机 IP 的免费额度（Kilo 匿名 200 次/小时）。命中退避期的
     /// 模型直接跳过探测并回填上次的拒因。
     pub free_probe_cache: std::sync::Mutex<crate::free_sources::ProbeCache>,
+    /// 路由候选的短期冷却：key = `upstream\0model`。
+    ///
+    /// 只影响候选顺序：冷却中的候选排到链尾，仍保留兜底尝试；不改变
+    /// `/上游/v1` 的强制路由，也不改变日志里的真实上游归属。
+    pub route_health: std::sync::Mutex<HashMap<String, Instant>>,
     /// ZCode 插件的配置与 OAuth 临时状态；账号事实源在 `db`。
     pub zcode: Arc<crate::zcode::service::ZcodeService>,
     /// 服务线程的 Tokio 句柄；托盘「刷新模型目录」用它触发异步刷新。
@@ -152,6 +157,7 @@ impl AppState {
             models_cache: tokio::sync::RwLock::new(ModelsCache::default()),
             update,
             free_probe_cache: std::sync::Mutex::new(crate::free_sources::ProbeCache::default()),
+            route_health: std::sync::Mutex::new(HashMap::new()),
             zcode,
             runtime: std::sync::OnceLock::new(),
             shutdown,
@@ -420,15 +426,46 @@ impl AppState {
     }
 }
 
+/// 统一接入口的作用域：默认全部可见上游，或指定分组。
+#[derive(Debug, Clone)]
+enum UnifiedScope {
+    All,
+    Group(String),
+}
+
+impl UnifiedScope {
+    fn group_id(&self) -> Option<&str> {
+        match self {
+            Self::Group(id) => Some(id.as_str()),
+            Self::All => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::All => "默认范围".to_string(),
+            Self::Group(id) => format!("分组 \"{id}\""),
+        }
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     use axum::routing::{delete, get, post, put};
     axum::Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/unified/v1/models", get(models_unified))
+        .route("/unified/{group}/v1/models", get(models_unified_group))
         .route("/{upstream}/v1/models", get(models_forced))
         .route("/v1/chat/completions", post(chat))
+        .route("/unified/v1/chat/completions", post(chat_unified))
+        .route(
+            "/unified/{group}/v1/chat/completions",
+            post(chat_unified_group),
+        )
         .route("/{upstream}/v1/chat/completions", post(chat_forced))
         .route("/ui/", get(ui_index))
+        .route("/ui/classic", get(ui_classic))
         .route("/ui/{*path}", get(ui_asset))
         .route("/api/info", get(api_info))
         .route("/api/update/status", get(crate::update::api_update_status))
@@ -467,6 +504,67 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/api/config/backups/restore",
             post(crate::api_extra::backups_restore),
+        )
+        // 接入编排：模板、读模型、快速添加、受控更新与密钥写入。
+        .route(
+            "/api/access",
+            get(crate::access::list).post(crate::access::quick_add),
+        )
+        .route("/api/access/templates", get(crate::access::list_templates))
+        .route("/api/access/quick", post(crate::access::quick_add))
+        .route("/api/access/custom", post(crate::access::custom_add))
+        .route(
+            "/api/access/{id}",
+            get(crate::access::detail)
+                .patch(crate::access::update)
+                .delete(crate::access::delete),
+        )
+        .route("/api/access/{id}/secret", post(crate::access::write_secret))
+        .route("/api/access/{id}/probe", post(crate::access::probe))
+        // 凭据池：池与成员的脱敏 CRUD、探测。
+        .route(
+            "/api/pools",
+            get(crate::credential_pool::list).post(crate::credential_pool::create),
+        )
+        .route(
+            "/api/pools/{id}",
+            get(crate::credential_pool::detail)
+                .patch(crate::credential_pool::update)
+                .delete(crate::credential_pool::delete),
+        )
+        .route(
+            "/api/pools/{id}/members",
+            post(crate::credential_pool::add_member_handler),
+        )
+        .route(
+            "/api/pools/{id}/members/{mid}",
+            axum::routing::patch(crate::credential_pool::update_member)
+                .delete(crate::credential_pool::delete_member),
+        )
+        .route("/api/pools/{id}/probe", post(crate::credential_pool::probe))
+        // 插件：登记、启停、幂等接入/解绑。
+        .route("/api/plugins", get(crate::plugin::list))
+        .route("/api/plugins/install", post(crate::plugin::install))
+        .route(
+            "/api/plugins/{id}",
+            get(crate::plugin::detail)
+                .patch(crate::plugin::set_enabled)
+                .delete(crate::plugin::uninstall),
+        )
+        .route("/api/plugins/{id}/attach", post(crate::plugin::attach))
+        .route("/api/plugins/{id}/detach", post(crate::plugin::detach))
+        // AI 可读配置：只读 + 草案 + 人工确认应用。
+        .route("/llms.txt", get(crate::ai_api::llms_txt))
+        .route("/api/ai/manifest", get(crate::ai_api::manifest))
+        .route("/api/ai/schema", get(crate::ai_api::schema))
+        .route("/api/ai/templates", get(crate::ai_api::templates))
+        .route("/api/ai/inspect", get(crate::ai_api::inspect))
+        .route("/api/ai/plan", post(crate::ai_api::plan))
+        .route("/api/ai/apply", post(crate::ai_api::apply))
+        .route("/api/ai/audit", get(crate::ai_api::audit))
+        .route(
+            "/api/ai/settings",
+            get(crate::ai_api::get_settings).put(crate::ai_api::put_settings),
         )
         .route(
             "/api/pricing",
@@ -653,11 +751,94 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
                         .find(|u| u.models.iter().any(|m| m == id))
                         .map(|u| u.name.clone())
                 })
+                .or_else(|| cfg.group_id_from_model(id).map(|_| "group".to_string()))
                 .unwrap_or_else(|| "model-gate".to_string());
             json!({"id": id, "object": "model", "created": 0, "owned_by": owner})
         })
         .collect();
     Json(json!({"object": "list", "data": data})).into_response()
+}
+
+/// 统一接入口的模型清单：`上游/模型` 作为模型参数，客户端只需配置一个 Base URL。
+///
+/// 与 `/上游/v1/models` 同口径：宣告各上游可路由的模型（声明清单 + `modelMap`
+/// 别名），不受顶层 `models` 白名单影响，也不触发上游目录拉取。
+async fn models_unified(State(state): State<Arc<AppState>>) -> Response {
+    models_unified_inner(&state, UnifiedScope::All)
+}
+
+async fn models_unified_group(
+    State(state): State<Arc<AppState>>,
+    Path(group): Path<String>,
+) -> Response {
+    models_unified_inner(&state, UnifiedScope::Group(group))
+}
+
+fn models_unified_inner(state: &AppState, scope: UnifiedScope) -> Response {
+    let cfg = state.cfg();
+    let upstreams = match unified_upstreams_for(&cfg, &scope) {
+        Some(upstreams) => upstreams,
+        None => return unknown_unified_group(state, scope.group_id().unwrap_or_default()),
+    };
+    let mut data: Vec<Value> = cfg
+        .group_model_list_for(&upstreams)
+        .into_iter()
+        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "group"}))
+        .collect();
+    data.extend(
+        cfg.qualified_model_list_for(&upstreams).into_iter().map(
+            |(id, owner)| json!({"id": id, "object": "model", "created": 0, "owned_by": owner}),
+        ),
+    );
+    Json(json!({"object": "list", "data": data})).into_response()
+}
+
+/// 把统一作用域解析成可展示的上游；分组不存在返回 `None`。
+fn unified_upstreams_for<'a>(cfg: &'a Config, scope: &UnifiedScope) -> Option<Vec<&'a Upstream>> {
+    match scope {
+        UnifiedScope::All => Some(cfg.unified_visible_upstreams()),
+        UnifiedScope::Group(id) => cfg.unified_group_upstreams(id),
+    }
+}
+
+fn unknown_unified_group(state: &AppState, group: &str) -> Response {
+    let cfg = state.cfg();
+    let groups: Vec<String> = cfg
+        .unified
+        .groups
+        .iter()
+        .map(|item| item.id.clone())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let message = if groups.is_empty() {
+        format!("未知的统一接口分组 \"{group}\"；当前没有配置任何分组")
+    } else {
+        format!(
+            "未知的统一接口分组 \"{group}\"。可用分组：{}",
+            groups.join("、")
+        )
+    };
+    error_json(
+        StatusCode::NOT_FOUND,
+        message,
+        "invalid_request_error",
+        "unknown_unified_group",
+    )
+}
+
+fn unified_upstream_denied(scope: &UnifiedScope, upstream: &str) -> Response {
+    error_json(
+        StatusCode::FORBIDDEN,
+        format!(
+            "上游 \"{upstream}\" 不在统一接口{}的可见范围内",
+            match scope {
+                UnifiedScope::All => "默认范围".to_string(),
+                UnifiedScope::Group(id) => format!("分组 \"{id}\""),
+            }
+        ),
+        "invalid_request_error",
+        "upstream_not_allowed",
+    )
 }
 
 async fn models_forced(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
@@ -691,14 +872,41 @@ async fn chat_forced(
     chat_inner(state, Some(name), headers, body).await
 }
 
+async fn chat_unified(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    chat_scoped(state, None, Some(UnifiedScope::All), headers, body).await
+}
+
+async fn chat_unified_group(
+    State(state): State<Arc<AppState>>,
+    Path(group): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    chat_scoped(state, None, Some(UnifiedScope::Group(group)), headers, body).await
+}
+
 async fn chat_inner(
     state: Arc<AppState>,
     forced: Option<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    chat_scoped(state, forced, None, headers, body).await
+}
+
+async fn chat_scoped(
+    state: Arc<AppState>,
+    forced: Option<String>,
+    scope: Option<UnifiedScope>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let started = Instant::now();
-    let mut payload: Value = match serde_json::from_slice(&body) {
+    let payload: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
         _ => {
             return error_json(
@@ -729,35 +937,929 @@ async fn chat_inner(
         );
     }
     let cfg_guard = state.cfg();
-    let upstream: Upstream = match forced.as_deref() {
-        Some(name) => match cfg_guard.upstream(name) {
-            Some(u) => u.clone(),
-            None => return unknown_upstream(&state, name),
+    // 统一接入口：先解析作用域，再解析模型名。
+    let scope_allowed: Option<Vec<String>> = match &scope {
+        None => None,
+        Some(scope) => match unified_upstreams_for(&cfg_guard, scope) {
+            Some(upstreams) => Some(upstreams.into_iter().map(|up| up.name.clone()).collect()),
+            None => return unknown_unified_group(&state, scope.group_id().unwrap_or_default()),
         },
-        None => match cfg_guard.pick_upstream(Some(&requested_model)) {
-            Some(u) => u.clone(),
-            None => {
-                return error_json(
-                    StatusCode::BAD_GATEWAY,
-                    "未配置任何上游",
-                    "upstream_error",
-                    "no_upstream",
-                )
+    };
+    if let (Some(scope), Some(allowed)) = (&scope, &scope_allowed) {
+        if allowed.is_empty() {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("统一接口{}没有可用上游", scope.describe()),
+                "upstream_error",
+                "no_unified_upstream",
+            );
+        }
+    }
+    // URL 前缀强制指定优先；否则识别统一模型名 `上游/模型`。
+    // `group/<id>` 是保留前缀：先于 `上游/模型` 解析，避免被同名上游截走。
+    let (forced, route_model) = match forced {
+        Some(name) => (Some(name), requested_model.clone()),
+        None => {
+            let effective = cfg_guard
+                .aliases
+                .get(&requested_model)
+                .map(String::as_str)
+                .unwrap_or(&requested_model);
+            if effective.starts_with("group/") {
+                (None, requested_model.clone())
+            } else {
+                match cfg_guard.split_qualified_model(&requested_model) {
+                    Some((up, model)) => (Some(up.name.clone()), model.to_string()),
+                    None => (None, requested_model.clone()),
+                }
             }
-        },
+        }
+    };
+    if let (Some(scope), Some(allowed), Some(name)) = (&scope, &scope_allowed, forced.as_deref()) {
+        if !allowed.iter().any(|item| item == name) {
+            return unified_upstream_denied(scope, name);
+        }
+    }
+
+    // 解析候选链：强制上游 = 单条；group/<id> = 成员顺序；普通模型 = 主选 +
+    // 其它声明了同一模型的上游（最多 3 条，避免放大上游压力）。
+    let plan = match build_route_plan(
+        &state,
+        &cfg_guard,
+        &requested_model,
+        &route_model,
+        forced.as_deref(),
+        scope_allowed.as_deref(),
+        scope.as_ref(),
+    ) {
+        Ok(plan) => plan,
+        Err(response) => return response,
     };
     let max_tokens = cfg_guard.max_tokens;
     drop(cfg_guard);
+
+    let group_header = plan.group.clone();
+    let mut attempts: Vec<String> = Vec::new();
+    let mut last_failure: Option<RouteFailure> = None;
+
+    for (index, target) in plan.targets.iter().enumerate() {
+        let has_more = index + 1 < plan.targets.len();
+        let upstream = &target.upstream;
+        // 真实发给上游的模型名在 prepare 阶段解析（modelMap）；zcode 分支
+        // 需要提前算出来传给 transport。
+        let target_model = upstream
+            .model_map
+            .get(&target.model)
+            .cloned()
+            .unwrap_or_else(|| target.model.clone());
+        let attempt_label = |status: u16| match &target.credential {
+            Some(credential) => format!("{}/{}={status}", upstream.name, credential.label),
+            None => format!("{}={status}", upstream.name),
+        };
+
+        // ZCode 原生插件：不走 HTTP 上游，直接交给账号池 + 本机 CLI worker。
+        if upstream.transport == "zcode" {
+            let stream = payload
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let response = crate::zcode::transport::chat(
+                &state,
+                upstream,
+                &payload,
+                &requested_model,
+                &target_model,
+                &ctx,
+                started,
+                stream,
+            )
+            .await;
+            let status = response.status();
+            attempts.push(attempt_label(status.as_u16()));
+            if status.is_success() {
+                mark_route_success(&state, upstream, &target_model);
+                log_route_success(&requested_model, group_header.as_deref(), &attempts);
+                return with_route_headers(
+                    response,
+                    upstream,
+                    &target_model,
+                    group_header.as_deref(),
+                    &attempts,
+                );
+            }
+            if has_more && is_retryable_failure(status, "") {
+                mark_route_failure(&state, upstream, &target_model, status, "");
+                tracing::warn!(
+                    requested = %requested_model,
+                    upstream = %upstream.name,
+                    model = %target_model,
+                    status = status.as_u16(),
+                    "路由候选失败，切换下一个"
+                );
+                last_failure = Some(RouteFailure {
+                    upstream: upstream.clone(),
+                    model: target_model,
+                    status,
+                    message: format!("ZCode 上游返回 {}", status.as_u16()),
+                    // ZCode transport 已记录本次尝试；最终成功会用同 id 覆盖，
+                    // 最终失败则保留它更具体的错误。
+                    recorded: true,
+                });
+                continue;
+            }
+            if is_retryable_failure(status, "") {
+                mark_route_failure(&state, upstream, &target_model, status, "");
+            }
+            return with_route_headers(
+                response,
+                upstream,
+                &target_model,
+                group_header.as_deref(),
+                &attempts,
+            );
+        }
+
+        let prepared = match prepare_attempt(
+            &state,
+            upstream,
+            &target.model,
+            &payload,
+            max_tokens,
+            target.credential.as_ref(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(response) => {
+                let status = response.status();
+                if has_more && is_retryable_failure(status, "") {
+                    mark_route_failure(&state, upstream, &target_model, status, "");
+                    mark_pool_failure(&state, target, status, "");
+                    last_failure = Some(RouteFailure {
+                        upstream: upstream.clone(),
+                        model: target_model,
+                        status,
+                        message: "候选准备失败".to_string(),
+                        recorded: false,
+                    });
+                    continue;
+                }
+                return response;
+            }
+        };
+        let response = match state
+            .client
+            .post(&prepared.url)
+            .headers(prepared.headers.clone())
+            .json(&prepared.outbound)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                if has_more {
+                    mark_route_failure(
+                        &state,
+                        upstream,
+                        &prepared.target_model,
+                        StatusCode::BAD_GATEWAY,
+                        "",
+                    );
+                    mark_pool_failure(&state, target, StatusCode::BAD_GATEWAY, "");
+                    attempts.push(format!("{}=network", upstream.name));
+                    tracing::warn!(
+                        requested = %requested_model,
+                        upstream = %upstream.name,
+                        model = %prepared.target_model,
+                        error = %err,
+                        "路由候选连接失败，切换下一个"
+                    );
+                    last_failure = Some(RouteFailure {
+                        upstream: upstream.clone(),
+                        model: prepared.target_model,
+                        status: StatusCode::BAD_GATEWAY,
+                        message: err.to_string(),
+                        recorded: false,
+                    });
+                    continue;
+                }
+                mark_route_failure(
+                    &state,
+                    upstream,
+                    &prepared.target_model,
+                    StatusCode::BAD_GATEWAY,
+                    "",
+                );
+                mark_pool_failure(&state, target, StatusCode::BAD_GATEWAY, "");
+                record(
+                    &state,
+                    upstream,
+                    &requested_model,
+                    &prepared.target_model,
+                    &ctx,
+                    started,
+                    502,
+                    false,
+                    None,
+                    Some(err.to_string()),
+                );
+                return error_json(
+                    StatusCode::BAD_GATEWAY,
+                    format!("无法连接上游 {}: {err}", upstream.base_url),
+                    "upstream_error",
+                    "upstream_failed",
+                );
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            let message = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| text.clone());
+            let message = privacy_error_hint(upstream, message);
+            attempts.push(attempt_label(status.as_u16()));
+            if has_more && is_retryable_failure(status, &message) {
+                mark_route_failure(&state, upstream, &prepared.target_model, status, &message);
+                mark_pool_failure(&state, target, status, &message);
+                tracing::warn!(
+                    requested = %requested_model,
+                    upstream = %upstream.name,
+                    model = %prepared.target_model,
+                    status = status.as_u16(),
+                    error = %brief_text(&message, 200),
+                    "路由候选失败，切换下一个"
+                );
+                last_failure = Some(RouteFailure {
+                    upstream: upstream.clone(),
+                    model: prepared.target_model,
+                    status,
+                    message,
+                    recorded: false,
+                });
+                continue;
+            }
+            if is_retryable_failure(status, &message) {
+                mark_route_failure(&state, upstream, &prepared.target_model, status, &message);
+                mark_pool_failure(&state, target, status, &message);
+            }
+            record(
+                &state,
+                upstream,
+                &requested_model,
+                &prepared.target_model,
+                &ctx,
+                started,
+                status.as_u16(),
+                prepared.stream,
+                None,
+                Some(message.clone()),
+            );
+            return error_json(
+                status,
+                format!("上游返回 {}: {message}", status.as_u16()),
+                "upstream_error",
+                "upstream_failed",
+            );
+        }
+
+        mark_route_success(&state, upstream, &prepared.target_model);
+        mark_pool_success(&state, target);
+        attempts.push(attempt_label(200));
+        log_route_success(&requested_model, group_header.as_deref(), &attempts);
+
+        if prepared.is_opencode && !prepared.client_stream {
+            let text = response.text().await.unwrap_or_default();
+            let (value, usage) =
+                opencode::aggregate_sse(&text, &prepared.tool_state, &requested_model);
+            record_ex(
+                &state,
+                upstream,
+                &requested_model,
+                &prepared.target_model,
+                &ctx,
+                started,
+                200,
+                false,
+                usage.as_ref(),
+                None,
+                0,
+                false,
+                false,
+            );
+            let response = Json(value).into_response();
+            return with_route_headers(
+                response,
+                upstream,
+                &prepared.target_model,
+                group_header.as_deref(),
+                &attempts,
+            );
+        }
+        if !prepared.stream {
+            let text = response.text().await.unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&text).ok();
+            let (usage, mut value, err, truncated, paused) = match upstream.protocol.as_str() {
+                "anthropic" => {
+                    let data = parsed.unwrap_or_else(|| json!({}));
+                    (
+                        Some(anthropic::usage_of(
+                            data.get("usage").unwrap_or(&Value::Null),
+                        )),
+                        anthropic::to_openai(&data, &requested_model, &state.thinking),
+                        None,
+                        false,
+                        false,
+                    )
+                }
+                "commandcode" => {
+                    let mut st = commandcode::consume_ndjson(&text);
+                    let mut attempts_count = 0;
+                    while st.paused && upstream.pause_turn && attempts_count < 5 {
+                        attempts_count += 1;
+                        st.paused = false;
+                        let retry = state
+                            .client
+                            .post(&prepared.url)
+                            .headers(prepared.headers.clone())
+                            .json(&prepared.outbound)
+                            .send()
+                            .await;
+                        match retry {
+                            Ok(resp) if resp.status().is_success() => {
+                                let more = resp.text().await.unwrap_or_default();
+                                st.merge(commandcode::consume_ndjson(&more));
+                            }
+                            _ => break,
+                        }
+                    }
+                    let body = commandcode::body_from_state(&st, &requested_model);
+                    let err = if st.error.is_empty() {
+                        None
+                    } else {
+                        Some(st.error.clone())
+                    };
+                    (Some(st.usage()), body, err, !st.saw_finish, st.paused)
+                }
+                _ => {
+                    let parsed = parsed
+                        .unwrap_or_else(|| json!({"error": {"message": "上游响应不是合法 JSON"}}));
+                    (parsed.get("usage").cloned(), parsed, None, false, false)
+                }
+            };
+            record_ex(
+                &state,
+                upstream,
+                &requested_model,
+                &prepared.target_model,
+                &ctx,
+                started,
+                200,
+                false,
+                usage.as_ref(),
+                err,
+                0,
+                truncated,
+                paused,
+            );
+            if upstream.protocol == "openai" {
+                value["model"] = json!(requested_model);
+            }
+            let response = Json(value).into_response();
+            return with_route_headers(
+                response,
+                upstream,
+                &prepared.target_model,
+                group_header.as_deref(),
+                &attempts,
+            );
+        }
+        let pause_turn = upstream.pause_turn;
+        let response = match upstream.protocol.as_str() {
+            "anthropic" => {
+                stream_anthropic(
+                    state.clone(),
+                    upstream.clone(),
+                    requested_model.clone(),
+                    prepared.target_model.clone(),
+                    response,
+                    ctx.clone(),
+                )
+                .await
+            }
+            "commandcode" => {
+                stream_commandcode(
+                    state.clone(),
+                    upstream.clone(),
+                    requested_model.clone(),
+                    prepared.target_model.clone(),
+                    response,
+                    prepared.url.clone(),
+                    prepared.headers.clone(),
+                    prepared.outbound.clone(),
+                    pause_turn,
+                    ctx.clone(),
+                )
+                .await
+            }
+            _ if prepared.is_opencode => {
+                stream_opencode(
+                    state.clone(),
+                    upstream.clone(),
+                    requested_model.clone(),
+                    prepared.target_model.clone(),
+                    response,
+                    prepared.tool_state,
+                    ctx.clone(),
+                )
+                .await
+            }
+            _ => {
+                stream_response(
+                    state.clone(),
+                    upstream.clone(),
+                    requested_model.clone(),
+                    prepared.target_model.clone(),
+                    response,
+                    ctx.clone(),
+                )
+                .await
+            }
+        };
+        return with_route_headers(
+            response,
+            upstream,
+            &prepared.target_model,
+            group_header.as_deref(),
+            &attempts,
+        );
+    }
+
+    // 所有候选都失败：按最后一个真实尝试记录用量，再返回聚合错误。
+    // ZCode 失败已由 transport 内部记录，避免用泛化错误覆盖它的具体拒因。
+    if let Some(failure) = &last_failure {
+        if !failure.recorded {
+            record(
+                &state,
+                &failure.upstream,
+                &requested_model,
+                &failure.model,
+                &ctx,
+                started,
+                failure.status.as_u16(),
+                false,
+                None,
+                Some(failure.message.clone()),
+            );
+        }
+    }
+    let chain = if attempts.is_empty() {
+        "无可用候选".to_string()
+    } else {
+        attempts.join(" -> ")
+    };
+    let message = match group_header.as_deref() {
+        Some(group) => format!("路由组「group/{group}」全部候选失败：{chain}"),
+        None => format!("模型「{requested_model}」的上游候选全部失败：{chain}"),
+    };
+    let status = if last_failure
+        .as_ref()
+        .map(|failure| failure.status == StatusCode::TOO_MANY_REQUESTS)
+        .unwrap_or(false)
+    {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    error_json(status, message, "upstream_error", "all_candidates_failed")
+}
+
+/// 普通模型自动补位时的候选上限（主选 + 最多 2 条备选）。
+const MAX_ROUTE_ATTEMPTS: usize = 3;
+
+struct AttemptTarget {
+    upstream: Upstream,
+    model: String,
+    /// 池成员（`credentialPool` 绑定时）。同一上游的多个成员会展开成多个候选，
+    /// 复用现有候选链实现成员级故障转移。
+    credential: Option<crate::credential_pool::PoolCredential>,
+}
+
+struct RoutePlan {
+    targets: Vec<AttemptTarget>,
+    /// `group/<id>` 的 id；普通模型为 `None`。
+    group: Option<String>,
+}
+
+struct RouteFailure {
+    upstream: Upstream,
+    model: String,
+    status: StatusCode,
+    message: String,
+    /// ZCode transport 已在内部记录过本候选的失败，避免重复覆盖。
+    recorded: bool,
+}
+
+struct PreparedAttempt {
+    target_model: String,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    outbound: Value,
+    client_stream: bool,
+    stream: bool,
+    is_opencode: bool,
+    tool_state: opencode::ToolState,
+}
+
+/// 把一个上游展开成候选：绑定凭据池时，每个可用成员一个候选（最多 5 个），
+/// 复用现有候选链实现成员级故障转移；未绑定池时保持单候选。
+///
+/// 设计约束：池存在但无可用成员时默认**不回落**单 Key，避免误用错误凭据；
+/// 只有池显式声明 `fallbackToSingle` 才回落。
+fn expand_attempt_targets(
+    state: &AppState,
+    upstream: &Upstream,
+    model: &str,
+) -> Vec<AttemptTarget> {
+    // ZCode 走账号池 transport，密钥选择由 zcode 模块负责，不在这里展开。
+    if upstream.transport == "zcode" {
+        return vec![AttemptTarget {
+            upstream: upstream.clone(),
+            model: model.to_string(),
+            credential: None,
+        }];
+    }
+    let Some(pool_id) = upstream.credential_pool.as_deref() else {
+        return vec![AttemptTarget {
+            upstream: upstream.clone(),
+            model: model.to_string(),
+            credential: None,
+        }];
+    };
+    let Some(pool) = crate::credential_pool::get_pool(state, pool_id) else {
+        tracing::warn!(
+            upstream = %upstream.name,
+            pool = %pool_id,
+            "上游绑定的凭据池不存在，禁止回落单 Key"
+        );
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    let mut exclude: Vec<String> = Vec::new();
+    for _ in 0..5 {
+        match crate::credential_pool::select_credential(state, &pool, &exclude) {
+            Ok(credential) => {
+                exclude.push(credential.member_id.clone());
+                targets.push(AttemptTarget {
+                    upstream: upstream.clone(),
+                    model: model.to_string(),
+                    credential: Some(credential),
+                });
+            }
+            Err(reason) => {
+                if targets.is_empty() {
+                    tracing::warn!(
+                        upstream = %upstream.name,
+                        pool = %pool_id,
+                        %reason,
+                        "凭据池没有可用成员"
+                    );
+                }
+                break;
+            }
+        }
+    }
+    if targets.is_empty() && pool.fallback_to_single {
+        targets.push(AttemptTarget {
+            upstream: upstream.clone(),
+            model: model.to_string(),
+            credential: None,
+        });
+    }
+    targets
+}
+
+fn pool_unavailable_response(upstream: &Upstream) -> Response {
+    error_json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "上游「{}」的凭据池没有可用成员（全部冷却/停用/配额耗尽）",
+            upstream.name
+        ),
+        "upstream_error",
+        "pool_unavailable",
+    )
+}
+
+fn mark_pool_failure(state: &AppState, target: &AttemptTarget, status: StatusCode, message: &str) {
+    let Some(credential) = &target.credential else {
+        return;
+    };
+    let hard = status == StatusCode::TOO_MANY_REQUESTS || is_quota_message(message);
+    crate::credential_pool::mark_failure(state, &credential.member_id, hard);
+}
+
+fn mark_pool_success(state: &AppState, target: &AttemptTarget) {
+    if let Some(credential) = &target.credential {
+        crate::credential_pool::mark_success(state, &credential.member_id);
+    }
+}
+
+/// 解析本次请求的候选链。
+///
+/// - `forced`（URL 前缀或 `上游/模型`）：只走这一条，保持既有强制语义；
+/// - `group/<id>`：按成员声明顺序；
+/// - 普通模型：主选 + 其它声明了同一模型的上游，最多 [`MAX_ROUTE_ATTEMPTS`] 条。
+fn build_route_plan(
+    state: &AppState,
+    cfg: &Config,
+    requested_model: &str,
+    route_model: &str,
+    forced: Option<&str>,
+    scope_allowed: Option<&[String]>,
+    scope: Option<&UnifiedScope>,
+) -> Result<RoutePlan, Response> {
+    let scope_allows = |name: &str| {
+        scope_allowed
+            .map(|allowed| allowed.iter().any(|item| item == name))
+            .unwrap_or(true)
+    };
+    if let Some(name) = forced {
+        let upstream = cfg
+            .upstream(name)
+            .ok_or_else(|| unknown_upstream(state, name))?;
+        let targets = expand_attempt_targets(state, upstream, route_model);
+        if targets.is_empty() {
+            return Err(pool_unavailable_response(upstream));
+        }
+        return Ok(RoutePlan {
+            targets,
+            group: None,
+        });
+    }
+
+    let effective = cfg
+        .aliases
+        .get(requested_model)
+        .map(String::as_str)
+        .unwrap_or(requested_model);
+    if effective.starts_with("group/") {
+        let group_id = cfg.group_id_from_model(effective).ok_or_else(|| {
+            error_json(
+                StatusCode::NOT_FOUND,
+                format!("未知的路由组「{effective}」；路由组格式为 group/<id>，id 不能包含 /"),
+                "invalid_request_error",
+                "unknown_group",
+            )
+        })?;
+        let group = cfg.route_group(group_id).ok_or_else(|| {
+            let available: Vec<&str> = cfg.groups.iter().map(|group| group.id.as_str()).collect();
+            let message = if available.is_empty() {
+                format!("未知的路由组「group/{group_id}」；当前没有配置任何路由组")
+            } else {
+                format!(
+                    "未知的路由组「group/{group_id}」。可用路由组：{}",
+                    available.join("、")
+                )
+            };
+            error_json(
+                StatusCode::NOT_FOUND,
+                message,
+                "invalid_request_error",
+                "unknown_group",
+            )
+        })?;
+        let mut targets = Vec::new();
+        for (upstream, model) in cfg.group_targets(group) {
+            if !scope_allows(upstream.name.as_str()) {
+                continue;
+            }
+            targets.extend(expand_attempt_targets(state, upstream, &model));
+        }
+        if targets.is_empty() {
+            let message = match scope {
+                Some(scope) => format!(
+                    "路由组「group/{}」在统一接口{}没有可见成员",
+                    group.id,
+                    scope.describe()
+                ),
+                None => format!("路由组「group/{}」没有可用成员", group.id),
+            };
+            return Err(error_json(
+                if scope.is_some() {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+                message,
+                "upstream_error",
+                "group_unavailable",
+            ));
+        }
+        order_targets_by_health(state, &mut targets);
+        return Ok(RoutePlan {
+            targets,
+            group: Some(group.id.clone()),
+        });
+    }
+
+    let primary = cfg
+        .pick_upstream_scoped(Some(route_model), scope_allowed)
+        .ok_or_else(|| {
+            error_json(
+                StatusCode::BAD_GATEWAY,
+                "未配置任何上游",
+                "upstream_error",
+                "no_upstream",
+            )
+        })?;
+    let mut targets = expand_attempt_targets(state, primary, route_model);
+    if targets.is_empty() {
+        return Err(pool_unavailable_response(primary));
+    }
+    // 自动故障切换：其它声明了同一模型的上游，按配置顺序补位。
+    // 上限按“上游数”计，不按成员数计：一个池的多个成员仍算一个上游。
+    let alias_target = cfg
+        .aliases
+        .get(route_model)
+        .map(String::as_str)
+        .unwrap_or(route_model);
+    let mut upstream_count = 1;
+    for upstream in &cfg.upstreams {
+        if upstream_count >= MAX_ROUTE_ATTEMPTS {
+            break;
+        }
+        if upstream.name == primary.name || !scope_allows(upstream.name.as_str()) {
+            continue;
+        }
+        let declares = upstream.models.iter().any(|model| model == alias_target)
+            || upstream.model_map.contains_key(route_model);
+        if declares {
+            let expanded = expand_attempt_targets(state, upstream, route_model);
+            if !expanded.is_empty() {
+                upstream_count += 1;
+                targets.extend(expanded);
+            }
+        }
+    }
+    order_targets_by_health(state, &mut targets);
+    Ok(RoutePlan {
+        targets,
+        group: None,
+    })
+}
+
+fn route_key(upstream: &str, model: &str) -> String {
+    format!("{upstream}\u{0}{model}")
+}
+
+/// 冷却中的候选排到链尾；稳定排序保留人工顺序。全部冷却时仍按原顺序尝试。
+fn order_targets_by_health(state: &AppState, targets: &mut [AttemptTarget]) {
+    let now = Instant::now();
+    let health = state.route_health.lock().unwrap_or_else(|e| e.into_inner());
+    targets.sort_by_key(|target| {
+        health
+            .get(&route_key(&target.upstream.name, &target.model))
+            .map(|until| *until > now)
+            .unwrap_or(false)
+    });
+}
+
+fn mark_route_success(state: &AppState, upstream: &Upstream, model: &str) {
+    state
+        .route_health
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&route_key(&upstream.name, model));
+}
+
+fn mark_route_failure(
+    state: &AppState,
+    upstream: &Upstream,
+    model: &str,
+    status: StatusCode,
+    message: &str,
+) {
+    let seconds = if status == StatusCode::TOO_MANY_REQUESTS || is_quota_message(message) {
+        300
+    } else {
+        60
+    };
+    let until = Instant::now() + Duration::from_secs(seconds);
+    state
+        .route_health
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(route_key(&upstream.name, model), until);
+}
+
+fn is_quota_message(message: &str) -> bool {
+    let text = message.to_lowercase();
+    [
+        "insufficient_quota",
+        "quota exceeded",
+        "quota_exhausted",
+        "quota exhausted",
+        "daily limit",
+        "free usage limit",
+        "credit balance",
+        "out of credits",
+        "余额",
+        "额度",
+        "配额",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+/// 可切换的失败：连接失败、408、429、5xx；少数上游用 400/403 + 明确配额
+/// 文案表示耗尽，也允许切换。普通 400/401/403/404 直接透传，避免掩盖配置错误。
+fn is_retryable_failure(status: StatusCode, message: &str) -> bool {
+    let code = status.as_u16();
+    if code == 408 || code == 429 || code >= 500 {
+        return true;
+    }
+    (code == 400 || code == 403) && is_quota_message(message)
+}
+
+fn log_route_success(requested_model: &str, group: Option<&str>, attempts: &[String]) {
+    if attempts.len() <= 1 {
+        return;
+    }
+    tracing::info!(
+        requested = %requested_model,
+        group = group.unwrap_or(""),
+        chain = %attempts.join(" -> "),
+        "路由切换后成功"
+    );
+}
+
+/// 补齐真实上游、候选链与路由组响应头；流式响应在开始写字节前调用。
+fn with_route_headers(
+    mut response: Response,
+    upstream: &Upstream,
+    target_model: &str,
+    group: Option<&str>,
+    attempts: &[String],
+) -> Response {
+    if let Ok(value) = upstream.name.parse() {
+        response.headers_mut().insert("x-bridge-upstream", value);
+    }
+    if let Ok(value) = target_model.parse() {
+        response
+            .headers_mut()
+            .insert("x-bridge-upstream-model", value);
+    }
+    if let Some(group) = group {
+        if let Ok(value) = group.parse() {
+            response.headers_mut().insert("x-bridge-group", value);
+        }
+    }
+    if let Ok(value) = attempts.len().to_string().parse() {
+        response
+            .headers_mut()
+            .insert("x-bridge-route-attempts", value);
+    }
+    if !attempts.is_empty() {
+        if let Ok(value) = attempts.join(" -> ").parse() {
+            response.headers_mut().insert("x-bridge-route-chain", value);
+        }
+    }
+    response
+}
+
+/// 为一次候选尝试准备真实模型名、请求体、地址和鉴权头。
+///
+/// 从原 `chat_scoped` 中抽出：每个候选都必须用全新的 payload 克隆，避免
+/// 前一个候选的 `model` / 隐私字段污染后一个候选。
+fn prepare_attempt(
+    state: &AppState,
+    upstream: &Upstream,
+    route_model: &str,
+    payload: &Value,
+    max_tokens: u64,
+    credential: Option<&crate::credential_pool::PoolCredential>,
+) -> Result<PreparedAttempt, Response> {
     let target_model = upstream
         .model_map
-        .get(&requested_model)
+        .get(route_model)
         .cloned()
-        .unwrap_or_else(|| requested_model.clone());
-    // 逐模型密钥：必须用最终发给上游的 target_model 选 key。
-    // 用 requested_model 会漏掉 modelMap 映射，静默用错厂商密钥。
-    let model_key = upstream.key_for_model(&target_model);
+        .unwrap_or_else(|| route_model.to_string());
+    // 池成员优先：同一上游的候选可能携带不同成员密钥；未绑定时回落到
+    // 逐模型密钥（必须用最终发给上游的 target_model 选 key）。
+    let model_key = match credential {
+        Some(credential) => crate::config::KeySelection {
+            key: credential.key.clone(),
+            source: "pool".into(),
+            env_name: None,
+            from: "pool".into(),
+        },
+        None => upstream.key_for_model(&target_model),
+    };
     if !upstream.model_keys.is_empty() {
-        // 只记录来源，不记录密钥值。
         tracing::debug!(
             upstream = %upstream.name,
             model = %target_model,
@@ -774,28 +1876,19 @@ async fn chat_inner(
         .unwrap_or(false);
     let is_opencode = upstream.transport == "opencode";
     if is_opencode && !opencode::is_free_model(&target_model) {
-        return error_json(StatusCode::BAD_REQUEST,
-                          format!("模型 {target_model} 不是 OpenCode 免费模型；transport=opencode 只接受 -free、big-pickle 或 grok-code"),
-                          "invalid_request_error", "model_not_free");
+        return Err(error_json(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "模型 {target_model} 不是 OpenCode 免费模型；transport=opencode 只接受 -free、big-pickle 或 grok-code"
+            ),
+            "invalid_request_error",
+            "model_not_free",
+        ));
     }
     let stream = client_stream || is_opencode;
-    // ZCode 原生插件：不走 HTTP 上游，直接交给账号池 + 本机 CLI worker。
-    if upstream.transport == "zcode" {
-        return crate::zcode::transport::chat(
-            &state,
-            &upstream,
-            &payload,
-            &requested_model,
-            &target_model,
-            &ctx,
-            started,
-            stream,
-        )
-        .await;
-    }
     let base = upstream.base_url.trim_end_matches('/');
-    // 上游/模型声明的最大输出：超过时收敛，避免上游直接拒绝或截断。
     let model_limit = upstream.model_max_output_tokens(&target_model);
+    let mut payload = payload.clone();
     if let Some(limit) = model_limit {
         for key in ["max_tokens", "max_completion_tokens"] {
             if let Some(requested) = payload.get(key).and_then(Value::as_u64) {
@@ -820,9 +1913,8 @@ async fn chat_inner(
         url = opencode::rewrite_free_url(&url);
     }
     let mut headers = reqwest::header::HeaderMap::new();
-    let outbound: Value;
+    let mut outbound: Value;
     let mut tool_state = opencode::ToolState::default();
-    // 只有 wire 形态不同的协议需要分支；provider 差异全部走 compat。
     match upstream.protocol.as_str() {
         "openai" => {
             payload["model"] = json!(target_model);
@@ -843,19 +1935,22 @@ async fn chat_inner(
         }
         "commandcode" => {
             if model_key.key.is_empty() && upstream.compat.auth_scheme != "none" {
-                return error_json(StatusCode::UNAUTHORIZED,
-                                  "未配置 CommandCode 凭据：请设置 COMMAND_CODE_API_KEY 环境变量，或在面板「写入密钥」保存",
-                                  "authentication_error", "missing_api_key");
+                return Err(error_json(
+                    StatusCode::UNAUTHORIZED,
+                    "未配置 CommandCode 凭据：请设置 COMMAND_CODE_API_KEY 环境变量，或在面板「写入密钥」保存",
+                    "authentication_error",
+                    "missing_api_key",
+                ));
             }
             outbound = commandcode::build_payload(&payload, &target_model, fallback_max);
         }
         other => {
-            return error_json(
+            return Err(error_json(
                 StatusCode::NOT_IMPLEMENTED,
                 format!("Rust 内核尚未实现 {other} 协议（迁移中）"),
                 "server_error",
                 "not_implemented",
-            );
+            ));
         }
     }
 
@@ -879,8 +1974,7 @@ async fn chat_inner(
         }
     }
     // 2) 鉴权：bearer / x-api-key / both / header；空 key 表示不发送鉴权头。
-    // 逐模型命中时用该模型的 key，否则回落到上游级 key；头风格始终由 compat 决定。
-    apply_auth_headers(&mut headers, &upstream, &model_key.key);
+    apply_auth_headers(&mut headers, upstream, &model_key.key);
     // 3) 会话头：opencode / commandcode 等由 compat 声明，不再写死协议名。
     if !upstream.compat.session_header.is_empty() {
         let raw = session_id(&payload);
@@ -927,225 +2021,21 @@ async fn chat_inner(
             headers.insert(name, value);
         }
     }
-    if upstream.compat.zdr {
-        headers.insert("x-cmd-zdr", "1".parse().unwrap());
+    // 通用隐私策略：用户意图由 compat.privacy 决定，落地方式由 provider profile 声明。
+    for warning in apply_privacy(&upstream.compat.privacy, &mut headers, &mut outbound) {
+        tracing::warn!(upstream = %upstream.name, "{warning}");
     }
 
-    let retry_headers = headers.clone();
-    let retry_payload = outbound.clone();
-    let response = match state
-        .client
-        .post(&url)
-        .headers(headers)
-        .json(&outbound)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => {
-            record(
-                &state,
-                &upstream,
-                &requested_model,
-                &target_model,
-                &ctx,
-                started,
-                502,
-                false,
-                None,
-                Some(err.to_string()),
-            );
-            return error_json(
-                StatusCode::BAD_GATEWAY,
-                format!("无法连接上游 {}: {err}", upstream.base_url),
-                "upstream_error",
-                "upstream_failed",
-            );
-        }
-    };
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| text.clone());
-        record(
-            &state,
-            &upstream,
-            &requested_model,
-            &target_model,
-            &ctx,
-            started,
-            status.as_u16(),
-            stream,
-            None,
-            Some(message.clone()),
-        );
-        return error_json(
-            status,
-            format!("上游返回 {}: {message}", status.as_u16()),
-            "upstream_error",
-            "upstream_failed",
-        );
-    }
-    if is_opencode && !client_stream {
-        let text = response.text().await.unwrap_or_default();
-        let (value, usage) = opencode::aggregate_sse(&text, &tool_state, &requested_model);
-        record_ex(
-            &state,
-            &upstream,
-            &requested_model,
-            &target_model,
-            &ctx,
-            started,
-            200,
-            false,
-            usage.as_ref(),
-            None,
-            0,
-            false,
-            false,
-        );
-        let mut out = Json(value).into_response();
-        out.headers_mut()
-            .insert("x-bridge-upstream", upstream.name.parse().unwrap());
-        out.headers_mut()
-            .insert("x-bridge-upstream-model", target_model.parse().unwrap());
-        return out;
-    }
-    if !stream {
-        let text = response.text().await.unwrap_or_default();
-        let parsed = serde_json::from_str::<Value>(&text).ok();
-        let (usage, mut value, err, truncated, paused) = match upstream.protocol.as_str() {
-            "anthropic" => {
-                let data = parsed.unwrap_or_else(|| json!({}));
-                (
-                    Some(anthropic::usage_of(
-                        data.get("usage").unwrap_or(&Value::Null),
-                    )),
-                    anthropic::to_openai(&data, &requested_model, &state.thinking),
-                    None,
-                    false,
-                    false,
-                )
-            }
-            "commandcode" => {
-                let mut st = commandcode::consume_ndjson(&text);
-                let mut attempts = 0;
-                while st.paused && upstream.pause_turn && attempts < 5 {
-                    attempts += 1;
-                    st.paused = false;
-                    let retry = state
-                        .client
-                        .post(&url)
-                        .headers(retry_headers.clone())
-                        .json(&retry_payload)
-                        .send()
-                        .await;
-                    match retry {
-                        Ok(resp) if resp.status().is_success() => {
-                            let more = resp.text().await.unwrap_or_default();
-                            st.merge(commandcode::consume_ndjson(&more));
-                        }
-                        _ => break,
-                    }
-                }
-                let body = commandcode::body_from_state(&st, &requested_model);
-                let err = if st.error.is_empty() {
-                    None
-                } else {
-                    Some(st.error.clone())
-                };
-                (Some(st.usage()), body, err, !st.saw_finish, st.paused)
-            }
-            _ => {
-                let parsed = parsed
-                    .unwrap_or_else(|| json!({"error": {"message": "上游响应不是合法 JSON"}}));
-                (parsed.get("usage").cloned(), parsed, None, false, false)
-            }
-        };
-        record_ex(
-            &state,
-            &upstream,
-            &requested_model,
-            &target_model,
-            &ctx,
-            started,
-            200,
-            false,
-            usage.as_ref(),
-            err,
-            0,
-            truncated,
-            paused,
-        );
-        if upstream.protocol == "openai" {
-            value["model"] = json!(requested_model);
-        }
-        let mut out = Json(value).into_response();
-        out.headers_mut()
-            .insert("x-bridge-upstream", upstream.name.parse().unwrap());
-        out.headers_mut()
-            .insert("x-bridge-upstream-model", target_model.parse().unwrap());
-        return out;
-    }
-    let pause_turn = upstream.pause_turn;
-    match upstream.protocol.as_str() {
-        "anthropic" => {
-            stream_anthropic(
-                state,
-                upstream,
-                requested_model,
-                target_model,
-                response,
-                ctx,
-            )
-            .await
-        }
-        "commandcode" => {
-            stream_commandcode(
-                state,
-                upstream,
-                requested_model,
-                target_model,
-                response,
-                url,
-                retry_headers,
-                retry_payload,
-                pause_turn,
-                ctx,
-            )
-            .await
-        }
-        _ if is_opencode => {
-            stream_opencode(
-                state,
-                upstream,
-                requested_model,
-                target_model,
-                response,
-                tool_state,
-                ctx,
-            )
-            .await
-        }
-        _ => {
-            stream_response(
-                state,
-                upstream,
-                requested_model,
-                target_model,
-                response,
-                ctx,
-            )
-            .await
-        }
-    }
+    Ok(PreparedAttempt {
+        target_model,
+        url,
+        headers,
+        outbound,
+        client_stream,
+        stream,
+        is_opencode,
+        tool_state,
+    })
 }
 
 async fn stream_response(
@@ -1779,6 +2669,21 @@ pub(crate) fn error_json(
 
 async fn ui_index() -> impl IntoResponse {
     let version = env!("CARGO_PKG_VERSION");
+    // v3 控制台为默认入口；经典面板保留在 /ui/classic，旧资源与旧接口全部可用。
+    let html = include_str!("../ui/v3.html")
+        .replace("href=\"v3.css\"", &format!("href=\"v3.css?v={version}\""))
+        .replace("src=\"v3.js\"", &format!("src=\"v3.js?v={version}\""));
+    (
+        [
+            ("content-type", "text/html; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        html,
+    )
+}
+
+async fn ui_classic() -> impl IntoResponse {
+    let version = env!("CARGO_PKG_VERSION");
     let html = include_str!("../ui/index.html")
         .replace(
             "href=\"style.css\"",
@@ -1815,6 +2720,11 @@ async fn ui_asset(Path(path): Path<String>) -> Response {
             include_str!("../ui/zcode.js"),
         ),
         "style.css" => ("text/css; charset=utf-8", include_str!("../ui/style.css")),
+        "v3.css" => ("text/css; charset=utf-8", include_str!("../ui/v3.css")),
+        "v3.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/v3.js"),
+        ),
         _ => {
             return error_json(
                 StatusCode::NOT_FOUND,
@@ -1926,7 +2836,9 @@ async fn api_config_save(
     crate::config_store::strip_secrets(&mut to_write);
 
     // 先诊断、后落盘：error 级问题不写入配置文件。
-    let candidate = Config::from_value(merged.clone());
+    // 带上本地密钥库解析，避免把已加密保存的密钥误报为缺失。
+    let store = crate::secret_store::SecretStore::load(&state.config_path);
+    let candidate = Config::from_value_with_store(merged.clone(), &store);
     let diagnostics = candidate.diagnostics();
     let errors: Vec<&crate::config::Diagnostic> =
         diagnostics.iter().filter(|d| d.level == "error").collect();
@@ -2067,10 +2979,12 @@ async fn api_upstreams(State(state): State<Arc<AppState>>) -> impl IntoResponse 
                 "apiKeyEnv": u.api_key_env,
                 "apiKeyFile": u.api_key_file,
                 "apiKeyAgent": u.api_key_agent,
+                "apiKeyStore": u.api_key_store,
                 // 逐模型密钥：只回显变量名/来源与可用性，绝不回显密钥本体。
                 "modelKeys": u.model_keys.iter().map(|mk| json!({
                     "model": mk.pattern,
                     "env": mk.env_name,
+                    "store": mk.store_id,
                     "source": mk.source,
                     "configured": mk.missing.is_none(),
                     "missing": mk.missing,
@@ -2090,11 +3004,13 @@ async fn api_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         for up in cfg.upstreams.iter() {
             if let Some(target) = ups.get_mut(&up.name).and_then(Value::as_object_mut) {
                 target.remove("apiKey");
+                target.remove("apiKeyEnc");
                 // 逐模型条目里的历史明文 apiKey 也不得回显给面板。
                 if let Some(keys) = target.get_mut("modelKeys").and_then(Value::as_object_mut) {
                     for (_, spec) in keys.iter_mut() {
                         if let Some(spec) = spec.as_object_mut() {
                             spec.remove("apiKey");
+                            spec.remove("apiKeyEnc");
                         }
                     }
                 }
@@ -2306,6 +3222,57 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
+    /// 假上游：返回带固定标记的 OpenAI 响应，用于断言请求实际落到了哪条上游。
+    fn spawn_fixed_chat_server(marker: &'static str, serves: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(serves) {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("复制流"));
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = trimmed.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                }
+                let body = json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "model": "m",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": marker},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
     /// 同一个上游下，不同模型必须使用各自的密钥；`modelMap` 解析后的
     /// 真实模型名也必须命中对应密钥（不能用请求名查表）。
     #[test]
@@ -2367,6 +3334,276 @@ mod tests {
             "modelMap 别名必须按真实模型 real-a 选 key"
         );
         assert_eq!(third.0.as_deref(), Some("key-b"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 统一模型名 `上游/模型` 必须锁定该上游；裸模型名仍按原规则分发。
+    #[test]
+    fn chat_routes_qualified_model_to_named_upstream() {
+        let url_a = spawn_fixed_chat_server("from-a", 2);
+        let url_b = spawn_fixed_chat_server("from-b", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {
+                "a": {
+                    "protocol": "openai",
+                    "baseUrl": url_a,
+                    "models": ["same"],
+                    "default": true
+                },
+                "b": {
+                    "protocol": "openai",
+                    "baseUrl": url_b,
+                    "models": ["same"]
+                }
+            }
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-proxy-unified-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+        let runtime = rt();
+
+        let ask = |model: &str| {
+            let body = Bytes::from(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            );
+            let resp = runtime.block_on(chat_inner(state.clone(), None, HeaderMap::new(), body));
+            let upstream = resp
+                .headers()
+                .get("x-bridge-upstream")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let target = resp
+                .headers()
+                .get("x-bridge-upstream-model")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let bytes = runtime
+                .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+                .expect("读取响应体");
+            let value: Value = serde_json::from_slice(&bytes).expect("响应是 JSON");
+            (upstream, target, value)
+        };
+
+        // 裸模型名保持原有分发：两条上游都声明了 same，取配置里靠前的 a。
+        let (upstream, target, value) = ask("same");
+        assert_eq!(upstream, "a");
+        assert_eq!(target, "same");
+        assert_eq!(value["choices"][0]["message"]["content"], "from-a");
+
+        // 统一模型名锁定 b，并回显调用方请求的完整模型名。
+        let (upstream, target, value) = ask("b/same");
+        assert_eq!(upstream, "b");
+        assert_eq!(target, "same");
+        assert_eq!(value["model"], "b/same");
+        assert_eq!(value["choices"][0]["message"]["content"], "from-b");
+
+        // 显式写 a/ 与原有 URL 前缀语义一致。
+        let (upstream, _, value) = ask("a/same");
+        assert_eq!(upstream, "a");
+        assert_eq!(value["choices"][0]["message"]["content"], "from-a");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 统一接入口默认范围：被 visibleUpstreams 隐藏的上游必须拒绝。
+    #[test]
+    fn chat_unified_all_scope_rejects_hidden_upstream() {
+        let url_a = spawn_fixed_chat_server("from-a", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "unified": {"visibleUpstreams": ["a"]},
+            "upstreams": {
+                "a": {
+                    "protocol": "openai",
+                    "baseUrl": url_a,
+                    "models": ["same"]
+                },
+                "b": {
+                    "protocol": "openai",
+                    "baseUrl": "http://127.0.0.1:1",
+                    "models": ["same"]
+                }
+            }
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-proxy-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+        let runtime = rt();
+
+        let ask = |model: &str| {
+            let body = Bytes::from(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            );
+            let resp = runtime.block_on(chat_scoped(
+                state.clone(),
+                None,
+                Some(UnifiedScope::All),
+                HeaderMap::new(),
+                body,
+            ));
+            let status = resp.status();
+            let bytes = runtime
+                .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+                .expect("读取响应体");
+            let value: Value = serde_json::from_slice(&bytes).expect("响应是 JSON");
+            (status, value)
+        };
+
+        let (status, value) = ask("b/same");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"]["code"], "upstream_not_allowed");
+
+        let (status, value) = ask("a/same");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["choices"][0]["message"]["content"], "from-a");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分组作用域：只允许组成员，未知分组 404，空分组 503。
+    #[test]
+    fn chat_unified_group_rejects_non_members_and_unknown_group() {
+        let url_b = spawn_fixed_chat_server("from-b", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "unified": {
+                "groups": [
+                    {"id": "g1", "upstreams": ["b"]},
+                    {"id": "empty", "upstreams": []}
+                ]
+            },
+            "upstreams": {
+                "a": {
+                    "protocol": "openai",
+                    "baseUrl": "http://127.0.0.1:1",
+                    "models": ["same"]
+                },
+                "b": {
+                    "protocol": "openai",
+                    "baseUrl": url_b,
+                    "models": ["same"]
+                }
+            }
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-proxy-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+        let runtime = rt();
+
+        let ask = |model: &str, group: &str| {
+            let body = Bytes::from(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            );
+            let resp = runtime.block_on(chat_scoped(
+                state.clone(),
+                None,
+                Some(UnifiedScope::Group(group.to_string())),
+                HeaderMap::new(),
+                body,
+            ));
+            let status = resp.status();
+            let bytes = runtime
+                .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+                .expect("读取响应体");
+            let value: Value = serde_json::from_slice(&bytes).expect("响应是 JSON");
+            (status, value)
+        };
+
+        let (status, value) = ask("a/same", "g1");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(value["error"]["code"], "upstream_not_allowed");
+
+        let (status, value) = ask("b/same", "g1");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["choices"][0]["message"]["content"], "from-b");
+
+        let (status, value) = ask("b/same", "nosuch");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value["error"]["code"], "unknown_unified_group");
+
+        let (status, value) = ask("b/same", "empty");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(value["error"]["code"], "no_unified_upstream");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 统一清单：默认只列可见上游；分组再按成员收窄；未知分组 404。
+    #[test]
+    fn models_unified_scope_filters_visible_and_group() {
+        let cfg = crate::config::Config::from_value(json!({
+            "unified": {
+                "visibleUpstreams": ["a", "b"],
+                "groups": [
+                    {"id": "g1", "upstreams": ["b"]},
+                    {"id": "hidden", "upstreams": ["c"]}
+                ]
+            },
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["am"]},
+                "b": {"protocol": "openai", "baseUrl": "http://b", "models": ["bm"]},
+                "c": {"protocol": "openai", "baseUrl": "http://c", "models": ["cm"]}
+            }
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-proxy-models-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+        let runtime = rt();
+
+        let read = |scope: UnifiedScope| {
+            let resp = models_unified_inner(&state, scope);
+            let status = resp.status();
+            let bytes = runtime
+                .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+                .expect("读取响应体");
+            let value: Value = serde_json::from_slice(&bytes).expect("响应是 JSON");
+            let ids: Vec<String> = value["data"]
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, ids, value)
+        };
+
+        let (status, ids, _) = read(UnifiedScope::All);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids, vec!["a/am", "b/bm"]);
+
+        let (status, ids, _) = read(UnifiedScope::Group("g1".to_string()));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ids, vec!["b/bm"]);
+
+        // 组内成员 c 被 visibleUpstreams 隐藏 → 清单为空。
+        let (status, ids, _) = read(UnifiedScope::Group("hidden".to_string()));
+        assert_eq!(status, StatusCode::OK);
+        assert!(ids.is_empty());
+
+        let (status, _, value) = read(UnifiedScope::Group("nosuch".to_string()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(value["error"]["code"], "unknown_unified_group");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2775,6 +4012,310 @@ mod tests {
         headers.insert("x-conversation-id", "conv-1".parse().unwrap());
         assert_eq!(resolve_session(&headers, &payload), "conv-1");
     }
+
+    #[test]
+    fn apply_privacy_writes_header_and_body_adapters() {
+        let privacy = Privacy {
+            zdr: Some(true),
+            training: TrainingPolicy::Deny,
+            zdr_adapter: PrivacyAdapter::Header {
+                name: "x-test-zdr".into(),
+                value: "1".into(),
+            },
+            training_allow_adapter: PrivacyAdapter::None,
+            training_deny_adapter: PrivacyAdapter::Body {
+                path: "provider.data_collection".into(),
+                value: json!("deny"),
+            },
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut body = json!({"model": "m"});
+        let warnings = apply_privacy(&privacy, &mut headers, &mut body);
+        assert!(warnings.is_empty(), "支持的适配器不应产生警告");
+        assert_eq!(headers.get("x-test-zdr").unwrap(), "1");
+        assert_eq!(body["provider"]["data_collection"], "deny");
+    }
+
+    #[test]
+    fn apply_privacy_reports_workspace_and_unsupported_without_sending() {
+        let privacy = Privacy {
+            zdr: Some(true),
+            training: TrainingPolicy::Allow,
+            zdr_adapter: PrivacyAdapter::Unsupported {
+                reason: "no request-level zdr".into(),
+            },
+            training_allow_adapter: PrivacyAdapter::Workspace {
+                url: "https://example.com/console".into(),
+                setting: "Settings › Privacy".into(),
+            },
+            training_deny_adapter: PrivacyAdapter::None,
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut body = json!({});
+        let warnings = apply_privacy(&privacy, &mut headers, &mut body);
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("ZDR") && w.contains("不支持")));
+        assert!(warnings.iter().any(|w| w.contains("控制台")));
+        assert!(headers.is_empty());
+        assert_eq!(body, json!({}));
+    }
+
+    #[test]
+    fn set_json_path_creates_intermediate_objects() {
+        let mut body = json!({});
+        assert!(set_json_path(&mut body, "provider.zdr", json!(true)));
+        assert_eq!(body["provider"]["zdr"], true);
+        assert!(!set_json_path(&mut body, "", json!(true)));
+    }
+
+    fn pool_test_state(cfg: crate::config::Config) -> (Arc<AppState>, Arc<Db>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mg-proxy-pool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db.clone(), dir.join("c.json")));
+        (state, db, dir)
+    }
+
+    fn header_of(response: &Response, name: &str) -> String {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// 路由组按成员顺序尝试：第一个 429，第二个成功；日志记录真实上游与真实模型。
+    #[test]
+    fn route_group_switches_to_next_member_on_429() {
+        let url_a = spawn_status_server(
+            "429 Too Many Requests",
+            r#"{"error":{"message":"quota exhausted"}}"#,
+            1,
+        );
+        let url_b = spawn_fixed_chat_server("from-b", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "groups": {"daily": ["a/same", "b/same"]},
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": url_a, "models": ["same"]},
+                "b": {"protocol": "openai", "baseUrl": url_b, "models": ["same"]}
+            }
+        }));
+        let (state, db, dir) = pool_test_state(cfg);
+        let runtime = rt();
+        let body = Bytes::from(
+            json!({
+                "model": "group/daily",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        );
+        let resp = runtime.block_on(chat_inner(state, None, HeaderMap::new(), body));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header_of(&resp, "x-bridge-upstream"), "b");
+        assert_eq!(header_of(&resp, "x-bridge-upstream-model"), "same");
+        assert_eq!(header_of(&resp, "x-bridge-group"), "daily");
+        assert_eq!(header_of(&resp, "x-bridge-route-attempts"), "2");
+
+        let rows = db.list_usage(&Filters::default(), 10, 0, "ts", "desc");
+        assert_eq!(rows.len(), 1, "一次客户端请求只落一条最终用量");
+        assert_eq!(rows[0]["upstream"], "b", "日志必须记录真实成功上游");
+        assert_eq!(rows[0]["requested_model"], "group/daily");
+        assert_eq!(rows[0]["upstream_model"], "same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没有显式路由组时，普通模型名也会在同模型候选间自动切换。
+    #[test]
+    fn same_model_auto_failover_switches_to_declared_upstream() {
+        let url_a = spawn_status_server(
+            "502 Bad Gateway",
+            r#"{"error":{"message":"upstream boom"}}"#,
+            1,
+        );
+        let url_b = spawn_fixed_chat_server("from-b", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": url_a, "models": ["same"]},
+                "b": {"protocol": "openai", "baseUrl": url_b, "models": ["same"]}
+            }
+        }));
+        let (state, db, dir) = pool_test_state(cfg);
+        let runtime = rt();
+        let body = Bytes::from(
+            json!({
+                "model": "same",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        );
+        let resp = runtime.block_on(chat_inner(state, None, HeaderMap::new(), body));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header_of(&resp, "x-bridge-upstream"), "b");
+        assert_eq!(header_of(&resp, "x-bridge-route-attempts"), "2");
+        let rows = db.list_usage(&Filters::default(), 10, 0, "ts", "desc");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["upstream"], "b");
+        assert_eq!(rows[0]["requested_model"], "same");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// URL 前缀 / `上游/模型` 的强制语义不变：失败也不跨上游切换。
+    #[test]
+    fn forced_upstream_does_not_failover() {
+        let url_a = spawn_status_server(
+            "502 Bad Gateway",
+            r#"{"error":{"message":"upstream boom"}}"#,
+            1,
+        );
+        let url_b = spawn_fixed_chat_server("from-b", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": url_a, "models": ["same"]},
+                "b": {"protocol": "openai", "baseUrl": url_b, "models": ["same"]}
+            }
+        }));
+        let (state, _db, dir) = pool_test_state(cfg);
+        let runtime = rt();
+        let body = Bytes::from(
+            json!({
+                "model": "same",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        );
+        let resp = runtime.block_on(chat_inner(
+            state,
+            Some("a".to_string()),
+            HeaderMap::new(),
+            body,
+        ));
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "强制上游失败应直接返回，而不是切到 b 成功"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一会话允许多种模型混用：每次请求各落一条，session 相同、真实上游不同。
+    #[test]
+    fn same_session_can_mix_models_and_logs_real_upstreams() {
+        let url_a = spawn_fixed_chat_server("from-a", 1);
+        let url_b = spawn_fixed_chat_server("from-b", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": url_a, "models": ["m1"]},
+                "b": {"protocol": "openai", "baseUrl": url_b, "models": ["m2"]}
+            }
+        }));
+        let (state, db, dir) = pool_test_state(cfg);
+        let runtime = rt();
+        for model in ["m1", "m2"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", "sess-mix".parse().unwrap());
+            let body = Bytes::from(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            );
+            let resp = runtime.block_on(chat_inner(state.clone(), None, headers, body));
+            assert_eq!(resp.status(), StatusCode::OK, "模型 {model} 应成功");
+        }
+        let filters = Filters {
+            session: Some("sess-mix".to_string()),
+            ..Default::default()
+        };
+        let mut rows: Vec<(String, String, String)> = db
+            .list_usage(&filters, 10, 0, "ts", "asc")
+            .into_iter()
+            .map(|row| {
+                (
+                    row["session"].as_str().unwrap_or("").to_string(),
+                    row["upstream"].as_str().unwrap_or("").to_string(),
+                    row["upstream_model"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("sess-mix".to_string(), "a".to_string(), "m1".to_string()),
+                ("sess-mix".to_string(), "b".to_string(), "m2".to_string())
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 统一接口的分组作用域会过滤路由组成员，不能绕过可见白名单。
+    #[test]
+    fn unified_scope_filters_route_group_members() {
+        let url_hidden = spawn_fixed_chat_server("hidden", 1);
+        let url_visible = spawn_fixed_chat_server("visible", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "unified": {"visibleUpstreams": ["visible"]},
+            "groups": {"daily": ["hidden/same", "visible/same"]},
+            "upstreams": {
+                "hidden": {"protocol": "openai", "baseUrl": url_hidden, "models": ["same"]},
+                "visible": {"protocol": "openai", "baseUrl": url_visible, "models": ["same"]}
+            }
+        }));
+        let (state, _db, dir) = pool_test_state(cfg);
+        let runtime = rt();
+        let body = Bytes::from(
+            json!({
+                "model": "group/daily",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        );
+        let resp = runtime.block_on(chat_scoped(
+            state,
+            None,
+            Some(UnifiedScope::All),
+            HeaderMap::new(),
+            body,
+        ));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&resp, "x-bridge-upstream"),
+            "visible",
+            "隐藏上游不能因路由组而绕过统一接口白名单"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_route_group_returns_404() {
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1", "models": ["m"]}
+            }
+        }));
+        let (state, _db, dir) = pool_test_state(cfg);
+        let runtime = rt();
+        let body = Bytes::from(
+            json!({
+                "model": "group/missing",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        );
+        let resp = runtime.block_on(chat_inner(state, None, HeaderMap::new(), body));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// 按上游声明的鉴权方式写入一个密钥。
@@ -2808,6 +4349,120 @@ pub(crate) fn apply_auth_headers(
         }
         _ => insert_header(headers, "authorization", &bearer),
     }
+}
+
+/// 把通用隐私意图落到当前上游的 wire 上。
+///
+/// - Header：写请求头
+/// - Body：按点分路径写请求体（自动创建中间对象）
+/// - Workspace / Unsupported / None：不修改请求，返回警告交给调用方记录
+pub(crate) fn apply_privacy(
+    privacy: &Privacy,
+    headers: &mut reqwest::header::HeaderMap,
+    body: &mut Value,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if privacy.zdr == Some(true) {
+        apply_privacy_adapter(&privacy.zdr_adapter, "ZDR", headers, body, &mut warnings);
+    }
+    match privacy.training {
+        TrainingPolicy::Inherit => {}
+        TrainingPolicy::Allow => apply_privacy_adapter(
+            &privacy.training_allow_adapter,
+            "允许训练",
+            headers,
+            body,
+            &mut warnings,
+        ),
+        TrainingPolicy::Deny => apply_privacy_adapter(
+            &privacy.training_deny_adapter,
+            "禁止训练",
+            headers,
+            body,
+            &mut warnings,
+        ),
+    }
+    warnings
+}
+
+fn apply_privacy_adapter(
+    adapter: &PrivacyAdapter,
+    label: &str,
+    headers: &mut reqwest::header::HeaderMap,
+    body: &mut Value,
+    warnings: &mut Vec<String>,
+) {
+    match adapter {
+        PrivacyAdapter::None => {}
+        PrivacyAdapter::Header { name, value } => {
+            if let (Ok(name), Ok(value)) = (
+                name.parse::<reqwest::header::HeaderName>(),
+                value.parse::<reqwest::header::HeaderValue>(),
+            ) {
+                headers.insert(name, value);
+            } else {
+                warnings.push(format!("{label} 请求头「{name}」无效，未发送"));
+            }
+        }
+        PrivacyAdapter::Body { path, value } => {
+            if !set_json_path(body, path, value.clone()) {
+                warnings.push(format!("{label} 请求体路径「{path}」无效，未写入"));
+            }
+        }
+        PrivacyAdapter::Workspace { url, setting } => {
+            warnings.push(format!("{label} 需要在上游控制台设置：{setting}（{url}）"));
+        }
+        PrivacyAdapter::Unsupported { reason } => {
+            warnings.push(format!("{label} 在该上游不支持：{reason}"));
+        }
+    }
+}
+
+/// 按点分路径写入 JSON；路径为空或中间节点不是对象时返回 false。
+fn set_json_path(root: &mut Value, path: &str, value: Value) -> bool {
+    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let mut current = root;
+    for part in &parts[..parts.len() - 1] {
+        if !current.is_object() {
+            *current = json!({});
+        }
+        let obj = current.as_object_mut().expect("just ensured object");
+        if !obj.contains_key(*part) {
+            obj.insert((*part).to_string(), json!({}));
+        }
+        current = obj.get_mut(*part).expect("just inserted");
+    }
+    let last = parts[parts.len() - 1];
+    if !current.is_object() {
+        *current = json!({});
+    }
+    if let Some(obj) = current.as_object_mut() {
+        obj.insert(last.to_string(), value);
+        true
+    } else {
+        false
+    }
+}
+
+/// 把上游「训练数据授权」类错误翻译成可操作的中文提示。
+fn privacy_error_hint(upstream: &Upstream, message: String) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("trains on request data") && lower.contains("privacy settings") {
+        let hint = match &upstream.compat.privacy.training_allow_adapter {
+            PrivacyAdapter::Workspace { url, setting } => {
+                format!("请让 workspace owner/admin 在 {url} → {setting} 打开授权")
+            }
+            PrivacyAdapter::Unsupported { reason } => {
+                format!("该上游没有请求级授权开关：{reason}")
+            }
+            _ => "请在上游控制台的隐私设置中允许使用请求数据训练".to_string(),
+        };
+        return format!("{message}（该模型会使用请求数据训练；{hint}，或改用不训练的模型）");
+    }
+    message
 }
 
 fn key_with_prefix(prefix: &str, key: &str) -> String {

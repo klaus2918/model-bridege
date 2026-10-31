@@ -171,6 +171,13 @@ impl ZcodeCli {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW：避免 CLI 调用弹出控制台窗口。
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+        }
         let output =
             tokio::time::timeout(Duration::from_secs(self.timeout_seconds), command.output())
                 .await

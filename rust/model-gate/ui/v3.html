@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model-Gate · 接入控制台</title>
+<link rel="stylesheet" href="v3.css">
+</head>
+<body>
+<header class="shell-top">
+  <div class="brand">
+    <span class="brand-mark">MG</span>
+    <span class="brand-name">Model-Gate</span>
+    <span class="brand-ver" id="version">v3</span>
+  </div>
+  <div class="top-status">
+    <span class="dot" id="conn-dot"></span>
+    <span id="conn-text">连接中…</span>
+    <span class="sep">/</span>
+    <span id="listen-addr">127.0.0.1:8900</span>
+  </div>
+  <div class="top-actions">
+    <button class="btn ghost sm" id="open-classic" title="保留原面板的全部高级功能">经典面板</button>
+    <button class="btn ghost sm" id="theme-toggle" title="切换深色 / 浅色">主题</button>
+    <button class="btn primary sm" id="quick-add">+ 添加接入</button>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="sidebar">
+    <nav id="nav">
+      <div class="nav-group">
+        <div class="nav-label">工作台</div>
+        <button class="nav-item active" data-view="overview"><span class="nav-ico">◈</span>总览</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">接入</div>
+        <button class="nav-item" data-view="access"><span class="nav-ico">⇄</span>全部接入</button>
+        <button class="nav-item" data-view="models"><span class="nav-ico">▤</span>模型目录</button>
+        <button class="nav-item" data-view="routes"><span class="nav-ico">⑃</span>路由组</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">资源</div>
+        <button class="nav-item" data-view="credentials"><span class="nav-ico">⚿</span>凭据池</button>
+        <button class="nav-item" data-view="plugins"><span class="nav-ico">⬡</span>插件</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">观测</div>
+        <button class="nav-item" data-view="traffic"><span class="nav-ico">∿</span>流量</button>
+        <button class="nav-item" data-view="observe"><span class="nav-ico">◎</span>观测</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">设置</div>
+        <button class="nav-item" data-view="settings"><span class="nav-ico">⚙</span>设置</button>
+      </div>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="foot-line">配置事实源</div>
+      <div class="foot-mono">bridge.config.json</div>
+      <div class="foot-note">旧接口 /v1 · /unified/v1 全部保留</div>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <!-- 总览 -->
+    <section class="view active" id="view-overview">
+      <div class="page-head">
+        <div>
+          <h1>总览</h1>
+          <p class="sub">网关是否正常、哪个接入有问题、下一步做什么。</p>
+        </div>
+        <div class="head-meta" id="overview-meta"></div>
+      </div>
+      <div class="stat-row" id="overview-stats"></div>
+      <div class="split">
+        <div class="stack">
+          <div class="card">
+            <div class="card-head">
+              <h2>接入健康</h2>
+              <div class="card-actions">
+                <button class="btn ghost sm" id="overview-probe">连通性自检</button>
+                <button class="btn ghost sm" id="overview-refresh">刷新</button>
+              </div>
+            </div>
+            <div id="health-results" class="inline-note" hidden></div>
+            <div id="overview-access" class="list"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>最近请求</h2><button class="btn ghost sm" data-go="traffic">查看全部</button></div>
+            <div id="overview-recent" class="list compact"></div>
+          </div>
+        </div>
+        <div class="stack narrow">
+          <div class="card accent">
+            <div class="card-head"><h2>快速开始</h2></div>
+            <ol class="steps">
+              <li><b>添加官方厂商</b><span>选模板、填 Key，两步完成。</span></li>
+              <li><b>接入插件</b><span>安装只登记；接入才创建上游。</span></li>
+              <li><b>配置 AI 助手</b><span>只读目录 + 草案，密钥永不外泄。</span></li>
+            </ol>
+            <div class="card-actions wrap">
+              <button class="btn primary sm" data-add="official">添加官方厂商</button>
+              <button class="btn ghost sm" data-go="plugins">打开插件</button>
+              <button class="btn ghost sm" data-go="settings">AI 配置</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>待处理</h2><span class="pill" id="todo-count">0</span></div>
+            <div id="overview-todos" class="list compact"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 全部接入 -->
+    <section class="view" id="view-access">
+      <div class="page-head">
+        <div>
+          <h1>全部接入</h1>
+          <p class="sub">官方、自定义、免费、账号与插件，最终都归一为一个接入对象。</p>
+        </div>
+        <div class="head-actions">
+          <button class="btn ghost sm" id="access-refresh">刷新</button>
+          <button class="btn primary sm" id="access-add">+ 添加接入</button>
+        </div>
+      </div>
+      <div class="toolbar">
+        <input class="input search" id="access-search" placeholder="搜索标识 / 地址 / 模板">
+        <select class="input select" id="access-kind">
+          <option value="">全部来源</option>
+          <option value="official">官方</option>
+          <option value="custom">自定义</option>
+          <option value="free">免费</option>
+          <option value="account">账号池</option>
+          <option value="plugin">插件</option>
+        </select>
+        <select class="input select" id="access-health">
+          <option value="">全部状态</option>
+          <option value="ok">正常</option>
+          <option value="warn">待处理</option>
+        </select>
+      </div>
+      <div class="card flush">
+        <div class="table-wrap">
+          <table class="table" id="access-table">
+            <thead>
+              <tr>
+                <th>接入</th><th>协议 / 地址</th><th>模型</th><th>凭据</th><th>健康</th><th>今日</th><th class="right">操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="empty" id="access-empty" hidden>
+          <div class="empty-mark">⇄</div>
+          <h3>还没有接入</h3>
+          <p>官方厂商只需选择模板并填写 Key；自定义厂商只需 5 项。</p>
+          <button class="btn primary" data-add="official">添加第一个接入</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 模型目录 -->
+    <section class="view" id="view-models">
+      <div class="page-head">
+        <div><h1>模型目录</h1><p class="sub">声明模型、别名与上游映射；目录属于接入，不再单独占一级页签。</p></div>
+        <button class="btn ghost sm" id="models-refresh">刷新</button>
+      </div>
+      <div class="card flush">
+        <div class="table-wrap">
+          <table class="table" id="models-table">
+            <thead><tr><th>接入</th><th>协议</th><th>声明</th><th>别名 / 映射</th><th>模型</th><th class="right">操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 路由组 -->
+    <section class="view" id="view-routes">
+      <div class="page-head">
+        <div><h1>路由组</h1><p class="sub">默认、命名分组与统一入口可见性；请求失败按声明顺序切换。</p></div>
+        <button class="btn ghost sm" id="routes-refresh">刷新</button>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>统一入口</h2><span class="pill" id="unified-count">0 个可见</span></div>
+          <div id="unified-list" class="list compact"></div>
+          <p class="hint">统一入口：<code>/unified/v1</code>；分组：<code>/unified/{组}/v1</code>。</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>路由组</h2><span class="pill" id="group-count">0 组</span></div>
+          <div id="group-list" class="list compact"></div>
+          <p class="hint">组成员按声明顺序尝试；写错成员不会静默落到默认上游。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 凭据池 -->
+    <section class="view" id="view-credentials">
+      <div class="page-head">
+        <div><h1>凭据池</h1><p class="sub">多 Key / 多账号统一管理：优先级、轮换、冷却、配额与故障转移。</p></div>
+        <div class="head-actions">
+          <button class="btn ghost sm" id="pools-refresh">刷新</button>
+          <button class="btn primary sm" id="pool-add">+ 新建凭据池</button>
+        </div>
+      </div>
+      <div id="pool-list" class="grid two"></div>
+      <div class="card" id="zcode-note">
+        <div class="card-head"><h2>ZCode 账号池</h2><span class="pill">兼容旧资产</span></div>
+        <p class="hint">ZCode 账号、领取记录与验证码仍由原面板管理；此处只做池状态映射，不复制账号密文。</p>
+        <button class="btn ghost sm" id="open-zcode">打开 ZCode 账号页</button>
+      </div>
+    </section>
+
+    <!-- 插件 -->
+    <section class="view" id="view-plugins">
+      <div class="page-head">
+        <div><h1>插件</h1><p class="sub">安装只登记，不修改配置；接入才经内核创建上游。</p></div>
+        <div class="head-actions">
+          <button class="btn ghost sm" id="plugins-refresh">刷新</button>
+          <button class="btn primary sm" id="plugin-install-open">安装本地插件</button>
+        </div>
+      </div>
+      <div class="notice">安装不会修改你的配置；接入才会创建上游。密钥永远由人工在本机填写。</div>
+      <div id="plugin-list" class="grid three"></div>
+    </section>
+
+    <!-- 流量 -->
+    <section class="view" id="view-traffic">
+      <div class="page-head">
+        <div><h1>流量</h1><p class="sub">用量与请求日志合并；先回答“谁在花、哪里慢、哪里错”。</p></div>
+        <div class="head-actions">
+          <select class="input select" id="traffic-range">
+            <option value="1">今天</option>
+            <option value="7">近 7 天</option>
+            <option value="30">近 30 天</option>
+          </select>
+          <button class="btn ghost sm" id="traffic-refresh">刷新</button>
+        </div>
+      </div>
+      <div class="stat-row" id="traffic-stats"></div>
+      <div class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>上游用量</h2></div>
+          <div class="table-wrap"><table class="table" id="traffic-upstreams"><thead><tr><th>上游</th><th class="num">请求</th><th class="num">Token</th><th class="num">失败</th></tr></thead><tbody></tbody></table></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>请求日志</h2><button class="btn ghost sm" id="logs-clear">清空</button></div>
+          <div class="table-wrap"><table class="table" id="traffic-logs"><thead><tr><th>时间</th><th>上游</th><th>模型</th><th>状态</th><th class="num">耗时</th></tr></thead><tbody></tbody></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 观测 -->
+    <section class="view" id="view-observe">
+      <div class="page-head">
+        <div><h1>观测</h1><p class="sub">统一诊断与提示词审查；默认只看最近 24h 的 error / warn。</p></div>
+        <button class="btn ghost sm" id="observe-refresh">刷新</button>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>诊断</h2><span class="pill" id="diag-count">0</span></div>
+          <div id="diagnostic-list" class="list compact"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>提示词记录</h2><button class="btn ghost sm" id="open-prompts">打开完整页</button></div>
+          <div id="prompt-list" class="list compact"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置 -->
+    <section class="view" id="view-settings">
+      <div class="page-head">
+        <div><h1>设置</h1><p class="sub">分组卡片，不再一页长表单；原始 JSON 仍保留在高级入口。</p></div>
+        <button class="btn primary sm" id="settings-save">保存设置</button>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>全局</h2></div>
+          <div class="form-grid">
+            <label class="field"><span>监听地址</span><input class="input" id="set-host"></label>
+            <label class="field"><span>端口</span><input class="input" id="set-port" type="number" min="1" max="65535"></label>
+            <label class="field"><span>默认模型</span><input class="input" id="set-default-model" placeholder="留空 = 按接入顺序"></label>
+            <label class="field"><span>请求超时（秒）</span><input class="input" id="set-timeout" type="number" min="1"></label>
+            <label class="field"><span>模型缓存（秒）</span><input class="input" id="set-models-cache" type="number" min="0"></label>
+            <label class="check"><input type="checkbox" id="set-access-log"> 记录访问日志</label>
+            <label class="check"><input type="checkbox" id="set-prompt-capture"> 记录提示词</label>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>AI 配置接口</h2><span class="pill">只读 + 草案</span></div>
+          <div class="form-grid">
+            <label class="check"><input type="checkbox" id="set-ai-enabled"> 启用 AI 配置接口</label>
+            <label class="check"><input type="checkbox" id="set-ai-apply"> 允许 AI 应用非敏感计划</label>
+            <label class="check"><input type="checkbox" id="set-ai-pool"> 允许读取池统计（不含成员标签）</label>
+          </div>
+          <div class="inline-note">入口：<code>GET /api/ai/manifest</code> · <code>GET /llms.txt</code> · 密钥永不返回。</div>
+          <div class="card-actions wrap">
+            <button class="btn ghost sm" id="ai-manifest">查看 manifest</button>
+            <button class="btn ghost sm" id="ai-audit">审计记录</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>模板</h2><span class="pill" id="template-count">0</span></div>
+          <div id="template-list" class="list compact"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>高级</h2></div>
+          <p class="hint">原始 JSON、备份恢复、诊断导出、免费来源、提示词会话演进仍在经典面板。</p>
+          <div class="card-actions wrap">
+            <button class="btn ghost sm" id="settings-classic">打开经典面板</button>
+            <button class="btn ghost sm" id="settings-backups">备份列表</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 详情抽屉 -->
+<div class="drawer" id="drawer" hidden>
+  <div class="drawer-head">
+    <div class="drawer-title">
+      <div class="drawer-name" id="drawer-name">接入</div>
+      <div class="drawer-badges" id="drawer-badges"></div>
+    </div>
+    <button class="icon-btn" id="drawer-close" title="关闭">×</button>
+  </div>
+  <div class="drawer-tabs" id="drawer-tabs">
+    <button class="drawer-tab active" data-dtab="overview">概览</button>
+    <button class="drawer-tab" data-dtab="connection">连接</button>
+    <button class="drawer-tab" data-dtab="credential">凭据</button>
+    <button class="drawer-tab" data-dtab="models">模型</button>
+    <button class="drawer-tab" data-dtab="diagnostics">诊断</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+  <div class="drawer-foot">
+    <button class="btn ghost sm" id="drawer-probe">测试连接</button>
+    <div class="spacer"></div>
+    <button class="btn danger sm" id="drawer-delete">删除接入</button>
+  </div>
+</div>
+<div class="scrim" id="scrim" hidden></div>
+
+<!-- 模态框 -->
+<div class="modal" id="modal" hidden>
+  <div class="modal-head">
+    <div>
+      <h2 id="modal-title">添加接入</h2>
+      <p class="sub" id="modal-sub">官方厂商：选模板 → 填 Key。</p>
+    </div>
+    <button class="icon-btn" id="modal-close">×</button>
+  </div>
+  <div class="modal-body" id="modal-body"></div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<script src="v3.js"></script>
+</body>
+</html>

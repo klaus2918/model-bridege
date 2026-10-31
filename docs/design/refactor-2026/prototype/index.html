@@ -1,0 +1,847 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model-Gate · 设计稿 v3</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0A0E0D; --surface:#111715; --surface2:#161E1B; --surface3:#1C2521;
+  --line:#24302B; --line2:#2F3D36; --text:#E8EDE9; --muted:#8FA098; --faint:#5F6F67;
+  --signal:#7BE495; --signal-dim:rgba(123,228,149,.12); --signal-line:rgba(123,228,149,.35);
+  --amber:#E5B567; --amber-dim:rgba(229,181,103,.12);
+  --danger:#F07167; --danger-dim:rgba(240,113,103,.12);
+  --info:#7CC7D9; --info-dim:rgba(124,199,217,.12);
+  --shadow:0 24px 80px rgba(0,0,0,.45);
+  --r:10px; --r-sm:8px;
+  --font:"IBM Plex Sans","Noto Sans SC","Microsoft YaHei",sans-serif;
+  --mono:"IBM Plex Mono","JetBrains Mono",Consolas,monospace;
+}
+html[data-theme="light"]{
+  --bg:#F4F1E8; --surface:#FBF9F3; --surface2:#EFEBDF; --surface3:#E6E1D3;
+  --line:#D8D2C2; --line2:#C7C0AE; --text:#1A211E; --muted:#5F6B64; --faint:#8A938D;
+  --signal:#1F7A4D; --signal-dim:rgba(31,122,77,.10); --signal-line:rgba(31,122,77,.32);
+  --amber:#9A6414; --amber-dim:rgba(154,100,20,.10);
+  --danger:#B3372F; --danger-dim:rgba(179,55,47,.10);
+  --info:#23697A; --info-dim:rgba(35,105,122,.10);
+  --shadow:0 24px 70px rgba(50,45,30,.18);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;
+  -webkit-font-smoothing:antialiased;overflow:hidden;
+  background-image:linear-gradient(rgba(123,228,149,.028) 1px,transparent 1px),linear-gradient(90deg,rgba(123,228,149,.028) 1px,transparent 1px);
+  background-size:36px 36px;
+}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer;border:0;background:none}
+a{color:inherit;text-decoration:none}
+::selection{background:var(--signal-dim);color:var(--text)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--line2);border-radius:8px;border:3px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-track{background:transparent}
+
+.app{display:grid;grid-template-columns:236px 1fr;height:100vh}
+/* ── sidebar ── */
+.sidebar{background:rgba(10,15,13,.72);border-right:1px solid var(--line);display:flex;flex-direction:column;padding:18px 12px 14px;backdrop-filter:blur(8px)}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 10px 22px}
+.brand .mark{width:26px;height:26px;border:1px solid var(--signal-line);border-radius:7px;display:grid;place-items:center;color:var(--signal);font-family:var(--mono);font-size:14px;background:var(--signal-dim)}
+.brand .name{font-weight:700;letter-spacing:.02em;font-size:15px}
+.brand .ver{font-family:var(--mono);font-size:10px;color:var(--faint);margin-left:auto}
+.nav-group{margin:10px 8px 4px;font-size:10px;letter-spacing:.14em;color:var(--faint);font-family:var(--mono)}
+.nav{display:flex;flex-direction:column;gap:2px}
+.nav button{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:8px;color:var(--muted);text-align:left;font-size:13.5px;position:relative;transition:background .14s,color .14s}
+.nav button:hover{background:var(--surface2);color:var(--text)}
+.nav button.active{background:var(--signal-dim);color:var(--text)}
+.nav button.active::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:2px;border-radius:2px;background:var(--signal)}
+.nav .ico{width:17px;text-align:center;font-family:var(--mono);font-size:13px;color:var(--faint)}
+.nav button.active .ico{color:var(--signal)}
+.nav .count{margin-left:auto;font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:99px;background:var(--surface3);color:var(--muted)}
+.side-foot{margin-top:auto;padding:12px 10px 4px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);display:flex;flex-direction:column;gap:7px}
+.side-foot .row{display:flex;align-items:center;gap:8px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:none}
+.dot.ok{background:var(--signal);box-shadow:0 0 0 3px var(--signal-dim)}
+.dot.warn{background:var(--amber);box-shadow:0 0 0 3px var(--amber-dim)}
+.dot.err{background:var(--danger);box-shadow:0 0 0 3px var(--danger-dim)}
+.dot.idle{background:var(--faint)}
+
+/* ── main ── */
+.main{display:flex;flex-direction:column;min-width:0;height:100vh}
+.topbar{height:62px;display:flex;align-items:center;gap:16px;padding:0 28px;border-bottom:1px solid var(--line);background:rgba(10,14,13,.55);backdrop-filter:blur(10px);flex:none}
+html[data-theme="light"] .topbar{background:rgba(251,249,243,.7)}
+.crumb{display:flex;align-items:center;gap:8px;min-width:180px}
+.crumb .k{font-family:var(--mono);font-size:10px;letter-spacing:.12em;color:var(--faint)}
+.crumb h1{font-size:16px;margin:0;font-weight:600;letter-spacing:-.01em}
+.top-search{margin-left:auto;display:flex;align-items:center;gap:8px;width:280px;padding:7px 11px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--muted)}
+.top-search input{background:none;border:0;outline:0;width:100%;font-size:12.5px}
+.top-search kbd{font-family:var(--mono);font-size:10px;border:1px solid var(--line2);padding:1px 5px;border-radius:4px;color:var(--faint)}
+.icon-btn{width:34px;height:34px;border:1px solid var(--line);border-radius:8px;display:grid;place-items:center;color:var(--muted);background:var(--surface)}
+.icon-btn:hover{color:var(--text);border-color:var(--line2)}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:8px 13px;border-radius:8px;border:1px solid var(--line);background:var(--surface);color:var(--text);font-size:12.5px;font-weight:500;transition:.14s}
+.btn:hover{border-color:var(--line2);background:var(--surface2)}
+.btn.primary{background:var(--signal);border-color:var(--signal);color:#07130C;font-weight:600}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn.ghost{background:transparent}
+.btn.danger{color:var(--danger);border-color:var(--danger-dim);background:transparent}
+.btn.sm{padding:5px 9px;font-size:11.5px;border-radius:6px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.content{overflow:auto;padding:26px 30px 60px;flex:1}
+.view{display:none;max-width:1320px;margin:0 auto;animation:fade .16s ease-out}
+.view.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.page-head{display:flex;align-items:flex-end;gap:16px;margin-bottom:22px}
+.page-head .t{font-size:22px;font-weight:650;letter-spacing:-.02em;margin:0}
+.page-head .s{color:var(--muted);font-size:12.5px;margin-top:5px}
+.page-head .actions{margin-left:auto;display:flex;gap:8px;align-items:center}
+.hint{color:var(--faint);font-size:11.5px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ── overview ── */
+.status-strip{display:flex;align-items:center;gap:18px;padding:14px 18px;border:1px solid var(--line);border-radius:var(--r);background:linear-gradient(180deg,var(--surface2),var(--surface));margin-bottom:16px;position:relative;overflow:hidden}
+.status-strip::after{content:"";position:absolute;right:-40px;top:-60px;width:220px;height:220px;background:radial-gradient(circle,var(--signal-dim),transparent 65%);pointer-events:none}
+.status-strip .live{display:flex;align-items:center;gap:9px;font-weight:600}
+.status-strip .sep{width:1px;height:22px;background:var(--line)}
+.status-strip .meta{color:var(--muted);font-size:12px;display:flex;gap:16px;flex-wrap:wrap}
+.status-strip .meta b{color:var(--text);font-family:var(--mono);font-weight:500}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+.kpi{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);padding:15px 16px;position:relative;overflow:hidden;transition:border-color .14s}
+.kpi:hover{border-color:var(--line2)}
+.kpi .lbl{font-size:11px;color:var(--muted);letter-spacing:.02em}
+.kpi .val{font-family:var(--mono);font-size:25px;font-weight:500;letter-spacing:-.03em;margin-top:6px}
+.kpi .val small{font-size:11px;color:var(--muted);letter-spacing:0;margin-left:4px}
+.kpi .delta{font-size:11px;margin-top:5px;color:var(--muted)}
+.kpi .delta.up{color:var(--signal)} .kpi .delta.down{color:var(--danger)}
+.kpi .spark{position:absolute;right:12px;bottom:12px;opacity:.5}
+.grid-main{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+.box{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);overflow:hidden}
+.box-head{display:flex;align-items:center;gap:10px;padding:14px 17px;border-bottom:1px solid var(--line)}
+.box-head h2{font-size:13px;margin:0;font-weight:600;letter-spacing:.01em}
+.box-head .hint{margin-left:auto}
+.box-body{padding:6px 0}
+.health-row{display:grid;grid-template-columns:minmax(0,1fr) 72px 76px 84px 20px;align-items:center;gap:12px;padding:11px 17px;border-bottom:1px solid rgba(36,48,43,.55);cursor:pointer;transition:background .12s}
+html[data-theme="light"] .health-row{border-bottom-color:rgba(216,210,194,.7)}
+.health-row:last-child{border-bottom:0}
+.health-row:hover{background:var(--surface2)}
+.health-row .who{display:flex;align-items:center;gap:10px;min-width:0}
+.health-row .who .n{font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.health-row .who .p{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+.health-row .num{font-family:var(--mono);font-size:11.5px;color:var(--muted);text-align:right}
+.health-row .num b{color:var(--text);font-weight:500}
+.health-row .state{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted)}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:4px;border:1px solid var(--line2);font-size:10.5px;color:var(--muted);white-space:nowrap;line-height:1.5}
+.badge.official{color:var(--signal);border-color:var(--signal-line);background:var(--signal-dim)}
+.badge.custom{color:var(--info);border-color:rgba(124,199,217,.3);background:var(--info-dim)}
+.badge.free{color:var(--amber);border-color:rgba(229,181,103,.3);background:var(--amber-dim)}
+.badge.account{color:#C6A8F0;border-color:rgba(198,168,240,.3);background:rgba(198,168,240,.1)}
+.badge.plugin{color:#E8A0C8;border-color:rgba(232,160,200,.3);background:rgba(232,160,200,.1)}
+.badge.err{color:var(--danger);border-color:var(--danger-dim);background:var(--danger-dim)}
+.badge.warn{color:var(--amber);border-color:rgba(229,181,103,.3);background:var(--amber-dim)}
+.badge.ok{color:var(--signal);border-color:var(--signal-line);background:var(--signal-dim)}
+.side-stack{display:flex;flex-direction:column;gap:16px}
+.todo{display:flex;gap:11px;padding:11px 16px;border-bottom:1px solid rgba(36,48,43,.55)}
+html[data-theme="light"] .todo{border-bottom-color:rgba(216,210,194,.7)}
+.todo:last-child{border-bottom:0}
+.todo .ic{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;font-family:var(--mono);font-size:11px;flex:none}
+.todo .ic.w{background:var(--amber-dim);color:var(--amber)}
+.todo .ic.e{background:var(--danger-dim);color:var(--danger)}
+.todo .ic.i{background:var(--info-dim);color:var(--info)}
+.todo .tx{font-size:12px;line-height:1.55}
+.todo .tx b{display:block;font-weight:550;margin-bottom:2px}
+.todo .tx span{color:var(--muted);font-size:11px}
+.quick{padding:14px 16px;display:flex;flex-direction:column;gap:7px}
+.quick button{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:7px;color:var(--muted);font-size:12px;text-align:left;border:1px solid transparent}
+.quick button:hover{background:var(--surface2);border-color:var(--line);color:var(--text)}
+.quick .n{font-family:var(--mono);font-size:10px;color:var(--faint);width:13px}
+.event{display:flex;gap:11px;padding:10px 17px;font-size:11.5px;color:var(--muted)}
+.event .t{font-family:var(--mono);font-size:10px;color:var(--faint);width:42px;flex:none;padding-top:1px}
+.event b{color:var(--text);font-weight:500}
+
+/* ── toolbar/table ── */
+.toolbar{display:flex;align-items:center;gap:9px;margin-bottom:14px;flex-wrap:wrap}
+.field{display:flex;align-items:center;gap:7px;border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:7px 10px;color:var(--muted);min-width:180px}
+.field input{background:none;border:0;outline:0;width:100%;font-size:12.5px}
+.select{border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:7px 10px;font-size:12px;color:var(--muted);outline:0}
+.toolbar .right{margin-left:auto;display:flex;gap:7px;align-items:center}
+.seg{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{padding:6px 10px;font-size:11.5px;color:var(--muted);background:var(--surface)}
+.seg button.active{background:var(--surface3);color:var(--text)}
+.table-wrap{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th{font-size:10.5px;letter-spacing:.06em;color:var(--faint);font-weight:500;text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);background:rgba(0,0,0,.08);white-space:nowrap}
+html[data-theme="light"] th{background:rgba(0,0,0,.02)}
+td{padding:12px 14px;border-bottom:1px solid rgba(36,48,43,.5);font-size:12.5px;vertical-align:middle}
+html[data-theme="light"] td{border-bottom-color:rgba(216,210,194,.6)}
+tr:last-child td{border-bottom:0}
+tbody tr{cursor:pointer;transition:background .12s}
+tbody tr:hover{background:var(--surface2)}
+td .name{font-weight:550;display:flex;align-items:center;gap:8px}
+td .sub{color:var(--faint);font-size:10.5px;margin-top:3px}
+.right{text-align:right}
+.center{text-align:center}
+.empty{padding:42px 20px;text-align:center;color:var(--muted)}
+.empty .big{font-size:26px;color:var(--faint);margin-bottom:10px;font-family:var(--mono)}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.up-card{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);padding:15px;cursor:pointer;transition:.14s}
+.up-card:hover{border-color:var(--line2);transform:translateY(-1px)}
+.up-card .top{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.up-card .top .n{font-weight:600}
+.up-card .top .more{margin-left:auto;color:var(--faint)}
+.up-card .url{font-family:var(--mono);font-size:10.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:12px}
+.up-card .stats{display:flex;gap:16px;font-size:11px;color:var(--muted)}
+.up-card .stats b{font-family:var(--mono);color:var(--text);font-weight:500}
+
+/* ── drawer ── */
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.45);opacity:0;pointer-events:none;transition:opacity .18s;z-index:40}
+.scrim.show{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;right:0;bottom:0;width:580px;max-width:94vw;background:var(--surface);border-left:1px solid var(--line);box-shadow:var(--shadow);transform:translateX(102%);transition:transform .2s cubic-bezier(.4,0,.2,1);z-index:50;display:flex;flex-direction:column}
+.drawer.show{transform:none}
+.drawer-head{padding:20px 22px 14px;border-bottom:1px solid var(--line)}
+.drawer-head .row1{display:flex;align-items:center;gap:9px}
+.drawer-head h2{margin:0;font-size:18px;font-weight:650;letter-spacing:-.01em}
+.drawer-head .sub{color:var(--faint);font-family:var(--mono);font-size:10.5px;margin-top:5px}
+.drawer-head .actions{margin-left:auto;display:flex;gap:6px}
+.drawer-tabs{display:flex;gap:2px;padding:0 22px;border-bottom:1px solid var(--line)}
+.drawer-tabs button{padding:10px 11px;font-size:12px;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px}
+.drawer-tabs button.active{color:var(--text);border-bottom-color:var(--signal)}
+.drawer-body{overflow:auto;padding:18px 22px 90px;flex:1}
+.drawer-foot{border-top:1px solid var(--line);padding:12px 22px;display:flex;gap:8px;align-items:center;background:var(--surface)}
+.drawer-foot .hint{margin-right:auto}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:10px 14px;font-size:12.5px;margin-bottom:18px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0;word-break:break-all}
+.kv dd.mono{font-family:var(--mono);font-size:11.5px}
+.panel-sec{margin-bottom:20px}
+.panel-sec h3{font-size:11px;letter-spacing:.1em;color:var(--faint);font-family:var(--mono);font-weight:500;margin:0 0 10px;text-transform:uppercase}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.form-grid .full{grid-column:1/-1}
+label.fl{display:flex;flex-direction:column;gap:5px;font-size:11.5px;color:var(--muted)}
+label.fl input,label.fl select{border:1px solid var(--line);background:var(--bg);border-radius:7px;padding:8px 10px;outline:0;font-size:12.5px;color:var(--text)}
+label.fl input:focus,label.fl select:focus{border-color:var(--signal-line)}
+label.fl .help{font-size:10.5px;color:var(--faint);line-height:1.5}
+.check{display:flex;align-items:flex-start;gap:9px;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);cursor:pointer}
+.check input{margin-top:2px;accent-color:var(--signal)}
+.check .t{font-size:12px;font-weight:550}
+.check .d{font-size:10.5px;color:var(--muted);margin-top:2px;line-height:1.5}
+.radio-row{display:flex;gap:8px;flex-wrap:wrap}
+.radio-chip{padding:7px 11px;border:1px solid var(--line);border-radius:7px;font-size:11.5px;color:var(--muted);background:var(--bg)}
+.radio-chip.active{border-color:var(--signal-line);color:var(--text);background:var(--signal-dim)}
+.notice{padding:10px 12px;border-radius:8px;font-size:11.5px;line-height:1.6;border:1px solid var(--line);background:var(--surface2);color:var(--muted)}
+.notice.warn{border-color:rgba(229,181,103,.28);background:var(--amber-dim)}
+.notice.info{border-color:rgba(124,199,217,.25);background:var(--info-dim)}
+.notice b{color:var(--text)}
+
+/* ── modal ── */
+.modal{position:fixed;inset:0;display:grid;place-items:center;z-index:60;pointer-events:none;opacity:0;transition:opacity .16s}
+.modal.show{opacity:1;pointer-events:auto}
+.modal .sheet{width:min(900px,94vw);max-height:88vh;overflow:auto;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);transform:translateY(8px) scale(.995);transition:transform .18s}
+.modal.show .sheet{transform:none}
+.modal-head{display:flex;align-items:center;gap:10px;padding:19px 24px 14px;border-bottom:1px solid var(--line)}
+.modal-head h2{margin:0;font-size:17px;font-weight:650}
+.modal-head .x{margin-left:auto}
+.modal-body{padding:20px 24px}
+.modal-foot{padding:14px 24px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;background:var(--surface)}
+.modal-foot .hint{margin-right:auto}
+.stepper{display:flex;align-items:center;gap:10px;padding:0 24px 16px;font-size:11.5px;color:var(--faint)}
+.stepper .st{display:flex;align-items:center;gap:7px}
+.stepper .n{width:20px;height:20px;border-radius:50%;border:1px solid var(--line2);display:grid;place-items:center;font-family:var(--mono);font-size:10px}
+.stepper .st.active{color:var(--text)}
+.stepper .st.active .n{border-color:var(--signal);color:var(--signal);background:var(--signal-dim)}
+.stepper .st.done .n{border-color:var(--signal-line);color:var(--signal)}
+.stepper .bar{width:34px;height:1px;background:var(--line)}
+.vendor-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+.vendor{border:1px solid var(--line);border-radius:9px;background:var(--bg);padding:13px;text-align:left;transition:.12s;position:relative}
+.vendor:hover{border-color:var(--line2);background:var(--surface2)}
+.vendor.active{border-color:var(--signal-line);background:var(--signal-dim)}
+.vendor .vn{font-weight:600;font-size:12.5px}
+.vendor .vd{font-size:10.5px;color:var(--muted);margin-top:4px}
+.vendor .tag{position:absolute;top:9px;right:9px;font-family:var(--mono);font-size:9px;color:var(--signal)}
+.searchline{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:8px;padding:9px 12px;background:var(--bg)}
+.searchline input{background:none;border:0;outline:0;width:100%;font-size:13px}
+.summary{border:1px solid var(--line);border-radius:9px;background:var(--bg);padding:14px;font-size:12px;line-height:1.8}
+.summary .r{display:flex;gap:10px}
+.summary .k{color:var(--muted);width:78px;flex:none}
+.summary .v{font-family:var(--mono);font-size:11.5px;word-break:break-all}
+.success-mark{width:52px;height:52px;border-radius:50%;border:1px solid var(--signal-line);background:var(--signal-dim);color:var(--signal);display:grid;place-items:center;font-size:24px;margin:8px auto 14px}
+
+/* ── credentials ── */
+.pool-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}
+.pool{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);padding:15px;position:relative;overflow:hidden}
+.pool::after{content:"";position:absolute;right:-30px;top:-40px;width:120px;height:120px;background:radial-gradient(circle,var(--signal-dim),transparent 70%)}
+.pool .ph{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.pool .pn{font-weight:600}
+.pool .pu{font-family:var(--mono);font-size:10.5px;color:var(--faint)}
+.pool .big{font-family:var(--mono);font-size:26px;margin:10px 0 2px;letter-spacing:-.03em}
+.pool .big small{font-size:11px;color:var(--muted);letter-spacing:0}
+.pool .bar{height:4px;border-radius:4px;background:var(--surface3);margin:10px 0;overflow:hidden;display:flex}
+.pool .bar i{display:block;height:100%}
+.pool .meta{display:flex;gap:12px;font-size:10.5px;color:var(--muted)}
+.members{width:100%}
+.members td{padding:10px 14px}
+.st{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.st .dot{width:6px;height:6px;box-shadow:none}
+.switch{width:34px;height:19px;border-radius:99px;background:var(--surface3);border:1px solid var(--line2);position:relative;transition:.15s;flex:none}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:var(--faint);transition:.15s}
+.switch.on{background:var(--signal-dim);border-color:var(--signal-line)}
+.switch.on::after{left:17px;background:var(--signal)}
+
+/* ── plugins ── */
+.plugin-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.plugin{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);padding:16px}
+.plugin .ph{display:flex;align-items:flex-start;gap:10px}
+.plugin .ic{width:34px;height:34px;border-radius:8px;background:var(--surface3);display:grid;place-items:center;font-family:var(--mono);font-size:13px;color:var(--signal);flex:none}
+.plugin .pn{font-weight:600}
+.plugin .pv{font-family:var(--mono);font-size:10px;color:var(--faint);margin-top:2px}
+.plugin .pd{font-size:11.5px;color:var(--muted);line-height:1.6;margin:11px 0}
+.plugin .pf{display:flex;align-items:center;gap:8px;margin-top:10px}
+.plugin .pf .right{margin-left:auto;display:flex;gap:6px}
+
+/* ── traffic / observe ── */
+.chart{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);padding:18px;margin-bottom:14px}
+.chart .ch{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.chart .ch h2{font-size:13px;margin:0;font-weight:600}
+.chart .ch .legend{margin-left:auto;display:flex;gap:14px;font-size:10.5px;color:var(--muted)}
+.chart .ch .legend i{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:5px}
+.bars{height:150px;display:flex;align-items:flex-end;gap:5px;padding-top:10px;border-bottom:1px solid var(--line)}
+.bars .b{flex:1;background:linear-gradient(180deg,var(--signal),rgba(123,228,149,.18));border-radius:2px 2px 0 0;min-height:2px;opacity:.85;transition:.15s}
+.bars .b:hover{opacity:1}
+.xlabels{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;color:var(--faint);margin-top:7px}
+.diag{display:flex;gap:11px;padding:12px 15px;border-bottom:1px solid rgba(36,48,43,.55);font-size:12px}
+.diag:last-child{border-bottom:0}
+.diag .ic{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;font-family:var(--mono);font-size:10px;flex:none}
+.diag .ic.e{background:var(--danger-dim);color:var(--danger)}
+.diag .ic.w{background:var(--amber-dim);color:var(--amber)}
+.diag .ic.i{background:var(--info-dim);color:var(--info)}
+.diag b{font-weight:550;display:block;margin-bottom:2px}
+.diag span{color:var(--muted);font-size:11px;line-height:1.55}
+
+/* ── settings ── */
+.settings-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;align-items:start}
+.set-card{border:1px solid var(--line);border-radius:var(--r);background:var(--surface);padding:17px}
+.set-card h2{font-size:13px;margin:0 0 13px;font-weight:600;display:flex;align-items:center;gap:8px}
+.set-card .rows{display:flex;flex-direction:column;gap:11px}
+.set-row{display:flex;align-items:center;gap:12px;font-size:12px}
+.set-row .l{color:var(--muted)}
+.set-row .r{margin-left:auto;font-family:var(--mono);font-size:11.5px}
+.set-card .hint{line-height:1.6}
+
+/* toast */
+.toast{position:fixed;bottom:22px;left:50%;transform:translate(-50%,20px);background:var(--surface3);border:1px solid var(--line2);color:var(--text);padding:10px 16px;border-radius:9px;font-size:12px;box-shadow:var(--shadow);opacity:0;pointer-events:none;transition:.18s;z-index:80;display:flex;align-items:center;gap:8px}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:1100px){
+  .kpis{grid-template-columns:repeat(2,1fr)}
+  .grid-main{grid-template-columns:1fr}
+  .cards,.pool-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:820px){
+  .app{grid-template-columns:1fr}
+  .sidebar{display:none}
+  .content{padding:18px}
+  .vendor-grid{grid-template-columns:repeat(2,1fr)}
+  .plugin-grid,.settings-grid{grid-template-columns:1fr}
+  .top-search{display:none}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="mark">◧</span>
+      <span class="name">Model-Gate</span>
+      <span class="ver">v3.0</span>
+    </div>
+    <div class="nav-group">工作台</div>
+    <div class="nav">
+      <button class="active" data-view="overview"><span class="ico">⌂</span>总览</button>
+    </div>
+    <div class="nav-group">接入</div>
+    <div class="nav">
+      <button data-view="access"><span class="ico">⇄</span>全部接入<span class="count">6</span></button>
+      <button data-view="models"><span class="ico">≡</span>模型目录</button>
+      <button data-view="routes"><span class="ico">⑃</span>路由组</button>
+    </div>
+    <div class="nav-group">资源</div>
+    <div class="nav">
+      <button data-view="credentials"><span class="ico">⚿</span>凭据池<span class="count">3</span></button>
+      <button data-view="plugins"><span class="ico">◫</span>插件<span class="count">5</span></button>
+    </div>
+    <div class="nav-group">观测</div>
+    <div class="nav">
+      <button data-view="traffic"><span class="ico">◔</span>流量</button>
+      <button data-view="observe"><span class="ico">◉</span>提示词与诊断<span class="count" style="color:var(--amber)">3</span></button>
+    </div>
+    <div class="nav-group">设置</div>
+    <div class="nav">
+      <button data-view="settings"><span class="ico">⚙</span>设置</button>
+    </div>
+    <div class="side-foot">
+      <div class="row"><span class="dot ok"></span><span>运行中 · 127.0.0.1:8900</span></div>
+      <div class="row"><span class="dot ok"></span><span>数据库正常 · 4h 15m</span></div>
+      <div class="row" style="justify-content:space-between"><span>配置 revision</span><span class="mono">cfg_123</span></div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumb">
+        <span class="k">MODEL-GATE</span>
+        <h1 id="crumb-title">总览</h1>
+      </div>
+      <div class="top-search">
+        <span class="mono" style="font-size:11px;color:var(--faint)">/</span>
+        <input id="global-search" placeholder="搜索接入、模型、设置…">
+        <kbd>⌘K</kbd>
+      </div>
+      <button class="icon-btn" id="theme-btn" title="切换主题">◐</button>
+      <button class="btn primary" onclick="openQuick()">＋ 添加接入</button>
+    </header>
+
+    <main class="content">
+      <!-- ══════════ 总览 ══════════ -->
+      <section class="view active" id="view-overview">
+        <div class="page-head">
+          <div>
+            <h2 class="t">今天，网关运行良好。</h2>
+            <div class="s">4 个接入在线，1 个需要关注。最近一次配置变更在 12 分钟前。</div>
+          </div>
+          <div class="actions">
+            <button class="btn" onclick="toast('已复制接入地址')">复制接入地址</button>
+            <button class="btn" onclick="toast('连通性自检已开始')">运行自检</button>
+          </div>
+        </div>
+
+        <div class="status-strip">
+          <div class="live"><span class="dot ok"></span>运行中</div>
+          <div class="sep"></div>
+          <div class="meta">
+            <span>监听 <b>127.0.0.1:8900</b></span>
+            <span>代理端点 <b>/v1</b></span>
+            <span>默认模型 <b>deepseek-v4.1-flash</b></span>
+            <span>运行 <b>4h 15m</b></span>
+          </div>
+          <div style="margin-left:auto" class="hint mono">cfg_123 · 12 分钟前</div>
+        </div>
+
+        <div class="kpis">
+          <div class="kpi"><div class="lbl">今日请求</div><div class="val">1,284</div><div class="delta up">↑ 12.4% 较昨日</div><svg class="spark" width="56" height="20"><polyline points="0,16 8,14 16,15 24,9 32,11 40,6 48,7 56,3" fill="none" stroke="var(--signal)" stroke-width="1.2" opacity=".8"/></svg></div>
+          <div class="kpi"><div class="lbl">Token 用量</div><div class="val">9.2<small>M</small></div><div class="delta">今日 6 个模型产生费用</div></div>
+          <div class="kpi"><div class="lbl">失败请求</div><div class="val" style="color:var(--amber)">3</div><div class="delta down">0.23% · 2 个已自动切换</div></div>
+          <div class="kpi"><div class="lbl">P95 延迟</div><div class="val">820<small>ms</small></div><div class="delta up">↓ 60ms 较昨日</div></div>
+        </div>
+
+        <div class="grid-main">
+          <div class="side-stack">
+            <div class="box">
+              <div class="box-head"><h2>接入健康</h2><span class="hint">按异常优先排序</span><button class="btn sm ghost" style="margin-left:auto" onclick="go('access')">查看全部</button></div>
+              <div class="box-body" id="health-list"></div>
+            </div>
+            <div class="box">
+              <div class="box-head"><h2>最近事件</h2><span class="hint">最近 24 小时</span></div>
+              <div class="box-body">
+                <div class="event"><span class="t">10:42</span><span><b>zcode</b> 账号池成员 #3 进入冷却，预计 42s 后恢复。</span></div>
+                <div class="event"><span class="t">10:31</span><span><b>my-gateway</b> 测试连接成功，P95 延迟 1.2s。</span></div>
+                <div class="event"><span class="t">10:08</span><span><b>deepseek</b> 模板更新可用：v1 → v2（新增模型目录地址）。</span></div>
+                <div class="event"><span class="t">09:55</span><span>配置已保存，备份 <b class="mono">bak_01J</b> 可恢复。</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="side-stack">
+            <div class="box">
+              <div class="box-head"><h2>快速开始</h2></div>
+              <div class="quick">
+                <button onclick="openQuick()"><span class="n">01</span>添加官方厂商 <span style="margin-left:auto;color:var(--faint)">只填 Key</span></button>
+                <button onclick="go('plugins')"><span class="n">02</span>从插件接入上游</button>
+                <button onclick="go('credentials')"><span class="n">03</span>管理凭据池</button>
+                <button onclick="go('settings')"><span class="n">04</span>配置 AI 助手接口</button>
+              </div>
+            </div>
+            <div class="box">
+              <div class="box-head"><h2>待处理</h2><span class="badge warn" style="margin-left:auto">3</span></div>
+              <div class="box-body">
+                <div class="todo"><span class="ic w">!</span><div class="tx"><b>1 个池成员冷却中</b><span>zcode · 账号 #3 · 剩余 42s</span></div></div>
+                <div class="todo"><span class="ic i">↑</span><div class="tx"><b>1 个模板有更新</b><span>deepseek · v1 → v2</span></div></div>
+                <div class="todo"><span class="ic e">×</span><div class="tx"><b>1 个接入凭据缺失</b><span>my-gateway · 待补充 Key</span></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════ 接入 ══════════ -->
+      <section class="view" id="view-access">
+        <div class="page-head">
+          <div><h2 class="t">全部接入</h2><div class="s">官方、自定义、免费来源、账号池和插件，统一在这里管理。</div></div>
+          <div class="actions"><button class="btn" onclick="toast('已导出脱敏配置')">导出</button><button class="btn primary" onclick="openQuick()">＋ 添加接入</button></div>
+        </div>
+        <div class="toolbar">
+          <div class="field"><span class="mono" style="font-size:11px;color:var(--faint)">/</span><input id="access-search" placeholder="搜索名称、地址或模型…" oninput="renderAccess()"></div>
+          <select class="select"><option>全部来源</option><option>官方</option><option>自定义</option><option>免费</option><option>账号池</option><option>插件</option></select>
+          <select class="select"><option>全部状态</option><option>正常</option><option>需关注</option><option>待补充</option></select>
+          <div class="right"><span class="hint" id="access-count">6 个接入</span><div class="seg"><button class="active" id="vt-table" onclick="setView('table')">列表</button><button id="vt-cards" onclick="setView('cards')">卡片</button></div></div>
+        </div>
+        <div class="table-wrap" id="access-table">
+          <table><thead><tr><th>接入</th><th>协议 / 地址</th><th class="right">模型</th><th>凭据</th><th>状态</th><th class="right">今日</th><th></th></tr></thead><tbody id="access-body"></tbody></table>
+        </div>
+        <div class="cards" id="access-cards" style="display:none"></div>
+      </section>
+
+      <!-- ══════════ 模型目录 ══════════ -->
+      <section class="view" id="view-models">
+        <div class="page-head"><div><h2 class="t">模型目录</h2><div class="s">来自各接入的声明与拉取结果；别名与定价在这里维护。</div></div><div class="actions"><button class="btn">刷新目录</button></div></div>
+        <div class="toolbar"><div class="field" style="min-width:260px"><span class="mono" style="font-size:11px;color:var(--faint)">/</span><input placeholder="搜索模型、别名、上游…"></div><select class="select"><option>全部上游</option></select><select class="select"><option>全部来源</option></select></div>
+        <div class="table-wrap"><table><thead><tr><th>模型</th><th>上游</th><th>来源</th><th>别名</th><th class="right">输入 / 百万</th><th class="right">输出 / 百万</th><th>状态</th></tr></thead><tbody>
+          <tr><td><div class="name">deepseek-v4.1-flash</div><div class="sub">deepseek</div></td><td>DeepSeek 官方</td><td><span class="badge ok">目录拉取</span></td><td class="mono">ds-flash</td><td class="right mono">¥0.50</td><td class="right mono">¥2.00</td><td><span class="st"><span class="dot ok"></span>正常</span></td></tr>
+          <tr><td><div class="name">glm-5.3-flash</div><div class="sub">zcode</div></td><td>ZCode 账号池</td><td><span class="badge account">固定清单</span></td><td class="mono">—</td><td class="right mono">—</td><td class="right mono">—</td><td><span class="st"><span class="dot ok"></span>正常</span></td></tr>
+          <tr><td><div class="name">claude-sonnet-4.5</div><div class="sub">anthropic</div></td><td>Anthropic 官方</td><td><span class="badge ok">目录拉取</span></td><td class="mono">sonnet</td><td class="right mono">$3.00</td><td class="right mono">$15.00</td><td><span class="st"><span class="dot ok"></span>正常</span></td></tr>
+          <tr><td><div class="name">qwen3-max</div><div class="sub">dashscope</div></td><td>通义千问</td><td><span class="badge ok">目录拉取</span></td><td class="mono">—</td><td class="right mono">—</td><td class="right mono">—</td><td><span class="st"><span class="dot warn"></span>未定价</span></td></tr>
+        </tbody></table></div>
+      </section>
+
+      <!-- ══════════ 路由组 ══════════ -->
+      <section class="view" id="view-routes">
+        <div class="page-head"><div><h2 class="t">路由组</h2><div class="s">有序成员链，失败时按顺序切换；`group/&lt;id&gt;` 作为虚拟模型暴露。</div></div><div class="actions"><button class="btn primary">＋ 新建路由组</button></div></div>
+        <div class="box"><div class="box-head"><h2>生产对话</h2><span class="badge ok">group/prod</span><span class="hint" style="margin-left:auto">3 个成员 · 统一入口可见</span></div><div class="box-body">
+          <div class="health-row"><div class="who"><span class="mono" style="color:var(--faint);width:18px">1</span><span class="n">deepseek / deepseek-v4.1-flash</span><span class="badge official">官方</span></div><div class="num">P95 <b>820ms</b></div><div class="num">今日 <b>842</b></div><div class="state"><span class="dot ok"></span>正常</div><div>›</div></div>
+          <div class="health-row"><div class="who"><span class="mono" style="color:var(--faint);width:18px">2</span><span class="n">my-gateway / deepseek-v4.1-flash</span><span class="badge custom">自定义</span></div><div class="num">P95 <b>1.2s</b></div><div class="num">今日 <b>126</b></div><div class="state"><span class="dot warn"></span>需关注</div><div>›</div></div>
+          <div class="health-row"><div class="who"><span class="mono" style="color:var(--faint);width:18px">3</span><span class="n">zcode / glm-5.3-flash</span><span class="badge account">账号池</span></div><div class="num">P95 <b>890ms</b></div><div class="num">今日 <b>310</b></div><div class="state"><span class="dot ok"></span>正常</div><div>›</div></div>
+        </div></div>
+      </section>
+
+      <!-- ══════════ 凭据 ══════════ -->
+      <section class="view" id="view-credentials">
+        <div class="page-head"><div><h2 class="t">凭据池</h2><div class="s">多 Key、多账号统一轮换、冷却与配额；密钥只显示状态，不回显。</div></div><div class="actions"><button class="btn">新建池</button><button class="btn primary">＋ 添加成员</button></div></div>
+        <div class="pool-grid" id="pool-grid"></div>
+        <div class="box">
+          <div class="box-head"><h2>成员</h2><span class="badge ok">池 pool_zcode</span><span class="hint" style="margin-left:auto">策略 priority · 冷却 60s · 连续失败 3 次熔断</span></div>
+          <div class="table-wrap" style="border:0;border-radius:0"><table class="members"><thead><tr><th>标签</th><th>类型</th><th>状态</th><th class="right">优先级</th><th class="right">今日请求</th><th>配额</th><th>最近使用</th><th></th></tr></thead><tbody>
+            <tr><td><div class="name">主账号 · GLM Plan</div><div class="sub">legacy:zcode:1</div></td><td>账号</td><td><span class="st"><span class="dot ok"></span>可用</span></td><td class="right mono">10</td><td class="right mono">182</td><td class="mono" style="font-size:11px">∞</td><td class="mono" style="font-size:11px">10:44:02</td><td><span class="switch on" onclick="toggleSwitch(event)"></span></td></tr>
+            <tr><td><div class="name">备用账号</div><div class="sub">legacy:zcode:2</div></td><td>账号</td><td><span class="st"><span class="dot ok"></span>可用</span></td><td class="right mono">20</td><td class="right mono">96</td><td class="mono" style="font-size:11px">∞</td><td class="mono" style="font-size:11px">10:43:11</td><td><span class="switch on" onclick="toggleSwitch(event)"></span></td></tr>
+            <tr><td><div class="name">账号 #3</div><div class="sub">legacy:zcode:3</div></td><td>账号</td><td><span class="st"><span class="dot warn"></span>冷却 42s</span></td><td class="right mono">30</td><td class="right mono">32</td><td class="mono" style="font-size:11px">∞</td><td class="mono" style="font-size:11px">10:42:20</td><td><span class="switch on" onclick="toggleSwitch(event)"></span></td></tr>
+            <tr><td><div class="name">账号 #4</div><div class="sub">legacy:zcode:4</div></td><td>账号</td><td><span class="st"><span class="dot idle"></span>已禁用</span></td><td class="right mono">40</td><td class="right mono">0</td><td class="mono" style="font-size:11px">∞</td><td class="mono" style="font-size:11px">—</td><td><span class="switch" onclick="toggleSwitch(event)"></span></td></tr>
+          </tbody></table></div>
+        </div>
+        <div class="notice info" style="margin-top:14px"><b>密钥安全：</b>池成员密钥存放在本机 DPAPI 加密库，面板只显示“可用/冷却/禁用”，不显示 Key；AI 接口只能看到计数。</div>
+      </section>
+
+      <!-- ══════════ 插件 ══════════ -->
+      <section class="view" id="view-plugins">
+        <div class="page-head"><div><h2 class="t">插件</h2><div class="s">插件只声明“怎么接”；安装不改配置，接入才创建上游。</div></div><div class="actions"><button class="btn">导入本地插件</button><button class="btn primary">打开市场</button></div></div>
+        <div class="plugin-grid">
+          <div class="plugin"><div class="ph"><span class="ic">Z</span><div style="flex:1"><div class="pn">ZCode Start Plan</div><div class="pv">modelgate.account.zcode · 1.2.0</div></div><span class="badge account">账号</span></div><div class="pd">GLM 账号池、自动领取与验证码；仅官方 native 插件，不可卸载。</div><div class="pf"><span class="badge ok">已启用</span><span class="hint">1 个接入</span><span class="right"><button class="btn sm">管理</button><button class="btn sm ghost">禁用</button></span></div></div>
+          <div class="plugin"><div class="ph"><span class="ic">K</span><div style="flex:1"><div class="pn">Kilo 免费来源</div><div class="pv">modelgate.free.kilo · 1.0.3</div></div><span class="badge free">免费</span></div><div class="pd">OpenRouter 免费池代理，19 个候选模型；可探测可用性与限流。</div><div class="pf"><span class="badge ok">已启用</span><span class="hint">1 个接入</span><span class="right"><button class="btn sm">管理</button><button class="btn sm ghost">卸载</button></span></div></div>
+          <div class="plugin"><div class="ph"><span class="ic">C</span><div style="flex:1"><div class="pn">CommandCode</div><div class="pv">modelgate.provider.commandcode · 1.1.0</div></div><span class="badge plugin">Provider</span></div><div class="pd">CLI 指纹传输、会话头与 ZDR 请求头；声明 64K 输出上限。</div><div class="pf"><span class="badge ok">已启用</span><span class="hint">未接入</span><span class="right"><button class="btn sm primary" onclick="toast('已打开接入向导')">接入</button><button class="btn sm ghost">详情</button></span></div></div>
+          <div class="plugin"><div class="ph"><span class="ic">D</span><div style="flex:1"><div class="pn">DeepSeek 官方模板</div><div class="pv">modelgate.provider.deepseek · 2.0.0</div></div><span class="badge official">内置</span></div><div class="pd">协议、地址、鉴权与隐私默认值；选择后只需填写 Key。</div><div class="pf"><span class="badge ok">已启用</span><span class="hint">1 个接入</span><span class="right"><button class="btn sm">查看模板</button></span></div></div>
+        </div>
+      </section>
+
+      <!-- ══════════ 流量 ══════════ -->
+      <section class="view" id="view-traffic">
+        <div class="page-head"><div><h2 class="t">流量</h2><div class="s">请求、Token 与失败；日志合并为同一视图的时间线。</div></div><div class="actions"><select class="select"><option>最近 24 小时</option><option>最近 7 天</option></select><button class="btn">导出</button></div></div>
+        <div class="chart">
+          <div class="ch"><h2>请求量</h2><div class="legend"><span><i style="background:var(--signal)"></i>成功</span><span><i style="background:var(--danger)"></i>失败</span></div></div>
+          <div class="bars" id="bars"></div>
+          <div class="xlabels"><span>00:00</span><span>04:00</span><span>08:00</span><span>12:00</span><span>16:00</span><span>20:00</span><span>24:00</span></div>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>接入</th><th>模型</th><th>状态</th><th class="right">耗时</th><th class="right">Token</th><th class="right">费用</th></tr></thead><tbody>
+          <tr><td class="mono" style="font-size:11px">10:44:02</td><td>deepseek</td><td class="mono" style="font-size:11px">deepseek-v4.1-flash</td><td><span class="badge ok">200</span></td><td class="right mono">820ms</td><td class="right mono">1,240</td><td class="right mono">¥0.003</td></tr>
+          <tr><td class="mono" style="font-size:11px">10:43:57</td><td>zcode</td><td class="mono" style="font-size:11px">glm-5.3-flash</td><td><span class="badge ok">200</span></td><td class="right mono">1.1s</td><td class="right mono">860</td><td class="right mono">—</td></tr>
+          <tr><td class="mono" style="font-size:11px">10:43:40</td><td>my-gateway</td><td class="mono" style="font-size:11px">deepseek-v4.1-flash</td><td><span class="badge err">429</span></td><td class="right mono">2.4s</td><td class="right mono">—</td><td class="right mono">—</td></tr>
+          <tr><td class="mono" style="font-size:11px">10:42:20</td><td>zcode</td><td class="mono" style="font-size:11px">glm-5.3-flash</td><td><span class="badge warn">重试后成功</span></td><td class="right mono">3.0s</td><td class="right mono">712</td><td class="right mono">—</td></tr>
+        </tbody></table></div>
+      </section>
+
+      <!-- ══════════ 观测 ══════════ -->
+      <section class="view" id="view-observe">
+        <div class="page-head"><div><h2 class="t">提示词与诊断</h2><div class="s">提示词记录默认关闭；诊断按接入聚合，先看阻断项。</div></div><div class="actions"><button class="btn">导出诊断</button></div></div>
+        <div class="grid-main">
+          <div class="box"><div class="box-head"><h2>诊断</h2><span class="badge err">1 error</span><span class="badge warn">2 warn</span><span class="hint" style="margin-left:auto">最近 24h</span></div><div class="box-body">
+            <div class="diag"><span class="ic e">×</span><div><b>my-gateway 凭据缺失</b><span>该接入声明了 apiKeyStore 但密钥库中没有对应条目。请求会失败。前往「凭据」补充 Key。</span></div></div>
+            <div class="diag"><span class="ic w">!</span><div><b>账号 #3 冷却中</b><span>连续失败 3 次触发熔断，剩余 42s；当前池仍有 2 个可用成员，请求未中断。</span></div></div>
+            <div class="diag"><span class="ic w">!</span><div><b>deepseek 模板有更新</b><span>模板 v1 → v2：新增模型目录地址。当前配置不受影响，可选择更新。</span></div></div>
+            <div class="diag"><span class="ic i">i</span><div><b>openai 隐私为账户级</b><span>该厂商无请求级 ZDR 开关；面板中的勾选仅记录意图。请在厂商控制台确认数据政策。</span></div></div>
+          </div></div>
+          <div class="side-stack">
+            <div class="box"><div class="box-head"><h2>提示词记录</h2><span class="badge warn" style="margin-left:auto">已关闭</span></div><div class="body" style="padding:15px"><div class="notice">提示词记录默认关闭。开启后会保存入站 messages，并按保留天数清理。此功能涉及内容隐私，建议仅在排障时临时开启。</div><button class="btn" style="margin-top:10px" onclick="toast('已打开设置')">前往设置</button></div></div>
+            <div class="box"><div class="box-head"><h2>最近会话</h2></div><div class="box-body">
+              <div class="event"><span class="t">10:44</span><span><b>deepseek</b> · 12 轮 · 3 个工具调用</span></div>
+              <div class="event"><span class="t">10:31</span><span><b>zcode</b> · 6 轮 · 无工具</span></div>
+              <div class="event"><span class="t">10:12</span><span><b>my-gateway</b> · 2 轮 · 失败</span></div>
+            </div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════ 设置 ══════════ -->
+      <section class="view" id="view-settings">
+        <div class="page-head"><div><h2 class="t">设置</h2><div class="s">全局默认、隐私、AI 配置与高级入口；改动会写入审计。</div></div><div class="actions"><button class="btn">恢复备份</button><button class="btn primary">保存更改</button></div></div>
+        <div class="settings-grid">
+          <div class="set-card"><h2>全局</h2><div class="rows">
+            <div class="set-row"><span class="l">监听</span><span class="r">127.0.0.1 : 8900</span></div>
+            <div class="set-row"><span class="l">默认模型</span><span class="r">deepseek-v4.1-flash</span></div>
+            <div class="set-row"><span class="l">请求超时</span><span class="r">600s</span></div>
+            <div class="set-row"><span class="l">模型缓存</span><span class="r">300s</span></div>
+            <div class="set-row"><span class="l">配置 revision</span><span class="r">cfg_123</span></div>
+          </div></div>
+          <div class="set-card"><h2>隐私默认</h2><div class="rows">
+            <div class="set-row"><span class="l">新接入默认 ZDR</span><span class="r" style="color:var(--signal)">已开启</span></div>
+            <div class="set-row"><span class="l">默认 training</span><span class="r">deny</span></div>
+            <div class="hint">ZDR 是“用户意图”。实际是否生效取决于厂商能力：请求级 / 账户级 / 不支持。面板会在每个接入上明确标注。</div>
+          </div></div>
+          <div class="set-card"><h2>AI 配置</h2><div class="rows">
+            <div class="set-row"><span class="l">启用 AI 配置接口</span><span class="r"><span class="switch on" onclick="toggleSwitch(event)"></span></span></div>
+            <div class="set-row"><span class="l">允许应用非敏感变更</span><span class="r"><span class="switch" onclick="toggleSwitch(event)"></span></span></div>
+            <div class="set-row"><span class="l">允许读取池统计</span><span class="r"><span class="switch on" onclick="toggleSwitch(event)"></span></span></div>
+            <div class="set-row"><span class="l">密钥可读</span><span class="r" style="color:var(--danger)">永不</span></div>
+            <div class="hint">AI 只能生成草案；应用需要人工确认令牌。密钥、账号、Cookie 永不经由该接口。</div>
+          </div></div>
+          <div class="set-card"><h2>模板</h2><div class="rows">
+            <div class="set-row"><span class="l">官方模板</span><span class="r">14 套</span></div>
+            <div class="set-row"><span class="l">有更新</span><span class="r" style="color:var(--amber)">1 套（deepseek）</span></div>
+            <div class="set-row"><span class="l">自定义模板</span><span class="r">0 套</span></div>
+            <div class="hint">模板提供协议、地址、鉴权、隐私与模型目录默认值；选择后只填空字段。</div>
+          </div></div>
+          <div class="set-card" style="grid-column:1/-1"><h2>高级</h2><div class="rows">
+            <div class="set-row"><span class="l">原始配置 JSON</span><span class="r"><button class="btn sm">打开编辑器</button></span></div>
+            <div class="set-row"><span class="l">备份</span><span class="r">最近 5 个 · <button class="btn sm ghost">查看</button></span></div>
+            <div class="set-row"><span class="l">诊断导出</span><span class="r"><button class="btn sm ghost">导出脱敏诊断</button></span></div>
+            <div class="hint">原始 JSON 仅供高级用户；保存前会走同一校验器，不会跳过校验。</div>
+          </div></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- ══════════ 快速添加 ══════════ -->
+<div class="modal" id="quick-modal">
+  <div class="sheet">
+    <div class="modal-head"><h2>添加接入</h2><span class="hint">官方厂商只需填写 Key</span><button class="icon-btn x" onclick="closeQuick()">×</button></div>
+    <div class="stepper" id="stepper">
+      <div class="st active" data-s="1"><span class="n">1</span>选择厂商</div><span class="bar"></span>
+      <div class="st" data-s="2"><span class="n">2</span>填写凭据</div><span class="bar"></span>
+      <div class="st" data-s="3"><span class="n">3</span>完成</div>
+    </div>
+    <div class="modal-body" id="quick-body"></div>
+    <div class="modal-foot" id="quick-foot"></div>
+  </div>
+</div>
+
+<!-- ══════════ 上游详情抽屉 ══════════ -->
+<div class="scrim" id="scrim" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div class="row1"><span class="dot ok" id="dr-dot"></span><h2 id="dr-name">DeepSeek 官方</h2><span class="badge official" id="dr-kind">官方</span><span class="actions"><button class="btn sm" onclick="toast('测试连接中…')">测试</button><button class="icon-btn" onclick="closeDrawer()">×</button></span></div>
+    <div class="sub" id="dr-sub">deepseek · openai</div>
+  </div>
+  <div class="drawer-tabs">
+    <button class="active" data-dt="overview" onclick="drawerTab(this)">概览</button>
+    <button data-dt="conn" onclick="drawerTab(this)">连接</button>
+    <button data-dt="cred" onclick="drawerTab(this)">凭据</button>
+    <button data-dt="model" onclick="drawerTab(this)">模型</button>
+    <button data-dt="adv" onclick="drawerTab(this)">高级</button>
+    <button data-dt="diag" onclick="drawerTab(this)">诊断</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+  <div class="drawer-foot"><span class="hint" id="dr-hint">所有改动保存后立即生效</span><button class="btn" onclick="closeDrawer()">取消</button><button class="btn primary" onclick="toast('已保存（演示）')">保存</button></div>
+</aside>
+
+<div class="toast" id="toast"><span class="dot ok"></span><span id="toast-text">已保存</span></div>
+
+<script>
+const U = [
+  {id:'deepseek', name:'DeepSeek 官方', kind:'official', kindLabel:'官方', protocol:'openai', url:'https://api.deepseek.com', models:12, fetched:12, cred:'单 Key', credState:'ok', state:'ok', stateLabel:'正常', today:842, fail:0, p95:'820ms', privacy:'请求级', zdr:true},
+  {id:'openai', name:'OpenAI 官方', kind:'official', kindLabel:'官方', protocol:'openai', url:'https://api.openai.com/v1', models:28, fetched:28, cred:'单 Key', credState:'ok', state:'ok', stateLabel:'正常', today:96, fail:0, p95:'1.4s', privacy:'账户级', zdr:true},
+  {id:'my-gateway', name:'我的中转', kind:'custom', kindLabel:'自定义', protocol:'openai', url:'https://gateway.example.com/v1', models:6, fetched:0, cred:'待补充', credState:'err', state:'warn', stateLabel:'需关注', today:126, fail:3, p95:'1.2s', privacy:'请求级', zdr:true},
+  {id:'zcode', name:'ZCode 账号池', kind:'account', kindLabel:'账号池', protocol:'anthropic', url:'https://zcode.z.ai/api/v1/zcode-plan', models:2, fetched:0, cred:'池 3/4', credState:'ok', state:'ok', stateLabel:'正常', today:310, fail:1, p95:'890ms', privacy:'账户级', zdr:false},
+  {id:'kilo', name:'Kilo 免费来源', kind:'free', kindLabel:'免费', protocol:'openai', url:'https://api.kilo.ai/v1', models:19, fetched:14, cred:'无需', credState:'ok', state:'ok', stateLabel:'正常', today:88, fail:0, p95:'1.8s', privacy:'不支持', zdr:false},
+  {id:'commandcode', name:'CommandCode', kind:'plugin', kindLabel:'插件', protocol:'commandcode', url:'https://api.commandcode.ai', models:8, fetched:0, cred:'单 Key', credState:'ok', state:'warn', stateLabel:'模板更新', today:22, fail:0, p95:'2.1s', privacy:'请求级', zdr:true}
+];
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+
+function go(view){
+  $$('.view').forEach(v=>v.classList.remove('active'));
+  const el = document.getElementById('view-'+view); if(el) el.classList.add('active');
+  $$('.nav button').forEach(b=>b.classList.toggle('active', b.dataset.view===view));
+  const titles={overview:'总览',access:'全部接入',models:'模型目录',routes:'路由组',credentials:'凭据池',plugins:'插件',traffic:'流量',observe:'提示词与诊断',settings:'设置'};
+  $('#crumb-title').textContent = titles[view]||'总览';
+  $('.content').scrollTop = 0;
+}
+$$('.nav button').forEach(b=>b.onclick=()=>go(b.dataset.view));
+
+$('#theme-btn').onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme')==='light' ? 'dark' : 'light';
+  document.documentElement.setAttribute('data-theme', cur);
+  toast(cur==='light'?'已切换浅色主题':'已切换深色主题');
+};
+
+function healthRow(u){
+  return `<div class="health-row" onclick="openDrawer('${u.id}')">
+    <div class="who"><span class="dot ${u.state}"></span><span class="n">${u.name}</span><span class="badge ${u.kind}">${u.kindLabel}</span><span class="p">${u.protocol}</span></div>
+    <div class="num">${u.p95}</div><div class="num"><b>${u.today}</b> 次</div>
+    <div class="state">${u.state==='ok'?'运行正常':u.state==='warn'?'需关注':'待补充'}</div><div style="color:var(--faint)">›</div>
+  </div>`;
+}
+$('#health-list').innerHTML = U.slice().sort((a,b)=>(a.state==='ok'?1:0)-(b.state==='ok'?1:0)).map(healthRow).join('');
+
+let accessView='table';
+function setView(v){ accessView=v; $('#access-table').style.display=v==='table'?'':'none'; $('#access-cards').style.display=v==='cards'?'grid':'none'; $('#vt-table').classList.toggle('active',v==='table'); $('#vt-cards').classList.toggle('active',v==='cards'); }
+function accessRows(){
+  const q=($('#access-search').value||'').toLowerCase();
+  return U.filter(u=>!q||u.name.toLowerCase().includes(q)||u.url.toLowerCase().includes(q));
+}
+function renderAccess(){
+  const list=accessRows();
+  $('#access-count').textContent=list.length+' 个接入';
+  $('#access-body').innerHTML=list.map(u=>`<tr onclick="openDrawer('${u.id}')">
+    <td><div class="name">${u.name}<span class="badge ${u.kind}">${u.kindLabel}</span></div><div class="sub">${u.id}</div></td>
+    <td><div class="mono" style="font-size:11px;color:var(--muted)">${u.protocol}</div><div class="sub">${u.url}</div></td>
+    <td class="right mono">${u.fetched?u.fetched:u.models}${u.fetched?'':' *'}</td>
+    <td>${u.credState==='err'?`<span class="badge err">${u.cred}</span>`:`<span class="st"><span class="dot ${u.credState}"></span>${u.cred}</span>`}</td>
+    <td><span class="st"><span class="dot ${u.state}"></span>${u.stateLabel}</span></td>
+    <td class="right"><span class="mono">${u.today}</span>${u.fail?`<span class="mono" style="color:var(--danger);font-size:10px"> / ${u.fail} 失败</span>`:''}</td>
+    <td style="color:var(--faint)">›</td></tr>`).join('');
+  $('#access-cards').innerHTML=list.map(u=>`<div class="up-card" onclick="openDrawer('${u.id}')">
+    <div class="top"><span class="dot ${u.state}"></span><span class="n">${u.name}</span><span class="badge ${u.kind}">${u.kindLabel}</span><span class="more">›</span></div>
+    <div class="url">${u.protocol} · ${u.url}</div>
+    <div class="stats"><span>模型 <b>${u.models}</b></span><span>今日 <b>${u.today}</b></span><span>P95 <b>${u.p95}</b></span></div>
+  </div>`).join('');
+}
+renderAccess();
+
+/* ── quick add ── */
+let step=1, selectedTemplate=null;
+const templates=[
+  {id:'deepseek',name:'DeepSeek',desc:'官方 · openai',tag:'推荐'},
+  {id:'openai',name:'OpenAI',desc:'官方 · openai',tag:''},
+  {id:'anthropic',name:'Anthropic',desc:'官方 · anthropic',tag:''},
+  {id:'kimi',name:'Kimi',desc:'官方 · openai',tag:''},
+  {id:'zhipu',name:'智谱 GLM',desc:'官方 · openai',tag:''},
+  {id:'minimax',name:'MiniMax',desc:'官方 · openai',tag:''},
+  {id:'dashscope',name:'通义千问',desc:'官方 · openai',tag:''},
+  {id:'custom',name:'自定义 / 中转',desc:'5 项必填',tag:'高级'}
+];
+function openQuick(){ $('#quick-modal').classList.add('show'); step=1; selectedTemplate=null; renderQuick(); }
+function closeQuick(){ $('#quick-modal').classList.remove('show'); }
+function renderQuick(){
+  $$('#stepper .st').forEach(el=>{ const s=+el.dataset.s; el.classList.toggle('active',s===step); el.classList.toggle('done',s<step); });
+  const body=$('#quick-body'), foot=$('#quick-foot');
+  if(step===1){
+    body.innerHTML = `<div class="searchline"><span class="mono" style="color:var(--faint)">/</span><input id="vendor-search" placeholder="搜索厂商，例如 DeepSeek、OpenAI…" oninput="filterVendors()"></div>
+      <div class="vendor-grid" id="vendor-grid">${templates.map(t=>`<button class="vendor ${selectedTemplate===t.id?'active':''}" data-id="${t.id}" onclick="pickTemplate('${t.id}')"><div class="vn">${t.name}</div><div class="vd">${t.desc}</div>${t.tag?`<span class="tag">${t.tag}</span>`:''}</button>`).join('')}</div>
+      <div class="notice info" style="margin-top:14px"><b>官方厂商</b>会自动带出协议、地址、鉴权与隐私默认值；你只需要填写 Key。自定义/中转需要填写 5 项。</div>`;
+    foot.innerHTML = `<span class="hint">选择后可先预览默认值</span><button class="btn" onclick="closeQuick()">取消</button><button class="btn primary" ${selectedTemplate?'':'disabled'} onclick="step=2;renderQuick()">下一步</button>`;
+  } else if(step===2){
+    const t=templates.find(x=>x.id===selectedTemplate)||templates[0];
+    const custom=t.id==='custom';
+    body.innerHTML = `<div class="summary" style="margin-bottom:16px">
+        <div class="r"><span class="k">模板</span><span class="v">${t.name}${custom?'（自定义）':' · 官方'}</span></div>
+        <div class="r"><span class="k">协议</span><span class="v">${custom?'openai（默认）':'由模板决定'}</span></div>
+        <div class="r"><span class="k">地址</span><span class="v">${custom?'需要你填写':'由模板预填，可修改'}</span></div>
+      </div>
+      <div class="form-grid">
+        <label class="fl full"><span>上游标识 *</span><input id="q-name" value="${custom?'my-gateway':t.id}" placeholder="例如 deepseek"><span class="help">用于 /${'{upstream}'}/v1 与统一入口的模型前缀，不可包含斜杠。</span></label>
+        ${custom?`<label class="fl"><span>厂商 *</span><input id="q-vendor" placeholder="例如 我的中转 / 某云"></label>
+        <label class="fl"><span>协议 *</span><select><option>openai</option><option>anthropic</option><option>commandcode</option><option>opencode</option></select></label>
+        <label class="fl full"><span>请求地址 *</span><input id="q-url" placeholder="https://gateway.example.com/v1"></label>`:``}
+        <label class="fl full"><span>API Key *</span><input id="q-key" type="password" placeholder="粘贴 Key，保存后不可回显"><span class="help">写入本机 DPAPI 加密库；配置只保存引用。</span></label>
+      </div>
+      <label class="check" style="margin-top:14px"><input type="checkbox" checked><div><div class="t">请求零数据保留（ZDR）</div><div class="d">${custom?'按请求发送 ZDR 标记（若厂商支持）；你之后可以修改。':'该厂商支持请求级开关，默认已勾选；实际发送由协议适配器决定。'}</div></div></label>
+      <details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted);font-size:12px">高级设置（模型、别名、超时、逐模型 Key）</summary><div class="hint" style="margin-top:8px;line-height:1.7">默认跟随模板；模型目录会自动拉取，失败时可在接入详情中手动填写。逐模型 Key 与模型覆盖不影响本次添加。</div></details>`;
+    foot.innerHTML = `<span class="hint">第 2 步，共 3 步</span><button class="btn" onclick="step=1;renderQuick()">上一步</button><button class="btn primary" onclick="finishQuick()">添加并测试</button>`;
+  } else {
+    body.innerHTML = `<div class="success-mark">✓</div><div style="text-align:center;font-size:15px;font-weight:600">接入已创建</div><div style="text-align:center;color:var(--muted);font-size:12px;margin:6px 0 18px">已写入配置并完成一次连通性测试。</div>
+      <div class="summary"><div class="r"><span class="k">接入</span><span class="v" id="done-name">deepseek</span></div><div class="r"><span class="k">协议</span><span class="v">openai</span></div><div class="r"><span class="k">凭据</span><span class="v">已写入本机加密库 · 不可回显</span></div><div class="r"><span class="k">隐私</span><span class="v">ZDR 已开启 · 请求级</span></div><div class="r"><span class="k">测试</span><span class="v" style="color:var(--signal)">200 OK · 420ms</span></div></div>`;
+    foot.innerHTML = `<span class="hint">密钥不会出现在响应、日志或审计中</span><button class="btn" onclick="closeQuick();toast('已再打开添加向导')">再添加一个</button><button class="btn primary" onclick="closeQuick()">完成</button>`;
+  }
+}
+function pickTemplate(id){ selectedTemplate=id; renderQuick(); }
+function filterVendors(){ const q=($('#vendor-search').value||'').toLowerCase(); $$('#vendor-grid .vendor').forEach(el=>{ el.style.display = el.textContent.toLowerCase().includes(q)?'':'none'; }); }
+function finishQuick(){ $('#done-name').textContent=($('#q-name')?.value||selectedTemplate||'deepseek'); step=3; renderQuick(); }
+
+/* ── drawer ── */
+let current=U[0];
+function openDrawer(id){
+  current=U.find(u=>u.id===id)||U[0];
+  $('#dr-name').textContent=current.name;
+  $('#dr-kind').textContent=current.kindLabel;
+  $('#dr-kind').className='badge '+current.kind;
+  $('#dr-sub').textContent=current.id+' · '+current.protocol;
+  $('#dr-dot').className='dot '+current.state;
+  $$('.drawer-tabs button').forEach(b=>b.classList.toggle('active',b.dataset.dt==='overview'));
+  renderDrawer('overview');
+  $('#scrim').classList.add('show'); $('#drawer').classList.add('show');
+}
+function closeDrawer(){ $('#scrim').classList.remove('show'); $('#drawer').classList.remove('show'); }
+function drawerTab(btn){ $$('.drawer-tabs button').forEach(b=>b.classList.remove('active')); btn.classList.add('active'); renderDrawer(btn.dataset.dt); }
+function renderDrawer(tab){
+  const u=current; let h='';
+  if(tab==='overview'){
+    h=`<div class="kv"><dt>地址</dt><dd class="mono">${u.url}</dd><dt>协议</dt><dd>${u.protocol}</dd><dt>模型</dt><dd>${u.models} 个 · ${u.fetched?u.fetched+' 个已拉取':'目录待拉取'}</dd><dt>凭据</dt><dd>${u.cred} · ${u.credState==='err'?'<span style="color:var(--danger)">待补充</span>':'已配置'}</dd><dt>隐私</dt><dd>${u.privacy} · <span class="badge ${u.zdr?'ok':''}">${u.zdr?'ZDR 开':'ZDR 关'}</span> <button class="btn sm ghost" onclick="toast('打开隐私设置')">修改</button></dd><dt>今日</dt><dd>${u.today} 次 · 失败 ${u.fail} · P95 ${u.p95}</dd></div>
+      <div class="notice ${u.credState==='err'?'warn':'info'}"><b>${u.credState==='err'?'需要处理：':'提示：'}</b>${u.credState==='err'?'该接入没有可用凭据，请求会返回 401。前往「凭据」写入 Key。':'密钥不会在此页面回显；替换密钥需重新输入。'}</div>`;
+  } else if(tab==='conn'){
+    h=`<div class="form-grid"><label class="fl full"><span>请求地址</span><input value="${u.url}"></label><label class="fl"><span>协议</span><select><option>${u.protocol}</option><option>openai</option><option>anthropic</option></select></label><label class="fl"><span>传输</span><select><option>默认</option><option>opencode</option><option>zcode</option></select></label><label class="fl"><span>超时（秒）</span><input value="600"></label><label class="fl"><span>模型缓存（秒）</span><input value="300"></label><label class="fl full"><span>上游标识</span><input value="${u.id}" disabled><span class="help">创建后不可修改，避免破坏客户端调用路径。</span></label></div>`;
+  } else if(tab==='cred'){
+    h=`<div class="panel-sec"><h3>凭据来源</h3><div class="radio-row"><button class="radio-chip active">本机加密库（推荐）</button><button class="radio-chip">环境变量</button><button class="radio-chip">凭据文件</button></div></div>
+      <div class="panel-sec"><h3>当前状态</h3><div class="notice ${u.credState==='err'?'warn':''}"><b>${u.credState==='err'?'未配置':'已配置'}</b> · 来源 ${u.cred}${u.credState==='err'?' · 请写入密钥':' · 密钥不可回显'}</div>
+      <label class="fl" style="margin-top:12px"><span>${u.credState==='err'?'写入 API Key':'替换 API Key'}</span><input type="password" placeholder="粘贴后立即加密保存"></label></div>
+      <label class="check"><input type="checkbox"><div><div class="t">绑定凭据池</div><div class="d">多 Key/账号轮换、冷却与配额；绑定后优先于单 Key。</div></div></label>`;
+  } else if(tab==='model'){
+    h=`<div class="panel-sec"><h3>目录</h3><div class="kv"><dt>已声明</dt><dd>${u.models} 个</dd><dt>已拉取</dt><dd>${u.fetched||'—'} 个</dd><dt>自动拉取</dt><dd>开启</dd></div></div>
+      <div class="notice">模型目录由接入实时拉取；拉取失败不会阻断请求。别名与模型覆盖在「模型目录」页维护。</div>`;
+  } else if(tab==='adv'){
+    h=`<div class="panel-sec"><h3>兼容与高级</h3><div class="form-grid"><label class="fl"><span>模板</span><select><option>${u.kind==='custom'?'custom':u.id}</option></select></label><label class="fl"><span>模板版本</span><input value="v1" disabled></label><label class="fl full"><span>会话头</span><select><option>跟随模板</option><option>开启</option><option>关闭</option></select></label></div></div>
+      <details><summary style="cursor:pointer;color:var(--muted);font-size:12px">原始配置片段</summary><pre class="mono" style="font-size:10.5px;line-height:1.7;color:var(--muted);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto">{\n  "protocol": "${u.protocol}",\n  "baseUrl": "${u.url}",\n  "template": "${u.id}",\n  "kind": "${u.kind}",\n  "privacy": { "zdr": ${u.zdr} }\n}</pre></details>`;
+  } else {
+    h=`<div class="diag"><span class="ic ${u.credState==='err'?'e':'w'}">${u.credState==='err'?'×':'!'}</span><div><b>${u.credState==='err'?'凭据缺失':'无阻断错误'}</b><span>${u.credState==='err'?'该接入声明了 apiKeyStore，但密钥库中没有对应条目。':'当前接入没有阻断级诊断。'}</span></div></div>
+      <div class="diag"><span class="ic i">i</span><div><b>隐私能力：${u.privacy}</b><span>${u.privacy==='请求级'?'ZDR 会随请求发送。':u.privacy==='账户级'?'需要在该厂商控制台开启；面板仅记录意图。':'该厂商不支持请求级 ZDR，请阅读其数据政策。'}</span></div></div>`;
+  }
+  $('#drawer-body').innerHTML=h;
+}
+
+/* ── pools ── */
+const pools=[
+  {name:'ZCode 账号池',id:'pool_zcode',up:'zcode',strategy:'priority',total:4,ok:2,cool:1,dis:1,req:310},
+  {name:'DeepSeek 主 Key',id:'pool_deepseek',up:'deepseek',strategy:'priority',total:2,ok:2,cool:0,dis:0,req:842},
+  {name:'中转备用',id:'pool_gateway',up:'my-gateway',strategy:'round_robin',total:2,ok:0,cool:0,dis:0,req:126}
+];
+$('#pool-grid').innerHTML=pools.map(p=>`<div class="pool"><div class="ph"><span class="dot ${p.ok?'ok':'warn'}"></span><span class="pn">${p.name}</span><span class="badge" style="margin-left:auto">${p.strategy}</span></div><div class="pu">${p.id} · ${p.up}</div><div class="big">${p.ok}<small> / ${p.total} 可用</small></div><div class="bar"><i style="width:${p.ok/p.total*100}%;background:var(--signal)"></i><i style="width:${p.cool/p.total*100}%;background:var(--amber)"></i><i style="width:${p.dis/p.total*100}%;background:var(--faint)"></i></div><div class="meta"><span>冷却 ${p.cool}</span><span>禁用 ${p.dis}</span><span>今日 ${p.req}</span></div></div>`).join('');
+
+/* ── chart ── */
+const bars=$('#bars');
+const vals=[28,22,18,15,12,10,14,26,44,58,66,72,64,70,78,82,74,68,72,86,94,88,76,62];
+bars.innerHTML=vals.map((v,i)=>`<div class="b" style="height:${v}%;opacity:${i>19?.95:.7}" title="${i}:00 · ${v*12} 请求"></div>`).join('');
+
+/* ── misc ── */
+function toggleSwitch(e){ e.stopPropagation(); e.currentTarget.classList.toggle('on'); toast(e.currentTarget.classList.contains('on')?'已启用':'已禁用'); }
+let toastTimer;
+function toast(msg){ $('#toast-text').textContent=msg; $('#toast').classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),2200); }
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeQuick(); closeDrawer(); } if((e.metaKey||e.ctrlKey)&&e.key==='k'){ e.preventDefault(); $('#global-search').focus(); } });
+$('#global-search').addEventListener('keydown',e=>{ if(e.key==='Enter'){ const q=e.target.value.trim(); if(q){ go('access'); $('#access-search').value=q; renderAccess(); } } });
+document.getElementById('quick-modal').addEventListener('click',e=>{ if(e.target.id==='quick-modal') closeQuick(); });
+
+/* 设计稿深链：便于评审直接打开某个页面/步骤 */
+function applyHash(){
+  const h=(location.hash||'').replace(/^#/,'');
+  if(!h) return;
+  if(h.startsWith('quick')){
+    openQuick();
+    const m=h.match(/^quick-(\d+)$/);
+    if(m){ step=Math.max(1,Math.min(3,+m[1])); if(step>=2) selectedTemplate='deepseek'; renderQuick(); }
+    return;
+  }
+  if(h.startsWith('drawer-')){
+    const id=h.slice(7); go('access'); setTimeout(()=>openDrawer(id),30); return;
+  }
+  const known=['overview','access','models','routes','credentials','plugins','traffic','observe','settings'];
+  if(known.includes(h)) go(h);
+}
+window.addEventListener('hashchange',applyHash);
+applyHash();
+</script>
+</body>
+</html>

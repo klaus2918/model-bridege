@@ -86,8 +86,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "app.js syntax check failed" }
           node --check scripts/ui_smoke.js
           if ($LASTEXITCODE -ne 0) { throw "ui_smoke.js syntax check failed" }
-          node scripts/ui_smoke.js --exe dist/Model-Gate-rust.exe --port 18942 --debug-port 19222
-          if ($LASTEXITCODE -ne 0) { throw "UI smoke failed: $LASTEXITCODE" }
+          node scripts/ui_smoke.js --exe dist/Model-Gate-rust.exe --port 18942 --debug-port 19222 --ui-path /ui/classic
+          if ($LASTEXITCODE -ne 0) { throw "Classic UI smoke failed: $LASTEXITCODE" }
+
+      - name: 面板 v3 冒烟
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tmp = Join-Path $env:RUNNER_TEMP "mg-v3-smoke"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          $config = '{"host":"127.0.0.1","port":18943,"upstreams":{"demo":{"protocol":"openai","baseUrl":"http://127.0.0.1:65535","apiKeyStore":"upstream:demo","template":"openai","kind":"official","label":"演示上游","privacy":{"zdr":true,"training":"deny"},"models":["demo-model"]}}}'
+          Set-Content -Path "$tmp\bridge.config.json" -Value $config -Encoding utf8
+          $p = Start-Process "dist\Model-Gate-rust.exe" -ArgumentList @('--config', "$tmp\bridge.config.json", '--db', "$tmp\modelgate.db", '--port', '18943', '--no-gui', '--no-browser', '--force-multi') -PassThru -WindowStyle Hidden -RedirectStandardOutput "$tmp\server.out.log" -RedirectStandardError "$tmp\server.err.log"
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              try { $null = Invoke-RestMethod 'http://127.0.0.1:18943/health'; $ready = $true; break } catch { Start-Sleep -Milliseconds 300 }
+            }
+            if (-not $ready) { throw "v3 smoke server not ready" }
+            node scripts/ui_smoke_v3.js --base http://127.0.0.1:18943 --screenshot-dir "$tmp\screenshots"
+            if ($LASTEXITCODE -ne 0) { throw "v3 UI smoke failed: $LASTEXITCODE" }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
 
       - name: 历史数据库迁移冒烟
         shell: pwsh
@@ -132,9 +153,16 @@ jobs:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.meta.outputs.version) }}
           name: Model-Gate v${{ steps.meta.outputs.version }} (Rust)
           body: |
-            Model-Gate Rust 桌面版：托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
+            Model-Gate v3：接入控制台重构 + 凭据池 + 插件 + AI 配置接口。
+            Rust 桌面版：托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
 
-            - **ZCode 账号池（新）**：本机导入/OAuth/粘贴 JWT、DPAPI 加密、验证码池、Start Plan 自动领取；`transport=zcode` 经本机 ZCode app-server 走 GLM-5.3-Flash / GLM-5.3，账号池轮询与失败换号。
+            - **v3 控制台（默认 `/ui/`）**：7 个功能域 / 5 个侧栏分区 / 9 个子视图；经典面板完整保留在 `/ui/classic`。
+            - **快速添加**：官方厂商选模板 → 填 Key 两步完成；自定义厂商只填标识、厂商、地址、协议、Key 五项。
+            - **隐私**：新增接入默认勾选 ZDR，可随时修改；按厂商能力如实显示「请求级 / 账户级 / 不支持请求级」。
+            - **凭据池**：priority / round_robin / weighted / least_used 四种策略，冷却、熔断、配额与成员级故障转移；密钥只存本机 DPAPI。
+            - **插件**：manifest `auth.mode=pool`、安装只登记、attach 幂等建池；卸载默认保留上游与凭据。
+            - **AI 配置接口**：`/api/ai/manifest`、`schema`、`templates`、`inspect`、`plan`、`apply`、`audit`、`/llms.txt`；默认只读 + 草案，密钥/账号/Cookie 永不返回。
+            - 兼容：`bridge.config.json` 仍为唯一事实源；`/v1`、`/{upstream}/v1`、`/unified/v1` 与旧配置读取全部保留。
             - 安装包：`Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe`（安装时可选安装目录）
             - 便携版：`Model-Gate-rust.exe`（单文件，免安装）
             - 校验：`SHA256SUMS`

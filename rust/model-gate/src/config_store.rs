@@ -123,13 +123,16 @@ pub fn strip_secrets(value: &mut Value) {
 /// 清掉单个上游对象里的明文密钥与面板只读字段。
 fn strip_upstream_secrets(entry: &mut Map<String, Value>) {
     entry.remove("apiKey");
+    // 预留的“内联密文”字段也不写入配置：密钥只进独立密钥库文件。
+    entry.remove("apiKeyEnc");
     entry.remove("_keyConfigured");
     entry.remove("_keySource");
-    // 逐模型密钥同样只允许变量名/路径引用。
+    // 逐模型密钥同样只允许变量名/路径/密钥库引用。
     if let Some(model_keys) = entry.get_mut("modelKeys").and_then(Value::as_object_mut) {
         for (_, spec) in model_keys.iter_mut() {
             if let Some(spec) = spec.as_object_mut() {
                 spec.remove("apiKey");
+                spec.remove("apiKeyEnc");
             }
         }
     }
@@ -430,6 +433,26 @@ mod tests {
         assert!(keys["model-b"].get("apiKey").is_none());
         assert_eq!(keys["model-a"]["apiKeyEnv"], json!("A_KEY"));
         assert_eq!(keys["model-b"]["apiKeyFile"], json!("D:/keys/b.json"));
+    }
+
+    #[test]
+    fn strip_secrets_keeps_store_reference() {
+        let mut v = json!({
+            "upstreams": {
+                "a": {
+                    "apiKeyStore": "upstream:a",
+                    "modelKeys": {
+                        "model-a": {"apiKeyStore": "model:a:model-a"}
+                    }
+                }
+            }
+        });
+        strip_secrets(&mut v);
+        assert_eq!(v["upstreams"]["a"]["apiKeyStore"], json!("upstream:a"));
+        assert_eq!(
+            v["upstreams"]["a"]["modelKeys"]["model-a"]["apiKeyStore"],
+            json!("model:a:model-a")
+        );
     }
 
     #[test]

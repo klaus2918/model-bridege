@@ -43,6 +43,20 @@
         },
         "limits": {},
         "zdr": false,
+        "privacyAdapters": {
+          "zdr": {
+            "kind": "unsupported",
+            "reason": "该上游未声明请求级 ZDR 开关"
+          },
+          "trainingAllow": {
+            "kind": "unsupported",
+            "reason": "该上游未声明请求级训练授权开关"
+          },
+          "trainingDeny": {
+            "kind": "unsupported",
+            "reason": "该上游未声明请求级训练开关"
+          }
+        },
         "versionHeader": "",
         "environmentHeader": "",
         "catalog": {
@@ -89,6 +103,21 @@
         "session": {
           "header": "x-opencode-session",
           "idStyle": "hex32"
+        },
+        "privacyAdapters": {
+          "zdr": {
+            "kind": "unsupported",
+            "reason": "OpenCode 不读取请求级 ZDR 头；数据保留由模型条款决定"
+          },
+          "trainingAllow": {
+            "kind": "workspace",
+            "url": "https://opencode.ai/console",
+            "setting": "Settings › Privacy → Allow paid endpoints that train on request data"
+          },
+          "trainingDeny": {
+            "kind": "unsupported",
+            "reason": "OpenCode 不提供请求级训练开关；请改用不训练的模型"
+          }
         }
       },
       "defaults": {
@@ -562,6 +591,21 @@
           "downgradeForced": true
         },
         "zdr": true,
+        "privacyAdapters": {
+          "zdr": {
+            "kind": "header",
+            "name": "x-cmd-zdr",
+            "value": "1"
+          },
+          "trainingAllow": {
+            "kind": "unsupported",
+            "reason": "CommandCode 未声明请求级训练授权开关"
+          },
+          "trainingDeny": {
+            "kind": "unsupported",
+            "reason": "CommandCode 未声明请求级训练开关"
+          }
+        },
         "versionHeader": "x-command-code-version",
         "environmentHeader": "x-cli-environment",
         "limits": {
@@ -615,6 +659,21 @@
         "endpoint": {
           "chat": "/v1/chat/completions",
           "models": "/v1/models"
+        },
+        "privacyAdapters": {
+          "zdr": {
+            "kind": "body",
+            "path": "provider.zdr",
+            "value": true
+          },
+          "trainingAllow": {
+            "kind": "none"
+          },
+          "trainingDeny": {
+            "kind": "body",
+            "path": "provider.data_collection",
+            "value": "deny"
+          }
         },
         "capabilities": {
           "stream": true,

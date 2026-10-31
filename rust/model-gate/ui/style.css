@@ -883,7 +883,25 @@ details.fold > .actions.sticky-actions { padding: 10px 0 6px; }
 .table-wrap tbody td.empty { text-align: center; color: var(--text-3); padding: 18px 10px; }
 .table-wrap + .pager,
 .table-wrap + .hint { margin-top: 10px; }
+#unified-group-table input[type="text"] { width: 100%; }
+#unified-group-table select[multiple] { width: 100%; min-width: 180px; }
 .hint + .pager { margin-top: 8px; }
+
+/* ── 路由组 ────────────────────────────────────────────── */
+#route-group-list { gap: 10px; }
+.route-group-card {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2); padding: 12px; display: grid; gap: 8px;
+}
+.route-group-card .route-group-head { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
+.route-group-card .route-group-head label { flex: 1 1 220px; }
+.route-group-card textarea {
+  width: 100%; min-height: 84px; font-family: var(--mono);
+  font-size: 12px; line-height: 1.6;
+}
+.route-group-card .route-group-actions {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+}
 
 /* ── 应用更新 ──────────────────────────────────────────── */
 #update-btn.update-available {

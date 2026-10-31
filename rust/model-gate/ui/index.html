@@ -20,7 +20,7 @@
     <button class="tab-btn" data-tab="usage">用量</button>
     <button class="tab-btn" data-tab="prompts">提示词</button>
     <button class="tab-btn" data-tab="free">免费来源</button>
-    <button class="tab-btn" data-tab="zcode">ZCode</button>
+    <button class="tab-btn" data-tab="zcode" hidden>ZCode</button>
     <button class="tab-btn" data-tab="logs">日志</button>
   </nav>
   <div class="conn" id="conn">连接中…</div>
@@ -267,6 +267,8 @@
           thinking 回传（多轮会话必需）</label>
         <label class="check" title="默认隐藏；勾选并保存后，导航栏才会出现「免费来源」页签">
           <input type="checkbox" name="freeSourcesPanel"> 显示「免费来源」页签</label>
+        <label class="check" title="默认隐藏；勾选并保存后，导航栏才会出现「ZCode」页签">
+          <input type="checkbox" name="zcodePanel"> 显示「ZCode」页签</label>
       </div>
 
       <div class="section-head" id="config-prompt"><h2>提示词记录</h2></div>
@@ -288,6 +290,45 @@
         </label>
       </div>
 
+      </details>
+
+      <details class="box fold" id="config-group-unified" data-fold="config-unified" open>
+      <summary>
+        <span class="fold-title">统一接入</span>
+        <span class="hint">/unified/v1 默认全部可见上游；/unified/{分组}/v1 只含该组</span>
+        <button type="button" class="ghost" id="add-unified-group">＋ 新增分组</button>
+      </summary>
+      <div class="section-head"><h2>允许展示的上游</h2></div>
+      <div class="hint">全部不勾选 = 全部上游；勾选后只允许展示选中的上游。未勾选的上游仍可通过 /名称/v1 使用。</div>
+      <div class="grid grid-2" id="unified-visible-list"></div>
+      <div class="section-head"><h2>分组</h2></div>
+      <div class="table-wrap">
+        <table class="sortable-table" id="unified-group-table">
+          <thead><tr>
+            <th style="width:20%">分组标识</th>
+            <th style="width:24%">显示名称</th>
+            <th>包含上游（Ctrl/Cmd 多选）</th>
+            <th class="num">操作</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="hint" id="unified-group-hint">分组标识用于 /unified/{标识}/v1；只能使用字母、数字、-、_、.。分组只影响统一接口，不影响 /v1 与 /名称/v1。</div>
+      </details>
+
+      <details class="box fold" id="config-group-groups" data-fold="config-groups" open>
+      <summary>
+        <span class="fold-title">路由组</span>
+        <span class="hint">对外虚拟模型 group/&lt;id&gt;；成员按顺序切换，日志仍记真实上游/模型</span>
+        <button type="button" class="ghost" id="add-route-group">＋ 新增路由组</button>
+      </summary>
+      <div class="hint">
+        请求 <code>model=group/daily</code> 时按成员顺序尝试。成员每行一个：<code>上游/模型</code>、
+        已声明的模型名或已有别名。连接失败、429、5xx 才切换；401/403/404 与普通 400 不切换。
+        URL 前缀 <code>/上游/v1</code> 与 <code>model=上游/模型</code> 仍强制单上游，不参与切换。
+      </div>
+      <div id="route-group-list" class="grid"></div>
+      <div class="hint" id="route-group-hint">顺序即人工优先级；同一会话可以继续请求其它模型，日志按每次请求的真实上游分别记录。</div>
       </details>
 
       <details class="box fold" id="config-group-upstreams" data-fold="config-upstreams" open>
@@ -843,10 +884,11 @@
     </div>
   </section>
 
-  <!-- ══════════ ZCode 账号池 ══════════ -->
+  <!-- ══════════ ZCode 账号池（可选） ══════════ -->
   <section class="panel" id="panel-zcode">
     <div class="toolbar">
-      <span class="hint" id="zcode-hint">ZCode 原生插件：账号池、自动领取 Start Plan、GLM 请求按账号轮询。JWT 只存本机加密库，不显示原文。</span>
+      <span class="hint" id="zcode-hint">ZCode 是可选接入：不启用只影响聊天、不会启动 CLI；每日领取不需要安装 ZCode，只需账号和 Chrome。</span>
+      <button class="ghost" id="zcode-help">配置说明</button>
       <button class="ghost" id="zcode-refresh">刷新</button>
     </div>
 
@@ -854,40 +896,48 @@
 
     <div class="box">
       <div class="box-head">
-        <h2>插件设置</h2>
-        <span class="hint" id="zcode-save-hint">修改后点「保存设置」；路径留空时自动探测。</span>
+        <h2>基础设置</h2>
+        <span class="hint" id="zcode-save-hint">「启用」只影响聊天请求；每日领取不需要安装 ZCode，只需账号 JWT 和 Chrome。</span>
       </div>
       <form id="zcode-config-form" autocomplete="off">
         <div class="grid grid-3">
-          <label class="check"><input type="checkbox" id="zcode-enabled"> 启用 ZCode 插件</label>
-          <label>backend
-            <select id="zcode-backend" class="filter-select">
-              <option value="appserver">appserver（推荐，本机 CLI）</option>
-              <option value="direct">direct（实验，已实测 405/3012）</option>
-            </select>
+          <label class="check"><input type="checkbox" id="zcode-enabled"> 启用 ZCode 插件（可选）</label>
+          <label>ZCode CLI 路径
+            <input id="zcode-cli-path" type="text" spellcheck="false" placeholder="留空时自动探测">
           </label>
-          <label>领取间隔（秒，0=关）
-            <input id="zcode-claim-interval" type="number" min="0" step="60">
+          <label class="check"><input type="checkbox" id="zcode-auto-claim"> 每日定时领取 Start Plan</label>
+          <label id="zcode-claim-interval-row" hidden>每日领取时间（本地时区）
+            <input id="zcode-claim-daily-time" type="time">
           </label>
-          <label>单请求账号尝试数
+          <label>请求失败时最多换几个账号
             <input id="zcode-concurrency" type="number" min="1" max="4">
           </label>
-          <label>浏览器路径（Chrome/Edge）
-            <input id="zcode-browser-path" type="text" spellcheck="false">
-          </label>
-          <label>ZCode CLI 路径
-            <input id="zcode-cli-path" type="text" spellcheck="false">
-          </label>
-          <label>Node 路径
-            <input id="zcode-node-path" type="text" spellcheck="false">
-          </label>
-          <label>ZCode 数据目录
-            <input id="zcode-data-dir" type="text" spellcheck="false">
-          </label>
-          <label>验证码 SceneId
-            <input id="zcode-captcha-scene" type="text" spellcheck="false">
-          </label>
         </div>
+
+        <details class="fold" id="zcode-advanced">
+          <summary>高级设置（路径、连接方式、验证码参数；通常无需修改）</summary>
+          <div class="grid grid-3">
+            <label>连接方式
+              <select id="zcode-backend" class="filter-select">
+                <option value="appserver">本机 CLI（推荐）</option>
+                <option value="direct">直连（已实测不可用）</option>
+              </select>
+            </label>
+            <label>Node 路径
+              <input id="zcode-node-path" type="text" spellcheck="false">
+            </label>
+            <label>ZCode 数据目录
+              <input id="zcode-data-dir" type="text" spellcheck="false">
+            </label>
+            <label>浏览器路径（Chrome/Edge）
+              <input id="zcode-browser-path" type="text" spellcheck="false">
+            </label>
+            <label>验证码场景 ID
+              <input id="zcode-captcha-scene" type="text" spellcheck="false">
+            </label>
+          </div>
+        </details>
+
         <div class="actions">
           <button type="button" class="primary" id="zcode-save">保存设置</button>
           <button type="button" class="ghost" id="zcode-captcha-test">验证码自检</button>
@@ -896,14 +946,14 @@
       </form>
     </div>
 
-    <div class="box">
+    <div class="box" id="zcode-accounts-box">
       <div class="box-head">
-        <h2>账号池</h2>
+        <h2>ZCode 账号（可选）</h2>
         <span class="hint" id="zcode-pool-hint">—</span>
       </div>
       <div class="toolbar">
         <button class="primary" id="zcode-import-local">从本机 ZCode 导入</button>
-        <button class="ghost" id="zcode-add-manual">粘贴 JWT / API Key</button>
+        <button class="ghost" id="zcode-add-manual">批量添加账号</button>
         <button class="ghost" id="zcode-oauth-start">OAuth 登录</button>
         <button class="ghost" id="zcode-claim-preview">预览可领</button>
         <button class="ghost" id="zcode-claim-now">立即领取</button>
@@ -923,10 +973,10 @@
       <div class="hint" id="zcode-account-hint">—</div>
     </div>
 
-    <div class="box">
+    <div class="box" id="zcode-glm-box">
       <div class="box-head">
-        <h2>GLM 提供商池</h2>
-        <span class="hint" id="zcode-glm-hint">接入后写入 upstreams.zcode；请求由账号池轮询，backend=appserver。</span>
+        <h2>GLM 接入（可选）</h2>
+        <span class="hint" id="zcode-glm-hint">启用后可把 GLM-5.3 / GLM-5.3-Flash 接入为普通上游。</span>
       </div>
       <div class="toolbar">
         <span class="hint">模型：GLM-5.3-Flash / GLM-5.3</span>
@@ -934,9 +984,9 @@
       </div>
     </div>
 
-    <div class="box">
+    <div class="box" id="zcode-claims-box">
       <div class="box-head">
-        <h2>最近领取</h2>
+        <h2>领取记录</h2>
         <span class="hint" id="zcode-claims-hint">只记录业务码/结果，不记录凭据。</span>
       </div>
       <div class="table-wrap">

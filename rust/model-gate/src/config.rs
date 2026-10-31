@@ -58,7 +58,12 @@ pub struct Compat {
     /// CLI 环境头名（值取自 cliEnvironment）
     pub environment_header: String,
     /// 是否发送 ZDR 安全头 `x-cmd-zdr: 1`
+    ///
+    /// 兼容字段：运行时以 [`Compat::privacy`] 为准；这里只保留旧配置/API 的
+    /// 布尔视图，避免已有配置和测试失效。
     pub zdr: bool,
+    /// 通用隐私策略（ZDR / 训练数据）：用户意图 + provider 适配器。
+    pub privacy: Privacy,
     /// 模型目录来源：endpoint | commandcode（注册表 catalog.source，可被 compat.catalog 覆盖）
     pub catalog_source: String,
     /// 模型目录端点路径
@@ -124,6 +129,262 @@ impl Capabilities {
     }
 }
 
+/// 隐私策略的落地点：不同上游对 ZDR / 训练数据的控制方式并不统一。
+///
+/// 设计目标：把「用户意图」与「线上实现」分开。用户只配置要不要 ZDR、
+/// 允许还是禁止训练；具体发头、改请求体，还是必须去上游控制台设置，
+/// 由 provider profile 的 `privacyAdapters` 声明。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrivacyAdapter {
+    /// 上游默认行为已满足，无需额外动作。
+    None,
+    /// 通过请求头落地。
+    Header { name: String, value: String },
+    /// 通过请求体 JSON 路径落地（点分隔，例如 provider.zdr）。
+    Body { path: String, value: Value },
+    /// 只能在上游控制台/账户设置里修改。
+    Workspace { url: String, setting: String },
+    /// 上游没有该能力。
+    Unsupported { reason: String },
+}
+
+impl Default for PrivacyAdapter {
+    fn default() -> Self {
+        Self::Unsupported {
+            reason: "该上游未声明请求级隐私能力".into(),
+        }
+    }
+}
+
+impl PrivacyAdapter {
+    pub fn to_json(&self) -> Value {
+        match self {
+            Self::None => json!({"kind": "none"}),
+            Self::Header { name, value } => {
+                json!({"kind": "header", "name": name, "value": value})
+            }
+            Self::Body { path, value } => json!({"kind": "body", "path": path, "value": value}),
+            Self::Workspace { url, setting } => {
+                json!({"kind": "workspace", "url": url, "setting": setting})
+            }
+            Self::Unsupported { reason } => json!({"kind": "unsupported", "reason": reason}),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::None => "无需额外动作".into(),
+            Self::Header { name, value } => format!("请求头 {name}: {value}"),
+            Self::Body { path, value } => format!("请求体 {path} = {value}"),
+            Self::Workspace { url, setting } => format!("上游控制台：{setting}（{url}）"),
+            Self::Unsupported { reason } => format!("不支持：{reason}"),
+        }
+    }
+}
+
+/// 训练数据策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingPolicy {
+    /// 未显式设置，跟随 profile / 上游默认。
+    Inherit,
+    /// 允许使用请求数据训练。
+    Allow,
+    /// 禁止使用请求数据训练。
+    Deny,
+}
+
+impl Default for TrainingPolicy {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+impl TrainingPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// 通用隐私策略：用户意图 + 上游适配器。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Privacy {
+    /// 是否要求零数据保留；None 表示未显式设置。
+    pub zdr: Option<bool>,
+    /// 训练数据策略。
+    pub training: TrainingPolicy,
+    /// ZDR 的落地方式（来自 profile / 显式 privacyAdapters）。
+    pub zdr_adapter: PrivacyAdapter,
+    /// “允许训练”的落地方式。
+    pub training_allow_adapter: PrivacyAdapter,
+    /// “禁止训练”的落地方式。
+    pub training_deny_adapter: PrivacyAdapter,
+}
+
+impl Default for Privacy {
+    fn default() -> Self {
+        Self {
+            zdr: None,
+            training: TrainingPolicy::Inherit,
+            zdr_adapter: PrivacyAdapter::default(),
+            training_allow_adapter: PrivacyAdapter::default(),
+            training_deny_adapter: PrivacyAdapter::default(),
+        }
+    }
+}
+
+impl Privacy {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "zdr": self.zdr,
+            "training": self.training.as_str(),
+            "adapters": {
+                "zdr": self.zdr_adapter.to_json(),
+                "trainingAllow": self.training_allow_adapter.to_json(),
+                "trainingDeny": self.training_deny_adapter.to_json(),
+            }
+        })
+    }
+
+    /// 配置期诊断：只在用户明确要求、且该上游无法按请求落地时提示。
+    pub fn diagnostics(&self, upstream: &str) -> Vec<(&'static str, String, String)> {
+        let mut out = Vec::new();
+        if self.zdr == Some(true) {
+            match &self.zdr_adapter {
+                PrivacyAdapter::None => out.push((
+                    "warn",
+                    format!("上游「{upstream}」要求 ZDR，但没有声明可用的落地方式"),
+                    "检查 compat.privacyAdapters.zdr".into(),
+                )),
+                PrivacyAdapter::Workspace { url, setting } => out.push((
+                    "warn",
+                    format!("上游「{upstream}」的 ZDR 只能在上游控制台设置：{setting}"),
+                    url.clone(),
+                )),
+                PrivacyAdapter::Unsupported { reason } => out.push((
+                    "warn",
+                    format!("上游「{upstream}」不支持请求级 ZDR：{reason}"),
+                    "关闭 compat.zdr / compat.privacy.zdr，或改用支持 ZDR 的上游".into(),
+                )),
+                PrivacyAdapter::Header { .. } | PrivacyAdapter::Body { .. } => {}
+            }
+        }
+        match self.training {
+            TrainingPolicy::Inherit => {}
+            TrainingPolicy::Allow => match &self.training_allow_adapter {
+                PrivacyAdapter::None
+                | PrivacyAdapter::Header { .. }
+                | PrivacyAdapter::Body { .. } => {}
+                PrivacyAdapter::Workspace { url, setting } => out.push((
+                    "warn",
+                    format!("上游「{upstream}」允许训练需要在上游控制台设置：{setting}"),
+                    url.clone(),
+                )),
+                PrivacyAdapter::Unsupported { reason } => out.push((
+                    "warn",
+                    format!("上游「{upstream}」不支持请求级“允许训练”：{reason}"),
+                    "该策略只能由上游账户或控制台决定".into(),
+                )),
+            },
+            TrainingPolicy::Deny => match &self.training_deny_adapter {
+                PrivacyAdapter::None
+                | PrivacyAdapter::Header { .. }
+                | PrivacyAdapter::Body { .. } => {}
+                PrivacyAdapter::Workspace { url, setting } => out.push((
+                    "warn",
+                    format!("上游「{upstream}」的训练策略只能在上游控制台设置：{setting}"),
+                    url.clone(),
+                )),
+                PrivacyAdapter::Unsupported { reason } => out.push((
+                    "warn",
+                    format!("上游「{upstream}」不支持请求级“禁止训练”：{reason}"),
+                    "改用明确不训练的上游或模型".into(),
+                )),
+            },
+        }
+        out
+    }
+}
+
+/// 从 profile 的 `privacyAdapters.<key>` 解析一个适配器。
+pub(crate) fn privacy_adapter_from_value(value: Option<&Value>) -> PrivacyAdapter {
+    let Some(obj) = value.and_then(Value::as_object) else {
+        return PrivacyAdapter::default();
+    };
+    let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "none" => PrivacyAdapter::None,
+        "header" => {
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let value = obj
+                .get("value")
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            if name.is_empty() {
+                PrivacyAdapter::Unsupported {
+                    reason: "privacyAdapters.header 缺少 name".into(),
+                }
+            } else {
+                PrivacyAdapter::Header {
+                    name: name.to_lowercase(),
+                    value,
+                }
+            }
+        }
+        "body" => {
+            let path = obj
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if path.is_empty() {
+                PrivacyAdapter::Unsupported {
+                    reason: "privacyAdapters.body 缺少 path".into(),
+                }
+            } else {
+                PrivacyAdapter::Body {
+                    path,
+                    value: obj.get("value").cloned().unwrap_or(Value::Null),
+                }
+            }
+        }
+        "workspace" => PrivacyAdapter::Workspace {
+            url: obj
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            setting: obj
+                .get("setting")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
+        "unsupported" => PrivacyAdapter::Unsupported {
+            reason: obj
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("该上游未声明请求级隐私能力")
+                .to_string(),
+        },
+        _ => PrivacyAdapter::Unsupported {
+            reason: format!("privacyAdapters.kind「{kind}」无效"),
+        },
+    }
+}
+
 impl Default for Compat {
     fn default() -> Self {
         Self {
@@ -145,6 +406,7 @@ impl Default for Compat {
             version_header: String::new(),
             environment_header: String::new(),
             zdr: false,
+            privacy: Privacy::default(),
             catalog_source: "endpoint".into(),
             catalog_path: "/v1/models".into(),
             catalog_plan: Value::Bool(false),
@@ -187,6 +449,18 @@ impl Compat {
                 c.session_id_style = "hex32".into();
                 // 免鉴权允许：与注册表 `opencode.authOptional` 一致（兜底副本也要对）。
                 c.auth_optional = true;
+                // OpenCode 不读取请求级 ZDR；Go 的训练授权在 workspace 控制台。
+                c.privacy.zdr_adapter = PrivacyAdapter::Unsupported {
+                    reason: "OpenCode 不读取请求级 ZDR 头；数据保留由模型条款决定".into(),
+                };
+                c.privacy.training_allow_adapter = PrivacyAdapter::Workspace {
+                    url: "https://opencode.ai/console".into(),
+                    setting: "Settings › Privacy → Allow paid endpoints that train on request data"
+                        .into(),
+                };
+                c.privacy.training_deny_adapter = PrivacyAdapter::Unsupported {
+                    reason: "OpenCode 不提供请求级训练开关；请改用不训练的模型".into(),
+                };
             }
             "commandcode" => {
                 c.profile = "commandcode".into();
@@ -197,6 +471,11 @@ impl Compat {
                 c.environment_header = "x-cli-environment".into();
                 c.extra_headers.push(("user-agent".into(), "cli".into()));
                 c.zdr = true;
+                c.privacy.zdr = Some(true);
+                c.privacy.zdr_adapter = PrivacyAdapter::Header {
+                    name: "x-cmd-zdr".into(),
+                    value: "1".into(),
+                };
                 c.tool_choice_downgrade = true;
                 c.max_output_tokens = Some(64_000);
                 c.catalog_source = "commandcode".into();
@@ -334,7 +613,9 @@ pub struct ModelKey {
     pub source: String,
     /// 环境变量名（面板展示与「写入密钥」使用）。
     pub env_name: Option<String>,
-    /// 配置里声明的来源（变量名 / 文件路径），用于诊断展示。
+    /// Model-Gate 加密密钥库引用 id（`model:上游:模型`）。
+    pub store_id: Option<String>,
+    /// 配置里声明的来源（变量名 / 文件路径 / 密钥库引用），用于诊断展示。
     pub configured_from: String,
     /// 读不到密钥的原因；`None` 表示可用。
     pub missing: Option<String>,
@@ -374,6 +655,10 @@ pub struct Upstream {
     pub api_key_file: Option<String>,
     /// 从 agent 客户端工具读取密钥的预设名（opencode/jcode/commandcode/custom）。
     pub api_key_agent: Option<String>,
+    /// Model-Gate 加密密钥库引用 id（`upstream:名称`）。
+    pub api_key_store: Option<String>,
+    /// 凭据池 id：存在时请求期优先从池选成员；`apiKeyStore` 仅作展示/兜底。
+    pub credential_pool: Option<String>,
     /// 逐模型密钥：模型 id（精确或单个 `*` 通配）→ 已解析的凭据。
     /// 命中时优先于上游级 `api_key`；未命中回落到上游级。
     pub model_keys: Vec<ModelKey>,
@@ -541,6 +826,42 @@ impl Upstream {
     }
 }
 
+/// 统一接入口的分组：`/unified/{id}/v1/...` 只展示组内允许展示的上游。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnifiedGroup {
+    /// URL 路径中的分组标识（字母/数字/-/_/.，最长 64）。
+    pub id: String,
+    /// 面板展示名；空时回落到 id。
+    pub label: String,
+    /// 组成员（上游名）。
+    pub upstreams: Vec<String>,
+}
+
+/// 统一接入口配置。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Unified {
+    /// 允许在统一接口展示的上游；空 = 全部。
+    pub visible_upstreams: Vec<String>,
+    /// 命名分组；`/unified/{id}/v1/...` 只在组内再按可见清单过滤。
+    pub groups: Vec<UnifiedGroup>,
+}
+
+/// 路由组：对外虚拟模型 `group/<id>`，成员按声明顺序依次尝试。
+///
+/// 成员写法：
+/// - `上游/模型`：直接锁定该上游；
+/// - 模型名：按普通路由规则找声明了该模型的上游；
+/// - 别名：先展开 `aliases`，再按上面两条解析。
+///
+/// 顺序就是人工维护的优先级；失败切换由 proxy 层执行。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteGroup {
+    /// `group/<id>` 中的 id。
+    pub id: String,
+    /// 原始成员声明，保留用户写法，解析在请求期完成。
+    pub members: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub raw: Value,
@@ -563,6 +884,10 @@ pub struct Config {
     pub prompt_max_chars: u64,
     pub aliases: HashMap<String, String>,
     pub upstreams: Vec<Upstream>,
+    /// 统一接入口的可见上游与命名分组。
+    pub unified: Unified,
+    /// 路由组：`group/<id>` 虚拟模型 → 有序成员链。
+    pub groups: Vec<RouteGroup>,
     /// 单价表（解析后的 `pricing` 配置）：非法条目被跳过并记入 issues。
     pub pricing: crate::pricing::PricingTable,
 }
@@ -575,10 +900,17 @@ impl Config {
         let text = text.trim_start_matches('\u{feff}');
         let raw: Value = serde_json::from_str(&text)
             .with_context(|| format!("配置不是合法 JSON: {}", path.display()))?;
-        Ok(Self::from_value(raw))
+        let store = crate::secret_store::SecretStore::load(path);
+        Ok(Self::from_value_with_store(raw, &store))
     }
 
+    /// 兼容入口：没有配置路径时使用空密钥库（单测、预览）。
     pub fn from_value(raw: Value) -> Self {
+        Self::from_value_with_store(raw, &crate::secret_store::SecretStore::empty())
+    }
+
+    /// 带本地加密密钥库解析配置。
+    pub fn from_value_with_store(raw: Value, store: &crate::secret_store::SecretStore) -> Self {
         let obj = raw.as_object().cloned().unwrap_or_default();
         let host = obj
             .get("host")
@@ -640,7 +972,7 @@ impl Config {
             .and_then(Value::as_object)
             .map(|m| {
                 m.iter()
-                    .map(|(name, value)| normalize_upstream(name, value, &obj))
+                    .map(|(name, value)| normalize_upstream(name, value, &obj, store))
                     .collect()
             })
             .unwrap_or_default();
@@ -651,6 +983,8 @@ impl Config {
             }
         }
 
+        let unified = normalize_unified(obj.get("unified"));
+        let groups = normalize_route_groups(obj.get("groups"));
         let pricing =
             crate::pricing::PricingTable::from_value(obj.get("pricing").unwrap_or(&Value::Null));
 
@@ -670,6 +1004,8 @@ impl Config {
             prompt_max_chars,
             aliases,
             upstreams,
+            unified,
+            groups,
             pricing,
         }
     }
@@ -708,6 +1044,164 @@ impl Config {
         self.default_upstream()
     }
 
+    /// 统一接口允许展示的上游；`visibleUpstreams` 为空表示全部，按配置顺序返回。
+    pub fn unified_visible_upstreams(&self) -> Vec<&Upstream> {
+        if self.unified.visible_upstreams.is_empty() {
+            return self.upstreams.iter().collect();
+        }
+        let allowed: HashSet<&str> = self
+            .unified
+            .visible_upstreams
+            .iter()
+            .map(String::as_str)
+            .collect();
+        self.upstreams
+            .iter()
+            .filter(|up| allowed.contains(up.name.as_str()))
+            .collect()
+    }
+
+    pub fn unified_group(&self, id: &str) -> Option<&UnifiedGroup> {
+        self.unified.groups.iter().find(|group| group.id == id)
+    }
+
+    /// 指定分组内允许展示的上游：分组不存在返回 `None`，空分组返回空数组。
+    pub fn unified_group_upstreams(&self, id: &str) -> Option<Vec<&Upstream>> {
+        let group = self.unified_group(id)?;
+        let members: HashSet<&str> = group.upstreams.iter().map(String::as_str).collect();
+        Some(
+            self.unified_visible_upstreams()
+                .into_iter()
+                .filter(|up| members.contains(up.name.as_str()))
+                .collect(),
+        )
+    }
+
+    /// 按 id 查路由组。
+    pub fn route_group(&self, id: &str) -> Option<&RouteGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    /// 从 `group/<id>` 取出组 id；格式不合法返回 `None`。
+    ///
+    /// 组 id 不允许包含 `/`，因此 `group/a/b` 不会命中任何组。
+    pub fn group_id_from_model<'m>(&self, model: &'m str) -> Option<&'m str> {
+        let id = model.strip_prefix("group/")?;
+        if id.is_empty() || id.contains('/') {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// 解析路由组成员：`上游/模型`、普通模型名或别名。
+    ///
+    /// 普通模型名只在上游明确声明了该模型时才解析成功，避免成员写错后
+    /// 静默落到默认上游；别名先展开，再按同样规则解析。
+    pub fn resolve_group_member<'a>(&'a self, raw: &str) -> Option<(&'a Upstream, String)> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if let Some((upstream, model)) = self.split_qualified_model(raw) {
+            return Some((upstream, model.to_string()));
+        }
+        let target = self.aliases.get(raw).map(String::as_str).unwrap_or(raw);
+        if target != raw {
+            if let Some((upstream, model)) = self.split_qualified_model(target) {
+                return Some((upstream, model.to_string()));
+            }
+        }
+        let upstream = self
+            .upstreams
+            .iter()
+            .find(|up| up.models.iter().any(|model| model == target))
+            .or_else(|| {
+                self.upstreams
+                    .iter()
+                    .find(|up| up.model_map.contains_key(target))
+            })?;
+        Some((upstream, target.to_string()))
+    }
+
+    /// 路由组的可路由成员（保持声明顺序；解析失败的成员跳过）。
+    pub fn group_targets(&self, group: &RouteGroup) -> Vec<(&Upstream, String)> {
+        let mut out: Vec<(&Upstream, String)> = Vec::new();
+        for member in &group.members {
+            let Some((upstream, model)) = self.resolve_group_member(member) else {
+                continue;
+            };
+            if out.iter().any(|(existing, existing_model)| {
+                existing.name == upstream.name && existing_model == &model
+            }) {
+                continue;
+            }
+            out.push((upstream, model));
+        }
+        out
+    }
+
+    /// 统一接口可见范围内的路由组清单：只要有一个成员落在可见上游里，
+    /// 就把 `group/<id>` 暴露出去；请求时仍会按可见范围过滤成员。
+    pub fn group_model_list_for(&self, upstreams: &[&Upstream]) -> Vec<String> {
+        let allowed: HashSet<&str> = upstreams.iter().map(|up| up.name.as_str()).collect();
+        self.groups
+            .iter()
+            .filter(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter_map(|member| self.resolve_group_member(member))
+                    .any(|(upstream, _)| allowed.contains(upstream.name.as_str()))
+            })
+            .map(|group| format!("group/{}", group.id))
+            .collect()
+    }
+
+    /// 在统一接口的可见范围内按模型名选上游。
+    ///
+    /// 与 [`Self::pick_upstream`] 的规则一致，但会跳过不可见上游：先看
+    /// 原有优先级结果，若被隐藏则在同一可见范围内重新找声明了该模型的上游，
+    /// 最后回落到可见范围内的默认上游 / 第一条。
+    pub fn pick_upstream_scoped(
+        &self,
+        model: Option<&str>,
+        allowed: Option<&[String]>,
+    ) -> Option<&Upstream> {
+        let Some(allowed) = allowed else {
+            return self.pick_upstream(model);
+        };
+        let allowed: HashSet<&str> = allowed.iter().map(String::as_str).collect();
+        if let Some(up) = self.pick_upstream(model) {
+            if allowed.contains(up.name.as_str()) {
+                return Some(up);
+            }
+        }
+        let name = model.unwrap_or("");
+        let target = self.aliases.get(name).map(String::as_str).unwrap_or(name);
+        if !target.is_empty() {
+            if let Some(up) = self.upstreams.iter().find(|up| {
+                allowed.contains(up.name.as_str()) && up.models.iter().any(|m| m == target)
+            }) {
+                return Some(up);
+            }
+            if let Some(up) = self
+                .upstreams
+                .iter()
+                .find(|up| allowed.contains(up.name.as_str()) && up.model_map.contains_key(name))
+            {
+                return Some(up);
+            }
+        }
+        self.upstreams
+            .iter()
+            .find(|up| allowed.contains(up.name.as_str()) && up.default)
+            .or_else(|| {
+                self.upstreams
+                    .iter()
+                    .find(|up| allowed.contains(up.name.as_str()))
+            })
+    }
+
     /// 对外模型清单：顶层白名单优先；否则合并各上游声明（去重保序），
     /// 再把全局别名与上游级 modelMap 的键值补进来（与 Python 版一致）。
     pub fn model_list(&self) -> Vec<String> {
@@ -740,6 +1234,95 @@ impl Config {
                 }
             }
         }
+        for group in &self.groups {
+            let id = format!("group/{}", group.id);
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// 解析统一模型名 `上游/模型`，返回上游与真正的模型名。
+    ///
+    /// 只有当 `/` 前的前缀与已配置上游名完全一致时才拆分，因此模型名自身
+    /// 带 `/`（如 `deepseek/deepseek-v4-flash`）不会被误伤；上游名本身含
+    /// `/` 时按最长前缀匹配，保证 `a/b` 优先于 `a`。
+    pub fn split_qualified_model<'m>(&self, model: &'m str) -> Option<(&Upstream, &'m str)> {
+        if model.is_empty() {
+            return None;
+        }
+        let mut best: Option<(&Upstream, &'m str)> = None;
+        for up in &self.upstreams {
+            if up.name.is_empty() {
+                continue;
+            }
+            let Some(rest) = model.strip_prefix(up.name.as_str()) else {
+                continue;
+            };
+            let Some(rest) = rest.strip_prefix('/') else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            let better = match best {
+                Some((current, _)) => up.name.len() > current.name.len(),
+                None => true,
+            };
+            if better {
+                best = Some((up, rest));
+            }
+        }
+        best
+    }
+
+    /// 统一接入清单：每个上游声明模型与 `modelMap`（别名 + 目标）的
+    /// `上游/模型` 形式。
+    ///
+    /// 与 `/上游/v1/models` 同口径：不受顶层 `models` 白名单影响，也不触发
+    /// 上游目录拉取；顺序固定为配置顺序 + 声明顺序 + modelMap 排序。
+    pub fn qualified_model_list(&self) -> Vec<(String, String)> {
+        self.qualified_model_list_impl(self.upstreams.iter())
+    }
+
+    /// 统一接入清单的可见范围版本：只输出给定上游（通常来自
+    /// [`Self::unified_visible_upstreams`] / [`Self::unified_group_upstreams`]）。
+    pub fn qualified_model_list_for(&self, upstreams: &[&Upstream]) -> Vec<(String, String)> {
+        self.qualified_model_list_impl(upstreams.iter().copied())
+    }
+
+    fn qualified_model_list_impl<'a>(
+        &self,
+        upstreams: impl IntoIterator<Item = &'a Upstream>,
+    ) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for up in upstreams {
+            if up.name.is_empty() {
+                continue;
+            }
+            let mut names: Vec<&str> = up.models.iter().map(String::as_str).collect();
+            let mut aliases: Vec<(&str, &str)> = up
+                .model_map
+                .iter()
+                .map(|(alias, target)| (alias.as_str(), target.as_str()))
+                .collect();
+            aliases.sort_unstable();
+            // 与 `model_list` 一致：modelMap 的别名和真实目标名都可被请求。
+            for (alias, target) in aliases {
+                names.extend([alias, target]);
+            }
+            for name in names {
+                if name.is_empty() {
+                    continue;
+                }
+                let id = format!("{}/{}", up.name, name);
+                if seen.insert(id.clone()) {
+                    out.push((id, up.name.clone()));
+                }
+            }
+        }
         out
     }
 }
@@ -766,7 +1349,18 @@ impl Diagnostic {
     }
 }
 
+/// 统一接口分组标识：URL 路径安全，最长 64。
+fn valid_unified_group_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 const TOP_LEVEL_KEYS: &[&str] = &[
+    "version",
+    "aiConfig",
     "port",
     "host",
     "defaultModel",
@@ -776,6 +1370,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "accessLog",
     "promptCapture",
     "freeSourcesPanel",
+    "zcodePanel",
     "promptRetentionDays",
     "promptMaxRecords",
     "promptMaxChars",
@@ -786,6 +1381,8 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "envFile",
     "upstreams",
     "upstream",
+    "unified",
+    "groups",
     "retentionDays",
     "pricing",
 ];
@@ -832,6 +1429,15 @@ const UPSTREAM_KEYS: &[&str] = &[
     "thinkingPassthrough",
     "downgradeForcedChoice",
     "modelOverrides",
+    // 新版可选字段（设计文档 02）：旧配置无需迁移，未知读取者忽略即可。
+    "apiKeyStore",
+    "template",
+    "templateVersion",
+    "kind",
+    "label",
+    "privacy",
+    "credentialPool",
+    "pluginId",
 ];
 
 const COMPAT_KEYS: &[&str] = &[
@@ -844,6 +1450,8 @@ const COMPAT_KEYS: &[&str] = &[
     "endpoint",
     "limits",
     "zdr",
+    "privacy",
+    "privacyAdapters",
     "versionHeader",
     "environmentHeader",
     "catalog",
@@ -890,17 +1498,20 @@ impl Config {
                     "maxOutputTokens": u.compat.max_output_tokens,
                     "maxContextTokens": u.compat.max_context_tokens,
                     "zdr": u.compat.zdr,
+                    "privacy": u.compat.privacy.to_json(),
                     "extraHeaders": headers,
                     "models": u.models,
                     "default": u.default,
                     "keySource": u.display_key_source(),
                     "keyConfigured": u.any_key_configured(),
                     "apiKeyAgent": u.api_key_agent,
+                    "apiKeyStore": u.api_key_store,
                     "capabilities": u.compat.capabilities.to_json(),
                     // 逐模型密钥只回显变量名/来源与可用性，绝不回显密钥本体。
                     "modelKeys": u.model_keys.iter().map(|mk| json!({
                         "model": mk.pattern,
                         "env": mk.env_name,
+                        "store": mk.store_id,
                         "source": mk.source,
                         "configured": mk.missing.is_none(),
                         "missing": mk.missing,
@@ -1042,6 +1653,280 @@ impl Config {
                     );
                 }
             }
+        }
+
+        // ── 统一接入：可见上游与分组 ────────────────────────────────
+        if let Some(unified) = raw_obj.and_then(|obj| obj.get("unified")) {
+            if !unified.is_object() {
+                push(
+                    "error",
+                    "invalid_unified",
+                    "unified",
+                    "unified 必须是对象".into(),
+                    "例如 {\"visibleUpstreams\":[],\"groups\":[]}",
+                );
+            }
+        }
+        if let Some(unified) = raw_obj
+            .and_then(|obj| obj.get("unified"))
+            .and_then(Value::as_object)
+        {
+            for key in unified.keys() {
+                if !["visibleUpstreams", "groups"].contains(&key.as_str()) {
+                    push(
+                        "warn",
+                        "unknown_unified_field",
+                        &format!("unified.{key}"),
+                        format!("统一接入字段「{key}」未知，不会生效"),
+                        "可用字段：visibleUpstreams、groups",
+                    );
+                }
+            }
+            if let Some(visible) = unified.get("visibleUpstreams") {
+                if !visible.is_array() {
+                    push(
+                        "error",
+                        "invalid_unified_visible",
+                        "unified.visibleUpstreams",
+                        "visibleUpstreams 必须是上游名数组".into(),
+                        "留空表示全部上游；例如 [\"go\",\"zen\"]",
+                    );
+                }
+            }
+            if let Some(groups) = unified.get("groups") {
+                if !groups.is_array() {
+                    push(
+                        "error",
+                        "invalid_unified_groups",
+                        "unified.groups",
+                        "groups 必须是数组".into(),
+                        "每项形如 {\"id\":\"team-a\",\"label\":\"团队 A\",\"upstreams\":[\"go\"]}",
+                    );
+                }
+            }
+        }
+        let upstream_names: HashSet<&str> =
+            self.upstreams.iter().map(|up| up.name.as_str()).collect();
+        for name in &self.unified.visible_upstreams {
+            if !upstream_names.contains(name.as_str()) {
+                push(
+                    "warn",
+                    "unified_visible_unknown",
+                    &format!("unified.visibleUpstreams.{name}"),
+                    format!("统一接口可见清单中的上游「{name}」不存在"),
+                    "检查上游名称，或从可见清单移除",
+                );
+            }
+        }
+        let visible_names: HashSet<&str> = if self.unified.visible_upstreams.is_empty() {
+            upstream_names.clone()
+        } else {
+            self.unified
+                .visible_upstreams
+                .iter()
+                .map(String::as_str)
+                .collect()
+        };
+        let mut group_ids: HashSet<&str> = HashSet::new();
+        for (index, group) in self.unified.groups.iter().enumerate() {
+            let path = format!("unified.groups[{index}]");
+            if group.id.is_empty() {
+                push(
+                    "error",
+                    "invalid_unified_group",
+                    &format!("{path}.id"),
+                    "统一接口分组标识不能为空".into(),
+                    "例如 team-a",
+                );
+            } else if !valid_unified_group_id(&group.id) {
+                push(
+                    "error",
+                    "invalid_unified_group",
+                    &format!("{path}.id"),
+                    format!("统一接口分组标识「{}」不合法", group.id),
+                    "只能包含字母、数字、-、_、.，且不超过 64 字符",
+                );
+            } else if !group_ids.insert(group.id.as_str()) {
+                push(
+                    "error",
+                    "duplicate_unified_group",
+                    &format!("{path}.id"),
+                    format!("统一接口分组标识「{}」重复", group.id),
+                    "每个分组标识必须唯一",
+                );
+            }
+            if group.upstreams.is_empty() {
+                push(
+                    "warn",
+                    "empty_unified_group",
+                    &format!("{path}.upstreams"),
+                    format!("统一接口分组「{}」没有包含任何上游", group.id),
+                    "该分组的模型清单会为空；请分配上游或删除分组",
+                );
+            }
+            for name in &group.upstreams {
+                if !upstream_names.contains(name.as_str()) {
+                    push(
+                        "warn",
+                        "unified_group_unknown_upstream",
+                        &format!("{path}.upstreams.{name}"),
+                        format!("统一接口分组「{}」引用的上游「{name}」不存在", group.id),
+                        "检查上游名称",
+                    );
+                } else if !visible_names.contains(name.as_str()) {
+                    push(
+                        "warn",
+                        "unified_group_hidden_upstream",
+                        &format!("{path}.upstreams.{name}"),
+                        format!(
+                            "统一接口分组「{}」包含的上游「{name}」不在可见清单中，不会展示",
+                            group.id
+                        ),
+                        "把该上游加入 visibleUpstreams，或从分组移除",
+                    );
+                }
+            }
+        }
+        if let Some(rows) = raw_obj
+            .and_then(|obj| obj.get("unified"))
+            .and_then(Value::as_object)
+            .and_then(|unified| unified.get("groups"))
+            .and_then(Value::as_array)
+        {
+            for (index, row) in rows.iter().enumerate() {
+                if !row.is_object() {
+                    push(
+                        "error",
+                        "invalid_unified_group",
+                        &format!("unified.groups[{index}]"),
+                        "统一接口分组必须是对象".into(),
+                        "每项形如 {\"id\":\"team-a\",\"label\":\"团队 A\",\"upstreams\":[\"go\"]}",
+                    );
+                }
+            }
+        }
+
+        // ── 路由组：group/<id> 虚拟模型 ──────────────────────────────
+        if let Some(groups) = raw_obj.and_then(|obj| obj.get("groups")) {
+            match groups.as_object() {
+                None => push(
+                    "error",
+                    "invalid_groups",
+                    "groups",
+                    "groups 必须是对象".into(),
+                    "例如 {\"daily\":[\"zcode/GLM-5.3-Flash\",\"go/deepseek-v4\"]}",
+                ),
+                Some(rows) => {
+                    for (id, raw_members) in rows {
+                        let path = format!("groups.{id}");
+                        if id.trim().is_empty() {
+                            push(
+                                "error",
+                                "invalid_group",
+                                "groups",
+                                "路由组 id 不能为空".into(),
+                                "例如 daily",
+                            );
+                        } else if !valid_unified_group_id(id.trim()) {
+                            push(
+                                "error",
+                                "invalid_group",
+                                &path,
+                                format!("路由组 id「{id}」不合法"),
+                                "只能包含字母、数字、-、_、.，且不超过 64 字符",
+                            );
+                        }
+                        let Some(members) = raw_members.as_array() else {
+                            push(
+                                "error",
+                                "invalid_group_members",
+                                &path,
+                                "路由组必须是成员数组".into(),
+                                "例如 [\"zcode/GLM-5.3-Flash\",\"go/deepseek-v4\"]",
+                            );
+                            continue;
+                        };
+                        if members.is_empty() {
+                            push(
+                                "warn",
+                                "empty_group",
+                                &path,
+                                format!("路由组「{id}」没有成员"),
+                                "请求 group/{id} 会返回无可用成员",
+                            );
+                        }
+                        let mut seen: HashSet<String> = HashSet::new();
+                        for (index, member) in members.iter().enumerate() {
+                            let member_path = format!("{path}[{index}]");
+                            let Some(member) = member.as_str() else {
+                                push(
+                                    "error",
+                                    "invalid_group_member",
+                                    &member_path,
+                                    "路由组成员必须是字符串".into(),
+                                    "例如 \"go/deepseek-v4\"",
+                                );
+                                continue;
+                            };
+                            let member = member.trim();
+                            if member.is_empty() {
+                                push(
+                                    "error",
+                                    "invalid_group_member",
+                                    &member_path,
+                                    "路由组成员不能为空".into(),
+                                    "删除空项或填写 上游/模型",
+                                );
+                                continue;
+                            }
+                            if !seen.insert(member.to_string()) {
+                                push(
+                                    "warn",
+                                    "duplicate_group_member",
+                                    &member_path,
+                                    format!("路由组「{id}」成员「{member}」重复"),
+                                    "重复成员只会尝试一次",
+                                );
+                            }
+                            match self.resolve_group_member(member) {
+                                None => push(
+                                    "error",
+                                    "group_member_unresolved",
+                                    &member_path,
+                                    format!("路由组成员「{member}」无法解析"),
+                                    "写成 上游/模型、已声明的模型名或已有别名",
+                                ),
+                                Some((upstream, model)) => {
+                                    let declared = upstream.models.iter().any(|m| m == &model)
+                                        || upstream.model_map.contains_key(member)
+                                        || self.aliases.contains_key(member);
+                                    if !declared {
+                                        push(
+                                            "warn",
+                                            "group_member_model_not_declared",
+                                            &member_path,
+                                            format!(
+                                                "成员「{member}」解析为 {} / {}，但该上游未声明此模型",
+                                                upstream.name, model
+                                            ),
+                                            "确认上游 models/modelMap 是否需要补上该模型",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if self.upstreams.iter().any(|up| up.name == "group") {
+            push(
+                "warn",
+                "reserved_group_prefix",
+                "upstreams.group",
+                "上游名「group」与路由组前缀 group/ 冲突".into(),
+                "模型名 group/<id> 会优先按路由组解析；建议改用其他上游名",
+            );
         }
 
         // ── 上游字段与能力 ──────────────────────────────────────────
@@ -1408,6 +2293,16 @@ impl Config {
                     );
                 }
             }
+            // 隐私策略：只有用户明确要求、且该上游无法按请求落地时才提示。
+            for (level, message, hint) in c.privacy.diagnostics(&up.name) {
+                push(
+                    level,
+                    "privacy_unsupported",
+                    &format!("{prefix}.compat.privacy"),
+                    message,
+                    &hint,
+                );
+            }
             if let Some(overrides) = raw_up.and_then(|r| r.get("modelOverrides")) {
                 match overrides.as_object() {
                     None => push(
@@ -1673,7 +2568,7 @@ impl Config {
                                         "error",
                                         "invalid_model_keys",
                                         &path,
-                                        "条目必须是环境变量名字符串或对象（apiKeyEnv / apiKeyFile / apiKeyAgentPath）".into(),
+                                        "条目必须是环境变量名字符串或对象（apiKeyEnv / apiKeyFile / apiKeyAgentPath / apiKeyStore）".into(),
                                         "",
                                     );
                                     None
@@ -1693,10 +2588,10 @@ impl Config {
                                         format!(
                                             "逐模型密钥「{pattern}」写有明文 apiKey，运行期已忽略"
                                         ),
-                                        "改用 apiKeyEnv / apiKeyFile，并通过面板写入密钥",
+                                        "改用 apiKeyEnv / apiKeyFile / apiKeyStore，并通过面板写入密钥",
                                     );
                                 }
-                                let has_source = ["apiKeyEnv", "apiKeyFile", "apiKeyAgent", "apiKeyAgentPath"]
+                                let has_source = ["apiKeyEnv", "apiKeyFile", "apiKeyAgent", "apiKeyAgentPath", "apiKeyStore"]
                                     .iter()
                                     .any(|k| obj.contains_key(*k));
                                 if !has_source {
@@ -1704,9 +2599,21 @@ impl Config {
                                         "error",
                                         "invalid_model_keys",
                                         &path,
-                                        "条目必须包含 apiKeyEnv / apiKeyFile / apiKeyAgentPath".into(),
+                                        "条目必须包含 apiKeyEnv / apiKeyFile / apiKeyAgentPath / apiKeyStore".into(),
                                         "",
                                     );
+                                }
+                                if let Some(store_id) = obj.get("apiKeyStore") {
+                                    match store_id.as_str() {
+                                        Some(id) if crate::secret_store::is_valid_id(id.trim()) => {}
+                                        _ => push(
+                                            "error",
+                                            "invalid_model_keys",
+                                            &format!("{path}.apiKeyStore"),
+                                            "apiKeyStore 必须是 upstream: / model: 开头的密钥库引用".into(),
+                                            "用面板「加密保存到 Model-Gate」生成引用",
+                                        ),
+                                    }
                                 }
                                 if let Some(env) = obj.get("apiKeyEnv") {
                                     match env.as_str() {
@@ -1733,7 +2640,7 @@ impl Config {
                                             format!(
                                                 "模型「{pattern}」的密钥未读到（{reason}），请求会回落到上游级密钥"
                                             ),
-                                            "检查环境变量 / 凭据文件，或用面板「写入逐模型密钥」",
+                                            "检查环境变量 / 凭据文件 / 加密密钥库，或用面板「写入逐模型密钥」",
                                         );
                                     }
                                 }
@@ -1771,6 +2678,7 @@ impl Config {
                 && up.api_key_env.is_none()
                 && up.api_key_file.is_none()
                 && up.api_key_agent.is_none()
+                && up.api_key_store.is_none()
                 // 纯逐模型密钥的上游：整体缺失由 model_key_missing 逐条报告，
                 // 不再额外报一条容易误导的 missing_credentials。
                 && up.model_keys.is_empty()
@@ -1780,7 +2688,24 @@ impl Config {
                     "missing_credentials",
                     &format!("{prefix}.apiKey"),
                     format!("上游「{}」没有配置密钥（将以空鉴权请求）", up.name),
-                    "设置 apiKeyEnv / apiKeyFile / apiKeyAgent；无需鉴权的上游请设置 compat.auth.scheme=none",
+                    "设置 apiKeyEnv / apiKeyFile / apiKeyAgent / apiKeyStore；无需鉴权的上游请设置 compat.auth.scheme=none",
+                );
+            }
+            if up.api_key_store.is_some()
+                && !up.key_configured()
+                && up.api_key_env.is_none()
+                && up.api_key_file.is_none()
+                && up.api_key_agent.is_none()
+            {
+                push(
+                    "warn",
+                    "store_key_unreadable",
+                    &format!("{prefix}.apiKeyStore"),
+                    format!(
+                        "上游「{}」引用了 Model-Gate 加密密钥库，但未读到可用密钥",
+                        up.name
+                    ),
+                    "在本机面板重新「加密保存到 Model-Gate」；DPAPI 密文只能由写入时的 Windows 用户/机器解密",
                 );
             }
             if up.api_key_agent.is_some() && !up.key_configured() {
@@ -1807,10 +2732,10 @@ impl Config {
                     "legacy_literal_api_key",
                     &format!("{prefix}.apiKey"),
                     format!(
-                        "上游「{}」在 JSON 中写有 apiKey，运行期已忽略：密钥只从环境变量或显式凭据文件读取",
+                        "上游「{}」在 JSON 中写有 apiKey，运行期已忽略：密钥只从环境变量、显式凭据文件或加密密钥库读取",
                         up.name
                     ),
-                    "删除 apiKey，改用 apiKeyEnv 并通过面板「写入密钥」保存；无需鉴权的上游请设置 compat.auth.scheme=none",
+                    "删除 apiKey，改用 apiKeyEnv / apiKeyStore 并通过面板「写入密钥」保存；无需鉴权的上游请设置 compat.auth.scheme=none",
                 );
             }
             if up.fetch_models == false
@@ -1899,6 +2824,91 @@ fn is_header_token(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// 统一接入口配置：缺省 = 全部上游可见、无分组。
+fn normalize_unified(value: Option<&Value>) -> Unified {
+    let Some(obj) = value.and_then(Value::as_object) else {
+        return Unified::default();
+    };
+    let visible_upstreams = trimmed_unique_strings(obj.get("visibleUpstreams"));
+    let groups = obj
+        .get("groups")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_object)
+                .map(|row| UnifiedGroup {
+                    id: row
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                    label: row
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                    upstreams: trimmed_unique_strings(row.get("upstreams")),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Unified {
+        visible_upstreams,
+        groups,
+    }
+}
+
+/// 路由组配置：`groups` 是「组 id → 成员数组」的对象。
+///
+/// 成员保持原始写法与顺序，请求期再解析；非法/空项在这里先剔除，
+/// 详细诊断由 [`Config::diagnostics`] 按原始 JSON 给出。
+fn normalize_route_groups(value: Option<&Value>) -> Vec<RouteGroup> {
+    let Some(obj) = value.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    obj.iter()
+        .filter_map(|(id, raw)| {
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let members = raw
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|member| !member.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(RouteGroup {
+                id: id.to_string(),
+                members,
+            })
+        })
+        .collect()
+}
+
+/// 字符串数组：trim、去空、去重保序。
+fn trimmed_unique_strings(value: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(rows) = value.and_then(Value::as_array) {
+        for row in rows {
+            if let Some(text) = row.as_str() {
+                let text = text.trim();
+                if !text.is_empty() && !out.iter().any(|existing| existing == text) {
+                    out.push(text.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn string_list(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -1911,7 +2921,12 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn normalize_upstream(name: &str, value: &Value, root: &Map<String, Value>) -> Upstream {
+fn normalize_upstream(
+    name: &str,
+    value: &Value,
+    root: &Map<String, Value>,
+    store: &crate::secret_store::SecretStore,
+) -> Upstream {
     let u = value.as_object().cloned().unwrap_or_default();
     let protocol = u
         .get("protocol")
@@ -1923,7 +2938,7 @@ fn normalize_upstream(name: &str, value: &Value, root: &Map<String, Value>) -> U
         .and_then(Value::as_str)
         .map(normalize_base_url)
         .unwrap_or_default();
-    let (api_key, key_source) = resolve_api_key(&u, root);
+    let (api_key, key_source) = resolve_api_key(&u, root, store);
     let model_map = u
         .get("modelMap")
         .and_then(Value::as_object)
@@ -1994,8 +3009,21 @@ fn normalize_upstream(name: &str, value: &Value, root: &Map<String, Value>) -> U
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        api_key_store: u
+            .get("apiKeyStore")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| crate::secret_store::is_valid_id(s))
+            .map(str::to_string),
+        // 凭据池 id：允许旧配置缺省；空串视为未绑定。
+        credential_pool: u
+            .get("credentialPool")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         // 逐模型密钥：字符串简写（环境变量名）或对象（apiKeyEnv / apiKeyFile / …）。
-        model_keys: resolve_model_keys(u.get("modelKeys")),
+        model_keys: resolve_model_keys(u.get("modelKeys"), store),
         model_overrides: u
             .get("modelOverrides")
             .and_then(Value::as_object)
@@ -2031,7 +3059,7 @@ fn resolve_compat(
         }
     }
     if let Some(enabled) = u.get("cmdZdr").and_then(Value::as_bool) {
-        c.zdr = enabled;
+        c.privacy.zdr = Some(enabled);
     }
     if let Some(enabled) = u.get("thinkingPassthrough").and_then(Value::as_bool) {
         c.thinking_passthrough = enabled;
@@ -2142,7 +3170,41 @@ fn resolve_compat(
             }
         }
         if let Some(v) = obj.get("zdr").and_then(Value::as_bool) {
-            c.zdr = v;
+            c.privacy.zdr = Some(v);
+        }
+        // 通用隐私意图：compat.privacy.{zdr,training}
+        if let Some(privacy) = obj.get("privacy").and_then(Value::as_object) {
+            match privacy.get("zdr") {
+                Some(Value::Bool(v)) => c.privacy.zdr = Some(*v),
+                Some(Value::String(v))
+                    if matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "auto" | "inherit" | "default"
+                    ) =>
+                {
+                    c.privacy.zdr = None;
+                }
+                _ => {}
+            }
+            if let Some(v) = privacy.get("training").and_then(Value::as_str) {
+                c.privacy.training = match v.to_ascii_lowercase().as_str() {
+                    "allow" => TrainingPolicy::Allow,
+                    "deny" | "no-training" | "disallow" => TrainingPolicy::Deny,
+                    _ => TrainingPolicy::Inherit,
+                };
+            }
+        }
+        // 适配器覆盖：默认来自 profile；高级用户可按上游改写。
+        if let Some(adapters) = obj.get("privacyAdapters").and_then(Value::as_object) {
+            if let Some(v) = adapters.get("zdr") {
+                c.privacy.zdr_adapter = privacy_adapter_from_value(Some(v));
+            }
+            if let Some(v) = adapters.get("trainingAllow") {
+                c.privacy.training_allow_adapter = privacy_adapter_from_value(Some(v));
+            }
+            if let Some(v) = adapters.get("trainingDeny") {
+                c.privacy.training_deny_adapter = privacy_adapter_from_value(Some(v));
+            }
         }
         if let Some(v) = obj.get("versionHeader") {
             c.version_header = v.as_str().unwrap_or("").to_string();
@@ -2165,6 +3227,33 @@ fn resolve_compat(
             c.capabilities.apply_json(caps);
         }
     }
+
+    // 新版顶层隐私意图：`upstreams.<name>.privacy`（设计文档 02 的新字段）。
+    // 显式顶层优先于 `compat.privacy`，但两者都保留，旧读取者仍能解释配置。
+    if let Some(privacy) = u.get("privacy").and_then(Value::as_object) {
+        match privacy.get("zdr") {
+            Some(Value::Bool(v)) => c.privacy.zdr = Some(*v),
+            Some(Value::String(v))
+                if matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "auto" | "inherit" | "default"
+                ) =>
+            {
+                c.privacy.zdr = None;
+            }
+            _ => {}
+        }
+        if let Some(v) = privacy.get("training").and_then(Value::as_str) {
+            c.privacy.training = match v.to_ascii_lowercase().as_str() {
+                "allow" => TrainingPolicy::Allow,
+                "deny" | "no-training" | "disallow" => TrainingPolicy::Deny,
+                _ => TrainingPolicy::Inherit,
+            };
+        }
+    }
+
+    // 旧布尔视图：运行时读 privacy，旧 API/测试仍读 zdr。
+    c.zdr = c.privacy.zdr.unwrap_or(false);
 
     // ── 全局开关：作为最终约束，避免单个上游绕过全局开关 ──────────────
     if root
@@ -2257,7 +3346,10 @@ pub(crate) fn expand_home(path: &str) -> PathBuf {
 /// - 对象写法复用上游级 `resolve_api_key` 的优先级（env → file → agent）；
 /// - 读不到值的条目**保留**在列表里并标记 `missing`，由诊断与健康检查点名，
 ///   运行时回落到上游级密钥（与 model-bridge 的兜底行为一致）。
-fn resolve_model_keys(value: Option<&Value>) -> Vec<ModelKey> {
+fn resolve_model_keys(
+    value: Option<&Value>,
+    store: &crate::secret_store::SecretStore,
+) -> Vec<ModelKey> {
     let Some(spec) = value.and_then(Value::as_object) else {
         return Vec::new();
     };
@@ -2274,7 +3366,7 @@ fn resolve_model_keys(value: Option<&Value>) -> Vec<ModelKey> {
             };
             // 明文 apiKey 永不作为凭据；保留字段只为诊断提示，读取时忽略。
             obj.remove("apiKey");
-            // 环境变量名两侧空白不应影响读取（面板输入常见）。
+            // 环境变量名/密钥库引用两侧空白不应影响读取（面板输入常见）。
             if let Some(env) = obj
                 .get("apiKeyEnv")
                 .and_then(Value::as_str)
@@ -2283,12 +3375,26 @@ fn resolve_model_keys(value: Option<&Value>) -> Vec<ModelKey> {
             {
                 obj.insert("apiKeyEnv".into(), json!(env));
             }
-            let (api_key, source) = resolve_api_key(&obj, &Map::new());
+            if let Some(store_id) = obj
+                .get("apiKeyStore")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_string)
+            {
+                obj.insert("apiKeyStore".into(), json!(store_id));
+            }
+            let (api_key, source) = resolve_api_key(&obj, &Map::new(), store);
             let env_name = obj
                 .get("apiKeyEnv")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let store_id = obj
+                .get("apiKeyStore")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| crate::secret_store::is_valid_id(s))
                 .map(str::to_string);
             let configured_from = model_key_source_label(&obj);
             let missing = if api_key.is_empty() {
@@ -2301,6 +3407,7 @@ fn resolve_model_keys(value: Option<&Value>) -> Vec<ModelKey> {
                 api_key,
                 source,
                 env_name,
+                store_id,
                 configured_from,
                 missing,
             }
@@ -2326,13 +3433,16 @@ fn model_key_source_label(spec: &Map<String, Value>) -> String {
     if let Some(path) = text("apiKeyAgentPath") {
         return path;
     }
+    if let Some(store_id) = text("apiKeyStore") {
+        return format!("Model-Gate 加密存储（{store_id}）");
+    }
     if spec.get("apiKeyAgent").is_some() {
         return "agent 凭据（未指定路径）".into();
     }
     "(未配置密钥来源)".into()
 }
 
-/// 密钥优先级：apiKeyEnv → apiKeyFile → agent 自定义路径 → 无凭据。
+/// 密钥优先级：apiKeyEnv → apiKeyFile → agent 自定义路径 → Model-Gate 加密密钥库 → 无凭据。
 ///
 /// `apiKeyEnv` 的取值顺序（**只认环境变量**）：
 /// 1. 进程环境 `std::env::var`；
@@ -2340,9 +3450,14 @@ fn model_key_source_label(spec: &Map<String, Value>) -> String {
 /// 3. Windows 用户级环境变量 `HKCU\Environment`。
 ///
 /// 没有任何内置 `.env` 兜底路径：凭据位置一律由用户显式指定。
+/// `apiKeyStore` 只接受 `upstream:` / `model:` 引用，实际密文在独立密钥库文件。
 /// JSON 里的 `apiKey` 字段**永不作为凭据来源**：历史配置中的非空值会被忽略，
 /// 并由 `diagnostics()` 给出 `legacy_literal_api_key` 迁移提示。
-fn resolve_api_key(u: &Map<String, Value>, _root: &Map<String, Value>) -> (String, String) {
+fn resolve_api_key(
+    u: &Map<String, Value>,
+    _root: &Map<String, Value>,
+    store: &crate::secret_store::SecretStore,
+) -> (String, String) {
     if let Some(env_name) = u.get("apiKeyEnv").and_then(Value::as_str) {
         let env_name = env_name.trim();
         if !env_name.is_empty() {
@@ -2386,6 +3501,17 @@ fn resolve_api_key(u: &Map<String, Value>, _root: &Map<String, Value>) -> (Strin
             .filter(|s| !s.is_empty());
         if let Some((value, label)) = read_agent_key(tool, provider, custom_path) {
             return (value, format!("agent:{label}"));
+        }
+    }
+    // 最后是 Model-Gate 自己的加密密钥库：配置只存引用，密文由 DPAPI 保护。
+    if let Some(store_id) = u
+        .get("apiKeyStore")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| crate::secret_store::is_valid_id(s))
+    {
+        if let Some(value) = store.get(store_id) {
+            return (value, "store".into());
         }
     }
     // 未配置任何来源时不伪造占位密钥：空 key 表示不发送鉴权头。
@@ -2724,6 +3850,16 @@ mod tests {
         Map::new()
     }
 
+    /// 测试兼容：多数配置测试不涉及加密密钥库，统一使用空库。
+    fn normalize_upstream(name: &str, value: &Value, root: &Map<String, Value>) -> Upstream {
+        super::normalize_upstream(
+            name,
+            value,
+            root,
+            &crate::secret_store::SecretStore::empty(),
+        )
+    }
+
     #[test]
     fn prompt_config_defaults_are_safe() {
         let cfg = Config::from_value(json!({
@@ -2790,6 +3926,147 @@ mod tests {
         assert_eq!(up.compat.environment_header, "x-cli-environment");
         assert!(up.compat.zdr);
         assert_eq!(up.compat.max_output_tokens, Some(64_000));
+        assert!(matches!(
+            &up.compat.privacy.zdr_adapter,
+            PrivacyAdapter::Header { name, value } if name == "x-cmd-zdr" && value == "1"
+        ));
+    }
+
+    #[test]
+    fn opencode_privacy_adapters_are_declared() {
+        let up = normalize_upstream(
+            "go",
+            &json!({
+                "protocol": "openai",
+                "baseUrl": "https://opencode.ai/zen/go/v1"
+            }),
+            &empty_root(),
+        );
+        assert!(
+            matches!(
+                &up.compat.privacy.zdr_adapter,
+                PrivacyAdapter::Unsupported { .. }
+            ),
+            "OpenCode 不读取请求级 ZDR 头"
+        );
+        assert!(
+            matches!(
+                &up.compat.privacy.training_allow_adapter,
+                PrivacyAdapter::Workspace { url, setting }
+                    if url.contains("opencode.ai") && setting.contains("Allow paid endpoints")
+            ),
+            "允许训练必须指向 workspace 控制台"
+        );
+        assert!(
+            matches!(
+                &up.compat.privacy.training_deny_adapter,
+                PrivacyAdapter::Unsupported { .. }
+            ),
+            "OpenCode 不支持请求级禁止训练"
+        );
+    }
+
+    #[test]
+    fn explicit_privacy_intent_and_adapter_overrides() {
+        let up = normalize_upstream(
+            "u",
+            &json!({
+                "protocol": "openai",
+                "baseUrl": "https://api.example.com/v1",
+                "compat": {
+                    "zdr": false,
+                    "privacy": {"zdr": true, "training": "deny"},
+                    "privacyAdapters": {
+                        "zdr": {"kind": "body", "path": "provider.zdr", "value": true},
+                        "trainingDeny": {
+                            "kind": "body",
+                            "path": "provider.data_collection",
+                            "value": "deny"
+                        }
+                    }
+                }
+            }),
+            &empty_root(),
+        );
+        assert_eq!(up.compat.privacy.zdr, Some(true), "privacy.zdr 覆盖旧 zdr");
+        assert_eq!(up.compat.privacy.training, TrainingPolicy::Deny);
+        assert!(matches!(
+            &up.compat.privacy.zdr_adapter,
+            PrivacyAdapter::Body { path, .. } if path == "provider.zdr"
+        ));
+        assert!(matches!(
+            &up.compat.privacy.training_deny_adapter,
+            PrivacyAdapter::Body { path, .. } if path == "provider.data_collection"
+        ));
+    }
+
+    #[test]
+    fn privacy_diagnostics_only_warn_when_requested_and_unsupported() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "go": {
+                    "protocol": "openai",
+                    "baseUrl": "https://opencode.ai/zen/go/v1",
+                    "compat": {"privacy": {"zdr": true, "training": "deny"}}
+                }
+            }
+        }));
+        let privacy: Vec<_> = cfg
+            .diagnostics()
+            .into_iter()
+            .filter(|d| d.code == "privacy_unsupported")
+            .collect();
+        assert_eq!(privacy.len(), 2, "ZDR 与禁止训练都应给出不支持提示");
+        assert!(privacy.iter().all(|d| d.level == "warn"));
+
+        let quiet = Config::from_value(json!({
+            "upstreams": {
+                "go": {
+                    "protocol": "openai",
+                    "baseUrl": "https://opencode.ai/zen/go/v1",
+                    "compat": {"zdr": false}
+                }
+            }
+        }));
+        assert!(
+            quiet
+                .diagnostics()
+                .iter()
+                .all(|d| d.code != "privacy_unsupported"),
+            "未请求隐私策略时不应产生噪音"
+        );
+    }
+
+    #[test]
+    fn effective_upstreams_exposes_resolved_privacy() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "u": {
+                    "protocol": "openai",
+                    "baseUrl": "https://api.example.com/v1",
+                    "compat": {
+                        "privacy": {"zdr": true, "training": "deny"},
+                        "privacyAdapters": {
+                            "zdr": {"kind": "body", "path": "provider.zdr", "value": true},
+                            "trainingDeny": {
+                                "kind": "body",
+                                "path": "provider.data_collection",
+                                "value": "deny"
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        let rows = cfg.effective_upstreams();
+        let row = rows
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["name"] == "u"))
+            .expect("effective 行存在");
+        assert_eq!(row["privacy"]["zdr"], true);
+        assert_eq!(row["privacy"]["training"], "deny");
+        assert_eq!(row["privacy"]["adapters"]["zdr"]["kind"], "body");
+        assert_eq!(row["privacy"]["adapters"]["trainingDeny"]["value"], "deny");
     }
 
     #[test]
@@ -3558,6 +4835,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 加密密钥库：一个上游共用一把；逐模型引用可覆盖。
+    #[cfg(windows)]
+    #[test]
+    fn secret_store_resolves_upstream_and_model_keys() {
+        let dir = std::env::temp_dir().join(format!("mg-store-keys-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("bridge.config.json");
+        let mut store = crate::secret_store::SecretStore::load(&config_path);
+        store
+            .set(&crate::secret_store::upstream_id("u"), "sk-upstream-shared")
+            .unwrap();
+        store
+            .set(&crate::secret_store::model_id("u", "model-b"), "sk-model-b")
+            .unwrap();
+
+        let cfg = Config::from_value_with_store(
+            json!({
+                "upstreams": {
+                    "u": {
+                        "protocol": "openai",
+                        "baseUrl": "https://api.example.com/v1",
+                        "apiKeyStore": "upstream:u",
+                        "models": ["model-a", "model-b"],
+                        "modelKeys": {
+                            "model-b": {"apiKeyStore": "model:u:model-b"}
+                        }
+                    }
+                }
+            }),
+            &store,
+        );
+        let up = &cfg.upstreams[0];
+        assert_eq!(up.key_source, "store");
+        assert_eq!(up.api_key, "sk-upstream-shared");
+        assert!(up.any_key_configured());
+        // 没有逐模型密钥的模型共用上游密钥。
+        let a = up.key_for_model("model-a");
+        assert_eq!(a.key, "sk-upstream-shared");
+        assert_eq!(a.from, "upstream");
+        // 独立 model 引用覆盖上游密钥。
+        let b = up.key_for_model("model-b");
+        assert_eq!(b.key, "sk-model-b");
+        assert_eq!(b.from, "model");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 逐模型密钥诊断：非法条目、未知模型、缺失、多通配、明文 apiKey。
     #[test]
     fn diagnostics_model_keys_codes() {
@@ -3596,5 +4919,312 @@ mod tests {
         ));
         assert!(has("invalid_model_keys", "upstreams.u.modelKeys.literal"));
         assert!(has("invalid_model_keys", "upstreams.u.modelKeys.empty"));
+    }
+
+    /// 统一模型名只在 `/` 前缀命中已配置上游时拆分，模型名自带的 `/` 不受影响。
+    #[test]
+    fn split_qualified_model_requires_known_upstream_prefix() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "go": {"protocol": "openai", "baseUrl": "http://x", "models": ["m"]},
+                "commandcode": {
+                    "protocol": "openai",
+                    "baseUrl": "http://y",
+                    "models": ["deepseek/deepseek-v4-flash"]
+                }
+            }
+        }));
+        let (up, model) = cfg.split_qualified_model("go/m").expect("应识别上游前缀");
+        assert_eq!(up.name, "go");
+        assert_eq!(model, "m");
+
+        let (up, model) = cfg
+            .split_qualified_model("commandcode/deepseek/deepseek-v4-flash")
+            .expect("应识别上游前缀");
+        assert_eq!(up.name, "commandcode");
+        assert_eq!(model, "deepseek/deepseek-v4-flash");
+
+        assert!(cfg
+            .split_qualified_model("deepseek/deepseek-v4-flash")
+            .is_none());
+        assert!(cfg.split_qualified_model("go/").is_none());
+        assert!(cfg.split_qualified_model("m").is_none());
+    }
+
+    /// 上游名本身含 `/` 时按最长前缀匹配，避免被短名抢先拆分。
+    #[test]
+    fn split_qualified_model_prefers_longest_upstream_name() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://x", "models": ["x"]},
+                "a/b": {"protocol": "openai", "baseUrl": "http://y", "models": ["y"]}
+            }
+        }));
+        let (up, model) = cfg.split_qualified_model("a/b/y").expect("应识别上游前缀");
+        assert_eq!(up.name, "a/b");
+        assert_eq!(model, "y");
+    }
+
+    /// 统一清单 = 各上游声明模型 + modelMap 别名，均带上游前缀；不受顶层白名单影响。
+    #[test]
+    fn qualified_model_list_prefixes_declared_models_and_aliases() {
+        let cfg = Config::from_value(json!({
+            "models": ["only-whitelisted"],
+            "upstreams": {
+                "go": {
+                    "protocol": "openai",
+                    "baseUrl": "http://x",
+                    "models": ["glm-5.3", "deepseek-v4"],
+                    "modelMap": {"glm": "glm-5.3"}
+                },
+                "zen": {"protocol": "openai", "baseUrl": "http://y", "models": ["free"]}
+            }
+        }));
+        assert_eq!(
+            cfg.qualified_model_list(),
+            vec![
+                ("go/glm-5.3".to_string(), "go".to_string()),
+                ("go/deepseek-v4".to_string(), "go".to_string()),
+                ("go/glm".to_string(), "go".to_string()),
+                ("zen/free".to_string(), "zen".to_string()),
+            ]
+        );
+    }
+
+    /// 统一接口：可见白名单先过滤，分组只在可见范围内再收窄。
+    #[test]
+    fn unified_scope_filters_visible_upstreams_and_groups() {
+        let cfg = Config::from_value(json!({
+            "unified": {
+                "visibleUpstreams": ["a", "b"],
+                "groups": [
+                    {"id": "g1", "label": "组一", "upstreams": ["b"]},
+                    {"id": "g2", "upstreams": ["c"]}
+                ]
+            },
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["am"]},
+                "b": {"protocol": "openai", "baseUrl": "http://b", "models": ["bm"]},
+                "c": {"protocol": "openai", "baseUrl": "http://c", "models": ["cm"]}
+            }
+        }));
+        let visible: Vec<&str> = cfg
+            .unified_visible_upstreams()
+            .into_iter()
+            .map(|up| up.name.as_str())
+            .collect();
+        assert_eq!(visible, vec!["a", "b"]);
+
+        let group = cfg.unified_group_upstreams("g1").expect("分组存在");
+        assert_eq!(group.len(), 1);
+        assert_eq!(group[0].name, "b");
+        assert_eq!(
+            cfg.qualified_model_list_for(&group),
+            vec![("b/bm".to_string(), "b".to_string())]
+        );
+
+        // g2 的成员 c 不在可见白名单中：分组存在但结果为空。
+        assert!(cfg.unified_group_upstreams("g2").unwrap().is_empty());
+        assert!(cfg.unified_group_upstreams("missing").is_none());
+    }
+
+    /// 不配 visibleUpstreams 时默认全部上游可见。
+    #[test]
+    fn unified_visible_defaults_to_all_upstreams() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["am"]},
+                "b": {"protocol": "openai", "baseUrl": "http://b", "models": ["bm"]}
+            }
+        }));
+        let visible: Vec<&str> = cfg
+            .unified_visible_upstreams()
+            .into_iter()
+            .map(|up| up.name.as_str())
+            .collect();
+        assert_eq!(visible, vec!["a", "b"]);
+        assert!(cfg.unified.groups.is_empty());
+    }
+
+    /// 可见范围内的自动分发必须跳过被隐藏的默认上游。
+    #[test]
+    fn pick_upstream_scoped_skips_hidden_default() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "hidden": {
+                    "protocol": "openai",
+                    "baseUrl": "http://hidden",
+                    "models": ["same"],
+                    "default": true
+                },
+                "visible": {
+                    "protocol": "openai",
+                    "baseUrl": "http://visible",
+                    "models": ["same"]
+                }
+            }
+        }));
+        let allowed = vec!["visible".to_string()];
+        let picked = cfg
+            .pick_upstream_scoped(Some("same"), Some(&allowed))
+            .expect("应选到可见上游");
+        assert_eq!(picked.name, "visible");
+    }
+
+    /// 分组标识非法/重复、引用未知或隐藏上游，都要给出可定位诊断。
+    #[test]
+    fn unified_diagnostics_report_invalid_groups() {
+        let cfg = Config::from_value(json!({
+            "unified": {
+                "visibleUpstreams": ["a", "ghost"],
+                "groups": [
+                    {"id": "team/a", "upstreams": ["a"]},
+                    {"id": "dup", "upstreams": ["b"]},
+                    {"id": "dup", "upstreams": ["ghost"]}
+                ]
+            },
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["am"]},
+                "b": {"protocol": "openai", "baseUrl": "http://b", "models": ["bm"]}
+            }
+        }));
+        let diags = cfg.diagnostics();
+        let has = |level: &str, code: &str, path: &str| {
+            diags
+                .iter()
+                .any(|d| d.level == level && d.code == code && d.path == path)
+        };
+        assert!(has(
+            "error",
+            "invalid_unified_group",
+            "unified.groups[0].id"
+        ));
+        assert!(has(
+            "error",
+            "duplicate_unified_group",
+            "unified.groups[2].id"
+        ));
+        assert!(has(
+            "warn",
+            "unified_visible_unknown",
+            "unified.visibleUpstreams.ghost"
+        ));
+        assert!(has(
+            "warn",
+            "unified_group_unknown_upstream",
+            "unified.groups[2].upstreams.ghost"
+        ));
+        assert!(has(
+            "warn",
+            "unified_group_hidden_upstream",
+            "unified.groups[1].upstreams.b"
+        ));
+    }
+
+    /// 路由组成员保持声明顺序；别名与 `上游/模型` 都能解析；重复成员只保留一次。
+    #[test]
+    fn route_groups_parse_order_and_resolve_members() {
+        let cfg = Config::from_value(json!({
+            "aliases": {"fast": "flash"},
+            "groups": {
+                "daily": ["a/flash", "b/flash", "fast", "a/flash"]
+            },
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["flash"]},
+                "b": {"protocol": "openai", "baseUrl": "http://b", "models": ["flash"]}
+            }
+        }));
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.groups[0].id, "daily");
+        assert_eq!(
+            cfg.groups[0].members,
+            vec!["a/flash", "b/flash", "fast", "a/flash"]
+        );
+        assert!(cfg.model_list().iter().any(|id| id == "group/daily"));
+        assert_eq!(cfg.group_id_from_model("group/daily"), Some("daily"));
+        assert_eq!(cfg.group_id_from_model("group/a/b"), None);
+
+        let group = cfg.route_group("daily").expect("组存在");
+        let targets: Vec<(String, String)> = cfg
+            .group_targets(group)
+            .into_iter()
+            .map(|(up, model)| (up.name.clone(), model))
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                ("a".to_string(), "flash".to_string()),
+                ("b".to_string(), "flash".to_string())
+            ],
+            "别名 fast 落到 a/flash，重复的 a/flash 只保留一次"
+        );
+    }
+
+    /// 路由组的可见性跟随统一接口的上游白名单：有任意成员可见就暴露。
+    #[test]
+    fn route_group_visibility_follows_unified_scope() {
+        let cfg = Config::from_value(json!({
+            "groups": {
+                "daily": ["a/flash", "b/flash"],
+                "only-b": ["b/flash"]
+            },
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["flash"]},
+                "b": {"protocol": "openai", "baseUrl": "http://b", "models": ["flash"]}
+            }
+        }));
+        let a = cfg.upstream("a").unwrap();
+        assert_eq!(
+            cfg.group_model_list_for(&[a]),
+            vec!["group/daily".to_string()]
+        );
+        let b = cfg.upstream("b").unwrap();
+        assert_eq!(
+            cfg.group_model_list_for(&[b]),
+            vec!["group/daily".to_string(), "group/only-b".to_string()]
+        );
+    }
+
+    /// 路由组成员写错、重复、模型未声明、组 id 非法都要可定位。
+    #[test]
+    fn route_group_diagnostics_report_member_problems() {
+        let cfg = Config::from_value(json!({
+            "groups": {
+                "daily": ["ghost/model", "a/missing", "a/flash", "a/flash", ""],
+                "bad/id": ["a/flash"]
+            },
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["flash"]}
+            }
+        }));
+        let diags = cfg.diagnostics();
+        let has = |level: &str, code: &str, path: &str| {
+            diags
+                .iter()
+                .any(|d| d.level == level && d.code == code && d.path == path)
+        };
+        assert!(has("error", "group_member_unresolved", "groups.daily[0]"));
+        assert!(has(
+            "warn",
+            "group_member_model_not_declared",
+            "groups.daily[1]"
+        ));
+        assert!(has("warn", "duplicate_group_member", "groups.daily[3]"));
+        assert!(has("error", "invalid_group_member", "groups.daily[4]"));
+        assert!(has("error", "invalid_group", "groups.bad/id"));
+    }
+
+    /// 上游名 `group` 会与虚拟模型前缀冲突，必须提示。
+    #[test]
+    fn route_group_reserved_prefix_warns_for_upstream_named_group() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "group": {"protocol": "openai", "baseUrl": "http://group", "models": ["m"]}
+            }
+        }));
+        assert!(cfg
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "reserved_group_prefix" && d.path == "upstreams.group"));
     }
 }

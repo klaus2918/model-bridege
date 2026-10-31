@@ -97,6 +97,62 @@ CREATE TABLE IF NOT EXISTS zcode_claims (
     created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_zcode_claims_account ON zcode_claims(account_id, created_at DESC);
+-- 凭据池：多账号/多 Key 的统一事实源。密钥本体仍在本地加密库，
+-- credential_members.secret_ref 只存引用（store:... / legacy:zcode:...）。
+CREATE TABLE IF NOT EXISTS credential_pools (
+    id               TEXT PRIMARY KEY,
+    upstream         TEXT NOT NULL,
+    plugin_id        TEXT,
+    strategy         TEXT NOT NULL DEFAULT 'priority',
+    status           TEXT NOT NULL DEFAULT 'active',
+    cooldown_seconds INTEGER NOT NULL DEFAULT 60,
+    failure_threshold INTEGER NOT NULL DEFAULT 3,
+    fallback_to_single INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_credential_pools_upstream ON credential_pools(upstream);
+CREATE TABLE IF NOT EXISTS credential_members (
+    id            TEXT PRIMARY KEY,
+    pool_id       TEXT NOT NULL,
+    label         TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    secret_ref    TEXT NOT NULL,
+    priority      INTEGER NOT NULL DEFAULT 100,
+    weight        INTEGER NOT NULL DEFAULT 1,
+    status        TEXT NOT NULL DEFAULT 'active',
+    cooldown_until TEXT,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    quota_json    TEXT,
+    last_used_at  TEXT,
+    usage_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_credential_members_pool ON credential_members(pool_id);
+-- 已安装插件：安装只写本表，不执行 DDL、不直接写 bridge.config.json。
+CREATE TABLE IF NOT EXISTS plugins (
+    id            TEXT PRIMARY KEY,
+    version       TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    tier          TEXT NOT NULL,
+    name          TEXT,
+    manifest_json TEXT NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    source        TEXT NOT NULL DEFAULT 'local',
+    installed_at  TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+-- 配置审计：AI/面板/插件的每次 plan/apply 只记录脱敏路径，不含密钥。
+CREATE TABLE IF NOT EXISTS config_audit (
+    id            TEXT PRIMARY KEY,
+    at            TEXT NOT NULL,
+    actor         TEXT,
+    action        TEXT,
+    plan_id       TEXT,
+    target        TEXT,
+    changed_paths TEXT,
+    result        TEXT,
+    backup_id     TEXT
+);
 "#;
 
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -271,7 +327,7 @@ impl Db {
         let result = (|| -> rusqlite::Result<()> {
             let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
             conn.execute(
-                "INSERT INTO usage_records (
+                "INSERT OR REPLACE INTO usage_records (
                     id, ts, created_at, upstream, protocol, requested_model,
                     upstream_model, prompt_tokens, completion_tokens,
                     cache_read_tokens, cache_write_tokens, total_tokens,

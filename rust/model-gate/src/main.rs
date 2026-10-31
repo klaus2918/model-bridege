@@ -1,12 +1,15 @@
 //! Model-Gate Rust 内核入口：本地代理 + 托盘常驻/系统浏览器面板（可用 --no-gui 纯代理）。
 // 始终使用 Windows GUI 子系统（含 debug 版）：任何构建都不弹控制台窗口，日志写入 data/modelgate.log。
 #![windows_subsystem = "windows"]
+mod access;
+mod ai_api;
 mod anthropic;
 mod api_extra;
 mod commandcode;
 mod commandcode_catalog;
 mod config;
 mod config_store;
+mod credential_pool;
 mod db;
 mod free_sources;
 mod free_sources_api;
@@ -14,10 +17,12 @@ mod gui;
 mod key_file;
 mod lifecycle;
 mod opencode_transport;
+mod plugin;
 mod pricing;
 mod prompt;
 mod provider_profiles;
 mod proxy;
+mod secret_store;
 mod thinking;
 mod ui_assets;
 mod update;

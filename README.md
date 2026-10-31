@@ -10,18 +10,47 @@
 > 后静默覆盖升级；也可在更新弹窗开启「发现新版本自动下载」「下载完成后自动安装」。
 > 便携版下载校验通过后可一键「启动安装包」走安装向导。启动时后台检查每 24 小时最多一次。
 >
-> **密钥安全**：密钥只从环境变量或你显式指定的凭据文件读取；JSON 中的明文 `apiKey`
-> 会被忽略并给出迁移提示，不进入运行态、不写入 SQLite。推荐用 `apiKeyEnv` 引用环境变量：
-> 面板「写入密钥」可选**写入用户环境变量**（Windows 用户变量 `HKCU\Environment`，读取时进程环境优先）
+> **密钥安全**：密钥只从环境变量、你显式指定的凭据文件或 Model-Gate 本机加密密钥库读取；
+> JSON 中的明文 `apiKey` 会被忽略并给出迁移提示，不进入运行态、不写入 SQLite。
+> 推荐用 `apiKeyEnv` 引用环境变量，或直接点面板「加密保存到本机」：
+> 密钥经 Windows DPAPI 加密后写入配置文件同目录的 `*.secrets.json`，`bridge.config.json` 只保留
+> `apiKeyStore` 引用（`upstream:名称` / `model:上游:模型`），密文绑定当前 Windows 用户与机器，
+> 接口不回显密钥。也可以**写入用户环境变量**（`HKCU\Environment`，读取时进程环境优先）
 > 或**写入你手动指定的文件**（JSON / `.env`，只写你填的那个路径，配置文件里仅存路径引用）。
 > **不再内置**任何厂商客户端凭据路径。`apiKeyFile` / `apiKeyAgentPath` 仅在你自己显式填写路径时读取。
-> 分享配置用 `bridge.config.example.json`（零明文）。`bridge.config.json` 已在 `.gitignore` 中，不会进版本库。
+> 分享配置用 `bridge.config.example.json`（零明文）。`bridge.config.json`、`*.secrets.json` 已在 `.gitignore` 中，不会进版本库。
 >
 > **ZCode 账号池（v2.28.0）**：新增「ZCode」页签，支持从本机 ZCode 导入、OAuth 登录、粘贴 JWT/API Key；
 > JWT 只存本机加密库（Windows DPAPI），不写配置文件、不回显。插件内置无头浏览器验证码池，
 > 可预览/领取 Start Plan、维护额度与冷却状态；`transport=zcode` 通过本机 ZCode app-server
 > 走 `GLM-5.3-Flash` / `GLM-5.3`，请求在账号池内轮询、失败自动换号。旧的 OpenAI/Anthropic/
 > CommandCode/opencode 上游与配置保持兼容。
+
+## v3 接入控制台（默认面板）
+
+`http://127.0.0.1:8900/ui/` 已切换为 **v3 控制台**；原面板完整保留在
+`http://127.0.0.1:8900/ui/classic`（顶栏「经典面板」可随时打开）。
+
+- **二级导航收敛为 5 个分区 / 9 个子视图**：工作台（总览）、接入（全部接入 / 模型目录 /
+  路由组）、资源（凭据池 / 插件）、观测（流量 / 观测）、设置。
+- **官方厂商只填 Key**：选择模板 → 粘贴 Key → 完成；协议、地址、鉴权、隐私默认值由模板提供。
+- **自定义厂商只填 5 项**：标识、厂商、请求地址、协议、Key；高级项默认折叠。
+- **隐私默认勾选**：新增接入默认记录 ZDR 意图，可随时修改；面板会如实显示
+  「请求级 / 账户级 / 不支持请求级」，不会因为勾选就宣称已保护。
+- **凭据池**：多 Key / 多账号统一管理，支持优先级、轮询、加权、最少使用四种策略，
+  失败冷却、半开恢复、配额耗尽与成员级故障转移；密钥只写本机 DPAPI 密钥库。
+- **插件**：安装只登记，不写配置；`attach` 才经内核备份、原子写、回读创建上游；
+  manifest 可声明 `auth.mode=pool` 由内核建池。
+- **AI 可读配置接口**：`/api/ai/manifest`、`/schema`、`/templates`、`/inspect`、
+  `/plan`、`/apply`、`/audit`、`/llms.txt`；默认只读 + 草案，apply 需要一次性确认令牌，
+  密钥/账号/Cookie 永不返回。
+
+**兼容承诺**：`bridge.config.json` 仍是唯一事实源；`/v1`、`/{upstream}/v1`、
+`/unified/v1`、`/unified/{group}/v1` 与旧配置读取全部保留；SQLite 只追加新表，不改旧表。
+
+设计与交互稿：`docs/design/refactor-2026/`；v3 实际页面截图：
+`docs/design/refactor-2026/screenshots-v3/`；实现说明：
+`docs/architecture/access-orchestration.md`。
 
 一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**多条上游**，并自动处理各上游的协议差异。
 
@@ -41,7 +70,7 @@ model-bridge
 
 ## 一、怎么指定与识别上游
 
-**两种方式，可混用。**
+**三种方式，可混用。**
 
 ### 方式一：按模型名自动分发（默认）
 
@@ -56,7 +85,7 @@ model: (未声明的名字)     → 默认上游（cch）
 
 简单，但**同名的模型会取配置里靠前的那个上游**，你无法指定。
 
-### 方式二：用 URL 前缀强制指定（推荐）
+### 方式二：用 URL 前缀强制指定
 
 在地址里带上游名，直接锁定，不看模型名：
 
@@ -82,6 +111,62 @@ curl http://127.0.0.1:8900/go/v1/models
 ```json
 {"error":{"message":"未知的上游前缀 \"nosuch\"。可用前缀：/cch、/go、/zen、/commandcode；..."}}
 ```
+
+### 方式三：统一接入口（推荐，只需一个 Base URL）
+
+把上游名写进 `model` 字段，使用 `http://127.0.0.1:8900/unified/v1`：
+
+```
+GET  /unified/v1/models              → 每项形如 go/deepseek-v4-flash
+POST /unified/v1/chat/completions    → model: "go/deepseek-v4-flash"
+```
+
+客户端只配一个 Base URL，就能在同名模型之间明确选择上游，不再需要为每条上游各配一份地址。
+
+```bat
+:: 先看统一清单（上游名 + 声明的模型 + modelMap 别名）
+curl http://127.0.0.1:8900/unified/v1/models
+
+:: 明确走 go 的 deepseek-v4-flash
+curl http://127.0.0.1:8900/unified/v1/chat/completions ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"go/deepseek-v4-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+```
+
+解析规则：
+
+- 只有 `/` 前的第一段与**已配置上游名**完全一致时才拆分，因此 `kilo/minimax/minimax-m3.1-flash:free` 会走 kilo、模型名为 `minimax/minimax-m3.1-flash:free`。
+- 前缀命中后强制该上游；其余处理（密钥、协议转换、流式、计费、用量与提示词记录）与现有 `/v1` 完全一致。
+- 未带可识别前缀的模型名仍按原有规则分发，所以统一入口也能当普通 `/v1` 使用。
+- 统一清单与 `/上游/v1/models` 同口径：返回各上游声明模型与 `modelMap` 别名，不受顶层 `models` 白名单影响，也不触发上游目录拉取。
+- 同样的 `上游/模型` 写法也可以直接发给 `/v1/chat/completions`；`/v1/models` 的返回保持原样，避免破坏既有客户端。
+
+#### 只暴露允许的上游：可见白名单与分组
+
+统一入口默认暴露全部上游。要收紧，在配置顶层加 `unified`：
+
+```json
+"unified": {
+  "visibleUpstreams": ["go", "zen"],
+  "groups": [
+    { "id": "team-a", "label": "团队 A", "upstreams": ["go"] },
+    { "id": "team-b", "label": "团队 B", "upstreams": ["zen"] }
+  ]
+}
+```
+
+| 地址 | 可访问的上游 |
+|------|--------------|
+| `/unified/v1/...` | `visibleUpstreams` 中的上游；留空 = 全部 |
+| `/unified/team-a/v1/...` | `visibleUpstreams` ∩ 分组 `team-a` 的成员 |
+| `/unified/team-b/v1/...` | `visibleUpstreams` ∩ 分组 `team-b` 的成员 |
+
+- `visibleUpstreams` 留空 = 全部上游；一旦填写，只暴露列出的上游。
+- 分组只做进一步收窄；分组成员不在可见白名单时不会展示。
+- 试图在统一入口请求未暴露的上游（如 `cch/model`）返回 403 `upstream_not_allowed`；未知分组返回 404 `unknown_unified_group`。
+- `/v1` 与 `/上游/v1` 不受影响，管理员仍可通过它们访问内部上游。
+- 面板「配置 → 统一接入」提供可见开关、分组增删改与成员分配；保存后立即生效。
+- 分组标识只能使用字母、数字、`-`、`_`、`.`，最长 64 字符。
 
 ### 怎么知道这次实际用了哪个上游
 
@@ -109,8 +194,8 @@ curl http://127.0.0.1:8900/health
 ### 该选哪种
 
 - **只有一个上游、或模型名不冲突** → 方式一，省事
-- **想明确控制、或模型名跨上游重复** → 方式二
-- **给不同 Agent 分配不同上游** → 方式二最合适，各填各的带前缀地址
+- **想让所有客户端只配一个地址、又要明确指定上游** → 方式三（推荐）
+- **想给不同 Agent 分配不同上游、各填各的地址** → 方式二
 
 ---
 
@@ -535,14 +620,16 @@ curl http://127.0.0.1:8900/v1/models
 |------|------|
 | `protocol` | `anthropic`（走 `/v1/messages`）、`openai`（走 `/v1/chat/completions`）或 `commandcode`（走 `/alpha/generate`）；不写则按 `baseUrl` 推断 |
 | `baseUrl` | 上游地址。**带不带 `/v1` 都行**，工具会自动规范化，不会拼出 `/v1/v1` |
-| `apiKey` | **已废弃**：JSON 中的明文 `apiKey` 不再作为凭据读取，只给迁移提示；请改用 `apiKeyEnv` |
-| `apiKeyEnv` | 要读取的环境变量名（推荐）：进程环境优先，其次本进程写入的用户变量 `HKCU\Environment` |
-| `apiKeyFile` | 兼容字段：仅当你**显式填写路径**时读取该 JSON 的 `apiKey` 字段；无内置默认路径。**路径可以写入本配置文件**（只存路径，不存密钥），建议优先用 `apiKeyEnv` |
+| `apiKey` | **已废弃**：JSON 中的明文 `apiKey` 不再作为凭据读取，只给迁移提示；请改用 `apiKeyEnv` 或 `apiKeyStore` |
+| `apiKeyEnv` | 要读取的环境变量名：进程环境优先，其次本进程写入的用户变量 `HKCU\Environment` |
+| `apiKeyStore` | Model-Gate 加密密钥库引用：`upstream:上游名`（该上游所有模型共用）或 `model:上游:模型`（逐模型覆盖）。密文由 Windows DPAPI 保存在同目录 `*.secrets.json`，配置里只有引用 |
+| `apiKeyFile` | 兼容字段：仅当你**显式填写路径**时读取该 JSON 的 `apiKey` 字段；无内置默认路径。**路径可以写入本配置文件**（只存路径，不存密钥），建议优先用 `apiKeyEnv` 或 `apiKeyStore` |
 | `apiKeyAgentPath` | 兼容字段：显式指定凭据文件路径（JSON 点路径或 `.env` 变量名）；同样没有内置预设，路径可写入本配置文件 |
 | `anthropicVersion` | `anthropic` 协议的 `anthropic-version` 头，默认 `2023-06-01` |
 | `default` | 设为 `true` 的上游承接未匹配到任何模型的请求 |
 | `models` | 该上游负责的模型名清单，用于按名分发 |
 | `modelMap` | 上游级短别名（短名 → 真实模型 id），不污染全局 `aliases`，见第五节 |
+| `modelKeys` | 逐模型密钥来源：键是模型 id（支持单个 `*` 通配），值是环境变量名或对象（`apiKeyEnv` / `apiKeyStore` / `apiKeyFile`）；未命中或读不到时回落到上游级密钥 |
 | `sessionHeader` | 是否注入 `x-opencode-session`（opencode 类上游必须为 `true`；`commandcode` 不适用，默认关闭） |
 | `fetchModels` | 是否从上游拉取模型清单（默认 `true`；`commandcode` 没有该端点，默认 `false`） |
 | `autoModels` | 是否把上游**全部**模型也暴露给下游（默认 `false`，只暴露 `models` 里声明的） |
@@ -551,8 +638,8 @@ curl http://127.0.0.1:8900/v1/models
 | `modelCatalog` | `commandcode` 专用：模型目录来源，`"auto"`（读本机 CLI，默认）/ `false`（只用配置声明）/ 具体文件路径 |
 | `modelCatalogPlan` | `commandcode` 专用：按套餐过滤对外清单，`"auto"`（探测，默认）/ `go` / `goat` / `pro` / `max` / `false`（不过滤） |
 | `pauseTurn` | `commandcode` 专用：收到 `pause_turn` 时用同一请求体自动续跑（默认 `true`，最多续 5 次） |
-| `cmdZdr` | `commandcode` 专用：是否发送 `x-cmd-zdr: 1`（ZDR 安全头，零数据留存信号），默认 `true`；设 `false` 可关闭 |
-| `compat` | 通用兼容能力覆盖层：鉴权方式、会话头、额外请求头、端点、思考回传、输出上限、ZDR 等。见第六节「Provider 兼容能力」 |
+| `cmdZdr` | 兼容字段：等价于 `compat.privacy.zdr`；CommandCode 默认 `true`，OpenCode 等不支持请求级 ZDR 的上游不会发送 `x-cmd-zdr` |
+| `compat` | 通用兼容能力覆盖层：鉴权方式、会话头、额外请求头、端点、思考回传、输出上限、隐私策略等。见第六节「Provider 兼容能力」 |
 | `modelOverrides` | 模型级覆盖（精确/通配），只影响 `limits` 与 `capabilities`；见下文「预设注册表与模型级覆盖」 |
 
 **面板保存后立即热重载；手工改文件后调用 `POST /api/config/reload` 或重启。**
@@ -593,44 +680,58 @@ curl http://127.0.0.1:8900/v1/models
 Rust 版的数据库路径与配置文件同目录（`data\modelgate.db`），从快捷方式等任意目录启动都能读到旧库，
 不会因工作目录变化而「历史清零」或在别处生成空库。
 
-### 密钥放哪：环境变量优先，文件可显式指定
+### 密钥放哪：本机加密库 / 环境变量 / 显式文件
 
 | 模式 | 配置写法 | 密钥存放 | 适用 |
 |---|---|---|---|
-| **用户环境变量**（推荐） | `"apiKeyEnv": "OPENCODE_API_KEY"` | 面板「写入密钥 → 写入用户环境变量」写入 `HKCU\Environment`；读取时进程环境优先，其次会话缓存，最后 `HKCU\Environment` | 长期使用、多上游共用、轮换方便 |
+| **本机加密密钥库**（推荐） | `"apiKeyStore": "upstream:go"` | 面板「加密保存到本机」用 Windows DPAPI 加密后写入同目录的 `bridge.config.secrets.json`；`bridge.config.json` 只留引用，接口不回显密钥 | 想直接在 Model-Gate 里保存、不依赖环境变量；密文绑定当前 Windows 用户与机器，换用户/换机需重写 |
+| **用户环境变量** | `"apiKeyEnv": "OPENCODE_API_KEY"` | 面板「写入密钥 → 写入用户环境变量」写入 `HKCU\Environment`；读取时进程环境优先，其次会话缓存，最后 `HKCU\Environment` | 长期使用、多上游共用、轮换方便 |
 | **自管凭据文件** | `"apiKeyFile": "D:\\secrets\\mykey.json"` 或 `apiKeyAgentPath` | 面板「写入密钥 → 写入指定文件」写进**你手填的路径**（JSON 根字段 `apiKey` / 点路径，或 `.env` 变量名）；也可由你自行维护该文件 | 已有自管凭据文件；路径必须自己填，**无内置默认路径** |
 | **不鉴权上游** | `"compat": { "auth": { "scheme": "none" } }` | 不保存、不发送密钥 | 本机回环服务、公开且无需鉴权的端点 |
 
 ```json
 "upstreams": {
   "go":  { "protocol": "openai", "baseUrl": "https://opencode.ai/zen/go", "apiKeyEnv": "OPENCODE_API_KEY", "models": ["deepseek-v4.1-flash"] },
-  "cc":  { "protocol": "commandcode", "baseUrl": "https://api.commandcode.ai", "apiKeyEnv": "COMMAND_CODE_API_KEY", "models": [] }
+  "cc":  { "protocol": "commandcode", "baseUrl": "https://api.commandcode.ai", "apiKeyEnv": "COMMAND_CODE_API_KEY", "models": [] },
+  "multi": {
+    "protocol": "openai",
+    "baseUrl": "https://api.example.com/v1",
+    "apiKeyStore": "upstream:multi",
+    "models": ["model-a", "model-b"],
+    "modelKeys": { "model-b": { "apiKeyStore": "model:multi:model-b" } }
+  }
 }
 ```
+
+上例 `multi` 的 `model-a` 与其它未单独配置的模型共用 `upstream:multi` 的密钥；
+`model-b` 用 `model:multi:model-b` 覆盖。一个上游可以共用一个 key，也可以按模型分别使用不同 key。
 
 **关系：同一上游按此顺序取第一个非空值**
 
 1. `apiKeyEnv` —— 进程环境 > 本进程写入的用户变量 > `HKCU\Environment`
 2. `apiKeyFile` —— 你显式填写的文件里的 `apiKey` 字段
 3. `apiKeyAgentPath` —— `apiKeyAgent` 启用时，你显式填写的路径（无内置预设）
-4. 都没有 —— 不发送鉴权头；不会生成占位密钥
+4. `apiKeyStore` —— Model-Gate 本机加密密钥库（若上面的来源都读不到值）
+5. 都没有 —— 不发送鉴权头；不会生成占位密钥
 
-> 面板里的密钥输入框配合「写入目标」下拉使用：「写入用户环境变量」写入 `HKCU\Environment`，
-> 「写入指定文件」写进你在「文件路径」里手填的那个文件（JSON 根字段 `apiKey` / 点路径，或 `.env` 变量名）。
-> 两种写法都**不会**把明文写进 `bridge.config.json`，配置文件里只保留路径引用。
+> 面板「密钥来源」四选一：**本机加密保存** / 环境变量 / 凭据文件 / 暂不配置。
+> 「加密保存到本机」会同时把 `apiKeyStore` 引用写进 `bridge.config.json`；
+> 「4. 逐模型密钥」可按模型单独加密保存（`model:上游:模型`），未单独配置的模型共用上游级密钥。
+> 环境变量与凭据文件两条路径同样**不会**把明文写进 `bridge.config.json`。
 > 面板同时提供「密钥文件（apiKeyFile）」输入框，填入绝对路径即从该 JSON 的 `apiKey` 字段读取；
 > 其他格式（JSON 点路径 / `.env` 变量名）用「密钥来源（自定义文件）」+ 字段名 + 路径。
 > 手工在 JSON 中写入的 `apiKey` **不再作为凭据读取**：配置诊断会给出 `legacy_literal_api_key` 迁移提示，且不回显原值。
 
-同一上游同时写 `apiKeyEnv` 与 `apiKeyFile` 时**前者生效**，后者被忽略；两个都写不算错，但配置页会以「实际生效来源」提示（`keySource` = env / user-env / file / agent:* / none）。
+同一上游同时写 `apiKeyEnv` 与 `apiKeyFile` 时**前者生效**，后者被忽略；两个都写不算错，但配置页会以「实际生效来源」提示（`keySource` = env / user-env / file / agent:* / store / none）。
 
 > 旧配置里的 `envFile`、内置 agent 预设（opencode / jcode / commandcode）已失效：启动时只在面板给出迁移提示，不阻断启动。`apiKeyFile` / `apiKeyAgentPath` 仍可用，但路径必须由你显式指定。
 
 **敏感隔离（不变式）**
 
 - `bridge.config.json` 里**永远不出现明文密钥**：面板保存时不携带 `apiKey`，后端落盘前还会再剥离一次；手工写入的非空 `apiKey` 在运行期被忽略。
-- `.gitignore` 已覆盖 `/bridge.config.json`、`/data/`、`*.env`、`**/auth.json`、`**/credentials*.json`、`*.key|*.pem|*.token`；对外分享只用 `bridge.config.example.json`（零明文）。
-- 只读接口不回显密钥：`/api/config` 与 `/api/upstreams` 仅给 `apiKeyEnv` / `apiKeyFile` 引用、`keySource` 与 `keyConfigured` 布尔值。
+- 本机加密密钥库 `*.secrets.json` 只存 DPAPI 密文（绑定当前 Windows 用户与机器），不提供明文导出接口；写入采用临时文件 → 回读校验 → 原子替换。
+- `.gitignore` 已覆盖 `/bridge.config.json`、`/data/`、`*.env`、`**/auth.json`、`**/credentials*.json`、`**/*.secrets.json`、`*.key|*.pem|*.token`；对外分享只用 `bridge.config.example.json`（零明文）。
+- 只读接口不回显密钥：`/api/config` 与 `/api/upstreams` 仅给 `apiKeyEnv` / `apiKeyFile` / `apiKeyStore` 引用、`keySource` 与 `keyConfigured` 布尔值。
 - 日志只记上游名、状态码与耗时，不记请求头；用量导出（CSV/JSON）只含统计字段与模型名。
 
 ### 加新上游
@@ -679,8 +780,18 @@ commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议�
 | 额外请求头 | `"compat": {"headers": {"x-client-name": "model-gate"}}` |
 | 关闭思考回传 | `"compat": {"thinking": {"passthrough": false}}` |
 | 收敛输出上限 | `"compat": {"limits": {"maxOutputTokens": 393216}}` |
+| 要求 ZDR | `"compat": {"privacy": {"zdr": true}}` |
+| 禁止训练 | `"compat": {"privacy": {"training": "deny"}}` |
+| 允许训练（如 OpenCode 会训练数据的模型） | `"compat": {"privacy": {"training": "allow"}}`，仍需去上游 console 开授权 |
 
-完整字段、预设矩阵与示例见 [`docs/architecture/provider-compat.md`](docs/architecture/provider-compat.md)。
+> 隐私入口是通用的，但落地方式因上游而异：CommandCode 用 `x-cmd-zdr` 请求头，OpenRouter/Kilo 用
+> 请求体 `provider.zdr` / `provider.data_collection`，OpenCode Go 只能去 workspace 的
+> `Settings › Privacy` 设置。Model-Gate 不会向不支持的上游静默发送无效头；会在配置诊断里明确提示。
+> 适配器定义见 `provider_profiles.json` 的 `compat.privacyAdapters`。
+
+完整字段、预设矩阵与示例见 [`docs/architecture/provider-compat.md`](docs/architecture/provider-compat.md)；
+隐私维度（ZDR / 训练 / 数据收集 / 区域）的完整调研与目标架构见
+[`docs/architecture/privacy-model.md`](docs/architecture/privacy-model.md)。
 
 ### 预设注册表与模型级覆盖
 
@@ -690,7 +801,7 @@ commandcode.ai → `commandcode`，其余 → `anthropic`）。接私有协议�
 
 注册表现在还为每个预设提供 `access` 接入元数据（`protocol` / `baseUrl` / `apiKeyEnv` /
 `defaultModels` / `docsUrl`）。面板把预设选择器前置到新增/编辑流程开头，选择后按「只填空字段」
-自动填充协议、地址、密钥变量和默认模型；密钥来源改为环境变量 / 凭据文件 / 暂不配置三选一，
+自动填充协议、地址、密钥变量和默认模型；密钥来源改为本机加密保存 / 环境变量 / 凭据文件 / 暂不配置四选一，
 不再同时平铺 `apiKeyEnv`、`apiKeyFile`、`apiKeyAgent` 三套字段。`compat` 仍只负责运行时行为。
 
 **模型级覆盖**（`upstreams.<name>.modelOverrides`，可选）在 `compat` 之上声明单模型差异：
@@ -784,10 +895,16 @@ cch 已显式关掉两者：
 
 ### 同名模型的归属
 
-合并列表里去重后归**配置里排在前面的上游**。想让 Agent 明确用某条上游，给它配带前缀的地址：
+合并列表里去重后归**配置里排在前面的上游**。想让 Agent 明确用某条上游，有两种做法：
 
 ```json
 { "base_url": "http://127.0.0.1:8900/go/v1" }
+```
+
+或使用统一接入口，在 `model` 里写 `上游/模型`：
+
+```json
+{ "base_url": "http://127.0.0.1:8900/unified/v1", "model": "go/deepseek-v4-flash" }
 ```
 
 ---
@@ -798,6 +915,10 @@ cch 已显式关掉两者：
 |------|------|------|
 | `/v1/chat/completions` | POST | 对话主接口，支持流式与工具调用 |
 | `/v1/models` | GET | 模型列表 |
+| `/unified/v1/chat/completions` | POST | 统一接入口：`model` 使用 `上游/模型`，只需配置一个 Base URL |
+| `/unified/v1/models` | GET | 统一接入口模型清单，每项形如 `上游/模型` |
+| `/unified/{分组}/v1/chat/completions` | POST | 只允许该分组内且已允许展示的上游 |
+| `/unified/{分组}/v1/models` | GET | 该分组的可见模型清单 |
 | `/api/zcode/status` | GET | ZCode 插件/账号池/验证码池/最近领取状态 |
 | `/api/zcode/accounts` | GET/POST/DELETE | 账号列表、粘贴入池、批量删除 |
 | `/api/zcode/claim/preview` | GET | 只读预览可领 Start Plan 套餐 |
@@ -1028,9 +1149,9 @@ powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1
 也可以直接调用 ISCC：
 
 ```bat
-iscc /DMyAppVersion=2.28.0 ^
+iscc /DMyAppVersion=3.0.0 ^
      /DMyAppSourceExe=dist\Model-Gate-rust.exe ^
-     /DMyOutputBaseFilename=Model-Gate-v2.28.0-rust-setup ^
+     /DMyOutputBaseFilename=Model-Gate-v3.0.0-rust-setup ^
      ModelGate.iss
 ```
 
@@ -1073,9 +1194,9 @@ iscc /DMyAppVersion=2.28.0 ^
 
 ### 发布
 
-1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `2.28.0`）。
-2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1` 与 `scripts\ui_smoke.js`。
-3. 打 tag 并推送：`git tag v2.28.0`、`git push origin v2.28.0`（Git 写操作需人工确认）。
+1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `3.0.0`）。
+2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1`、经典面板 `scripts\ui_smoke.js --ui-path /ui/classic` 与 v3 面板 `scripts\ui_smoke_v3.js`。
+3. 打 tag 并推送：`git tag v3.0.0`、`git push origin v3.0.0`（Git 写操作需人工确认）。
 4. `.github/workflows/release-rust.yml` 构建并上传：
    - `Model-Gate-v<版本>-rust-setup.exe`
    - `Model-Gate-rust.exe`（便携版）
