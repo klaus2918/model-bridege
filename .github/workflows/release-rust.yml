@@ -44,6 +44,21 @@ jobs:
       - name: 安装 sccache
         uses: mozilla-actions/sccache-action@v0.0.6
 
+      - name: 校验 sccache 可用
+        shell: pwsh
+        # 缓存后端（ghac）偶发不可用时，sccache 连 `rustc -vV` 都会以退出码 2 结束，
+        # 把整条流水线拖垮（v4.0.1 前两次就挂在这）。探测失败就清空 RUSTC_WRAPPER
+        # 回退直连 rustc——丢的只是编译缓存，构建本身照常进行。
+        run: |
+          $ErrorActionPreference = "Continue"
+          & rustc -vV *> $null
+          if ($LASTEXITCODE -ne 0) {
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            Write-Warning "sccache 不可用，本次构建回退到直连 rustc"
+          } else {
+            Write-Host "sccache 可用"
+          }
+
       - name: 启用 LLD 链接器
         shell: pwsh
         run: |
