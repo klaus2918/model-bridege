@@ -1235,8 +1235,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship.ps1 -MessageFil
 1. `hygiene.ps1` 清理噪音（`*.b64.png`、`debug*`、`*.stackdump`、`*.out/.err/.bak/.tmp`）；
 2. 门禁：提交信息格式（`<type>(<scope>): 【<领域名词>】<title> @AI G`）、中文 `.ps1` 必须带 UTF-8 BOM、
    全文无 U+FFFD、敏感信息扫描、文本兜底校验——任一失败即中止，不提交；
-3. `git add -A` → commit → push `origin`（失败自动重试）；
-4. 给了 `-Tag` 才打 tag：tag 必须等于 `v<Cargo.toml 版本>`，推送后即触发 `.github/workflows/release-rust.yml`。
+3. 暂存区有 `.rs` 改动时**先本地跑 `cargo test`**（与 CI 同一套命令），失败即中止——不让 CI 当第一个发现者；
+4. `git add -A` → commit → push `origin`（失败自动重试）；
+5. 给了 `-Tag` 才打 tag：tag 必须等于 `v<Cargo.toml 版本>`，推送后即触发 `.github/workflows/release-rust.yml`。
 
 版本号只在 `rust/model-gate/Cargo.toml` 改一处；tag 改版本时用 `-Tag` 由脚本强推移动（旧 Release 未发布时安全）。
 流水线失败时，`ship-diagnose.ps1` 用 `GITHUB_TOKEN` 或本机 git 凭据读日志、否则读 `::error::` 注解，输出失败步骤与关键行。

@@ -8,7 +8,7 @@
 
 | 脚本 | 用途 |
 |---|---|
-| `ship.ps1` | **收尾单一入口**：噪音卫生 → 提交信息格式 → 编码/BOM → 敏感信息扫描 → 文本兜底校验 → 提交 → 推送 →（可选）打 tag 触发发布 |
+| `ship.ps1` | **收尾单一入口**：噪音卫生 → 提交信息格式 → 编码/BOM → 敏感信息扫描 → 文本兜底校验 →（暂存区有 `.rs` 时）`cargo test` → 提交 → 推送 →（可选）打 tag 触发发布 |
 | `hygiene.ps1` | 噪音清理/报告：`*.b64.png`、`debug*`、`*.stackdump`、`*.out/*.err/*.bak/*.tmp`；`-ReportOnly` 只看不删 |
 | `ship-diagnose.ps1` | 查/等 release 流水线结论：失败时输出失败步骤与 `[FAIL]`/`::error::` 关键行（`-Wait` 轮询） |
 | `panel_api_smoke.ps1` | 启动 `--no-gui` 实例，检查 `/api/info`、`/api/update/status`、`/ui/` 与更新资源 |

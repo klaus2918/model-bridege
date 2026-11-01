@@ -182,6 +182,24 @@ if ($Python.Count -eq 0 -or -not $ValidateScript) {
     }
 }
 
+# ── 7. Rust 测试（暂存区有 .rs 就必跑）───────────────────
+# 教训：新增/改动的单测没在本地跑过就发版，CI 12 分钟后才在 cargo test 挂掉。
+# 这里用与 CI 相同的 cargo test 在提交前兜住。
+Step "Rust 测试"
+$rustChanged = @($staged | Where-Object { $_ -match '\.rs$' })
+if ($rustChanged.Count -eq 0) {
+    Good "没有 Rust 改动，跳过"
+} else {
+    $env:CARGO_TERM_COLOR = "never"
+    $testResult = Invoke-Native "cargo" @("test", "--manifest-path", "rust/model-gate/Cargo.toml", "--quiet")
+    if ($testResult.Code -ne 0) {
+        Bad ("cargo test 失败（{0} 个 Rust 文件有改动）" -f $rustChanged.Count)
+        ($testResult.Output | Select-Object -Last 25) | ForEach-Object { Write-Host ("  " + $_) }
+    } else {
+        Good "cargo test 通过"
+    }
+}
+
 Exit-WithProblems
 
 if ($DryRun) {
@@ -190,7 +208,7 @@ if ($DryRun) {
     exit 0
 }
 
-# ── 7. 提交 ────────────────────────────────────────────────
+# ── 8. 提交 ────────────────────────────────────────────────
 Step "提交"
 $msgPath = Join-Path $env:TEMP ("mg-commit-" + [guid]::NewGuid().ToString("N") + ".txt")
 [IO.File]::WriteAllText($msgPath, $msgText + "`n", $Utf8NoBom)
@@ -203,7 +221,7 @@ try {
 $sha = (git rev-parse --short HEAD).Trim()
 Good "已提交 $sha"
 
-# ── 8. 推送 ────────────────────────────────────────────────
+# ── 9. 推送 ────────────────────────────────────────────────
 Step "推送"
 $pushed = $false
 for ($i = 1; $i -le 6; $i++) {
@@ -215,7 +233,7 @@ for ($i = 1; $i -le 6; $i++) {
 if (-not $pushed) { throw "推送失败（重试 6 次）" }
 Good "已推送 origin"
 
-# ── 9. tag（可选，触发发布）───────────────────────────────
+# ── 10. tag（可选，触发发布）───────────────────────────────
 $tagOut = ""
 if ($Tag) {
     Step "打 tag 并发布：$Tag"

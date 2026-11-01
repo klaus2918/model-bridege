@@ -470,8 +470,10 @@ mod tests {
         let mut acc = ZcodeAccount::new("test", "zai", "jwt", "a.b.c").expect("account");
         acc.status = STATUS_COOLING.to_string();
         acc.cooling_until = Some(1_000);
-        assert!(!pickable(&acc, 1_000), "冷却未到期不应可选");
-        assert!(pickable(&acc, 1_001), "冷却到期即应恢复可选");
+        // cooling_until 是「冷却结束时刻」，到点即可选（pickable 用 <=）。
+        // 边界必须写成 999/1000：早先按「到点仍不可选」写，与实际实现相反，导致必挂。
+        assert!(!pickable(&acc, 999), "冷却未到期不应可选");
+        assert!(pickable(&acc, 1_000), "冷却到点（含该时刻）即恢复可选");
         acc.cooling_until = None; // 历史脏数据：冷却态但没有到期时间
         assert!(pickable(&acc, 0), "缺失到期时间按已到期处理");
         acc.enabled = false;
