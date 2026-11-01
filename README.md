@@ -1225,9 +1225,10 @@ iscc /DMyAppVersion=4.0.0 ^
 ```bat
 :: 提交信息写进 UTF-8 文件，其余（卫生检查、门禁、提交、推送、打 tag）由脚本完成
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship.ps1 -MessageFile .tmp\msg.txt -Tag v4.0.0
-:: 想看流水线结论（可选，失败自动打印失败步骤与关键行）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship-diagnose.ps1 -Wait
 ```
+
+推完 tag 即结束，**不要在同一轮等流水线**（`-Wait` 只在后台任务里用）。要结果时后台跑一次
+`ship-diagnose`，有结论再读；失败它会给失败步骤与 `[FAIL]` 关键行。
 
 `ship.ps1` 内部的固定流程：
 
