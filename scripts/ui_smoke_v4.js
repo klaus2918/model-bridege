@@ -462,7 +462,17 @@ async function main() {
     const hourLabels = await evaluate(
       `Array.from(document.querySelectorAll("#usage-trend .bar-col > span")).map((el) => el.textContent).filter(Boolean)`
     );
-    if (hourBars > 25 || hourBars === 0) throw new Error(`24h 趋势柱子数异常：${hourBars}`);
+    // CI 的干净实例没有任何请求：空态同样要验（趋势空态 + 明细空态 + 24h 切换生效）
+    if (hourBars === 0) {
+      const trendEmpty = await evaluate(`!!document.querySelector("#usage-trend .empty-line")`);
+      if (!trendEmpty) throw new Error("24h 趋势既没有柱子也没有空态");
+      await click(`#usage-tabs [data-usage-tab="request"]`);
+      await waitFor(() => evaluate(`!document.querySelector("#usage-panel-request").hidden`), 4000, "请求明细面板");
+      const detailEmpty = await evaluate(`!!document.querySelector("#usage-detail-table .empty-line")`);
+      if (!detailEmpty) throw new Error("请求明细既没有行也没有空态");
+      return `空数据实例：趋势空态 / 24h 切换生效 / 明细空态 / ${kpis} KPI`;
+    }
+    if (hourBars > 25) throw new Error(`24h 趋势柱子数异常：${hourBars}`);
     if (hourLabels.length && !hourLabels.every((label) => label.includes(":"))) {
       throw new Error(`24h 趋势刻度不是小时格式：${hourLabels.slice(0, 3).join(",")}`);
     }
@@ -501,12 +511,21 @@ async function main() {
 
   await check("提示词：列表、详情与会话演进", async () => {
     await navigate("prompts");
+    // 干净实例默认 promptCapture=false：列表是空态而不是记录，两种形态都要验
     await waitFor(
-      () => evaluate(`document.querySelectorAll("#prompt-table tbody tr[data-prompt-id]").length > 0`),
+      () =>
+        evaluate(
+          `document.querySelectorAll("#prompt-table tbody tr[data-prompt-id]").length > 0 || !!document.querySelector("#prompt-table tbody .empty-line")`
+        ),
       10000,
       "提示词列表"
     );
     const rows = await evaluate(`document.querySelectorAll("#prompt-table tbody tr[data-prompt-id]").length`);
+    if (rows === 0) {
+      const emptyText = await evaluate(`(document.querySelector("#prompt-table tbody .empty-line")?.textContent || "").trim()`);
+      if (!emptyText) throw new Error("提示词列表既无记录也无空态");
+      return `空数据实例：${emptyText}`;
+    }
     await evaluate(`document.querySelector("#prompt-table tbody tr[data-prompt-id]").click()`);
     await waitFor(
       () => evaluate(`document.querySelectorAll("#prompt-side-body .message-block").length > 0`),

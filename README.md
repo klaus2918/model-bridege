@@ -1220,14 +1220,25 @@ iscc /DMyAppVersion=4.0.0 ^
 
 ### 发布
 
-1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `4.0.0`）。
-2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1` 与 v4 面板 `scripts\ui_smoke_v4.js`。
-3. 打 tag 并推送：`git tag v4.0.0`、`git push origin v4.0.0`（Git 写操作需人工确认）。
-4. `.github/workflows/release-rust.yml` 构建并上传：
-   - `Model-Gate-v<版本>-rust-setup.exe`
-   - `Model-Gate-rust.exe`（便携版）
-   - `SHA256SUMS`
-5. 校验 Release 资产名与 `SHA256SUMS` 格式；应用内更新按精确文件名匹配。
+收尾是**一条命令**，不要逐步手工操作：
+
+```bat
+:: 提交信息写进 UTF-8 文件，其余（卫生检查、门禁、提交、推送、打 tag）由脚本完成
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship.ps1 -MessageFile .tmp\msg.txt -Tag v4.0.0
+:: 想看流水线结论（可选，失败自动打印失败步骤与关键行）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship-diagnose.ps1 -Wait
+```
+
+`ship.ps1` 内部的固定流程：
+
+1. `hygiene.ps1` 清理噪音（`*.b64.png`、`debug*`、`*.stackdump`、`*.out/.err/.bak/.tmp`）；
+2. 门禁：提交信息格式（`<type>(<scope>): 【<领域名词>】<title> @AI G`）、中文 `.ps1` 必须带 UTF-8 BOM、
+   全文无 U+FFFD、敏感信息扫描、文本兜底校验——任一失败即中止，不提交；
+3. `git add -A` → commit → push `origin`（失败自动重试）；
+4. 给了 `-Tag` 才打 tag：tag 必须等于 `v<Cargo.toml 版本>`，推送后即触发 `.github/workflows/release-rust.yml`。
+
+版本号只在 `rust/model-gate/Cargo.toml` 改一处；tag 改版本时用 `-Tag` 由脚本强推移动（旧 Release 未发布时安全）。
+流水线失败时，`ship-diagnose.ps1` 用 `GITHUB_TOKEN` 或本机 git 凭据读日志、否则读 `::error::` 注解，输出失败步骤与关键行。
 
 ### 回滚
 

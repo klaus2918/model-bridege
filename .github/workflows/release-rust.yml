@@ -75,8 +75,14 @@ jobs:
         working-directory: rust/model-gate
         run: |
           $ErrorActionPreference = "Stop"
-          cargo test
-          if ($LASTEXITCODE -ne 0) { throw "cargo test failed: $LASTEXITCODE" }
+          $out = & cargo test 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) {
+            # 失败原因以注解形式回传：公开可读，本地不必下载日志
+            ($out -split "`r?`n") | Where-Object { $_ -match 'FAILED|panicked at|error\[' } |
+              Select-Object -First 8 | ForEach-Object { Write-Host "::error::$($_.Trim())" }
+            throw "cargo test failed: $LASTEXITCODE"
+          }
 
       - name: 面板资源语法检查
         shell: pwsh
@@ -93,8 +99,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/panel_api_smoke.ps1 -Exe dist/Model-Gate-rust.exe -Port 18941
-          if ($LASTEXITCODE -ne 0) { throw "panel API smoke failed: $LASTEXITCODE" }
+          $out = & powershell -NoProfile -ExecutionPolicy Bypass -File scripts/panel_api_smoke.ps1 -Exe dist/Model-Gate-rust.exe -Port 18941 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) {
+            ($out -split "`r?`n") | Where-Object { $_ -match '\[FAIL\]|失败项|Exception|ParserError' } |
+              Select-Object -First 8 | ForEach-Object { Write-Host "::error::$($_.Trim())" }
+            throw "panel API smoke failed: $LASTEXITCODE"
+          }
 
       - name: 面板 v4 冒烟
         shell: pwsh
@@ -111,8 +122,13 @@ jobs:
               try { $null = Invoke-RestMethod 'http://127.0.0.1:18943/health'; $ready = $true; break } catch { Start-Sleep -Milliseconds 300 }
             }
             if (-not $ready) { throw "v4 smoke server not ready" }
-            node scripts/ui_smoke_v4.js --base http://127.0.0.1:18943 --screenshot-dir "$tmp\screenshots"
-            if ($LASTEXITCODE -ne 0) { throw "v4 UI smoke failed: $LASTEXITCODE" }
+            $out = & node scripts/ui_smoke_v4.js --base http://127.0.0.1:18943 --screenshot-dir "$tmp\screenshots" 2>&1 | Out-String
+            Write-Host $out
+            if ($LASTEXITCODE -ne 0) {
+              ($out -split "`r?`n") | Where-Object { $_ -match '^ - |\[FATAL\]|结果：' } |
+                Select-Object -First 10 | ForEach-Object { Write-Host "::error::$($_.Trim())" }
+              throw "v4 UI smoke failed: $LASTEXITCODE"
+            }
           } finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           }

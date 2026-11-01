@@ -8,6 +8,9 @@
 
 | 脚本 | 用途 |
 |---|---|
+| `ship.ps1` | **收尾单一入口**：噪音卫生 → 提交信息格式 → 编码/BOM → 敏感信息扫描 → 文本兜底校验 → 提交 → 推送 →（可选）打 tag 触发发布 |
+| `hygiene.ps1` | 噪音清理/报告：`*.b64.png`、`debug*`、`*.stackdump`、`*.out/*.err/*.bak/*.tmp`；`-ReportOnly` 只看不删 |
+| `ship-diagnose.ps1` | 查/等 release 流水线结论：失败时输出失败步骤与 `[FAIL]`/`::error::` 关键行（`-Wait` 轮询） |
 | `panel_api_smoke.ps1` | 启动 `--no-gui` 实例，检查 `/api/info`、`/api/update/status`、`/ui/` 与更新资源 |
 | `ui_smoke_v4.js` | v4 控制台无头浏览器冒烟：页面无 JS 异常、6 个一级入口、配置中心子页、接入抽屉、命令面板、用量分析、提示词、日志与诊断、设置与截图（需先启动实例并传 `--base`） |
 | `db_migration_smoke.js` | 历史数据库兼容冒烟：旧 schema + 旧数据启动，验证自动迁移、旧数据可读与新写入 |
@@ -20,6 +23,18 @@
 ## 常用命令
 
 ```powershell
+# 收尾一条命令：清理噪音 + 门禁 + 提交 + 推送（提交信息写 UTF-8 文件）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship.ps1 -MessageFile .tmp\msg.txt
+
+# 带发布：提交推送后打 tag（tag 必须与 Cargo.toml 版本一致）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship.ps1 -MessageFile .tmp\msg.txt -Tag v4.0.1
+
+# 只看门禁，不提交
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship.ps1 -MessageFile .tmp\msg.txt -DryRun
+
+# 发布后查结论（-Wait 轮询到完成；失败自动打印失败步骤与关键行）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship-diagnose.ps1 -Wait
+
 # 面板接口 + 更新资源冒烟（需先构建 dist\Model-Gate-rust.exe）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe
 
