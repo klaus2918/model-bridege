@@ -128,16 +128,32 @@ fn example_config_has_no_embedded_secret_or_env_file() {
     );
 }
 
+/// v4 面板的全部脚本（v4-core.js / v4-config.js / …），跨模块拼接后做静态断言。
+fn v4_panel_js() -> String {
+    let dir = crate_root().join("ui");
+    let mut out = String::new();
+    for entry in fs::read_dir(&dir).expect("read ui dir") {
+        let path = entry.expect("ui entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("v4") && name.ends_with(".js") {
+            out.push_str(&fs::read_to_string(&path).expect("read v4 ui module"));
+            out.push('\n');
+        }
+    }
+    assert!(!out.is_empty(), "ui/ 下应有 v4*.js 脚本");
+    out
+}
+
 #[test]
-fn v3_panel_uses_encrypted_store_only() {
-    let text = fs::read_to_string(crate_root().join("ui/v3.js")).expect("read ui/v3.js");
+fn v4_panel_uses_encrypted_store_only() {
+    let text = v4_panel_js();
     assert!(
         text.contains("本机加密库"),
-        "v3 凭据页必须明确写入本机加密库"
+        "v4 凭据页必须明确写入本机加密库"
     );
     assert!(
         !text.contains("apiKeyAgentPath"),
-        "旧面板的凭据文件路径不应回到 v3 主流程；兼容字段仍可由配置文件维护"
+        "旧面板的凭据文件路径不应回到 v4 主流程；兼容字段仍可由配置文件维护"
     );
 }
 /// 遍历 JSON，找出所有非空的 `apiKey` 字面量。

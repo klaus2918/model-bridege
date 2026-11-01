@@ -1,4 +1,4 @@
-/* v3 设置、统一接入、路由组与高级维护。依赖 window.MG。 */
+/* v4 设置、统一接入、路由组与高级维护。依赖 window.MG。 */
 (() => {
   "use strict";
   const MG = window.MG;
@@ -7,6 +7,8 @@
   let unifiedGroups = [];
   let routeGroups = [];
   let bound = false;
+  let snapshot = "";
+  let overwrite = false;
 
   const asArray = (value) => (Array.isArray(value) ? value : []);
   const lines = (value) => (Array.isArray(value) ? value.join("\n") : String(value || ""));
@@ -55,6 +57,14 @@
       );
     }
     return value;
+  }
+
+  function fingerprint(value) {
+    try {
+      return JSON.stringify(cleanConfig(value || {}));
+    } catch {
+      return "";
+    }
   }
 
   function upstreamNames() {
@@ -145,6 +155,10 @@
 
   function render() {
     const cfg = config();
+    snapshot = fingerprint(cfg);
+    overwrite = false;
+    const revision = $("#settings-revision");
+    if (revision) revision.hidden = true;
     setValue("#set-host", cfg.host || "127.0.0.1");
     setValue("#set-port", cfg.port || 8900);
     setValue("#set-default-model", cfg.defaultModel || "");
@@ -196,7 +210,7 @@
     }
 
     const service = $("#settings-service-hint");
-    if (service) service.textContent = `${state.info?.version ? `v${state.info.version}` : "v3"} · ${cfg.host || "127.0.0.1"}:${cfg.port || 8900}`;
+    if (service) service.textContent = `${state.info?.version ? `v${state.info.version}` : "—"} · ${cfg.host || "127.0.0.1"}:${cfg.port || 8900}`;
     const storage = $("#settings-storage-hint");
     if (storage) {
       const configPath = state.info?.configPath || state.info?.config_path || "bridge.config.json";
@@ -289,9 +303,26 @@
       if (!(await validateCurrent(next, false))) {
         return;
       }
+      if (!overwrite) {
+        const live = await api("/api/config");
+        const liveCfg = live.config && typeof live.config === "object" ? live.config : live;
+        if (snapshot && fingerprint(liveCfg) !== snapshot) {
+          const notice = $("#settings-revision");
+          if (notice) {
+            notice.hidden = false;
+            notice.scrollIntoView({ block: "nearest", behavior: "smooth" });
+          }
+          toast("配置已在其他窗口或磁盘上被修改，请先重载或确认覆盖", "error");
+          return;
+        }
+      }
       const backup = $("#settings-backup") ? $("#settings-backup").checked : true;
       await api("/api/config", { method: "POST", body: JSON.stringify({ config: next, backup }) });
       state.config = next;
+      overwrite = false;
+      snapshot = fingerprint(next);
+      const revision = $("#settings-revision");
+      if (revision) revision.hidden = true;
       await api("/api/ai/settings", {
         method: "PUT",
         body: JSON.stringify({
@@ -403,6 +434,7 @@
     ["models", "string[]", "上游合并", "对外模型白名单；填了就只暴露这些模型"],
     ["maxTokens", "number", "8192", "单次请求默认输出上限"],
     ["timeoutSeconds", "number", "600", "转发上游的超时秒数"],
+    ["maxBodyBytes", "number", "67108864", "chat 单次请求体上限（字节，默认 64 MiB）；超限返回 413 request_too_large"],
     ["modelsCacheSeconds", "number", "300", "模型目录缓存秒数"],
     ["accessLog", "boolean", "true", "是否写访问日志"],
     ["retentionDays", "number", "30", "用量记录保留天数，0 = 永久"],
@@ -415,7 +447,7 @@
     ["protocol", "string", "openai", "wire 协议：openai / anthropic / commandcode / opencode / zcode"],
     ["baseUrl", "string", "—", "上游请求地址，一般带 /v1 后缀"],
     ["apiKeyStore", "string", "—", "本机加密库引用；密钥由 Windows DPAPI 保存，配置只留引用"],
-    ["apiKeyEnv", "string", "—", "旧字段：密钥环境变量名；v3 默认使用加密库"],
+    ["apiKeyEnv", "string", "—", "旧字段：密钥环境变量名；v4 默认使用加密库"],
     ["default", "boolean", "false", "是否兜底接入；都未标记时取第一条"],
     ["models", "string[]", "—", "该接入提供的模型清单"],
     ["modelMap", "object", "{}", "模型映射：对外名 → 上游真实名"],
@@ -438,7 +470,7 @@
   function help() {
     openModal(
       "配置说明",
-      "v3 只暴露安全字段；密钥写入独立密钥库，永不回显。",
+      "v4 只暴露安全字段；密钥写入独立密钥库，永不回显。",
       `<div class="prose">
         <h3>最短配置</h3>
         <p>官方厂商：选模板 → 填 Key。自定义厂商：标识、厂商、请求地址、协议、Key 五项。其余字段均有模板默认值，可在接入详情中修改。</p>
@@ -495,6 +527,10 @@
     bound = true;
     $("#settings-reload").addEventListener("click", reloadConfig);
     $("#settings-restore").addEventListener("click", restoreBackup);
+    $("#settings-overwrite")?.addEventListener("click", () => {
+      overwrite = true;
+      save().catch((error) => toast(error.message, "error"));
+    });
     $("#settings-json").addEventListener("click", showRawConfig);
     $("#settings-diagnostics").addEventListener("click", exportDiagnostics);
     $("#settings-update").addEventListener("click", update);

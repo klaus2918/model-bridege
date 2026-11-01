@@ -1,4 +1,4 @@
-/* Model-Gate v3 控制台：深墨绿 + 信号绿；浅色为暖米白。
+/* Model-Gate v4 控制台：深墨绿 + 信号绿；浅色为暖米白。
    设计规范见 docs/design/refactor-2026/05-ui-redesign.md。 */
 :root {
   --bg: #0a0e0d;
@@ -515,8 +515,8 @@ a:hover { text-decoration: underline; }
   border-radius: 3px 3px 0 0; min-height: 3px;
 }
 .bar-col span {
-  color: var(--faint); font-family: var(--mono); font-size: 9.5px;
-  white-space: nowrap; transform: rotate(-28deg); transform-origin: top left;
+  color: var(--muted); font-family: var(--mono); font-size: 9px; line-height: 1;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
 }
 .mixbar { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 14px; }
 .mixbar-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) 92px; gap: 10px; align-items: center; font-size: 12px; }

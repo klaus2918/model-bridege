@@ -1,0 +1,91 @@
+{
+  "name": "Model-Gate Signal Desk v4",
+  "version": "4.0.0",
+  "source": "docs/design/refactor-2026/09-console-v4-design.md#6",
+  "color": {
+    "dark": {
+      "bg": "#0A0E0D",
+      "surface": "#111715",
+      "surface2": "#161E1B",
+      "surface3": "#1B2521",
+      "line": "#24302B",
+      "text": "#E8EDE9",
+      "muted": "#8FA098",
+      "faint": "#5F6F68",
+      "signal": "#7BE495",
+      "amber": "#E5B567",
+      "danger": "#F07167",
+      "info": "#7CC7D9",
+      "violet": "#B8A1E8",
+      "blue": "#8FB8FF"
+    },
+    "light": {
+      "bg": "#F4F1E8",
+      "surface": "#FBF9F3",
+      "surface2": "#EFEBDF",
+      "surface3": "#E7E2D4",
+      "line": "#D8D2C2",
+      "text": "#1A211E",
+      "muted": "#5F6B64",
+      "faint": "#8A948D",
+      "signal": "#1F7A4D",
+      "amber": "#9A6414",
+      "danger": "#B3372F",
+      "info": "#23697A",
+      "violet": "#6B4FA0",
+      "blue": "#2F5FA8"
+    }
+  },
+  "typography": {
+    "sans": ["IBM Plex Sans", "Noto Sans SC"],
+    "mono": ["IBM Plex Mono"],
+    "scale": {
+      "display": { "size": 28, "lineHeight": 36, "weight": 600, "tracking": -0.01 },
+      "h1": { "size": 22, "lineHeight": 30, "weight": 600, "tracking": -0.01 },
+      "h2": { "size": 16, "lineHeight": 24, "weight": 600, "tracking": 0 },
+      "body": { "size": 14, "lineHeight": 22, "weight": 400, "tracking": 0 },
+      "caption": { "size": 12, "lineHeight": 18, "weight": 400, "tracking": 0 },
+      "mono": { "size": 12.5, "lineHeight": 20, "weight": 400, "tracking": 0 }
+    }
+  },
+  "layout": {
+    "columns": 12,
+    "gutter": 24,
+    "pagePadding": 32,
+    "cardPadding": 20,
+    "sidebar": 240,
+    "topbar": 60,
+    "maxContentWidth": 1560,
+    "tableRow": { "comfortable": 52, "compact": 44 },
+    "drawer": 560
+  },
+  "radius": {
+    "card": 12,
+    "control": 8,
+    "badge": 4,
+    "drawer": 16
+  },
+  "shadow": {
+    "drawer": "0 24px 80px rgba(0,0,0,.55)"
+  },
+  "boards": [
+    { "id": "00", "name": "封面", "width": 1440, "height": 900 },
+    { "id": "01", "name": "设计系统", "width": 1440, "height": 2400 },
+    { "id": "02", "name": "总览", "width": 1440, "height": 1024 },
+    { "id": "03", "name": "用量分析", "width": 1440, "height": 1024 },
+    { "id": "04", "name": "提示词", "width": 1440, "height": 1024 },
+    { "id": "05", "name": "接入管理", "width": 1440, "height": 1024 },
+    { "id": "06", "name": "接入详情", "width": 1440, "height": 1024 },
+    { "id": "07", "name": "添加接入", "width": 1440, "height": 1024 },
+    { "id": "08", "name": "日志与诊断", "width": 1440, "height": 1024 },
+    { "id": "09", "name": "配置中心", "width": 1440, "height": 1024 },
+    { "id": "10", "name": "模型目录", "width": 1440, "height": 1024 },
+    { "id": "11", "name": "单价表", "width": 1440, "height": 1024 },
+    { "id": "12", "name": "统一入口与路由组", "width": 1440, "height": 1024 },
+    { "id": "13", "name": "凭据池", "width": 1440, "height": 1024 },
+    { "id": "14", "name": "资源库", "width": 1440, "height": 1024 },
+    { "id": "15", "name": "设置与高级维护", "width": 1440, "height": 1024 },
+    { "id": "16", "name": "状态集合", "width": 1440, "height": 1200 },
+    { "id": "17", "name": "窄屏", "width": 390, "height": 844 }
+  ]
+}

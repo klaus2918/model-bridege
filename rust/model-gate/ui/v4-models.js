@@ -1,4 +1,4 @@
-/* v3 模型目录与单价表。依赖 window.MG。 */
+/* v4 模型目录与单价表。依赖 window.MG。 */
 (() => {
   "use strict";
   const MG = window.MG;
@@ -9,12 +9,14 @@
     pageSize: 25,
     total: 0,
     rows: [],
+    usage: new Map(),
     loaded: false,
   };
   const pricing = {
     entries: [],
     fx: 7.2,
     loaded: false,
+    editing: -1,
   };
   let bound = false;
 
@@ -28,6 +30,15 @@
     $$("#model-tabs .seg-tab").forEach((button) => button.classList.toggle("active", button.dataset.modelTab === tab));
     $("#model-catalog-panel").hidden = tab !== "catalog";
     $("#model-pricing-panel").hidden = tab !== "pricing";
+    const title = $("#model-page-title");
+    const sub = $("#model-page-sub");
+    if (title) title.textContent = tab === "pricing" ? "单价表" : "模型目录";
+    if (sub) {
+      sub.textContent =
+        tab === "pricing"
+          ? "上游固定价优先于任意上游；精确匹配优先于通配，保存后可重算历史费用。"
+          : "模型清单、别名、上游映射与定价状态；未定价模型可一键聚焦。";
+    }
     if (tab === "pricing") loadPricing().catch((error) => toast(error.message, "error"));
   }
 
@@ -69,11 +80,17 @@
     if (search) params.set("q", search);
     if (upstream) params.set("upstream", upstream);
     if (price) params.set("price", price);
-    const data = await api(`/api/models/catalog?${params}`);
+    const [data, usageData] = await Promise.all([
+      api(`/api/models/catalog?${params}`),
+      api("/api/usage/models?range=1&limit=500").catch(() => ({ rows: [] })),
+    ]);
     let rows = Array.isArray(data.rows) ? data.rows : [];
     if (source) rows = rows.filter((row) => (row.sources || []).includes(source));
     catalog.rows = rows;
     catalog.total = Number(data.total || rows.length);
+    catalog.usage = new Map(
+      (Array.isArray(usageData.rows) ? usageData.rows : []).map((row) => [row.model, row])
+    );
     catalog.loaded = true;
     renderCatalog(data);
   }
@@ -81,37 +98,67 @@
   function renderCatalog(data = {}) {
     const rows = catalog.rows;
     const priced = rows.filter((row) => row.costHint).length;
-    const aliased = rows.filter((row) => (row.aliases || []).length).length;
-    const defaults = rows.filter((row) => row.default).length;
+    const unpriced = rows.length - priced;
+    const aliased = rows.reduce((sum, row) => sum + (row.aliases || []).length, 0);
     $("#model-kpis").innerHTML = `
-      <div class="stat"><span class="k">模型总数</span><span class="v">${num(catalog.total)}</span><span class="s">当前筛选</span></div>
-      <div class="stat signal"><span class="k">已配置单价</span><span class="v">${num(priced)}</span><span class="s">本页</span></div>
-      <div class="stat"><span class="k">有别名</span><span class="v">${num(aliased)}</span><span class="s">本页</span></div>
-      <div class="stat amber"><span class="k">默认模型</span><span class="v">${num(defaults)}</span><span class="s">本页</span></div>`;
+      <button class="model-kpi" data-model-kpi="all">
+        <span class="k">模型总数</span><span class="v">${num(catalog.total)}</span><span class="s">当前筛选 · 本页 ${rows.length}</span>
+      </button>
+      <button class="model-kpi signal" data-model-kpi="priced">
+        <span class="k">已定价</span><span class="v">${num(priced)}</span><span class="s">本页命中单价</span>
+      </button>
+      <button class="model-kpi ${unpriced ? "amber" : ""}" data-model-kpi="missing">
+        <span class="k">未定价</span><span class="v">${num(unpriced)}</span><span class="s">点击只看未定价</span>
+      </button>
+      <button class="model-kpi" data-model-kpi="aliased">
+        <span class="k">别名</span><span class="v">${num(aliased)}</span><span class="s">本页别名总数</span>
+      </button>`;
     const tbody = $("#model-catalog-table tbody");
     tbody.innerHTML = rows.length
       ? rows
-          .map((row, index) => {
+          .map((row) => {
             const upstreams = (row.upstreams || []).map((name) => `<span class="pill">${esc(name)}</span>`).join(" ");
-            const sources = (row.sources || []).map((source) => `<span class="badge">${esc(SOURCE_LABEL[source] || source)}</span>`).join(" ");
+            const sources = (row.sources || []).map((source) => `<span class="pill">${esc(SOURCE_LABEL[source] || source)}</span>`).join(" ");
             const aliases = (row.aliases || []).map((alias) => `<code>${esc(alias)}</code>`).join(" ");
+            const usage = catalog.usage.get(row.model) || {};
+            const pricedRow = Boolean(row.costHint);
             return `<tr>
-              <td><span class="name-cell">${esc(row.model)}${row.default ? ' <span class="pill signal">默认</span>' : ""}</span></td>
+              <td><div class="model-name">${esc(row.model)}${row.default ? ' <span class="pill signal">默认</span>' : ""}</div>
+                ${row.minPlan ? `<div class="tiny amber">套餐门槛 ${esc(row.minPlan)}</div>` : ""}</td>
               <td><div class="tagline">${upstreams || "—"}</div></td>
               <td>${sources || "—"}</td>
               <td>${aliases || "—"}</td>
-              <td>${row.minPlan ? `<span class="pill amber">${esc(row.minPlan)}</span>` : "—"}</td>
               <td class="num">${priceText(row.costHint)}</td>
+              <td class="num">${num(usage.requests || 0)}</td>
+              <td><span class="pill ${pricedRow ? "signal" : "amber"}">${pricedRow ? "已定价" : "未定价"}</span></td>
               <td class="right"><div class="actions">
-                <button class="btn ghost sm" data-model-default="${esc(row.model)}">设为默认</button>
                 <button class="btn ghost sm" data-model-price="${esc(row.model)}" data-price-upstream="${esc((row.upstreams || [])[0] || "")}">定价</button>
+                <button class="btn ghost sm" data-model-default="${esc(row.model)}">设为默认</button>
               </div></td>
             </tr>`;
           })
           .join("")
-      : `<tr><td colspan="7"><div class="empty-line">没有匹配的模型。</div></td></tr>`;
+      : `<tr><td colspan="8"><div class="empty-line">没有匹配的模型。</div></td></tr>`;
     const pages = Math.max(1, Math.ceil(catalog.total / catalog.pageSize));
     $("#model-page-info").textContent = `第 ${catalog.page} / ${pages} 页 · 共 ${num(catalog.total)} 条`;
+    $$("#model-kpis [data-model-kpi]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const kind = button.dataset.modelKpi;
+        const filter = $("#model-price-filter");
+        if (!filter) return;
+        if (kind === "priced") filter.value = "priced";
+        else if (kind === "missing") filter.value = "missing";
+        else if (kind === "all") filter.value = "";
+        else if (kind === "aliased") {
+          filter.value = "";
+          $("#model-search").value = "";
+          toast("别名在表格中查看；可用搜索框筛别名", "ok");
+          return;
+        }
+        catalog.page = 1;
+        loadCatalog().catch((error) => toast(error.message, "error"));
+      });
+    });
   }
 
   async function setDefaultModel(model) {
@@ -153,10 +200,10 @@
     const tbody = $("#pricing-table tbody");
     tbody.innerHTML = pricing.entries.length
       ? pricing.entries
-          .map((entry, index) => `<tr>
-            <td>${entry.upstream ? esc(entry.upstream) : '<span class="muted">全部</span>'}</td>
+          .map((entry, index) => `<tr class="${pricing.editing === index ? "editing" : ""}">
+            <td>${entry.upstream ? `<span class="pill">${esc(entry.upstream)}</span>` : '<span class="muted">全部上游</span>'}</td>
             <td><code>${esc(entry.model || "")}</code></td>
-            <td>${entry.type === "quota" ? '<span class="pill amber">额度制</span>' : '<span class="pill">按量</span>'}</td>
+            <td>${entry.type === "quota" ? '<span class="pill amber">额度制</span>' : '<span class="pill signal">按量</span>'}</td>
             <td>${esc(entry.currency || "USD")}</td>
             <td class="num">${entry.type === "quota" ? "—" : num(entry.input)}</td>
             <td class="num">${entry.type === "quota" ? "—" : num(entry.output)}</td>
@@ -168,8 +215,9 @@
             </div></td>
           </tr>`)
           .join("")
-      : `<tr><td colspan="9"><div class="empty-line">还没有单价条目。</div></td></tr>`;
+      : `<tr><td colspan="9"><div class="empty-line">还没有单价条目。用右侧编辑器新增，或编辑 JSON 批量导入。</div></td></tr>`;
     $("#pricing-empty").hidden = Boolean(pricing.entries.length);
+    $("#pricing-count").textContent = `${pricing.entries.length} 条`;
   }
 
   function entryForm(entry = {}, index = -1) {
@@ -187,48 +235,30 @@
     <div class="modal-actions"><button class="btn ghost" id="entry-cancel">取消</button><button class="btn primary" id="entry-save">${index >= 0 ? "保存条目" : "添加条目"}</button></div>`;
   }
 
+  function setEditorEntry(entry = {}, index = -1) {
+    pricing.editing = index;
+    $("#pricing-add-upstream").value = entry.upstream || "";
+    $("#pricing-add-model").value = entry.model || "";
+    $("#pricing-add-type").value = entry.type === "quota" ? "quota" : "per-token";
+    $("#pricing-add-currency").value = entry.currency === "CNY" ? "CNY" : "USD";
+    $("#pricing-add-input").value = entry.input ?? "";
+    $("#pricing-add-output").value = entry.output ?? "";
+    $("#pricing-add-label").value = entry.label || "";
+    $("#pricing-editor-title").textContent = index >= 0 ? "编辑条目" : "新增条目";
+    $("#pricing-editor-mode").textContent = index >= 0 ? `编辑 #${index + 1}` : "新增";
+    $("#pricing-editor-mode").className = `pill ${index >= 0 ? "amber" : ""}`;
+    $("#pricing-add").textContent = index >= 0 ? "保存条目" : "添加到最前";
+    $("#pricing-editor-cancel").hidden = index < 0;
+  }
+
+  function resetEditor() {
+    setEditorEntry({}, -1);
+  }
+
   function openEntry(index = -1) {
     const entry = index >= 0 ? pricing.entries[index] : {};
-    openModal(index >= 0 ? "编辑单价条目" : "新增单价条目", "单位：金额 / 百万 token；空值按 0 或未配置处理。", entryForm(entry, index));
-    $("#entry-cancel").addEventListener("click", closeModal);
-    $("#entry-save").addEventListener("click", () => {
-      const type = $("#entry-type").value;
-      const extraText = $("#entry-extra").value.trim();
-      let extra = {};
-      if (extraText) {
-        try {
-          extra = JSON.parse(extraText);
-        } catch {
-          toast("高级 JSON 不合法", "error");
-          return;
-        }
-      }
-      const item = {
-        ...(index >= 0 ? pricing.entries[index] : {}),
-        upstream: $("#entry-upstream").value.trim(),
-        model: $("#entry-model").value.trim(),
-        type,
-        currency: $("#entry-currency").value,
-        input: Number($("#entry-input").value) || 0,
-        output: Number($("#entry-output").value) || 0,
-        cacheRead: Number($("#entry-cache").value) || 0,
-        label: $("#entry-label").value.trim(),
-      };
-      if (!item.model) return toast("模型不能为空", "error");
-      if (extra.plan) item.plan = extra.plan;
-      else delete item.plan;
-      if (extra.peak) item.peak = extra.peak;
-      else delete item.peak;
-      if (type === "quota") {
-        delete item.input;
-        delete item.output;
-        delete item.cacheRead;
-      }
-      if (index >= 0) pricing.entries[index] = item;
-      else pricing.entries.unshift(item);
-      closeModal();
-      renderPricing();
-    });
+    setEditorEntry(entry, index);
+    $(".pricing-editor")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 
   async function savePricing() {
@@ -324,20 +354,33 @@
     $("#pricing-add").addEventListener("click", () => {
       const model = $("#pricing-add-model").value.trim();
       if (!model) return toast("模型不能为空", "error");
-      pricing.entries.unshift({
+      const type = $("#pricing-add-type").value;
+      const item = {
         upstream: $("#pricing-add-upstream").value,
         model,
-        type: $("#pricing-add-type").value,
+        type,
         currency: $("#pricing-add-currency").value,
         input: Number($("#pricing-add-input").value) || 0,
         output: Number($("#pricing-add-output").value) || 0,
         cacheRead: 0,
         label: $("#pricing-add-label").value.trim(),
-      });
+      };
+      if (type === "quota") {
+        delete item.input;
+        delete item.output;
+        delete item.cacheRead;
+      }
+      if (pricing.editing >= 0) {
+        pricing.entries[pricing.editing] = item;
+        toast("条目已更新，记得保存单价表", "ok");
+      } else {
+        pricing.entries.unshift(item);
+        toast("条目已添加，记得保存单价表", "ok");
+      }
       renderPricing();
-      $("#pricing-add-model").value = "";
-      $("#pricing-add-label").value = "";
+      resetEditor();
     });
+    $("#pricing-editor-cancel").addEventListener("click", resetEditor);
     $("#pricing-table").addEventListener("click", (event) => {
       const edit = event.target.closest("[data-price-edit]");
       if (edit) return openEntry(Number(edit.dataset.priceEdit));

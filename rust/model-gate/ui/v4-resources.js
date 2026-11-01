@@ -1,4 +1,4 @@
-/* v3 免费来源与 ZCode 账号池。依赖 window.MG。 */
+/* v4 免费来源与 ZCode 账号池。依赖 window.MG。 */
 (() => {
   "use strict";
   const MG = window.MG;
@@ -443,7 +443,123 @@
     });
   }
 
+  // ───────────────────────── 模板 ─────────────────────────
+
+  const tpl = { items: [], loading: false, bound: false };
+
+  const SUPPORT_TEXT = {
+    request: "请求级",
+    account: "账户级",
+    none: "不支持请求级",
+  };
+
+  function templateModels(template) {
+    const defaults = template.defaults || {};
+    const list = Array.isArray(defaults.defaultModels) ? defaults.defaultModels : [];
+    if (list.length) return list.length;
+    const models = template.models;
+    if (Array.isArray(models)) return models.length;
+    return defaults.autoModels || defaults.fetchModels ? 1 : 0;
+  }
+
+  function renderTemplatesPage() {
+    const items = tpl.items || [];
+    const summary = $("#template-summary");
+    if (summary) {
+      const official = items.filter((item) => item.kind === "official").length;
+      const protocols = new Set(items.map((item) => item.defaults?.protocol).filter(Boolean));
+      const requestLevel = items.filter((item) => item.privacy?.support === "request").length;
+      summary.innerHTML = `
+        <div class="template-stat"><span class="k">模板</span><b>${num(items.length)}</b><span class="s">官方 ${num(official)} · 自定义 ${num(Math.max(0, items.length - official))}</span></div>
+        <div class="template-stat"><span class="k">协议</span><b>${num(protocols.size)}</b><span class="s">${esc([...protocols].join(" / ") || "—")}</span></div>
+        <div class="template-stat signal"><span class="k">请求级隐私</span><b>${num(requestLevel)}</b><span class="s">可选 ZDR 的模板</span></div>
+        <div class="template-stat"><span class="k">默认模型</span><b>${num(items.reduce((sum, item) => sum + templateModels(item), 0))}</b><span class="s">来自模板默认值</span></div>`;
+    }
+
+    const body = $("#template-table tbody");
+    if (!body) return;
+    if (!items.length) {
+      body.innerHTML = `<tr><td colspan="7"><div class="empty-line">模板目录为空。检查内置模板或重新加载配置。</div></td></tr>`;
+      return;
+    }
+    body.innerHTML = items
+      .map((template) => {
+        const privacy = template.privacy || {};
+        const support = privacy.support || "none";
+        const tone = support === "request" ? "signal" : support === "account" ? "info" : "amber";
+        return `<tr data-template-row="${esc(template.id)}">
+          <td><div class="name-cell"><b>${esc(template.label || template.id)}</b></div><div class="tiny muted mono">${esc(template.id)} · v${esc(template.version || "—")}</div></td>
+          <td><span class="pill">${esc(template.kind || "official")}</span></td>
+          <td class="mono tiny">${esc(template.defaults?.protocol || "—")}</td>
+          <td><span class="addr" title="${esc(template.defaults?.baseUrl || "")}">${esc(template.defaults?.baseUrl || "自定义地址")}</span></td>
+          <td class="num">${num(templateModels(template))}</td>
+          <td><span class="pill ${tone}">${esc(SUPPORT_TEXT[support] || support)}</span></td>
+          <td class="right"><span class="actions">
+            <button class="btn ghost sm" data-template-view="${esc(template.id)}">查看</button>
+            <button class="btn primary sm" data-template-use="${esc(template.id)}">用于接入</button>
+          </span></td>
+        </tr>`;
+      })
+      .join("");
+  }
+
+  function showTemplate(template) {
+    const defaults = template.defaults || {};
+    const privacy = template.privacy || {};
+    openModal(
+      template.label || template.id,
+      `${template.id} · v${template.version || "—"} · ${template.kind || "official"}`,
+      `<div class="kv">
+        <span class="k">协议</span><span class="v mono">${esc(defaults.protocol || "—")}</span>
+        <span class="k">默认地址</span><span class="v mono">${esc(defaults.baseUrl || "自定义")}</span>
+        <span class="k">默认模型</span><span class="v">${esc((defaults.defaultModels || []).join("、") || "—")}</span>
+        <span class="k">必填字段</span><span class="v">${esc((template.requiredFields || []).join("、") || "—")}</span>
+        <span class="k">隐私能力</span><span class="v">${esc(SUPPORT_TEXT[privacy.support] || privacy.support || "—")}${privacy.zdrDefault ? " · 默认 ZDR" : ""}</span>
+        <span class="k">文档</span><span class="v">${template.docsUrl ? `<a href="${esc(template.docsUrl)}" target="_blank" rel="noreferrer">打开</a>` : "—"}</span>
+      </div>
+      <p class="hint" style="margin-top:12px">${esc(template.description || "未提供描述。")}</p>`
+    );
+  }
+
+  async function loadTemplates(force = true) {
+    if (tpl.loading) return;
+    tpl.loading = true;
+    try {
+      if (force) MG.state.templates = [];
+      await MG.refreshTemplates();
+      tpl.items = Array.isArray(MG.state.templates) ? MG.state.templates : [];
+      renderTemplatesPage();
+    } finally {
+      tpl.loading = false;
+    }
+  }
+
+  function bindTemplates() {
+    $("#templates-refresh")?.addEventListener("click", () => loadTemplates(true).catch((error) => toast(error.message, "error")));
+    $("#template-table")?.addEventListener("click", (event) => {
+      const view = event.target.closest("[data-template-view]");
+      if (view) {
+        const template = tpl.items.find((item) => item.id === view.dataset.templateView);
+        if (template) showTemplate(template);
+        return;
+      }
+      const use = event.target.closest("[data-template-use]");
+      if (use) {
+        const id = use.dataset.templateUse;
+        MG.openAddModal("official");
+        requestAnimationFrame(() => {
+          const card = document.querySelector(`#modal-body [data-template="${id}"]`);
+          if (card) card.click();
+        });
+      }
+    });
+  }
+
+  MG.registerView("templates", () => loadTemplates(true));
   MG.registerView("free", loadFree);
   MG.registerView("zcode", loadZcode);
-  document.addEventListener("DOMContentLoaded", bind);
+  document.addEventListener("DOMContentLoaded", () => {
+    bind();
+    bindTemplates();
+  });
 })();

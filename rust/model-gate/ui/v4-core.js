@@ -1,4 +1,4 @@
-/* Model-Gate v3 控制台（原生 JS，无构建步骤）。
+/* Model-Gate v4 控制台内核（原生 JS，无构建步骤）。
    设计约束：密钥不可回显；所有动态文本转义；旧接口保持可用。 */
 (() => {
   "use strict";
@@ -44,12 +44,6 @@
     plugins: [],
     config: null,
     info: null,
-    totals: null,
-    usageRows: [],
-    logs: [],
-    prompts: [],
-    health: [],
-    diagnostics: [],
     aiSettings: { enabled: true, allowApply: false, allowPoolStats: true },
     drawerId: null,
     drawerTab: "overview",
@@ -57,7 +51,6 @@
     addStep: 1,
     addTemplate: null,
     addResult: null,
-    trafficDays: 1,
     busy: false,
   };
 
@@ -178,7 +171,6 @@
     const data = await api("/api/access");
     state.access = Array.isArray(data.items) ? data.items : [];
     if (Array.isArray(data.templates) && data.templates.length) state.templates = data.templates;
-    state.diagnostics = Array.isArray(data.diagnostics) ? data.diagnostics : [];
   }
 
   async function refreshTemplates() {
@@ -219,7 +211,7 @@
 
   async function refreshInfo() {
     state.info = await api("/api/info");
-    $("#version").textContent = `v${state.info.version || "3"}`;
+    $("#version").textContent = `v${state.info.version || "—"}`;
     $("#listen-addr").textContent = `${state.info.host || "127.0.0.1"}:${state.info.port || 8900}`;
   }
 
@@ -229,16 +221,6 @@
       if (data.settings) state.aiSettings = data.settings;
     } catch {
       // 旧版本无该接口时保持默认。
-    }
-  }
-
-  async function refreshTotals(days = 1) {
-    try {
-      const range = days === 1 ? "1" : `${days}d`;
-      const data = await api(`/api/usage/totals?range=${range}`);
-      state.totals = data.totals || {};
-    } catch {
-      state.totals = {};
     }
   }
 
@@ -253,7 +235,6 @@
         refreshPlugins(),
         refreshConfig(),
         refreshAISettings(),
-        refreshTotals(1),
       ]);
       setConn(true, "运行中");
     } catch (error) {
@@ -298,10 +279,6 @@
       section.classList.toggle("active", section.id === `view-${view}`);
     });
     const loaders = {
-      overview: async () => {
-        await refreshTotals(1);
-        renderOverview();
-      },
       access: async () => {
         await refreshAccess();
         renderAccess();
@@ -322,12 +299,6 @@
       plugins: async () => {
         await Promise.all([refreshPlugins(), refreshAccess()]);
         renderPlugins();
-      },
-      traffic: async () => {
-        await refreshTraffic();
-      },
-      observe: async () => {
-        await refreshObserve();
       },
       settings: async () => {
         await Promise.all([refreshConfig(), refreshTemplates(), refreshAISettings(), refreshAccess()]);
@@ -359,128 +330,14 @@
   }
 
   function initTheme() {
-    const saved = localStorage.getItem("mg-v3-theme");
+    const saved = localStorage.getItem("mg-v4-theme") || localStorage.getItem("mg-v3-theme");
     document.documentElement.dataset.theme = saved === "light" ? "light" : "dark";
   }
 
   function toggleTheme() {
     const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
     document.documentElement.dataset.theme = next;
-    localStorage.setItem("mg-v3-theme", next);
-  }
-
-  // ───────────────────────── 总览 ─────────────────────────
-
-  function renderOverview() {
-    const access = state.access;
-    const totals = state.totals || {};
-    const configured = access.filter((item) => item.auth && item.auth.configured).length;
-    const issues = collectIssues();
-    const poolAvailable = state.pools.reduce((sum, pool) => sum + Number(pool.available || 0), 0);
-
-    $("#overview-stats").innerHTML = [
-      statCard("接入", access.length, `${configured} 个已配置凭据`, "", "access"),
-      statCard("今日请求", compactNum(totals.requests), `${num(totals.errors)} 次失败`, "signal", "traffic"),
-      statCard("今日 Token", compactNum(totals.total_tokens), `费用 ${Number(totals.cost || 0).toFixed(4)}`, "", "traffic"),
-      statCard("待处理", issues.length, issues.length ? "点击查看诊断" : "暂无异常", issues.length ? "amber" : "", "observe"),
-    ].join("");
-    $$("#overview-stats .stat.clickable").forEach((el) => {
-      el.addEventListener("click", () => navigate(el.dataset.go));
-    });
-    $("#overview-meta").textContent = access.length ? `共 ${access.length} 个接入 · ${poolAvailable} 个池成员可用` : "";
-    $("#overview-access").innerHTML = access.length
-      ? access
-          .slice()
-          .sort((a, b) => (a.health.state === "ok" ? 1 : 0) - (b.health.state === "ok" ? 1 : 0))
-          .map((item) => {
-            const pool = item.pool ? `池 ${item.pool.available}/${item.pool.members}` : authText(item);
-            return `<div class="row clickable" data-open="${esc(item.id)}">
-              ${statusDot(item.health.state)}
-              <div class="grow">
-                <div class="name">${esc(item.label || item.id)} ${badge(item.kind)}</div>
-                <div class="meta">${esc(item.protocol)} · ${esc(item.baseUrl || "—")}</div>
-              </div>
-              <div class="trail">${esc(pool)}</div>
-              <span class="pill">${item.models ? item.models.declared : 0} 模型</span>
-            </div>`;
-          })
-          .join("")
-      : `<div class="empty-line">还没有接入。点击右上角「添加接入」开始。</div>`;
-    bindRowOpeners($("#overview-access"));
-
-    const codes = issues.slice(0, 5);
-    $("#overview-todos").innerHTML = codes.length
-      ? codes
-          .map(
-            (issue) => `<div class="row">
-              <span class="pill ${issue.level === "error" ? "danger" : "amber"}">${esc(issue.level)}</span>
-              <div class="grow"><div class="name">${esc(issue.title)}</div><div class="meta">${esc(issue.detail)}</div></div>
-            </div>`
-          )
-          .join("")
-      : `<div class="empty-line">当前没有阻断项。</div>`;
-    $("#todo-count").textContent = String(issues.length);
-
-    renderRecentRequests();
-  }
-
-  function statCard(label, value, sub, tone, go) {
-    return `<div class="stat clickable ${tone}" data-go="${go}">
-      <div class="k">${esc(label)}</div>
-      <div class="v">${esc(value)}</div>
-      <div class="s">${esc(sub)}</div>
-    </div>`;
-  }
-
-  function collectIssues() {
-    const issues = [];
-    for (const item of state.access) {
-      if (item.health && item.health.state === "warn") {
-        issues.push({
-          level: "warn",
-          title: `${item.label || item.id} 待处理`,
-          detail: item.auth && item.auth.mode === "none" ? "免鉴权接入，请确认可用性" : "凭据未配置或池成员不可用",
-        });
-      }
-      if (Array.isArray(item.diagnostics)) {
-        for (const diag of item.diagnostics) {
-          if (diag.level === "error" || diag.level === "warn") {
-            issues.push({ level: diag.level, title: `${item.id} · ${diag.code}`, detail: diag.message });
-          }
-        }
-      }
-      if (item.pool && Number(item.pool.cooling || 0) > 0) {
-        issues.push({
-          level: "warn",
-          title: `${item.label || item.id} 有成员冷却`,
-          detail: `${item.pool.cooling} 个成员冷却中，可用 ${item.pool.available}/${item.pool.members}`,
-        });
-      }
-    }
-    return issues;
-  }
-
-  async function renderRecentRequests() {
-    const host = $("#overview-recent");
-    host.innerHTML = `<div class="empty-line">加载中…</div>`;
-    try {
-      const data = await api("/api/usage/list?limit=5");
-      const rows = Array.isArray(data.rows) ? data.rows : Array.isArray(data.items) ? data.items : [];
-      state.recentRows = rows;
-      host.innerHTML = rows.length
-        ? rows
-            .map(
-              (row) => `<div class="row">
-                <span class="status-line"><span class="dot ${row.status >= 400 ? "error" : "ok"}" style="width:7px;height:7px"></span></span>
-                <div class="grow"><div class="name">${esc(row.upstream || "—")}</div><div class="meta">${esc(row.requested_model || "—")}</div></div>
-                <div class="trail">${fmtMs(row.duration_ms)}<br><span class="muted">${fmtTime(row.ts)}</span></div>
-              </div>`
-            )
-            .join("")
-        : `<div class="empty-line">还没有请求记录。</div>`;
-    } catch (error) {
-      host.innerHTML = `<div class="empty-line">用量记录不可用：${esc(error.message)}</div>`;
-    }
+    localStorage.setItem("mg-v4-theme", next);
   }
 
   // ───────────────────────── 接入列表 ─────────────────────────
@@ -919,95 +776,463 @@
     bindRowOpeners(tbody);
   }
 
+  function upstreamNameList() {
+    const config = state.config || {};
+    const names = new Set(state.access.map((item) => item.id));
+    if (config.upstreams && typeof config.upstreams === "object") {
+      Object.keys(config.upstreams).forEach((name) => names.add(name));
+    }
+    return [...names].sort();
+  }
+
+  function routeGroupPairs() {
+    const groups = state.config?.groups;
+    if (Array.isArray(groups)) {
+      return groups.map((group) => ({
+        id: String(group.id || group.name || ""),
+        members: Array.isArray(group.members) ? group.members.map(String) : [],
+      })).filter((group) => group.id);
+    }
+    if (groups && typeof groups === "object") {
+      return Object.entries(groups).map(([id, members]) => ({
+        id,
+        members: Array.isArray(members) ? members.map(String) : [],
+      }));
+    }
+    return [];
+  }
+
+  function routeModelCount(name) {
+    const item = state.access.find((row) => row.id === name);
+    return Number(item?.models?.declared || 0);
+  }
+
+  function cleanRouteConfig(value) {
+    if (Array.isArray(value)) return value.map(cleanRouteConfig);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value)
+          .filter(([key]) => !key.startsWith("_") && value[key] !== undefined)
+          .map(([key, item]) => [key, cleanRouteConfig(item)])
+      );
+    }
+    return value;
+  }
+
+  async function saveRouteDraft(patch, message) {
+    const config = cleanRouteConfig({ ...(state.config || {}) });
+    if (patch.unified) config.unified = { ...(config.unified || {}), ...patch.unified };
+    if (patch.groups) config.groups = patch.groups;
+    try {
+      await api("/api/config", { method: "POST", body: JSON.stringify({ config, backup: true }) });
+      await refreshConfig();
+      renderRoutes();
+      toast(message || "路由配置已保存", "ok");
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+
   function renderRoutes() {
     const config = state.config || {};
     const unified = config.unified || {};
-    const visible = Array.isArray(unified.visibleUpstreams) ? unified.visibleUpstreams : [];
+    const storedVisible = Array.isArray(unified.visibleUpstreams) ? unified.visibleUpstreams.filter(Boolean) : [];
+    const names = upstreamNameList();
+    const visible = new Set(storedVisible.length ? storedVisible : names);
+    const routeGroups = routeGroupPairs();
     const groups = Array.isArray(unified.groups) ? unified.groups : [];
-    const routeGroups = Array.isArray(config.groups)
-      ? config.groups
-      : config.groups && typeof config.groups === "object"
-        ? Object.entries(config.groups).map(([id, members]) => ({ id, members }))
-        : [];
-    $("#unified-count").textContent = `${visible.length || state.access.length} 个可见`;
-    $("#unified-list").innerHTML = visible.length
-      ? visible.map((name) => `<div class="row"><span class="dot ok" style="width:7px;height:7px"></span><div class="grow">${esc(name)}</div></div>`).join("")
-      : `<div class="empty-line">未设置可见白名单：统一入口展示全部上游。</div>`;
+    let dirty = false;
+
+    const summary = $("#route-summary");
+    if (summary) {
+      summary.innerHTML = `
+        <div class="route-stat"><span class="k">上游</span><b>${num(names.length)}</b><span class="s">接入与配置去重</span></div>
+        <div class="route-stat ${storedVisible.length ? "amber" : "signal"}"><span class="k">统一入口可见</span><b>${storedVisible.length || names.length}</b><span class="s">${storedVisible.length ? "白名单生效" : "未设白名单 · 全部可见"}</span></div>
+        <div class="route-stat"><span class="k">命名分组</span><b>${num(groups.length)}</b><span class="s">/unified/{组}/v1</span></div>
+        <div class="route-stat"><span class="k">路由组</span><b>${num(routeGroups.length)}</b><span class="s">失败按成员顺序切换</span></div>
+        <div class="route-stat-actions">
+          <span class="pill" id="route-dirty" hidden>未保存</span>
+          <button class="btn ghost sm" id="route-visible-all">全部可见</button>
+          <button class="btn primary sm" id="route-save" disabled>保存路由</button>
+        </div>`;
+    }
+    $("#unified-count").textContent = `${visible.size} 个可见`;
     $("#group-count").textContent = `${routeGroups.length} 组`;
-    $("#group-list").innerHTML = routeGroups.length
+
+    const markDirty = () => {
+      dirty = true;
+      const pill = $("#route-dirty");
+      if (pill) pill.hidden = false;
+      const save = $("#route-save");
+      if (save) save.disabled = false;
+    };
+
+    const matrix = $("#unified-matrix");
+    if (matrix) {
+      matrix.innerHTML = names.length
+        ? names
+            .map(
+              (name) => `<label class="matrix-row">
+                <input type="checkbox" data-visible-upstream="${esc(name)}" ${visible.has(name) ? "checked" : ""}>
+                <span class="grow"><span class="nm">${esc(name)}</span><span class="sub">${routeModelCount(name)} 个模型 · /${esc(name)}/v1</span></span>
+                <span class="pill">${state.access.some((item) => item.id === name) ? "已接入" : "仅配置"}</span>
+              </label>`
+            )
+            .join("")
+        : `<div class="empty-line">还没有上游。先添加接入。</div>`;
+      $$("#unified-matrix [data-visible-upstream]").forEach((input) => {
+        input.addEventListener("change", () => {
+          const next = new Set(visible);
+          if (input.checked) next.add(input.dataset.visibleUpstream);
+          else next.delete(input.dataset.visibleUpstream);
+          visible.clear();
+          next.forEach((name) => visible.add(name));
+          markDirty();
+          $("#unified-count").textContent = `${visible.size} 个可见`;
+        });
+      });
+    }
+
+    const groupHost = $("#route-group-cards");
+    if (groupHost) {
+      groupHost.innerHTML = routeGroups.length
+        ? routeGroups
+            .map(
+              (group) => `<article class="route-group-card" data-group="${esc(group.id)}">
+                <div class="route-group-head">
+                  <div><div class="route-group-name">group/${esc(group.id)}</div><div class="hint">${group.members.length} 个成员 · 按顺序尝试</div></div>
+                  <span class="pill">${esc(group.id)}</span>
+                </div>
+                <ol class="route-members" data-group-members="${esc(group.id)}">
+                  ${group.members.length
+                    ? group.members
+                        .map(
+                          (member, index) => `<li draggable="true" data-member="${esc(member)}" data-index="${index}">
+                            <span class="drag">⋮⋮</span>
+                            <span class="grow"><b>${esc(member)}</b><small>${index + 1} · ${routeModelCount(member)} 个模型</small></span>
+                            <button class="icon-btn" data-member-up="${esc(member)}" title="上移" ${index === 0 ? "disabled" : ""}>↑</button>
+                            <button class="icon-btn" data-member-down="${esc(member)}" title="下移" ${index === group.members.length - 1 ? "disabled" : ""}>↓</button>
+                            <button class="icon-btn danger" data-member-remove="${esc(member)}" title="移除">×</button>
+                          </li>`
+                        )
+                        .join("")
+                    : `<li class="empty-line">还没有成员。从下方选择上游加入。</li>`}
+                </ol>
+                <div class="route-group-foot">
+                  <select class="input select" data-group-add-select="${esc(group.id)}">
+                    <option value="">添加上游…</option>
+                    ${names.filter((name) => !group.members.includes(name)).map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("")}
+                  </select>
+                  <button class="btn ghost sm" data-group-add="${esc(group.id)}">加入成员</button>
+                  <button class="btn danger sm" data-group-delete="${esc(group.id)}">删除组</button>
+                </div>
+              </article>`
+            )
+            .join("")
+        : `<div class="empty-line">还没有路由组。到「设置 → 路由组」新增，或从下方新建。</div>`;
+      groupHost.insertAdjacentHTML(
+        "beforeend",
+        `<div class="route-group-add"><input class="input" id="route-group-new" placeholder="新组标识，例如 fast"><button class="btn ghost sm" id="route-group-create">+ 新建路由组</button></div>`
+      );
+      bindRouteGroupActions(routeGroups, markDirty);
+    }
+
+    const save = $("#route-save");
+    if (save) {
+      save.addEventListener("click", () => {
+        const nextGroups = {};
+        routeGroups.forEach((group) => {
+          nextGroups[group.id] = group.members;
+        });
+        saveRouteDraft({ unified: { visibleUpstreams: visible.size === names.length ? [] : [...visible] }, groups: nextGroups }, "统一入口与路由组已保存");
+      });
+    }
+    $("#route-visible-all")?.addEventListener("click", () => {
+      visible.clear();
+      names.forEach((name) => visible.add(name));
+      $$("#unified-matrix [data-visible-upstream]").forEach((input) => {
+        input.checked = true;
+      });
+      $("#unified-count").textContent = `${names.length} 个可见`;
+      markDirty();
+    });
+
+    const previewInput = $("#route-preview-input");
+    const previewRun = $("#route-preview-run");
+    if (previewRun && previewInput) {
+      previewRun.addEventListener("click", () => renderRoutePreview(previewInput.value.trim()));
+      previewInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") renderRoutePreview(previewInput.value.trim());
+      });
+    }
+
+    // 让「在设置中编辑」真正跳到设置页的路由分区。
+    $$('#view-routes [data-config-sub="groups"]').forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        navigate("settings");
+        setTimeout(() => {
+          if (window.MG_APPLY_SETTINGS_SECTION) window.MG_APPLY_SETTINGS_SECTION("routes");
+          document.querySelector("#view-settings")?.scrollIntoView({ block: "start" });
+        }, 80);
+      });
+    });
+    void dirty;
+  }
+
+  function bindRouteGroupActions(routeGroups, markDirty) {
+    const findGroup = (id) => routeGroups.find((group) => group.id === id);
+    const mutate = (groupId, fn) => {
+      const group = findGroup(groupId);
+      if (!group) return;
+      fn(group.members);
+      markDirty();
+      renderGroupLists(routeGroups, markDirty);
+    };
+
+    $$("#route-group-cards [data-group-members]").forEach((list) => {
+      const groupId = list.dataset.groupMembers;
+      list.querySelectorAll("li[data-member]").forEach((item) => {
+        item.addEventListener("dragstart", (event) => {
+          event.dataTransfer.setData("text/plain", `${groupId}|${item.dataset.index}`);
+          event.dataTransfer.effectAllowed = "move";
+        });
+        item.addEventListener("dragover", (event) => event.preventDefault());
+        item.addEventListener("drop", (event) => {
+          event.preventDefault();
+          const [fromGroup, fromIndex] = String(event.dataTransfer.getData("text/plain") || "").split("|");
+          if (fromGroup !== groupId) return;
+          const toIndex = Number(item.dataset.index);
+          mutate(groupId, (members) => {
+            const [moved] = members.splice(Number(fromIndex), 1);
+            if (moved) members.splice(toIndex, 0, moved);
+          });
+        });
+      });
+      list.querySelectorAll("[data-member-up]").forEach((button) => {
+        button.addEventListener("click", () => mutate(groupId, (members) => {
+          const index = members.indexOf(button.dataset.memberUp);
+          if (index > 0) [members[index - 1], members[index]] = [members[index], members[index - 1]];
+        }));
+      });
+      list.querySelectorAll("[data-member-down]").forEach((button) => {
+        button.addEventListener("click", () => mutate(groupId, (members) => {
+          const index = members.indexOf(button.dataset.memberDown);
+          if (index >= 0 && index < members.length - 1) [members[index + 1], members[index]] = [members[index], members[index + 1]];
+        }));
+      });
+      list.querySelectorAll("[data-member-remove]").forEach((button) => {
+        button.addEventListener("click", () => mutate(groupId, (members) => {
+          const index = members.indexOf(button.dataset.memberRemove);
+          if (index >= 0) members.splice(index, 1);
+        }));
+      });
+    });
+
+    $$("#route-group-cards [data-group-add]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const groupId = button.dataset.groupAdd;
+        const select = document.querySelector(`[data-group-add-select="${groupId}"]`);
+        const name = select?.value;
+        if (!name) return;
+        mutate(groupId, (members) => {
+          if (!members.includes(name)) members.push(name);
+        });
+      });
+    });
+
+    $$("#route-group-cards [data-group-delete]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const group = findGroup(button.dataset.groupDelete);
+        if (!group) return;
+        if (!confirm(`删除路由组 group/${group.id}？`)) return;
+        routeGroups.splice(routeGroups.indexOf(group), 1);
+        markDirty();
+        renderGroupLists(routeGroups, markDirty);
+      });
+    });
+
+    $("#route-group-create")?.addEventListener("click", () => {
+      const input = $("#route-group-new");
+      const id = String(input?.value || "").trim();
+      if (!/^[A-Za-z0-9._-]+$/.test(id)) {
+        toast("组标识只允许字母、数字、- _ .", "error");
+        return;
+      }
+      if (findGroup(id)) {
+        toast("组标识已存在", "error");
+        return;
+      }
+      routeGroups.push({ id, members: [] });
+      if (input) input.value = "";
+      markDirty();
+      renderGroupLists(routeGroups, markDirty);
+    });
+  }
+
+  function renderGroupLists(routeGroups, markDirty) {
+    const host = $("#route-group-cards");
+    if (!host) return;
+    // 重新渲染成员列表与选择器，但保留已输入的新组名。
+    const draftName = $("#route-group-new")?.value || "";
+    const names = upstreamNameList();
+    host.innerHTML = routeGroups.length
       ? routeGroups
           .map(
-            (group) => `<div class="row">
-              <div class="grow"><div class="name">group/${esc(group.id)}</div><div class="meta">${esc((group.members || []).join(" → "))}</div></div>
-            </div>`
+            (group) => `<article class="route-group-card" data-group="${esc(group.id)}">
+              <div class="route-group-head"><div><div class="route-group-name">group/${esc(group.id)}</div><div class="hint">${group.members.length} 个成员 · 按顺序尝试</div></div><span class="pill">${esc(group.id)}</span></div>
+              <ol class="route-members" data-group-members="${esc(group.id)}">
+                ${group.members.length
+                  ? group.members
+                      .map(
+                        (member, index) => `<li draggable="true" data-member="${esc(member)}" data-index="${index}">
+                          <span class="drag">⋮⋮</span>
+                          <span class="grow"><b>${esc(member)}</b><small>${index + 1} · ${routeModelCount(member)} 个模型</small></span>
+                          <button class="icon-btn" data-member-up="${esc(member)}" ${index === 0 ? "disabled" : ""}>↑</button>
+                          <button class="icon-btn" data-member-down="${esc(member)}" ${index === group.members.length - 1 ? "disabled" : ""}>↓</button>
+                          <button class="icon-btn danger" data-member-remove="${esc(member)}">×</button>
+                        </li>`
+                      )
+                      .join("")
+                  : `<li class="empty-line">还没有成员。从下方选择上游加入。</li>`}
+              </ol>
+              <div class="route-group-foot">
+                <select class="input select" data-group-add-select="${esc(group.id)}"><option value="">添加上游…</option>${names.filter((name) => !group.members.includes(name)).map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("")}</select>
+                <button class="btn ghost sm" data-group-add="${esc(group.id)}">加入成员</button>
+                <button class="btn danger sm" data-group-delete="${esc(group.id)}">删除组</button>
+              </div>
+            </article>`
           )
           .join("")
-      : `<div class="empty-line">尚未配置路由组。可在「设置 → 路由组」维护。</div>`;
-    if (groups.length) {
-      $("#unified-list").innerHTML += groups
-        .map(
-          (group) => `<div class="row"><span class="pill">分组</span><div class="grow"><div class="name">${esc(group.label || group.id)}</div><div class="meta">${esc((group.upstreams || []).join("、"))}</div></div></div>`
-        )
-        .join("");
+      : `<div class="empty-line">还没有路由组。到「设置 → 路由组」新增，或从下方新建。</div>`;
+    host.insertAdjacentHTML("beforeend", `<div class="route-group-add"><input class="input" id="route-group-new" placeholder="新组标识，例如 fast" value="${esc(draftName)}"><button class="btn ghost sm" id="route-group-create">+ 新建路由组</button></div>`);
+    bindRouteGroupActions(routeGroups, markDirty);
+    markDirty();
+  }
+
+  function renderRoutePreview(query) {
+    const host = $("#route-preview-result");
+    if (!host) return;
+    if (!query) {
+      host.innerHTML = `<div class="empty-line">输入后显示尝试顺序与不切换规则。</div>`;
+      return;
     }
+    const groups = routeGroupPairs();
+    let order = [];
+    let mode = "";
+    if (query.startsWith("group/")) {
+      const id = query.slice(6);
+      const group = groups.find((item) => item.id === id);
+      if (!group) {
+        host.innerHTML = `<div class="inline-note danger">找不到路由组 group/${esc(id)}。请求会返回错误，不会静默落到默认上游。</div>`;
+        return;
+      }
+      order = group.members;
+      mode = `路由组 group/${esc(id)}`;
+    } else {
+      order = state.access
+        .filter((item) => JSON.stringify(item.models || {}).toLowerCase().includes(query.toLowerCase()))
+        .map((item) => item.id);
+      if (!order.length) order = state.access.map((item) => item.id);
+      mode = `模型 ${esc(query)}`;
+    }
+    host.innerHTML = `<div class="preview-mode">${mode}</div>
+      <ol class="preview-steps">${order.map((name, index) => `<li><span class="n">${index + 1}</span><span class="grow">${esc(name)}</span><span class="pill">${state.access.some((item) => item.id === name) ? "已接入" : "仅配置"}</span></li>`).join("") || '<li class="empty-line">没有可尝试的上游。</li>'}</ol>
+      <div class="inline-note" style="margin-top:10px">401 / 403 / 404 / 普通 400 不切换；只有网络错误、429、5xx 才继续下一个成员。</div>`;
   }
 
   // ───────────────────────── 凭据池 ─────────────────────────
 
   function renderPools() {
     const host = $("#pool-list");
-    if (!state.pools.length) {
-      host.innerHTML = `<div class="card"><div class="empty">
+    const summary = $("#pool-summary");
+    const pools = state.pools || [];
+    const totals = pools.reduce(
+      (acc, pool) => {
+        acc.members += Number(pool.members || 0);
+        acc.available += Number(pool.available || 0);
+        acc.cooling += Number(pool.cooling || 0);
+        acc.exhausted += Number(pool.exhausted || 0);
+        acc.disabled += Number(pool.disabled || 0);
+        acc.needsSecret += Number(pool.needs_secret || 0);
+        return acc;
+      },
+      { members: 0, available: 0, cooling: 0, exhausted: 0, disabled: 0, needsSecret: 0 }
+    );
+    if (summary) {
+      summary.innerHTML = `
+        <div class="pool-stat"><span class="k">池</span><b>${num(pools.length)}</b><span class="s">绑定上游 ${num(new Set(pools.map((pool) => pool.upstream)).size)} 个</span></div>
+        <div class="pool-stat signal"><span class="k">可用成员</span><b>${num(totals.available)}</b><span class="s">共 ${num(totals.members)} 个成员</span></div>
+        <div class="pool-stat ${totals.cooling ? "amber" : ""}"><span class="k">冷却中</span><b>${num(totals.cooling)}</b><span class="s">按失败阈值自动恢复</span></div>
+        <div class="pool-stat ${totals.exhausted || totals.needsSecret ? "danger" : ""}"><span class="k">需要补充</span><b>${num(totals.exhausted + totals.needsSecret)}</b><span class="s">配额耗尽 ${num(totals.exhausted)} · 待补密钥 ${num(totals.needsSecret)}</span></div>`;
+    }
+
+    if (!pools.length) {
+      host.innerHTML = `<div class="card pool-empty"><div class="empty">
         <div class="empty-mark">⚿</div><h3>还没有凭据池</h3>
-        <p>多 Key 或账号型接入可创建池；池成员密钥只写本机加密库。</p>
+        <p>多 Key 或账号型接入可创建池；池成员密钥只写本机加密库，界面只显示掩码与状态。</p>
         <button class="btn primary" id="pool-add-empty">+ 新建凭据池</button>
       </div></div>`;
       const button = $("#pool-add-empty");
       if (button) button.addEventListener("click", openPoolModal);
       return;
     }
-    host.innerHTML = state.pools
+    host.innerHTML = pools
       .map((pool) => {
         const detail = state.poolDetails[pool.id];
         const members = detail && Array.isArray(detail.memberList) ? detail.memberList : [];
-        return `<div class="card">
-          <div class="card-head">
-            <div>
-              <h2>${esc(pool.id)}</h2>
-              <div class="tiny muted">绑定上游 ${esc(pool.upstream)} · ${esc(STRATEGY_LABEL[pool.strategy] || pool.strategy)}</div>
-            </div>
-            <span class="pill ${pool.status === "active" ? "signal" : ""}">${esc(pool.status || "active")}</span>
+        const total = Number(pool.members || members.length || 0);
+        const available = Number(pool.available || 0);
+        const cooling = Number(pool.cooling || 0);
+        const exhausted = Number(pool.exhausted || 0);
+        const disabled = Number(pool.disabled || 0);
+        return `<article class="pool-card" data-pool="${esc(pool.id)}">
+          <div class="pool-card-head">
+            <div class="grow"><div class="pool-name">${esc(pool.id)}</div><div class="pool-sub">绑定上游 <b>${esc(pool.upstream || "—")}</b> · ${esc(STRATEGY_LABEL[pool.strategy] || pool.strategy || "priority")}</div></div>
+            <span class="pill ${pool.status === "active" || !pool.status ? "signal" : "amber"}">${esc(pool.status || "active")}</span>
           </div>
-          ${poolSummaryHtml(pool)}
-          <div class="hr"></div>
+          <div class="pool-meter" title="可用 ${available} / 共 ${total}">
+            ${Array.from({ length: Math.max(total, 1) }, (_, index) => {
+              const kind = index < available ? "ok" : index < available + cooling ? "cool" : index < available + cooling + exhausted ? "bad" : "off";
+              return `<i class="${kind}"></i>`;
+            }).join("")}
+          </div>
+          <div class="pool-tagline">
+            <span class="pill signal">可用 ${available}/${total}</span>
+            ${cooling ? `<span class="pill amber">冷却 ${cooling}</span>` : ""}
+            ${exhausted ? `<span class="pill danger">耗尽 ${exhausted}</span>` : ""}
+            ${disabled ? `<span class="pill">停用 ${disabled}</span>` : ""}
+            ${pool.quota_limit ? `<span class="pill">配额 ${compactNum(pool.quota_used)}/${compactNum(pool.quota_limit)}</span>` : ""}
+          </div>
           ${members.length
-            ? `<div class="table-wrap"><table class="table">
-                <thead><tr><th>成员</th><th>类型</th><th>状态</th><th class="num">优先级</th><th>最近使用</th><th class="right">操作</th></tr></thead>
+            ? `<div class="table-wrap pool-members"><table class="table">
+                <thead><tr><th>成员</th><th>状态</th><th class="num">优先级</th><th class="num">配额</th><th>冷却至 / 最近错误</th><th class="right">操作</th></tr></thead>
                 <tbody>${members
                   .map(
                     (member) => `<tr>
-                      <td>${esc(member.label)}</td>
-                      <td class="tiny">${esc(member.kind)}</td>
+                      <td><div class="name">${esc(member.label || member.id)}</div><div class="tiny muted mono">${esc(member.kind || "key")} · ${esc(String(member.id).slice(0, 10))}</div></td>
                       <td><span class="pill ${
                         member.status === "active" ? "signal" : member.cooling ? "amber" : member.status === "exhausted" ? "danger" : ""
-                      }">${esc(STATUS_LABEL[member.status] || member.status)}</span></td>
+                      }">${esc(STATUS_LABEL[member.status] || member.status || "—")}</span></td>
                       <td class="num">${num(member.priority)}</td>
-                      <td class="tiny muted">${fmtTime(member.lastUsedAt)}</td>
-                      <td class="right"><span class="actions">
+                      <td class="num tiny">${member.quota_limit ? `${compactNum(member.quota_used)}/${compactNum(member.quota_limit)}` : "—"}</td>
+                      <td class="tiny muted">${member.coolingUntil ? `冷却至 ${fmtTime(member.coolingUntil)}` : esc(member.lastError || "—")}</td>
+                      <td class="right"><div class="actions">
                         <button class="btn ghost sm" data-member-toggle="${esc(pool.id)}|${esc(member.id)}|${member.status === "disabled" ? "active" : "disabled"}">${member.status === "disabled" ? "启用" : "停用"}</button>
                         <button class="btn danger sm" data-member-delete="${esc(pool.id)}|${esc(member.id)}">删除</button>
-                      </span></td>
+                      </div></td>
                     </tr>`
                   )
                   .join("")}</tbody>
               </table></div>`
             : `<div class="empty-line">池里还没有成员。添加成员时只填标签与密钥。</div>`}
-          <div class="card-actions wrap" style="margin-top:12px">
+          <div class="pool-card-foot">
             <button class="btn primary sm" data-member-add="${esc(pool.id)}">+ 添加成员</button>
             <button class="btn ghost sm" data-pool-probe="${esc(pool.id)}">探测全部</button>
             <button class="btn ghost sm" data-pool-policy="${esc(pool.id)}">池设置</button>
           </div>
-        </div>`;
+        </article>`;
       })
       .join("");
     $$("[data-member-add]").forEach((button) => button.addEventListener("click", () => openMemberModal(button.dataset.memberAdd)));
@@ -1063,29 +1288,30 @@
       .map((plugin) => {
         const attached = Array.isArray(plugin.attached) ? plugin.attached : [];
         const mode = plugin.detail && plugin.detail.auth ? plugin.detail.auth.mode : "";
-        return `<div class="card">
-          <div class="card-head">
-            <div>
-              <h2>${esc(plugin.name || plugin.id)}</h2>
-              <div class="tiny muted mono">${esc(plugin.id)} · v${esc(plugin.version)}</div>
-            </div>
+        const name = plugin.name || plugin.id;
+        const initials = String(name).slice(0, 2).toUpperCase();
+        const kindLabel = { free: "免费来源", "free-source": "免费来源", account: "账号池", provider: "Provider", aggregator: "聚合", tool: "工具" }[plugin.kind] || plugin.kind || "插件";
+        return `<article class="plugin-card ${plugin.enabled ? "on" : "off"}" data-plugin="${esc(plugin.id)}">
+          <div class="plugin-head">
+            <span class="plugin-avatar">${esc(initials)}</span>
+            <div class="grow"><div class="plugin-name">${esc(name)}</div><div class="plugin-sub mono">${esc(plugin.id)} · v${esc(plugin.version)}</div></div>
             <span class="pill ${plugin.enabled ? "signal" : ""}">${plugin.enabled ? "启用" : "停用"}</span>
           </div>
-          <div class="tagline">
-            ${badge(plugin.kind === "free" ? "free" : plugin.kind === "account" ? "account" : "plugin", plugin.kind)}
-            <span class="pill">${esc(plugin.tier)}</span>
-            ${mode ? `<span class="pill">auth ${esc(mode)}</span>` : ""}
-            ${plugin.builtin ? `<span class="pill info">内置</span>` : `<span class="pill">已安装</span>`}
+          <div class="plugin-chips">
+            <span class="chip">${esc(kindLabel)}</span>
+            ${plugin.tier ? `<span class="chip">${esc(plugin.tier)}</span>` : ""}
+            ${mode ? `<span class="chip">auth ${esc(mode)}</span>` : ""}
+            ${plugin.builtin ? `<span class="chip on">内置</span>` : `<span class="chip">已安装</span>`}
           </div>
-          <p class="hint" style="margin:10px 0">${esc(plugin.description || "未提供描述。")}</p>
-          ${attached.length ? `<div class="inline-note">已接入：${esc(attached.join("、"))}</div>` : ""}
-          <div class="card-actions wrap">
-            <button class="btn primary sm" data-plugin-attach="${esc(plugin.id)}">接入</button>
+          <p class="plugin-desc">${esc(plugin.description || "未提供描述。")}</p>
+          <div class="plugin-meta">${attached.length ? `已接入 ${esc(attached.join("、"))}` : "未接入上游 · 安装只登记，接入才创建上游"}</div>
+          <div class="plugin-foot">
+            <button class="btn primary sm" data-plugin-attach="${esc(plugin.id)}">${plugin.enabled ? "接入" : "先启用"}</button>
             ${attached.length ? `<button class="btn ghost sm" data-plugin-detach="${esc(plugin.id)}" data-name="${esc(attached[0])}">解绑</button>` : ""}
             <button class="btn ghost sm" data-plugin-toggle="${esc(plugin.id)}" data-enabled="${plugin.enabled ? "0" : "1"}">${plugin.enabled ? "禁用" : "启用"}</button>
             ${plugin.builtin ? "" : `<button class="btn danger sm" data-plugin-remove="${esc(plugin.id)}">卸载</button>`}
           </div>
-        </div>`;
+        </article>`;
       })
       .join("");
     $$("[data-plugin-attach]").forEach((button) =>
@@ -1161,99 +1387,6 @@
     } catch (error) {
       toast(error.message, "error");
     }
-  }
-
-  // ───────────────────────── 流量 / 观测 ─────────────────────────
-
-  async function refreshTraffic() {
-    const range = state.trafficDays === 1 ? "1" : `${state.trafficDays}d`;
-    const [totals, upstreams, usage, logs] = await Promise.all([
-      api(`/api/usage/totals?range=${range}`).catch(() => ({ totals: {} })),
-      api(`/api/usage/upstreams?range=${range}&limit=20`).catch(() => ({})),
-      api(`/api/usage/list?range=${range}&limit=50`).catch(() => ({ rows: [] })),
-      api(`/api/logs?range=${range}&limit=50`).catch(() => ({})),
-    ]);
-    state.totals = totals.totals || {};
-    state.usageRows = Array.isArray(usage.rows) ? usage.rows : Array.isArray(usage.items) ? usage.items : [];
-    state.logs = Array.isArray(logs.logs) ? logs.logs : Array.isArray(logs.items) ? logs.items : Array.isArray(logs.rows) ? logs.rows : [];
-    renderTraffic(upstreams);
-  }
-
-  function renderTraffic(upstreams) {
-    const totals = state.totals || {};
-    $("#traffic-stats").innerHTML = [
-      statCard("请求", num(totals.requests), `成功 ${num(totals.ok)}`, "signal", ""),
-      statCard("Token", compactNum(totals.total_tokens), `缓存读 ${compactNum(totals.cache_read_tokens)}`, "", ""),
-      statCard("失败", num(totals.errors), "4xx / 5xx", Number(totals.errors) ? "danger" : "", ""),
-      statCard("P95", fmtMs(totals.p95_duration_ms || totals.p95), `平均 ${fmtMs(totals.avg_duration_ms)}`, "", ""),
-    ].join("");
-    const rows = Array.isArray(upstreams.rows)
-      ? upstreams.rows
-      : Array.isArray(upstreams.upstreams)
-        ? upstreams.upstreams
-        : Array.isArray(upstreams.items)
-          ? upstreams.items
-          : [];
-    $("#traffic-upstreams tbody").innerHTML = rows.length
-      ? rows
-          .map(
-            (row) => `<tr><td>${esc(row.upstream || row.name || "—")}</td><td class="num">${num(row.requests)}</td><td class="num">${compactNum(row.total_tokens)}</td><td class="num">${num(row.errors)}</td></tr>`
-          )
-          .join("")
-      : `<tr><td colspan="4" class="muted">暂无用量。</td></tr>`;
-    $("#traffic-logs tbody").innerHTML = state.logs.length
-      ? state.logs
-          .slice(0, 50)
-          .map(
-            (row) => `<tr>
-              <td class="tiny muted">${fmtTime(row.ts)}</td>
-              <td>${esc(row.upstream || "—")}</td>
-              <td class="tiny">${esc(row.requested_model || row.model || "—")}</td>
-              <td><span class="pill ${Number(row.status) >= 400 ? "danger" : "signal"}">${esc(row.status || "—")}</span></td>
-              <td class="num">${fmtMs(row.duration_ms)}</td>
-            </tr>`
-          )
-          .join("")
-      : `<tr><td colspan="5" class="muted">暂无请求日志。</td></tr>`;
-  }
-
-  async function refreshObserve() {
-    await refreshAccess();
-    const [health, prompts] = await Promise.all([
-      api("/api/upstreams/health").catch(() => ({})),
-      api("/api/prompts?limit=20").catch(() => ({})),
-    ]);
-    state.health = Array.isArray(health.upstreams) ? health.upstreams : Array.isArray(health.items) ? health.items : [];
-    state.prompts = Array.isArray(prompts.items) ? prompts.items : Array.isArray(prompts.prompts) ? prompts.prompts : Array.isArray(prompts.rows) ? prompts.rows : [];
-    renderObserve();
-  }
-
-  function renderObserve() {
-    const diagnostics = collectIssues();
-    $("#diag-count").textContent = String(diagnostics.length);
-    $("#diagnostic-list").innerHTML = diagnostics.length
-      ? diagnostics
-          .map(
-            (diag) => `<div class="row">
-              <span class="pill ${diag.level === "error" ? "danger" : "amber"}">${esc(diag.level)}</span>
-              <div class="grow"><div class="name">${esc(diag.title)}</div><div class="meta">${esc(diag.detail)}</div></div>
-            </div>`
-          )
-          .join("")
-      : `<div class="empty-line">最近没有 error / warn。</div>`;
-    $("#prompt-list").innerHTML = state.prompts.length
-      ? state.prompts
-          .map(
-            (prompt) => `<div class="row">
-              <div class="grow">
-                <div class="name">${esc(prompt.preview || prompt.requested_model || "记录")}</div>
-                <div class="meta">${esc(prompt.requested_model || "—")} · ${fmtTime(prompt.ts)}</div>
-              </div>
-              <span class="pill">${num(prompt.message_count)} 条</span>
-            </div>`
-          )
-          .join("")
-      : `<div class="empty-line">未开启提示词记录，或暂无记录。</div>`;
   }
 
   // ───────────────────────── 设置 ─────────────────────────
@@ -1868,7 +2001,6 @@
       if (button) navigate(button.dataset.view);
     });
     $$("[data-go]").forEach((button) => {
-      if (button.closest("#overview-stats")) return;
       button.addEventListener("click", () => navigate(button.dataset.go));
     });
     $("#theme-toggle").addEventListener("click", toggleTheme);
@@ -1879,10 +2011,6 @@
     $$("[data-add]").forEach((button) => button.addEventListener("click", () => openAddModal(button.dataset.add)));
     $("#quick-add").addEventListener("click", () => openAddModal("official"));
 
-    $("#overview-refresh").addEventListener("click", async () => {
-      await Promise.all([refreshAccess(), refreshPools(), refreshTotals(1)]);
-      renderOverview();
-    });
     $("#overview-probe").addEventListener("click", async () => {
       const host = $("#health-results");
       host.hidden = false;

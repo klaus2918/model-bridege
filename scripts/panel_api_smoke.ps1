@@ -101,25 +101,26 @@ try {
     Assert-PanelCheck "ui-index" "/ui/" {
         param($Body)
         if ($Body -notmatch 'id="update-btn"') { throw "首页缺少更新入口" }
+        if ($Body -notmatch 'v4-base\.css') { throw "首页不是 v4 控制台" }
     }
 
-    Assert-PanelCheck "ui-v3-js" "/ui/v3.js" {
+    Assert-PanelCheck "ui-v4-core" "/ui/v4-core.js" {
         param($Body)
         foreach ($Marker in @("/api/access", "/api/usage/list", "/api/pools")) {
-            if ($Body -notmatch [regex]::Escape($Marker)) { throw "v3.js 缺少 $Marker" }
+            if ($Body -notmatch [regex]::Escape($Marker)) { throw "v4-core.js 缺少 $Marker" }
         }
     }
 
-    Assert-PanelCheck "ui-v3-config" "/ui/v3-config.js" {
+    Assert-PanelCheck "ui-v4-config" "/ui/v4-config.js" {
         param($Body)
         foreach ($Marker in @("/api/config/validate", "/api/update/status", "/api/ai/settings")) {
-            if ($Body -notmatch [regex]::Escape($Marker)) { throw "v3-config.js 缺少 $Marker" }
+            if ($Body -notmatch [regex]::Escape($Marker)) { throw "v4-config.js 缺少 $Marker" }
         }
     }
 
-    Assert-PanelCheck "ui-v3-style" "/ui/v3.css" {
+    Assert-PanelCheck "ui-v4-style" "/ui/v4.css" {
         param($Body)
-        if ($Body -notmatch '\.drawer') { throw "v3.css 缺少抽屉样式" }
+        if ($Body -notmatch '\.drawer') { throw "v4.css 缺少抽屉样式" }
     }
 } finally {
     if ($Process -and -not $Process.HasExited) {

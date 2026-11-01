@@ -643,7 +643,15 @@ fn escape_csv(text: &str) -> String {
     }
 }
 
+/// 日志尾读窗口：只读文件末尾 512 KiB。
+///
+/// 高频自动刷新时整文件读取在长日志下会反复搬运几十 MB；
+/// 面板只展示最近若干行，因此按窗口从文件尾部读即可。
+const LOG_TAIL_BYTES: u64 = 512 * 1024;
+
 pub async fn logs_get(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    use std::io::{Read, Seek, SeekFrom};
+
     let query = params(&uri);
     let lines = query
         .get("lines")
@@ -660,11 +668,27 @@ pub async fn logs_get(State(state): State<Arc<AppState>>, uri: Uri) -> Response 
         .join("modelgate.log");
     if !path.is_file() {
         return Json(json!({"path": path.display().to_string(), "lines": [],
-                           "total": 0, "size": 0, "note": "日志文件尚未生成"}))
+                           "total": 0, "size": 0, "tail": false,
+                           "note": "日志文件尚未生成"}))
         .into_response();
     }
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let all: Vec<&str> = text.lines().collect();
+    let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let start_at = file_size.saturating_sub(LOG_TAIL_BYTES);
+    let text = (|| -> std::io::Result<String> {
+        let mut file = std::fs::File::open(&path)?;
+        if start_at > 0 {
+            file.seek(SeekFrom::Start(start_at))?;
+        }
+        let mut buffer = Vec::with_capacity((file_size - start_at) as usize + 1);
+        file.read_to_end(&mut buffer)?;
+        Ok(String::from_utf8_lossy(&buffer).to_string())
+    })()
+    .unwrap_or_default();
+    let mut all: Vec<&str> = text.lines().collect();
+    // 从中间截断时首行通常是半截，直接丢弃，避免展示残缺行。
+    if start_at > 0 && !all.is_empty() {
+        all.remove(0);
+    }
     let mut matched: Vec<(usize, &str)> = all
         .iter()
         .enumerate()
@@ -691,9 +715,11 @@ pub async fn logs_get(State(state): State<Arc<AppState>>, uri: Uri) -> Response 
         .collect();
     Json(json!({
         "path": path.display().to_string(),
-        "size": std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+        "size": file_size,
         "total": total,
         "matched": matched_count,
+        "tail": start_at > 0,
+        "windowBytes": LOG_TAIL_BYTES,
         "lines": payload,
     }))
     .into_response()

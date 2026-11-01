@@ -73,11 +73,12 @@ fn panel_api_calls(ui_dir: &Path) -> BTreeSet<String> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if name.starts_with("v3") && name.ends_with(".js") {
-            js.push_str(&fs::read_to_string(&path).expect("read v3 ui module"));
+        if name.starts_with("v4") && name.ends_with(".js") {
+            js.push_str(&fs::read_to_string(&path).expect("read v4 ui module"));
             js.push('\n');
         }
     }
+    assert!(!js.is_empty(), "ui/ 下应有 v4*.js 面板脚本");
     let mut calls = BTreeSet::new();
     for quote in ['"', '\'', '`'] {
         // marker 只到左括号为止：引号由解析器自己跳过空白后读取，
@@ -230,18 +231,18 @@ fn every_panel_api_call_has_a_registered_route() {
 
 #[test]
 fn panel_backup_controls_exist_in_html() {
-    let html = fs::read_to_string(ui_dir().join("v3.html")).expect("read ui/v3.html");
+    let html = fs::read_to_string(ui_dir().join("v4.html")).expect("read ui/v4.html");
     for id in [
         "settings-backup",
         "settings-storage-hint",
         "settings-restore",
         "settings-validate",
     ] {
-        assert!(html.contains(id), "v3 设置页缺少 #{id}");
+        assert!(html.contains(id), "v4 设置页缺少 #{id}");
     }
     assert!(
         html.contains("从文件重载"),
-        "v3 设置页应保留「从文件重载」按钮"
+        "v4 设置页应保留「从文件重载」按钮"
     );
 }
 
@@ -252,10 +253,10 @@ fn panel_backup_controls_exist_in_html() {
 /// 修复是加确认框；本守卫钉死它不被回退。
 #[test]
 fn reload_from_file_guards_unsaved_edits() {
-    let js = fs::read_to_string(ui_dir().join("v3-config.js")).expect("read ui/v3-config.js");
+    let js = fs::read_to_string(ui_dir().join("v4-config.js")).expect("read ui/v4-config.js");
     assert!(
         js.contains("settings-dirty"),
-        "v3 设置页未跟踪未保存改动状态 —— 「从文件重载」无法判断是否要先确认"
+        "v4 设置页未跟踪未保存改动状态 —— 「从文件重载」无法判断是否要先确认"
     );
     assert!(
         js.contains("未保存的面板改动会丢失"),
@@ -263,7 +264,7 @@ fn reload_from_file_guards_unsaved_edits() {
     );
     assert!(
         js.contains("reloadConfig"),
-        "v3 设置页缺少「从文件重载」实现"
+        "v4 设置页缺少「从文件重载」实现"
     );
 }
 

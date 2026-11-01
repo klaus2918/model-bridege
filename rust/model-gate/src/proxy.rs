@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -449,6 +449,13 @@ impl UnifiedScope {
     }
 }
 
+/// 非 chat 路由（面板 `/api/*` 等）缓冲式提取器的请求体上限：64 MiB。
+///
+/// axum 对 `Json` / `Bytes` 这类提取器的默认上限只有 2 MiB，面板保存稍大的配置、
+/// 提交较长的定价表时会被 413 挡住。这一层只能在建路由时固定，所以是常量；
+/// chat 路由不受它约束——`ChatBody` 按运行态的 `maxBodyBytes` 每请求限流。
+const BUFFERED_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     use axum::routing::{delete, get, post, put};
     axum::Router::new()
@@ -457,6 +464,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/unified/v1/models", get(models_unified))
         .route("/unified/{group}/v1/models", get(models_unified_group))
         .route("/{upstream}/v1/models", get(models_forced))
+        // chat 路由的请求体由 `ChatBody` 提取器按 `maxBodyBytes` 自己限流，
+        // 不用 `DefaultBodyLimit`：框架默认的 2 MiB 对多模态请求太小，且超限时
+        // 只会返回纯文本 413、不留任何日志。
         .route("/v1/chat/completions", post(chat))
         .route("/unified/v1/chat/completions", post(chat_unified))
         .route(
@@ -687,6 +697,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/usage/list", get(api_usage_list))
         .route("/api/usage/models", get(api_usage_models))
         .route("/api/usage/upstreams", get(api_usage_upstreams))
+        // 管理接口（面板）走 `Json` 提取器，抬到与 chat 同量级的入站上限。
+        .layer(DefaultBodyLimit::max(BUFFERED_BODY_LIMIT_BYTES))
         .fallback(not_found)
         .with_state(state)
 }
@@ -859,34 +871,158 @@ async fn models_forced(State(state): State<Arc<AppState>>, Path(name): Path<Stri
     }
 }
 
-async fn chat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    chat_inner(state, None, headers, body).await
+/// chat 请求体：带「实际大小 vs 上限」诊断的提取器。
+///
+/// 为什么不用 `Bytes` + `DefaultBodyLimit`：axum 对缓冲式提取器的默认上限只有
+/// 2 MiB，超限时框架直接返回纯文本 413（`Failed to buffer the request body:
+/// length limit exceeded`）——没有结构化错误码，也不写任何日志，客户端只看到
+/// 一个不明所以的 413。这里自己按 `maxBodyBytes` 限流：超限时写一条 warn 日志，
+/// 并回 OpenAI 形状的 JSON 错误，把「多大、上限多少、改哪个配置」讲清楚。
+pub struct ChatBody(pub Bytes);
+
+impl FromRequest<Arc<AppState>> for ChatBody {
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+        let limit = state.cfg().max_body_bytes;
+        let method = req.method().as_str().to_string();
+        let path = req.uri().path().to_string();
+        let user_agent = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| brief_text(v, 80));
+        // 声明的长度能提前判断就先拒，不把注定会被拒的正文读进内存。
+        let declared = req
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(size) = declared.filter(|size| *size > limit) {
+            return Err(reject_body_too_large(
+                &method,
+                &path,
+                user_agent.as_deref(),
+                size,
+                limit,
+            ));
+        }
+        // 没有 Content-Length（chunked）时只能边读边计数；这里同样按上限收口。
+        let mut stream = req.into_body().into_data_stream();
+        // 只按声明长度做有限预分配：声明很大、实际发得很小的正文不该预先吃满内存。
+        let mut buf = Vec::with_capacity(declared.unwrap_or(0).min(256 * 1024) as usize);
+        let mut total: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    tracing::warn!(
+                        "{} {} 读取请求体失败（已读 {}）：{err}",
+                        method,
+                        path,
+                        fmt_bytes(total)
+                    );
+                    return Err(error_json(
+                        StatusCode::BAD_REQUEST,
+                        format!("读取请求体失败：{err}"),
+                        "invalid_request_error",
+                        "body_read_failed",
+                    ));
+                }
+            };
+            total += chunk.len() as u64;
+            if total > limit {
+                return Err(reject_body_too_large(
+                    &method,
+                    &path,
+                    user_agent.as_deref(),
+                    total,
+                    limit,
+                ));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(Self(Bytes::from(buf)))
+    }
+}
+
+/// 请求体超限：写 warn 日志并返回 OpenAI 形状的 413。
+///
+/// 日志与响应都要给出「谁、多大、上限多少」，否则用户只能看到一句
+/// `length limit exceeded`，既不知道是哪个请求，也不知道该改哪里。
+fn reject_body_too_large(
+    method: &str,
+    path: &str,
+    user_agent: Option<&str>,
+    size: u64,
+    limit: u64,
+) -> Response {
+    let client = match user_agent {
+        Some(ua) => format!("，客户端 UA={ua}"),
+        None => String::new(),
+    };
+    tracing::warn!(
+        "{} {} 请求体超限 413：收到 {}{}，上限 {}（配置项 maxBodyBytes）；已拒绝，未转发上游",
+        method,
+        path,
+        fmt_bytes(size),
+        client,
+        fmt_bytes(limit)
+    );
+    error_json(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "请求体 {} 超过单次请求上限 {}（配置项 maxBodyBytes）。请减小请求体，或在 bridge.config.json 里调大 maxBodyBytes 后保存配置（即时生效）。",
+            fmt_bytes(size),
+            fmt_bytes(limit)
+        ),
+        "invalid_request_error",
+        "request_too_large",
+    )
+}
+
+/// 字节数的人类可读写法：日志与 413 提示共用，避免只看到一串裸数字。
+fn fmt_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value >= MIB {
+        format!("{:.1} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.1} KiB", value / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+async fn chat(State(state): State<Arc<AppState>>, headers: HeaderMap, body: ChatBody) -> Response {
+    chat_inner(state, None, headers, body.0).await
 }
 
 async fn chat_forced(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: ChatBody,
 ) -> Response {
-    chat_inner(state, Some(name), headers, body).await
+    chat_inner(state, Some(name), headers, body.0).await
 }
 
 async fn chat_unified(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: ChatBody,
 ) -> Response {
-    chat_scoped(state, None, Some(UnifiedScope::All), headers, body).await
+    chat_scoped(state, None, Some(UnifiedScope::All), headers, body.0).await
 }
 
 async fn chat_unified_group(
     State(state): State<Arc<AppState>>,
     Path(group): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: ChatBody,
 ) -> Response {
-    chat_scoped(state, None, Some(UnifiedScope::Group(group)), headers, body).await
+    chat_scoped(state, None, Some(UnifiedScope::Group(group)), headers, body.0).await
 }
 
 async fn chat_inner(
@@ -2667,12 +2803,30 @@ pub(crate) fn error_json(
         .into_response()
 }
 
-async fn ui_index() -> impl IntoResponse {
+fn ui_page_html(source: &'static str) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    // v3 控制台为唯一入口；/ui/classic 仅做永久跳转，旧 API 保持兼容。
-    let html = include_str!("../ui/v3.html")
-        .replace("href=\"v3.css\"", &format!("href=\"v3.css?v={version}\""))
-        .replace("src=\"v3.js\"", &format!("src=\"v3.js?v={version}\""));
+    let mut html = source.to_string();
+    // 资源带版本号，避免升级后浏览器复用旧 JS/CSS。
+    for file in [
+        "v4-base.css",
+        "v4.css",
+        "v4-core.js",
+        "v4-config.js",
+        "v4-models.js",
+        "v4-usage.js",
+        "v4-prompts.js",
+        "v4-resources.js",
+        "v4.js",
+    ] {
+        html = html.replace(&format!("href=\"{file}\""), &format!("href=\"{file}?v={version}\""));
+        html = html.replace(&format!("src=\"{file}\""), &format!("src=\"{file}?v={version}\""));
+    }
+    html
+}
+
+async fn ui_index() -> impl IntoResponse {
+    // v4 控制台是唯一入口。
+    let html = ui_page_html(include_str!("../ui/v4.html"));
     (
         [
             ("content-type", "text/html; charset=utf-8"),
@@ -2683,37 +2837,42 @@ async fn ui_index() -> impl IntoResponse {
 }
 
 async fn ui_classic() -> impl IntoResponse {
-    // 旧面板已由 v3 完整替代；保留路径做永久跳转，避免旧书签 404。
+    // 旧面板已由 v4 完整替代；保留路径做永久跳转，避免旧书签 404。
     axum::response::Redirect::permanent("/ui/")
 }
 
 async fn ui_asset(Path(path): Path<String>) -> Response {
     // 只允许固定文件名，天然挡住路径穿越。
     let (content_type, body): (&str, &'static str) = match path.as_str() {
-        "v3.css" => ("text/css; charset=utf-8", include_str!("../ui/v3.css")),
-        "v3.js" => (
+        "v4-base.css" => ("text/css; charset=utf-8", include_str!("../ui/v4-base.css")),
+        "v4.css" => ("text/css; charset=utf-8", include_str!("../ui/v4.css")),
+        "v4.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("../ui/v3.js"),
+            include_str!("../ui/v4.js"),
         ),
-        "v3-config.js" => (
+        "v4-core.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("../ui/v3-config.js"),
+            include_str!("../ui/v4-core.js"),
         ),
-        "v3-models.js" => (
+        "v4-config.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("../ui/v3-models.js"),
+            include_str!("../ui/v4-config.js"),
         ),
-        "v3-usage.js" => (
+        "v4-models.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("../ui/v3-usage.js"),
+            include_str!("../ui/v4-models.js"),
         ),
-        "v3-prompts.js" => (
+        "v4-usage.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("../ui/v3-prompts.js"),
+            include_str!("../ui/v4-usage.js"),
         ),
-        "v3-resources.js" => (
+        "v4-prompts.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("../ui/v3-resources.js"),
+            include_str!("../ui/v4-prompts.js"),
+        ),
+        "v4-resources.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("../ui/v4-resources.js"),
         ),
         _ => {
             return error_json(
@@ -3153,6 +3312,108 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
         Arc::new(AppState::new(cfg, db, dir.join("c.json")))
+    }
+
+    /// 请求体超限：必须回结构化 413（而不是框架的纯文本），并指出上限与配置项。
+    #[tokio::test]
+    async fn chat_body_over_limit_returns_reasoned_413() {
+        use tower::ServiceExt;
+
+        let cfg = crate::config::Config::from_value(json!({
+            "maxBodyBytes": 1024,
+            "upstreams": {
+                "u": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1", "apiKey": "k"}
+            }
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-body-limit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "x".repeat(4096)}]
+        })
+        .to_string();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/unified/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("读取 413 响应");
+        let payload: Value = serde_json::from_slice(&bytes).expect("413 响应必须是 JSON");
+        assert_eq!(payload["error"]["code"], "request_too_large");
+        let message = payload["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("maxBodyBytes"),
+            "错误信息要指出该改哪个配置：{message}"
+        );
+        assert!(
+            message.contains("1.0 KiB"),
+            "错误信息要给出当前上限：{message}"
+        );
+    }
+
+    /// 管理接口的 `Json` 提取器也必须放宽：超过 axum 默认 2 MiB 的正文要能正常解析。
+    #[tokio::test]
+    async fn admin_json_body_above_default_limit_is_accepted() {
+        use tower::ServiceExt;
+
+        let cfg = crate::config::Config::from_value(json!({
+            "upstreams": {
+                "u": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1", "apiKey": "k"}
+            }
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-admin-body-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+
+        // 3 MiB 正文：超过 axum 的 2 MiB 默认上限，低于本进程放宽后的 64 MiB。
+        let body = json!({
+            "config": {
+                "upstreams": {
+                    "u": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1", "apiKey": "k"}
+                },
+                "padding": "x".repeat(3 * 1024 * 1024)
+            }
+        })
+        .to_string();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "3 MiB 的管理接口请求体不应再被 2 MiB 默认上限拒绝"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("读取校验响应");
+        let payload: Value = serde_json::from_slice(&bytes).expect("校验响应必须是 JSON");
+        assert!(
+            payload.get("diagnostics").is_some(),
+            "应返回配置诊断：{payload}"
+        );
     }
 
     /// 假上游：记录每次请求的 `x-api-key` / `authorization`，并返回标准 OpenAI 响应。

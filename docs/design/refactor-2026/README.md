@@ -2,10 +2,11 @@
 
 > 状态：**已确认**（2026-10-31，用户确认按当前实现验收）。设计与原型目录本身不直接改生产代码；
 > 实现位于 `rust/model-gate/src/{access,credential_pool,plugin,ai_api}.rs` 与
-> `ui/v3.*`，实现说明见 `docs/architecture/access-orchestration.md`。
-> 目标版本：v3.0（暂定），必须兼容 v2.x 的配置、数据库和调用方式。
+> `ui/v4.*`，实现说明见 `docs/architecture/access-orchestration.md`。
+> 目标版本：v4.0（暂定），必须兼容 v2.x 的配置、数据库和调用方式。
 >
-> 实际页面截图：`screenshots-v3/`（总览、接入、详情抽屉、快速添加、凭据、插件、流量、设置）。
+> 控制台 v4 方案：`09-console-v4-design.md`（当前实现）；实际页面截图：`screenshots-v4/`。
+> `05-ui-redesign.md` / `prototype/` / `screenshots/` 为 v3 阶段设计存档。
 
 ## 1. 为什么重构
 
@@ -64,7 +65,8 @@
 | `05-ui-redesign.md` | 信息架构、页面规格、关键流程、组件与视觉规范 |
 | `prototype/index.html` | 高保真可交互原型（纯本地单文件） |
 | `screenshots/` | 设计稿关键页面截图 |
-| `screenshots-v3/` | v3 实现后的真实页面截图（总览/接入/抽屉/快速添加/凭据/插件/流量/设置） |
+| `09-console-v4-design.md` | 控制台 v4 信息架构、页面规格、交互规范、视觉系统与验收清单 |
+| `screenshots-v4/` | v4 实现后的真实页面截图（总览/用量/提示词/接入/配置中心/模型/日志/设置等） |
 | `../../architecture/access-orchestration.md` | 已落地实现、接口契约与验证口径 |
 
 ## 6. 分期路线

@@ -9,7 +9,7 @@
 | 脚本 | 用途 |
 |---|---|
 | `panel_api_smoke.ps1` | 启动 `--no-gui` 实例，检查 `/api/info`、`/api/update/status`、`/ui/` 与更新资源 |
-| `ui_smoke_v3.js` | v3 控制台无头浏览器冒烟：页面无 JS 异常、12 个视图切换、接入详情抽屉、快速添加、模型/定价、凭据池、插件、免费来源、ZCode、用量、提示词、运行日志、设置与截图（需先启动实例并传 `--base`） |
+| `ui_smoke_v4.js` | v4 控制台无头浏览器冒烟：页面无 JS 异常、6 个一级入口、配置中心子页、接入抽屉、命令面板、用量分析、提示词、日志与诊断、设置与截图（需先启动实例并传 `--base`） |
 | `db_migration_smoke.js` | 历史数据库兼容冒烟：旧 schema + 旧数据启动，验证自动迁移、旧数据可读与新写入 |
 | `rust_shell_acceptance.ps1` | 托盘壳黑盒验收：启动耗时、内存、无 WebView2、二次启动、配置保存 |
 | `upgrade_and_run.ps1` | 按 PID 停旧实例、启动版本化 exe 并等待 `/api/info` 就绪 |
@@ -23,14 +23,14 @@
 # 面板接口 + 更新资源冒烟（需先构建 dist\Model-Gate-rust.exe）
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe
 
-# v3 控制台冒烟（先启动实例，例如 dist\Model-Gate-rust.exe --port 8912；失败时保留现场）
-node scripts\ui_smoke_v3.js --base http://127.0.0.1:8912
+# v4 控制台冒烟（先启动实例，例如 dist\Model-Gate-rust.exe --port 8912；失败时保留现场）
+node scripts\ui_smoke_v4.js --base http://127.0.0.1:8912
 
 # 历史数据库兼容冒烟（旧 schema + 旧数据，自动迁移后读写验证）
 node scripts\db_migration_smoke.js --exe dist\Model-Gate-rust.exe
 
-# v3 冒烟并刷新文档截图
-node scripts\ui_smoke_v3.js --base http://127.0.0.1:8912 --screenshot-dir docs\design\refactor-2026\screenshots-v3
+# v4 冒烟并刷新文档截图
+node scripts\ui_smoke_v4.js --base http://127.0.0.1:8912 --screenshot-dir docs\design\refactor-2026\screenshots-v4
 
 # 桌面壳验收
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\rust_shell_acceptance.ps1 -Exe dist\Model-Gate.exe
@@ -40,7 +40,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\find_iscc.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\get_innosetup.ps1
 ```
 
-`ui_smoke_v3.js` / `db_migration_smoke.js` 需要 Node 22+（内置 WebSocket / `node:sqlite`）与本机 Chrome/Edge（仅 UI 冒烟）；默认自动探测，找不到时用 `--chrome` 指定。`db_migration_smoke.js` 会打印 Node 的实验性 SQLite 警告，不影响结果。
+`ui_smoke_v4.js` / `db_migration_smoke.js` 需要 Node 22+（内置 WebSocket / `node:sqlite`）与本机 Chrome/Edge（仅 UI 冒烟）；默认自动探测，找不到时用 `--chrome` 指定。`db_migration_smoke.js` 会打印 Node 的实验性 SQLite 警告，不影响结果。
 
 ## 约定
 

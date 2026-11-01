@@ -515,7 +515,7 @@ uninstall(plugin_id, {detach?=false, purge_data?=false}):
 | `src/provider_profiles.rs` | 注册表改读「内置插件 + 已安装插件」，内嵌 JSON 作 fallback | 现有 14 套顺序不变 |
 | `src/main.rs:320` | 调度改由 `runtime.scheduler` 声明 | ZCode 行为不变 |
 | `src/db.rs` | **只在 `SCHEMA` 追加三张表**；`MIGRATIONS` 不动 | G1/G2 守卫 |
-| `ui/v3.html` + `ui/v3.js` | 新增 v3「插件」视图 | 原有 v3 视图不动 |
+| `ui/v4.html` + `ui/v4-resources.js` | 新增 v4「插件」视图 | 原有 v4 视图不动 |
 | `src/zcode/*` | **不改** | 配置与表结构保持原样 |
 
 ---

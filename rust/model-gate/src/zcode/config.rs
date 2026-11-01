@@ -125,8 +125,16 @@ pub fn detect_zcode_cli() -> String {
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         candidates.push(
-            PathBuf::from(local)
+            PathBuf::from(&local)
                 .join("Programs")
+                .join("ZCode")
+                .join("resources")
+                .join("glm")
+                .join("zcode.cjs"),
+        );
+        // 部分安装器把应用放在 `Programs\ZCode\ZCode.exe`，CLI 仍在 resources 下。
+        candidates.push(
+            PathBuf::from(&local)
                 .join("ZCode")
                 .join("resources")
                 .join("glm")
@@ -134,6 +142,15 @@ pub fn detect_zcode_cli() -> String {
         );
     }
     if let Ok(pf) = std::env::var("PROGRAMFILES") {
+        candidates.push(
+            PathBuf::from(&pf)
+                .join("ZCode")
+                .join("resources")
+                .join("glm")
+                .join("zcode.cjs"),
+        );
+    }
+    if let Ok(pf) = std::env::var("PROGRAMFILES(X86)") {
         candidates.push(
             PathBuf::from(pf)
                 .join("ZCode")
@@ -155,11 +172,52 @@ pub fn detect_zcode_cli() -> String {
             .join("zcode.cjs"),
     );
     for path in candidates {
-        if path.exists() {
+        if path.is_file() {
             return path.display().to_string();
         }
     }
+    // 自定义安装目录（例如 D:\mysoft\ZCode）无法靠固定路径枚举覆盖：
+    // 从正在运行的 ZCode 客户端反推安装目录。只在固定候选全部落空时执行一次，
+    // 避免每次请求都拉起 PowerShell。
+    #[cfg(windows)]
+    if let Some(path) = detect_cli_from_running_process() {
+        return path.display().to_string();
+    }
     String::new()
+}
+
+/// 从运行中的 ZCode 客户端进程路径反推 `<install>/resources/glm/zcode.cjs`。
+///
+/// 用户可以把 ZCode 装到任意盘符/目录；卸载注册表项又可能是 GUID 子键，
+/// 直接读进程映像路径最稳。PowerShell 只用于这一次探测，且不创建控制台窗口。
+#[cfg(windows)]
+fn detect_cli_from_running_process() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Process -Name ZCode -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path)",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let exe = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if exe.is_empty() {
+        return None;
+    }
+    let cli = PathBuf::from(exe)
+        .parent()?
+        .join("resources")
+        .join("glm")
+        .join("zcode.cjs");
+    cli.is_file().then_some(cli)
 }
 
 pub fn detect_node() -> String {

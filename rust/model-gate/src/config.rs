@@ -862,6 +862,13 @@ pub struct RouteGroup {
     pub members: Vec<String>,
 }
 
+/// chat 单次请求体的默认上限：64 MiB。
+///
+/// 取值依据：纯文本对话通常只有几十到几百 KiB；带内联 base64 图片/附件的多模态
+/// 请求常见 5–20 MiB。axum 对缓冲式提取器的默认上限是 2 MiB，沿用会让正常请求
+/// 直接 413，因此这里给一个够用且仍能兜住异常放大的值。
+pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub raw: Value,
@@ -871,6 +878,9 @@ pub struct Config {
     pub models: Vec<String>,
     pub max_tokens: u64,
     pub timeout_seconds: f64,
+    /// chat 单次请求体上限（字节）。axum 对缓冲式提取器的默认上限只有 2 MiB，
+    /// 多模态请求（内联 base64 图片）很容易超过，必须显式给一个可用值。
+    pub max_body_bytes: u64,
     /// 模型目录缓存秒数（与 Python modelsCacheSeconds 对齐；Task 9 使用）
     pub models_cache_seconds: u64,
     pub access_log: bool,
@@ -933,6 +943,10 @@ impl Config {
             .get("timeoutSeconds")
             .and_then(Value::as_f64)
             .unwrap_or(600.0);
+        let max_body_bytes = obj
+            .get("maxBodyBytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_MAX_BODY_BYTES);
         let models_cache_seconds = obj
             .get("modelsCacheSeconds")
             .and_then(Value::as_u64)
@@ -996,6 +1010,7 @@ impl Config {
             models,
             max_tokens,
             timeout_seconds,
+            max_body_bytes,
             models_cache_seconds,
             access_log,
             prompt_capture,
@@ -1367,6 +1382,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "models",
     "maxTokens",
     "timeoutSeconds",
+    "maxBodyBytes",
     "accessLog",
     "promptCapture",
     "freeSourcesPanel",
@@ -1633,6 +1649,16 @@ impl Config {
                 "timeoutSeconds",
                 format!("超时 {} 秒过小，将按 600 秒运行", self.timeout_seconds),
                 "建议 60–3600 秒",
+            );
+        }
+        // 0 会让所有 chat 请求都被 413 拒绝，必须显式拦下。
+        if self.max_body_bytes == 0 {
+            push(
+                "error",
+                "invalid_max_body_bytes",
+                "maxBodyBytes",
+                "maxBodyBytes 必须大于 0，否则所有 chat 请求都会返回 413".into(),
+                "默认 67108864（64 MiB）；多模态请求建议 64 MiB 起",
             );
         }
         if !self.aliases.is_empty() {
@@ -3633,6 +3659,7 @@ fn fallback_default_config_value() -> Value {
         "models": ["mimo-v2.6-flash-free", "big-pickle"],
         "maxTokens": 8192,
         "timeoutSeconds": 600,
+        "maxBodyBytes": DEFAULT_MAX_BODY_BYTES,
         "accessLog": true,
         "promptCapture": false,
         "promptRetentionDays": 7,
@@ -3764,7 +3791,7 @@ mod default_config_tests {
 
 /// 面板内「配置说明」弹窗的内容契约。
 ///
-/// v3 的「配置说明」由 `ui/v3-config.js` 的 `help()` 提供；本模块只保留后端字段解析契约。
+/// v4 的「配置说明」由 `ui/v4-config.js` 的 `help()` 提供；本模块只保留后端字段解析契约。
 #[cfg(test)]
 mod tests {
     use super::*;

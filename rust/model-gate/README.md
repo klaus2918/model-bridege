@@ -91,6 +91,19 @@ deepseek-flash -> deepseek:deepseek-chat 502 120ms 失败: 无法连接上游 ..
 日志文件为 `data/modelgate.log`，启动时超过 5 MB 自动轮转，保留 `modelgate.log.1` ~ `.3`。
 面板「日志」页签保持 4 秒自动刷新。
 
+请求体超过 `maxBodyBytes`（默认 64 MiB）时不进上游，因此没有上面的访问日志行，只有一条 warn：
+
+```text
+POST /unified/v1/chat/completions 请求体超限 413：收到 12.5 MiB，客户端 UA=...，上限 64.0 MiB（配置项 maxBodyBytes）；已拒绝，未转发上游
+```
+
+413 的响应体是 OpenAI 形状的 JSON（`error.code = request_too_large`），message 写明实际大小、
+当前上限以及「调大 maxBodyBytes 后保存配置」的修复方式——正是为了避免客户端只显示
+axum 框架那句无上下文的 `Failed to buffer the request body: length limit exceeded`。
+
+面板自己的 `/api/*` 接口（`Json` 提取器）另有一层静态上限，已从 axum 默认的 2 MiB 抬到固定的
+64 MiB（`BUFFERED_BODY_LIMIT_BYTES`），保存较大的配置不会被 2 MiB 挡住。
+
 ## 密钥来源
 
 密钥只从环境变量或你显式指定的凭据文件读取。`apiKeyEnv` 指定变量名，取值顺序：
@@ -168,7 +181,7 @@ Windows 托盘不支持常驻鼠标正文字，
 
 **随包默认配置与说明弹窗**：默认配置收敛为单一来源 `default_config.json`——代码用 `include_str!` 内嵌
 （`config::default_config_value()`），安装包把它落为 `{app}\bridge.config.json`；配置说明则**长在面板里**：
-顶栏「配置说明」按钮打开软件内弹窗（`ui/v3-config.js` 的配置说明视图），内容讲清 JSON 格式、常用字段
+顶栏「配置说明」按钮打开软件内弹窗（`ui/v4-config.js` 的配置说明视图），内容讲清 JSON 格式、常用字段
 （顶层与 `upstreams` 两条）的用途与用法、密钥怎么写、改完怎么生效，不再随包发独立说明页。随包文件在安装包里是
 `onlyifdoesntexist` + `uninsneveruninstall`：**安装 / 升级 / 静默更新都不覆盖已有配置，
 卸载也不删用户配置与用量库**；便携版目录里没有配置时，首启自动生成与 `default_config.json`
@@ -194,7 +207,7 @@ src/
   thinking.rs    thinking 回传缓存
   update.rs      应用内更新（Release 检查 / 下载 / SHA256 / 静默安装）
   gui.rs         托盘 + Win32 消息循环 + 系统浏览器
-ui/              v3 控制台静态资源（v3.html / v3.css / v3-*.js）
+ui/              v4 控制台静态资源（v4.html / v4*.css / v4*.js）
 tests/fixtures/  Rust 单测夹具（legacy 配置、golden 快照）
 ```
 

@@ -15,6 +15,7 @@
   ],
   "maxTokens": 8192,
   "timeoutSeconds": 600,
+  "maxBodyBytes": 67108864,
   "accessLog": true,
   "modelsCacheSeconds": 300,
   "aliases": {},

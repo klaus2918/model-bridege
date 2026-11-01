@@ -208,9 +208,14 @@ impl ZcodeCli {
 fn find_builtin_in(root: &Path) -> Option<(String, PathBuf)> {
     let mut candidates = Vec::new();
     collect_builtin(root, &mut candidates, 0);
-    candidates
-        .into_iter()
-        .max_by_key(|(version, _)| version.clone())
+    // 与 ZCode GUI 的选择规则一致：优先非 `0.0.0-dev` 的正式运行时，其次取最近写入的
+    // `zcode-builtin.json`。只按版本字符串比较会在 3.9 / 3.10 这类跨位版本上选错。
+    candidates.into_iter().max_by_key(|(version, path)| {
+        let modified = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok();
+        (version.as_str() != "0.0.0-dev", modified)
+    })
 }
 
 fn collect_builtin(dir: &Path, out: &mut Vec<(String, PathBuf)>, depth: usize) {

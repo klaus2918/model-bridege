@@ -1,4 +1,4 @@
-/* v3 提示词列表、详情、会话演进与差异/工具分析。依赖 window.MG。 */
+/* v4 提示词列表、详情、会话演进与差异/工具分析。依赖 window.MG。 */
 (() => {
   "use strict";
   const MG = window.MG;

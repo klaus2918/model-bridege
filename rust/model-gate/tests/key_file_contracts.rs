@@ -137,20 +137,39 @@ fn file_target_has_no_builtin_default_path() {
     }
 }
 
+/// v4 面板的全部脚本（v4-core.js / v4-config.js / …）。
+///
+/// v4 把凭据输入拆到多个模块里，静态守卫必须跨模块扫描，
+/// 只查单一文件会漏掉「密钥只写通道」的实现。
+fn v4_panel_js() -> String {
+    let dir = crate_root().join("ui");
+    let mut out = String::new();
+    for entry in fs::read_dir(&dir).expect("read ui dir") {
+        let path = entry.expect("ui entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("v4") && name.ends_with(".js") {
+            out.push_str(&fs::read_to_string(&path).expect("read v4 ui module"));
+            out.push('\n');
+        }
+    }
+    assert!(!out.is_empty(), "ui/ 下应有 v4*.js 脚本");
+    out
+}
+
 #[test]
-fn v3_panel_never_persists_plaintext_secret() {
-    let text = read("ui/v3.js");
+fn v4_panel_never_persists_plaintext_secret() {
+    let text = v4_panel_js();
     assert!(
         text.contains("type=\"password\""),
-        "v3 凭据页必须使用 password 输入，密钥不回显"
+        "v4 凭据页必须使用 password 输入，密钥不回显"
     );
     assert!(
         text.contains("/secret"),
-        "v3 凭据页必须走密钥写入接口，而不是把密钥写进配置对象"
+        "v4 凭据页必须走密钥写入接口，而不是把密钥写进配置对象"
     );
     assert!(
         !text.contains("entry.apiKey =") && !text.contains("config.apiKey ="),
-        "v3 面板不得把明文密钥赋给配置对象"
+        "v4 面板不得把明文密钥赋给配置对象"
     );
 }
 #[test]

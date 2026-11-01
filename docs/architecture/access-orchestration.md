@@ -1,11 +1,11 @@
-# 接入编排、凭据池与 AI 配置接口（v3 实现说明）
+# 接入编排、凭据池与 AI 配置接口（v4 实现说明）
 
 > 对应设计：`docs/design/refactor-2026/`。本文记录**已落地实现**的边界、契约与验证口径，
 > 供后续维护与排查使用。
 
 ## 1. 目标与不可破坏的兼容约束
 
-v3 不新建第二份配置，也不替换代理内核。所有接入（官方、自定义、免费、账号、插件）
+v4 不新建第二份配置，也不替换代理内核。所有接入（官方、自定义、免费、账号、插件）
 最终仍归一为 `bridge.config.json#upstreams.<name>`。
 
 | # | 约束 | 实现 |
@@ -155,7 +155,7 @@ manifest（`modelgate.plugin/v1`）关键段：
 
 ## 8. UI
 
-- 唯一入口：`/ui/`（`v3.html + v3.css + v3.js + v3-*.js`）；
+- 唯一入口：`/ui/`（`v4.html + v4-base.css + v4.css + v4.js + v4-core/config/models/usage/prompts/resources.js`）；
 - `/ui/classic` 仅返回 308 永久跳转到 `/ui/`，旧面板资产已移除；
 - 侧栏 5 个分区、12 个子视图：总览 / 全部接入 / 模型与定价 / 路由组 / 凭据池 /
   插件 / 免费来源 / ZCode / 用量分析 / 提示词 / 运行日志 / 设置；
@@ -165,7 +165,7 @@ manifest（`modelgate.plugin/v1`）关键段：
 - 快速添加为两步向导（官方）或 5 项表单（自定义）；
 - 所有密钥输入为 `type=password`，保存后清空且不回显。
 
-实际截图：`docs/design/refactor-2026/screenshots-v3/`。
+设计稿与截图：`docs/design/refactor-2026/09-console-v4-design.md` 与 `docs/design/refactor-2026/v4/shots/`。
 
 ## 9. 诊断码
 
@@ -182,17 +182,17 @@ manifest（`modelgate.plugin/v1`）关键段：
 ```powershell
 cd rust\model-gate
 cargo test                      # 334 单元测试 + 集成/契约套件
-node --check ui\v3.js           # UI 脚本语法
+node --check ui\v4.js           # UI 脚本语法
 
 # 启动临时实例后
-node scripts\ui_smoke_v3.js --base http://127.0.0.1:8912 `
-  --screenshot-dir docs\design\refactor-2026\screenshots-v3
+node scripts\ui_smoke_v4.js --base http://127.0.0.1:8912 `
+  --screenshot-dir docs\design\refactor-2026\screenshots-v4
 ```
 
 已核对：
 
-- `/ui/` 加载 v3、`/ui/classic` 返回 308 -> `/ui/`；
+- `/ui/` 加载 v4、`/ui/classic` 返回 308 -> `/ui/`；
 - `/api/access/templates` 15 个模板；`/api/pools`、`/api/plugins` 可读；
 - `/api/ai/inspect` 不含 `sk-` / `secretRef` / `secret`；
 - `/v1/models`、`/unified/v1/models`、`/demo/v1/models` 均正常；
-- v3 smoke：16 通过、0 失败（含抽屉 6 页签、设置校验、旧路径跳转）。
+- v4 smoke（`scripts/ui_smoke_v4.js`）：15 通过、0 失败（含配置中心子页、接入/请求抽屉、命令面板、用量与日志）。

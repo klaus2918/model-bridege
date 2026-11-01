@@ -183,7 +183,7 @@
 | `rust/model-gate/src/free_sources.rs` | 免费判定、拒因归一化、退避、一键接入配置构造 |
 | `rust/model-gate/src/free_sources_api.rs` | 四个端点的实现 |
 | `rust/model-gate/provider_profiles.json` | `kilo` provider 预设（免密） |
-| `rust/model-gate/ui/v3-resources.js` | v3「免费来源 / ZCode」视图 |
+| `rust/model-gate/ui/v4-resources.js` | v4「免费来源 / ZCode」视图 |
 | `rust/model-gate/tests/fixtures/free_sources_golden.json` | 目录样本 + 拒因样本（golden） |
 
 面板静态资源与 provider 预设随 `rust-only-autoupdate` 迁到 `rust/model-gate/`，

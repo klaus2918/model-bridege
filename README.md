@@ -26,16 +26,24 @@
 > 走 `GLM-5.3-Flash` / `GLM-5.3`，请求在账号池内轮询、失败自动换号。旧的 OpenAI/Anthropic/
 > CommandCode/opencode 上游与配置保持兼容。
 
-## v3 接入控制台（默认面板）
+## v4 控制台（默认面板）
 
-`http://127.0.0.1:8900/ui/` 是 **唯一控制台**；旧 `/ui/classic` 仅做 308 永久跳转到 v3，
-旧面板资源已从仓库和运行时移除。
+`http://127.0.0.1:8900/ui/` 是 **唯一控制台**；旧 `/ui/classic` 仅做 308 永久跳转，
+v3 面板资源已从仓库和运行时移除。
 
-- **5 个分区 / 12 个子视图**：工作台（总览）、接入（全部接入 / 模型与定价 / 路由组）、
-  资源（凭据池 / 插件 / 免费来源 / ZCode）、观测（用量分析 / 提示词 / 运行日志）、设置。
-- **全部旧功能已进入 v3**：模型目录与定价、路由组、用量与请求明细、提示词演进与差异、
-  免费来源、ZCode 账号池、运行日志、备份恢复、配置说明与更新检查；接入详情提供
-  模型/别名/覆盖、`compat`、超时等高级编辑，不再跳旧面板。
+- **6 个一级入口 / 4 组**：工作台（总览）、分析（用量分析 / 提示词）、
+  运行（接入管理 / 日志与诊断）、配置（配置中心）。高频页面始终一次点击可达。
+- **配置中心是任务板**：模型与路由、凭据池、资源库、设置四张域卡片给出状态、待处理项与
+  常用动作；进入子页后用左侧二级导航。模型目录/单价表、统一入口/路由组、凭据池/ZCode、
+  插件/免费来源/模板、设置/高级维护都收在这里，不再占用一级导航。
+- **统一详情范式**：接入、请求、提示词、池成员等对象一律右侧抽屉或侧栏展开，`Esc` 关闭；
+  支持深链（`?view=config&sub=pricing`）、命令面板（`⌘K` 或 `/`）与
+  `g o/u/p/a/l/c/s/d` 快捷键。
+- **用量分析先结论后明细**：粘性作用域条（时间/上游/模型/会话/币种/自动刷新）写入
+  localStorage，刷新页面保留同一视角；5 个 KPI 带环比；趋势按范围自动切换小时/日粒度并
+  展示全部时间桶；上游/模型/会话/请求四个页签，请求明细分页、点行打开请求抽屉。
+- **日志与诊断**：运行日志只读文件尾部 512 KB（长日志不再整文件搬运），支持级别/关键字过滤、
+  行数切换、自动刷新保持滚动位置、复制/清空/跳到末尾；诊断页按严重度分组并给出修复动作。
 - **官方厂商只填 Key**：选择模板 → 粘贴 Key → 完成；协议、地址、鉴权、隐私默认值由模板提供。
 - **自定义厂商只填 5 项**：标识、厂商、请求地址、协议、Key；高级项默认折叠。
 - **隐私默认勾选**：新增接入默认记录 ZDR 意图，可随时修改；面板会如实显示
@@ -51,9 +59,8 @@
 **兼容承诺**：`bridge.config.json` 仍是唯一事实源；`/v1`、`/{upstream}/v1`、
 `/unified/v1`、`/unified/{group}/v1` 与旧配置读取全部保留；SQLite 只追加新表，不改旧表。
 
-设计与交互稿：`docs/design/refactor-2026/`；v3 实际页面截图：
-`docs/design/refactor-2026/screenshots-v3/`；实现说明：
-`docs/architecture/access-orchestration.md`。
+设计与交互稿：`docs/design/refactor-2026/`（v4 方案见 `09-console-v4-design.md`）；
+实现说明：`docs/architecture/access-orchestration.md`。
 
 一个本地代理，把 **OpenAI 格式**的请求按模型名分发到**多条上游**，并自动处理各上游的协议差异。
 
@@ -606,6 +613,7 @@ curl http://127.0.0.1:8900/v1/models
 | `defaultModel` | 请求未带 `model` 时使用 |
 | `maxTokens` | 请求未带 `max_tokens` 时的默认上限 |
 | `timeoutSeconds` | 单请求整体超时（秒） |
+| `maxBodyBytes` | chat 单次请求体上限（字节），默认 `67108864`（64 MiB）；超限返回 413 `request_too_large` |
 | `accessLog` | 是否打印每请求一行日志 |
 | `promptCapture` | 是否记录入站提示词（默认 `false`；只记 `messages`，不记响应） |
 | `promptRetentionDays` | 提示词保留天数，默认 `7`；`0` = 永久 |
@@ -1031,6 +1039,20 @@ CommandCode 的思考内容由它自己的事件流直接透出（不依赖这�
 `tokens=` 之后按上游协议追加附加信息：`think=补回条数`（anthropic）、
 `cache=缓存读+缓存写`、`截断(无 finish)`、`pause_turn 未续完`、`上游错误: ...`（后四项来自 CommandCode 协议）。
 
+请求体超限属于**入站拒绝**：请求没到上游，因此没有访问日志行，只有一条单独的 warn
+（含实际大小、上限与客户端 UA）：
+
+```
+... WARN model_gate::proxy: POST /unified/v1/chat/completions 请求体超限 413：收到 12.5 MiB，客户端 UA=...，上限 64.0 MiB（配置项 maxBodyBytes）；已拒绝，未转发上游
+```
+
+同时 413 的响应体是 OpenAI 形状的 JSON（`error.code = request_too_large`，message 里写明实际大小、
+上限与「调大 maxBodyBytes」的指引），客户端可以直接把原因显示给用户。
+
+面板自己的 `/api/*` 接口用的是 `Json` 提取器，axum 对它的默认上限同样只有 2 MiB；这一层已统一抬到
+**固定的 64 MiB**（`BUFFERED_BODY_LIMIT_BYTES`，不随 `maxBodyBytes` 变化）。保存较大的配置、
+提交长定价表不会再被 2 MiB 挡住；真的超过 64 MiB 时由框架返回 413。
+
 **面板用法（桌面版）**：用量页顶部的作用域条（时间预设 / 自定义起止 / 上游 / 模型）控制整页统计——
 KPI、趋势、占比、上游用量、模型用量与明细都会跟随，切换上游后模型下拉只保留该上游的模型。
 **统计区不再有自己的分组按钮**：趋势图的时间粒度自动适配区间（短区间按小时、长区间按天）；
@@ -1052,6 +1074,7 @@ KPI 首位是**缓存命中率**（命中输入 / 总输入，分母为 0 显示
 | **401 Invalid API key** | 该上游不该带 key 却带了，或 key 无效 | Zen 免费模型用 `compat.auth.scheme=none`（不再依赖 `apiKey`）；Go 需要有效 `OPENCODE_API_KEY` |
 | 401 Missing API key | Go 没读到密钥 | 检查进程环境或用户变量里的 `OPENCODE_API_KEY`（面板「写入密钥 → 写入用户环境变量」） |
 | 400 `MissingSessionID` | 该上游未注入会话头 | 确认该上游 `sessionHeader` 不为 `false` |
+| **413 `request_too_large`** | 请求体超过 `maxBodyBytes`（默认 64 MiB），多模态请求最易触发 | 日志里有「请求体超限 413」一行（含实际大小与上限）；调大 `maxBodyBytes` 后保存即可 |
 | 模型报不存在 | 该模型不在任何上游的 `models` 里，被送到默认上游 | 把模型名加到对应上游的 `models` |
 | 流式没有 `[DONE]` | 部分上游（如 minimax-m3）本身不发 | 上游行为，客户端按连接关闭结束即可 |
 | CommandCode 本地 401 | 没读到凭据（不打上游） | 在面板把 `COMMAND_CODE_API_KEY` 用「写入密钥」写入用户环境变量（或写入你指定的凭据文件），或由启动进程注入 |
@@ -1081,7 +1104,7 @@ Model-Gate/
 ├─ README.md                      # 本说明
 ├─ rust/model-gate/               # 唯一产品源码（Rust 代理内核 + 托盘 + 系统浏览器面板）
 │  ├─ src/                        # 代理、协议适配、配置、SQLite、更新、托盘
-│  ├─ ui/                         # 内嵌 v3 控制台（v3.html / v3.css / v3-*.js）
+│  ├─ ui/                         # 内嵌 v4 控制台（v4.html / v4*.css / v4*.js）
 │  ├─ tests/fixtures/             # Rust 单测夹具（含 legacy 配置）
 │  ├─ provider_profiles.json      # Provider 预设注册表（编译期内嵌）
 │  ├─ default_config.json         # 默认配置唯一来源（代码内嵌 + 安装包随附）
@@ -1111,13 +1134,13 @@ Rust-only 迁移删除），不要继续堆积在 `scripts/` 根目录。
 | `rust/model-gate/ui/` | 内嵌面板静态资源 |
 | `rust/model-gate/provider_profiles.json` | Provider 预设注册表 |
 | `rust/model-gate/default_config.json` | 默认配置唯一来源（代码内嵌 + 安装包随附为 `bridge.config.json`） |
-| `rust/model-gate/ui/v3*.js` | v3 控制台逻辑（含配置说明、模型/定价、用量、提示词、免费来源与 ZCode） |
+| `rust/model-gate/ui/v4*.js` | v4 控制台逻辑（外壳/命令面板、配置中心、模型与定价、用量、提示词、免费来源与 ZCode） |
 | `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 |
 | `ModelGate.iss` | Inno Setup 打包定义（固定 AppId，支持静默覆盖升级） |
 | `assets/ModelGate.ico` | 应用与托盘图标 |
 | `docs/` | 架构、兼容性、维护规范与示例配置 |
 | `scripts/panel_api_smoke.ps1` | 面板接口与更新资源冒烟 |
-| `scripts/ui_smoke_v3.js` | v3 无头浏览器冒烟（12 视图、抽屉、快速添加、配置校验、截图） |
+| `scripts/ui_smoke_v4.js` | v4 无头浏览器冒烟（6 个一级入口、配置中心子页、抽屉、命令面板、用量/日志、截图） |
 | `scripts/db_migration_smoke.js` | 历史数据库增量迁移冒烟（旧 schema + 旧数据启动、读取与新写入） |
 | `scripts/rust_shell_acceptance.ps1` | Rust 托盘壳黑盒验收 |
 | `scripts/upgrade_and_run.ps1` | 不停机升级辅助 |
@@ -1152,9 +1175,9 @@ powershell -ExecutionPolicy Bypass -File rust\model-gate\build-installer.ps1
 也可以直接调用 ISCC：
 
 ```bat
-iscc /DMyAppVersion=3.1.0 ^
+iscc /DMyAppVersion=4.0.0 ^
      /DMyAppSourceExe=dist\Model-Gate-rust.exe ^
-     /DMyOutputBaseFilename=Model-Gate-v3.1.0-rust-setup ^
+     /DMyOutputBaseFilename=Model-Gate-v4.0.0-rust-setup ^
      ModelGate.iss
 ```
 
@@ -1197,9 +1220,9 @@ iscc /DMyAppVersion=3.1.0 ^
 
 ### 发布
 
-1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `3.1.0`）。
-2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1` 与 v3 面板 `scripts\ui_smoke_v3.js`。
-3. 打 tag 并推送：`git tag v3.1.0`、`git push origin v3.1.0`（Git 写操作需人工确认）。
+1. 修改 `rust/model-gate/Cargo.toml` 的 `version`（例如 `4.0.0`）。
+2. 本地通过 `cargo fmt --check`、`cargo check`、`cargo test`、`scripts\panel_api_smoke.ps1` 与 v4 面板 `scripts\ui_smoke_v4.js`。
+3. 打 tag 并推送：`git tag v4.0.0`、`git push origin v4.0.0`（Git 写操作需人工确认）。
 4. `.github/workflows/release-rust.yml` 构建并上传：
    - `Model-Gate-v<版本>-rust-setup.exe`
    - `Model-Gate-rust.exe`（便携版）
@@ -1224,7 +1247,7 @@ cargo fmt --check
 cargo check
 cargo test
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe
-node scripts\ui_smoke_v3.js --base http://127.0.0.1:8912 --screenshot-dir docs\design\refactor-2026\screenshots-v3
+node scripts\ui_smoke_v4.js --base http://127.0.0.1:8912 --screenshot-dir docs\design\refactor-2026\screenshots-v4
 node scripts\db_migration_smoke.js --exe dist\Model-Gate-rust.exe
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\rust_shell_acceptance.ps1 -Exe dist\Model-Gate-rust.exe
 ```

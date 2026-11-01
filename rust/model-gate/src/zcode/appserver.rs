@@ -23,9 +23,15 @@ use super::client::ZcodeCli;
 use super::config::ZcodeConfig;
 use super::store::ZcodeAccount;
 
-const STARTUP_WAIT: Duration = Duration::from_secs(3);
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
-const TURN_TIMEOUT: Duration = Duration::from_secs(150);
+const STARTUP_WAIT: Duration = Duration::from_secs(8);
+const STARTUP_SETTLE: Duration = Duration::from_millis(2500);
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+const TURN_TIMEOUT: Duration = Duration::from_secs(600);
+/// Start Plan 账户注入时兜底暴露的模型。旧版 `zcode-builtin.json` 用
+/// `providerRules[].builtinModelIds` 声明，新版改由
+/// `builtinProviderModelRules`（modelId + providerId）描述；两条路径都要读。
+const START_PLAN_MODELS: [&str; 3] = ["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"];
+const START_PLAN_REASONING_LEVEL: &str = "max";
 
 #[derive(Debug, Clone)]
 pub struct AppServerResponse {
@@ -46,6 +52,26 @@ struct Rpc {
     usage: Option<Value>,
     turn_done: bool,
     turn_error: Option<String>,
+    session_id: Option<String>,
+    channel: Option<Value>,
+}
+
+/// 从 `model.streaming` 事件提取正文增量。
+///
+/// 只接受 `kind=text_delta`（缺省按正文兼容旧版本）；`reasoning_delta` 是思考过程，
+/// 混进 OpenAI 的 `content` 会把思考内容返回给客户端。
+fn event_text_delta(payload: &Value) -> Option<&str> {
+    if payload.get("done").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("text_delta");
+    if kind != "text_delta" {
+        return None;
+    }
+    payload.get("delta").and_then(Value::as_str)
 }
 
 impl Rpc {
@@ -67,20 +93,23 @@ impl Rpc {
     }
 
     async fn next_message(&mut self, timeout: Duration) -> Result<Option<Value>, String> {
-        let line = tokio::time::timeout(timeout, self.lines.next_line())
-            .await
-            .map_err(|_| "等待 app-server 消息超时".to_string())?
-            .map_err(|err| format!("读取 app-server 失败：{err}"))?;
-        let Some(line) = line else {
-            return Ok(None);
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            return Ok(None);
+        loop {
+            let line = tokio::time::timeout(timeout, self.lines.next_line())
+                .await
+                .map_err(|_| "等待 app-server 消息超时".to_string())?
+                .map_err(|err| format!("读取 app-server 失败：{err}"))?;
+            let Some(line) = line else {
+                return Err(self.error_with_stderr("app-server 输出已关闭".to_string()));
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                // JSON-RPC 之间可能夹空行；继续读，不把它当 EOF。
+                continue;
+            }
+            return serde_json::from_str::<Value>(line)
+                .map(Some)
+                .map_err(|err| format!("app-server 输出不是 JSON：{err}"));
         }
-        serde_json::from_str::<Value>(line)
-            .map(Some)
-            .map_err(|err| format!("app-server 输出不是 JSON：{err}"))
     }
 
     async fn handle_server_request(&mut self, msg: &Value) -> Result<(), String> {
@@ -95,18 +124,25 @@ impl Rpc {
                 "askUserQuestionAutoResolutionEnabled": true,
                 "modelContextBudgetStrategy": "preflight-v1",
             }),
-            "interaction/requestProviderRuntimeHeaders" => json!({
-                "headersApplied": true,
-                "requestAuth": {
-                    "apiKey": self.token,
-                    "headers": {
-                        "http-referer": "https://zcode.z.ai",
-                        "user-agent": format!("ZCode/{}", self.app_version),
-                        "x-zcode-app-version": self.app_version,
-                        "x-title": "Z Code@cli",
+            "interaction/requestProviderRuntimeHeaders" => {
+                let version = if self.app_version.trim().is_empty() {
+                    "0.17.1"
+                } else {
+                    self.app_version.as_str()
+                };
+                json!({
+                    "headersApplied": true,
+                    "requestAuth": {
+                        "apiKey": self.token,
+                        "headers": {
+                            "http-referer": "https://zcode.z.ai",
+                            "user-agent": format!("ZCode/{version}"),
+                            "x-zcode-app-version": version,
+                            "x-title": "Z Code@cli",
+                        }
                     }
-                }
-            }),
+                })
+            }
             "interaction/requestPermission" => json!({"decision": "deny"}),
             "interaction/browserList" => json!({"browsers": []}),
             "interaction/browserExecute" => json!({
@@ -125,7 +161,17 @@ impl Rpc {
     }
 
     fn handle_event(&mut self, params: &Value) {
+        // 只认当前会话的事件：app-server 可能把启动期/其他会话的事件也推到 stdout。
+        if let (Some(expected), Some(actual)) = (
+            self.session_id.as_deref(),
+            params.get("sessionId").and_then(Value::as_str),
+        ) {
+            if expected != actual {
+                return;
+            }
+        }
         let payload = params.get("payload").unwrap_or(&Value::Null);
+        // GUI 事件把 type 放在 params 顶层；部分遥测事件放在 payload.type。
         let ty = params
             .get("type")
             .and_then(Value::as_str)
@@ -133,8 +179,17 @@ impl Rpc {
             .unwrap_or("");
         match ty {
             "model.streaming" => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                if let Some(delta) = event_text_delta(payload) {
                     self.text.push_str(delta);
+                }
+            }
+            "session.updated" => {
+                if let Some(base_url) = payload.get("baseURL").and_then(Value::as_str) {
+                    self.channel = Some(json!({
+                        "providerId": payload.get("providerId").cloned().unwrap_or(Value::Null),
+                        "modelId": payload.get("modelId").cloned().unwrap_or(Value::Null),
+                        "baseURL": base_url,
+                    }));
                 }
             }
             "turn.completed" => {
@@ -142,19 +197,95 @@ impl Rpc {
                     .get("usage")
                     .cloned()
                     .or_else(|| params.get("usage").cloned());
+                // 有的版本不发 model.streaming 的 text_delta，只在 turn.completed
+                // 的 response 里给最终文本；只在没有增量时兜底，避免重复。
+                if self.text.is_empty() {
+                    if let Some(response) = payload.get("response").and_then(Value::as_str) {
+                        self.text.push_str(response);
+                    }
+                }
                 self.turn_done = true;
             }
             "turn.failed" => {
-                self.turn_error = Some(format!(
-                    "turn.failed：{}",
-                    payload
-                        .get("error")
-                        .cloned()
-                        .unwrap_or_else(|| payload.clone())
-                ));
+                let error = payload
+                    .get("error")
+                    .cloned()
+                    .unwrap_or_else(|| payload.clone());
+                let detail = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.get("code").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string());
+                let attribution = error.get("attribution").cloned().unwrap_or(Value::Null);
+                let suffix = if attribution.is_null() {
+                    String::new()
+                } else {
+                    format!("（{attribution}）")
+                };
+                self.turn_error = Some(format!("turn.failed：{detail}{suffix}"));
                 self.turn_done = true;
             }
             _ => {}
+        }
+    }
+
+    /// 等到 app-server 运行时进入 ready/committing 阶段。
+    ///
+    /// 参考实现实测：启动后不等就 `session/create` + `session/send`，回合会被静默丢弃
+    /// （send 已被接受，但事件流为空）。这里最多等 8s；超时不算失败，继续走后续请求，
+    /// 避免旧版本不发 startup 通知时把整次请求判死。
+    async fn wait_ready(&mut self, timeout: Duration) -> Result<bool, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            match self.next_message(remaining).await {
+                Ok(Some(msg)) => {
+                    if msg.get("method").is_some() {
+                        if msg.get("id").is_some() {
+                            self.handle_server_request(&msg).await?;
+                        } else {
+                            let params = msg.get("params").unwrap_or(&Value::Null);
+                            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                            let phase = params.get("phase").and_then(Value::as_str).unwrap_or("");
+                            if method.starts_with("startup/")
+                                && (phase == "ready" || phase == "committing")
+                            {
+                                return Ok(true);
+                            }
+                            self.handle_event(params);
+                        }
+                    }
+                }
+                Ok(None) => continue,
+                Err(err) if err.contains("超时") => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// 发送一条通知（没有 id、没有响应）。用于 `session/stop`。
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+        self.write(&json!({"method": method, "params": params}))
+            .await
+    }
+
+    /// 补发 `session/stop`：app-server 的回合锁在超时/中止后不会自己释放，
+    /// 不补这一刀，同一会话的下一轮会被拒 `A prompt is already running`。
+    async fn stop_turn(&mut self, reason: &str) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        if let Err(err) = self
+            .notify("session/stop", json!({"sessionId": session_id}))
+            .await
+        {
+            tracing::warn!("ZCode 补发 session/stop 失败（{reason}）：{}", brief(&err, 160));
+        } else {
+            tracing::warn!("ZCode 已补发 session/stop（{reason}）");
         }
     }
 
@@ -272,21 +403,44 @@ fn read_json(path: &Path) -> Option<Value> {
 }
 
 /// 从 builtin provider 配置读取该账户 provider 的模型清单。
+///
+/// 3.17.x 的 `providerRules[]` 不再带 `builtinModelIds`，模型清单改由
+/// `builtinProviderModelRules[]`（modelId + providerId）描述；两条路径都读，
+/// 保证新旧客户端都能注入正确的 `builtinModelIds`。
 fn builtin_models(path: &Path, provider: &str) -> Vec<String> {
-    builtin_provider_rule(path, provider)
-        .and_then(|rule| {
-            rule.get("builtinModelIds")
-                .and_then(Value::as_array)
-                .cloned()
-        })
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(raw) = read_json(path) else {
+        return Vec::new();
+    };
+    let mut models: Vec<String> = Vec::new();
+    if let Some(rule) = builtin_provider_rule(path, provider) {
+        if let Some(items) = rule.get("builtinModelIds").and_then(Value::as_array) {
+            for item in items {
+                if let Some(model) = item.as_str() {
+                    push_unique_model(&mut models, model);
+                }
+            }
+        }
+    }
+    if let Some(items) = raw
+        .pointer("/config/modelConfigRules/builtinProviderModelRules")
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            if item.get("providerId").and_then(Value::as_str) != Some(provider) {
+                continue;
+            }
+            if let Some(model) = item.get("modelId").and_then(Value::as_str) {
+                push_unique_model(&mut models, model);
+            }
+        }
+    }
+    models
+}
+
+fn push_unique_model(models: &mut Vec<String>, model: &str) {
+    if !models.iter().any(|existing| existing == model) {
+        models.push(model.to_string());
+    }
 }
 
 /// 从 builtin provider 配置读取该账户 provider 的完整定义。
@@ -314,8 +468,23 @@ fn builtin_revision(path: &Path) -> String {
         })
         .unwrap_or_else(|| "unknown".to_string());
     let mut hasher = Sha256::new();
-    hasher.update(path.display().to_string().as_bytes());
+    // registry 合并守卫做逐字符比较：`zcode-builtin:<revision>:<sha256(activeFilePath)>`。
+    // 必须按绝对路径计算；`std::path::absolute` 在 Windows 上可能带 `\\?\` 前缀，
+    // 需要去掉才能与 Node `path.resolve` 的结果一致。
+    hasher.update(normalized_path_for_hash(path).as_bytes());
     format!("zcode-builtin:{revision}:{:x}", hasher.finalize())
+}
+
+fn normalized_path_for_hash(path: &Path) -> String {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = absolute.display().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text
+    }
 }
 
 /// 选一个目标模型：优先请求值，其次 builtin 清单第一个。
@@ -335,7 +504,13 @@ async fn spawn_rpc(
     account: &ZcodeAccount,
     config: &ZcodeConfig,
 ) -> Result<(Rpc, String), String> {
-    let _home = cli.prepare_account_home(account)?;
+    let account_home = cli.prepare_account_home(account)?;
+    // ZCode CLI 以 `ZCODE_DATA_BASE_DIR/.zcode` 为数据根；账号隔离目录必须同时
+    // 作为 cwd 和该环境变量，否则 CLI 会读真实 ~/.zcode 的登录态，账号池隔离失效。
+    let data_base = account_home
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| account_home.clone());
     let real_data_dir = config.resolved_data_dir();
     let real_home = real_data_dir
         .parent()
@@ -351,12 +526,13 @@ async fn spawn_rpc(
         .arg("--surface")
         .arg("terminal")
         .arg("--no-color")
-        .current_dir(&real_home)
+        .current_dir(&data_base)
         .env("ZCODE_SERVICE_AUTHORITY_MODE", "desktop-local")
         .env("ZCODE_APP_VERSION", &version)
         .env("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", &builtin_path)
         .env("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", &personal)
         .env("ZCODE_BASE_URL", "https://zcode.z.ai")
+        .env("ZCODE_DATA_BASE_DIR", &data_base)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -410,6 +586,8 @@ async fn spawn_rpc(
         usage: None,
         turn_done: false,
         turn_error: None,
+        session_id: None,
+        channel: None,
     };
     Ok((rpc, builtin_path.display().to_string()))
 }
@@ -431,6 +609,10 @@ pub async fn chat(
         Path::new(&builtin_path),
     )
     .await;
+    if result.is_err() {
+        // 超时 / 中止 / 发送失败 / turn.failed 都要补 stop，避免回合锁泄漏。
+        rpc.stop_turn("本轮未正常结束").await;
+    }
     rpc.shutdown().await;
     result
 }
@@ -442,13 +624,22 @@ async fn run_session(
     prompt: &str,
     builtin_path: &Path,
 ) -> Result<AppServerResponse, String> {
-    // 等启动稳定；期间的 server request 会在第一个 request 循环里处理。
-    tokio::time::sleep(STARTUP_WAIT).await;
+    // 参考实现实测：启动后立刻 create/send 会被静默丢弃。先等 startup ready
+    // （最多 8s），再按 GUI 同款的 2.5s 稳定期；旧版本没有 startup 通知时退回
+    // 原来的 3s 固定等待，避免误伤。
+    let ready = rpc.wait_ready(STARTUP_WAIT).await?;
+    if ready {
+        tracing::info!("ZCode app-server 运行时就绪");
+        tokio::time::sleep(STARTUP_SETTLE).await;
+    } else {
+        tracing::warn!("ZCode app-server 未上报 startup/ready，按固定稳定期继续");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
     let provider = provider_id(account);
     let available = builtin_models(builtin_path, &provider);
     let model = select_model(requested_model, &available);
     let models = if available.is_empty() {
-        vec![model.clone()]
+        START_PLAN_MODELS.iter().map(|m| m.to_string()).collect()
     } else {
         available
     };
@@ -459,27 +650,17 @@ async fn run_session(
         revision,
         builtin_path.display()
     );
+    // 与 GUI 同款：只注入当前账号对应的 Start Plan provider。参考实现确认
+    // access 只接受 {type:'zhipu-account', entitled}，states 必须带 current；
+    // 多余的候选 provider 会让 registry 合并出现歧义。
     let mut providers = serde_json::Map::new();
-    let mut states = serde_json::Map::new();
-    for candidate in ["account:zai-start-plan", "account:bigmodel-start-plan"] {
-        let current = candidate == provider;
-        let candidate_models = builtin_models(builtin_path, candidate);
-        providers.insert(
-            candidate.to_string(),
-            json!({
-                "access": {"type": "zhipu-account", "entitled": current},
-                "builtinModelIds": if candidate_models.is_empty() { models.clone() } else { candidate_models },
-            }),
-        );
-        states.insert(
-            candidate.to_string(),
-            json!({
-                "availability": if current { "available" } else { "pending" },
-                "entitled": current,
-                "current": current,
-            }),
-        );
-    }
+    providers.insert(
+        provider.clone(),
+        json!({
+            "access": {"type": "zhipu-account", "entitled": true},
+            "builtinModelIds": models.clone(),
+        }),
+    );
     let mut states = serde_json::Map::new();
     states.insert(
         provider.clone(),
@@ -523,6 +704,7 @@ async fn run_session(
         .ok_or_else(|| format!("session/create 未返回 sessionId：{created}"))?
         .to_string();
     tracing::info!("ZCode session/create: {}", brief(&created.to_string(), 600));
+    rpc.session_id = Some(session_id.clone());
     let subscribed = rpc
         .request(
             "session/subscribe",
@@ -534,27 +716,32 @@ async fn run_session(
         "ZCode session/subscribe: {}",
         brief(&subscribed.to_string(), 600)
     );
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let mut provider_candidates = vec![
-        provider.clone(),
-        "account:zai-start-plan".to_string(),
-        "account:bigmodel-start-plan".to_string(),
-        "zai-start-plan".to_string(),
-        "bigmodel-start-plan".to_string(),
-    ];
-    provider_candidates.dedup();
-    let mut model_candidates = vec![
-        model.clone(),
-        "GLM-5.3".to_string(),
-        "GLM-5.3-Flash".to_string(),
-        "GLM-5.2".to_string(),
-        "GLM-5-Turbo".to_string(),
-    ];
-    model_candidates.dedup();
+    // 探测时序：create→subscribe、subscribe→send 之间各垫 1.5s；零延迟时
+    // 回合会被静默丢弃（send accepted 后事件流为空，参考实现多次复现）。
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut provider_candidates = vec![provider.clone()];
+    for fallback in ["account:zai-start-plan", "account:bigmodel-start-plan"] {
+        if !provider_candidates.iter().any(|item| item == fallback) {
+            provider_candidates.push(fallback.to_string());
+        }
+    }
+    let mut model_candidates = vec![model.clone()];
+    for fallback in START_PLAN_MODELS {
+        if !model_candidates.iter().any(|item| item == fallback) {
+            model_candidates.push(fallback.to_string());
+        }
+    }
     let mut set_error: Option<String> = None;
     let mut selected: Option<(String, String)> = None;
+    // 每次 setModel 失败通常立即返回；限制总尝试次数，避免协议异常时
+    // 2 个 provider × 4 个模型逐个等到 RPC 超时。
+    let mut attempts_left = 4usize;
     'outer: for candidate in provider_candidates {
         for candidate_model in &model_candidates {
+            if attempts_left == 0 {
+                break 'outer;
+            }
+            attempts_left -= 1;
             let attempt = rpc
                 .request(
                     "session/setModel",
@@ -563,7 +750,7 @@ async fn run_session(
                         "model": {
                             "providerId": candidate,
                             "modelId": candidate_model,
-                            "options": {"reasoningLevel": "max"},
+                            "options": {"reasoningLevel": START_PLAN_REASONING_LEVEL},
                         }
                     }),
                     RPC_TIMEOUT,
@@ -578,35 +765,35 @@ async fn run_session(
             }
         }
     }
-    let (selected_provider, selected_model) = match selected {
-        Some((provider, model)) => {
-            tracing::info!("ZCode setModel: provider={} model={}", provider, model);
-            (provider, model)
-        }
-        None => {
-            tracing::warn!(
-                "ZCode setModel 未命中，使用 session/send.modelSelection 兜底：{}",
-                brief(&set_error.unwrap_or_default(), 160)
+    match &selected {
+        Some((selected_provider, selected_model)) => {
+            tracing::info!(
+                "ZCode setModel: provider={} model={}",
+                selected_provider,
+                selected_model
             );
-            (provider.clone(), model.clone())
         }
-    };
+        None => tracing::warn!(
+            "ZCode setModel 未命中，继续使用会话默认模型：{}",
+            brief(&set_error.unwrap_or_default(), 160)
+        ),
+    }
     tokio::time::sleep(Duration::from_millis(800)).await;
+    // 与参考实现一致：setModel 已把会话切到目标模型，send 只发 sessionId + content。
+    // 额外的 modelSelection 不是所有 app-server 版本都接受，可能被 schema 拒绝。
     rpc.request(
         "session/send",
         json!({
             "sessionId": session_id,
             "content": prompt,
-            "modelSelection": {
-                "providerId": selected_provider,
-                "modelId": selected_model,
-                "options": {"reasoningLevel": "max"},
-            }
         }),
         RPC_TIMEOUT,
     )
     .await?;
     rpc.wait_turn(TURN_TIMEOUT).await?;
+    if let Some(channel) = rpc.channel.clone() {
+        tracing::info!("ZCode 本轮执行渠道：{}", brief(&channel.to_string(), 240));
+    }
     Ok(AppServerResponse {
         text: rpc.text.clone(),
         usage: rpc.usage.clone(),
@@ -645,5 +832,72 @@ mod tests {
         let value = builtin_revision(&path);
         let _ = std::fs::remove_file(&path);
         assert!(value.starts_with("zcode-builtin:abc:"));
+    }
+
+    #[test]
+    fn reasoning_delta_is_not_content() {
+        assert_eq!(
+            event_text_delta(&json!({"kind":"reasoning_delta","delta":"think"})),
+            None
+        );
+        assert_eq!(
+            event_text_delta(&json!({"kind":"text_delta","delta":"hi"})),
+            Some("hi")
+        );
+        assert_eq!(
+            event_text_delta(&json!({"kind":"text_delta","delta":"hi","done":true})),
+            None
+        );
+        // 旧版本不带 kind：按正文兼容。
+        assert_eq!(
+            event_text_delta(&json!({"delta":"legacy"})),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn builtin_models_reads_provider_model_rules() {
+        let path = std::env::temp_dir().join("mg-zcode-builtin-models.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "revision": 43,
+              "config": {
+                "providerConfigRules": {
+                  "providerRules": [{"providerId":"account:zai-start-plan"}]
+                },
+                "modelConfigRules": {
+                  "builtinProviderModelRules": [
+                    {"modelId":"GLM-5.3-Flash","providerId":"account:zai-start-plan"},
+                    {"modelId":"GLM-5.2","providerId":"account:zai-start-plan"},
+                    {"modelId":"GLM-5-Turbo","providerId":"account:zai-start-plan"},
+                    {"modelId":"other","providerId":"account:other"}
+                  ]
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let models = builtin_models(&path, "account:zai-start-plan");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            models,
+            vec![
+                "GLM-5.3-Flash".to_string(),
+                "GLM-5.2".to_string(),
+                "GLM-5-Turbo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_revision_uses_normalized_path_hash() {
+        let path = std::env::temp_dir().join("mg-zcode-revision-path-test.json");
+        std::fs::write(&path, r#"{"revision":43}"#).unwrap();
+        let value = builtin_revision(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(value.starts_with("zcode-builtin:43:"));
+        assert_eq!(value.rsplit(':').next().unwrap().len(), 64);
+        assert!(!value.contains(r"\\?\"));
     }
 }
