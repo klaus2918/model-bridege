@@ -6,23 +6,23 @@ html[data-ui="v4"] {
   --v4-sidebar: 216px;
   --v4-top: 56px;
   --v4-radius: 12px;
-  --v4-green: #7be495;
-  --v4-green-ink: #07130c;
+  --v4-accent: #f0a020;
+  --v4-accent-ink: #14100a;
   --v4-line-soft: color-mix(in srgb, var(--line) 72%, transparent);
 }
 
 html[data-ui="v4"] body {
   background:
-    radial-gradient(980px 460px at 18% -8%, rgba(123, 228, 149, 0.055), transparent 62%),
-    radial-gradient(900px 520px at 92% 0%, rgba(124, 199, 217, 0.04), transparent 58%),
+    radial-gradient(980px 460px at 18% -8%, rgba(240, 160, 32, 0.055), transparent 62%),
+    radial-gradient(900px 520px at 92% 0%, rgba(52, 208, 216, 0.04), transparent 58%),
     var(--bg);
   font-size: 13.5px;
 }
 
 html[data-ui="v4"][data-theme="light"] body {
   background:
-    radial-gradient(980px 460px at 18% -8%, rgba(31, 122, 77, 0.05), transparent 62%),
-    radial-gradient(900px 520px at 92% 0%, rgba(35, 105, 122, 0.04), transparent 58%),
+    radial-gradient(980px 460px at 18% -8%, rgba(178, 106, 0, 0.05), transparent 62%),
+    radial-gradient(900px 520px at 92% 0%, rgba(10, 127, 136, 0.04), transparent 58%),
     var(--bg);
 }
 
@@ -40,7 +40,7 @@ html[data-ui="v4"] .shell-top {
 html[data-ui="v4"] .brand { min-width: calc(var(--v4-sidebar) - 24px); gap: 9px; }
 html[data-ui="v4"] .brand-mark {
   width: 27px; height: 27px; border-radius: 7px;
-  background: var(--signal); color: var(--v4-green-ink);
+  background: var(--signal); color: var(--v4-accent-ink);
   font-size: 13px; letter-spacing: 0;
 }
 html[data-ui="v4"] .brand-name { font-size: 13.5px; font-weight: 650; letter-spacing: .01em; }
@@ -462,7 +462,7 @@ html[data-ui="v4"] .view[data-config-page] .page-head::before {
 html[data-ui="v4"] .cmdk {
   position: fixed; inset: 0; z-index: 120;
   display: grid; place-items: start center; padding-top: 12vh;
-  background: rgba(3, 7, 5, .62); backdrop-filter: blur(3px);
+  background: rgba(0, 0, 0, .62); backdrop-filter: blur(3px);
 }
 html[data-ui="v4"] .cmdk[hidden] { display: none; }
 html[data-ui="v4"] .cmdk-panel {
