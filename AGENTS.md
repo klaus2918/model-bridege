@@ -18,8 +18,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ship.ps1 -MessageFil
 
 - `ship.ps1` 推完 tag 就结束，**同一轮内不得等待流水线**：不许在前台跑 `ship-diagnose -Wait`，
   也不许手写轮询循环（2026-11-01 因此空耗 17 分钟）。
-- 需要结果时：起**后台任务**跑 `ship-diagnose`，只在有结论时读一次输出；或直接等用户/GitHub 通知。
-- 流水线失败只取一次结论（失败步骤 + `[FAIL]` 行），不做连续轮询、不重复拉日志。
+- **发版后的结果确认走一次性定时任务**：推完 tag 立刻 `schedule_create`（`after_seconds=900`，
+  prompt 写「查 <tag> 的发布流水线结论」），到点自动开一轮跑一次 `ship-diagnose` 并报结论。
+  这样可以不放后台任务、也不占当前对话轮次。
+- 已确认成功的版本不再巡检；流水线失败只取一次结论（失败步骤 + `[FAIL]` 行），不重复拉日志。
 
 ## 3. 卫生
 
