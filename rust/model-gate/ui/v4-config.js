@@ -2,7 +2,7 @@
 (() => {
   "use strict";
   const MG = window.MG;
-  const { $, esc, num, api, toast, state, openModal, closeModal } = MG;
+  const { $, esc, num, fmtTime, api, toast, state, openModal, closeModal } = MG;
 
   let unifiedGroups = [];
   let routeGroups = [];
@@ -500,26 +500,83 @@
     $("#help-close").addEventListener("click", closeModal);
   }
 
-  async function update() {
-    try {
+  // ───────────────────────── 检查更新 ─────────────────────────
+  //
+  // 关键点：`/api/update/status` 只读内存状态——从未检查过时 `latest` 为空，
+  // 直接拿它渲染会把「没查过」显示成「已是最新」。所以点击必须走
+  // `/api/update/check?force=1` 真正联网查询；`status` 只用于并发检查时轮询兜底。
+
+  const UPDATE_PHASE = {
+    idle: ["signal", "已是最新"],
+    available: ["amber", "发现新版本"],
+    downloading: ["amber", "正在下载"],
+    ready: ["amber", "安装包已就绪"],
+    installing: ["amber", "正在安装"],
+    error: ["danger", "检查失败"],
+  };
+  const UPDATE_SUB = "发布源：GitHub Releases；只检查，不自动替换本机文件。";
+
+  function updateCheckingHtml() {
+    return (
+      `<div class="prose"><p>正在向 GitHub Releases 查询最新版本…</p></div>` +
+      `<div class="modal-actions"><button class="btn primary" id="update-close">关闭</button></div>`
+    );
+  }
+
+  function updateResultHtml(data) {
+    const current = data.current || state.info?.version || "—";
+    const latest = data.latest ? `v${esc(data.latest)}` : "—";
+    const [tone, label] = UPDATE_PHASE[data.phase] || UPDATE_PHASE.idle;
+    const rows = [
+      `<dt>当前版本</dt><dd>v${esc(current)}</dd>`,
+      `<dt>最新版本</dt><dd>${latest}</dd>`,
+      `<dt>状态</dt><dd><span class="pill ${tone}">${label}</span></dd>`,
+      `<dt>检查时间</dt><dd>${esc(fmtTime(data.checked_at))}</dd>`,
+    ];
+    if (data.release_url) {
+      rows.push(
+        `<dt>发布说明</dt><dd><a href="${esc(data.release_url)}" target="_blank" rel="noreferrer">${esc(
+          data.tag || "打开 Release"
+        )}</a></dd>`
+      );
+    }
+    return (
+      `<div class="kv">${rows.join("")}</div>` +
+      `<div class="modal-actions"><button class="btn primary" id="update-close">关闭</button></div>`
+    );
+  }
+
+  // 弹窗内容会被整块替换，关闭按钮每轮都要重新挂一次。
+  function bindUpdateClose() {
+    $("#update-close")?.addEventListener("click", closeModal);
+  }
+
+  // 并发检查时 `/check` 不会等待，直接回 `checking`；轮询到终态再渲染。
+  async function waitUpdateResult() {
+    for (let i = 0; i < 20; i += 1) {
       const data = await api("/api/update/status");
-      const latest = data.latest || data.latestVersion || data.version || "—";
-      const current = data.current || state.info?.version || "—";
-      const available = data.available ?? data.updateAvailable;
+      if (data.phase !== "checking") return data;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    return api("/api/update/status");
+  }
+
+  async function update() {
+    openModal("检查更新", UPDATE_SUB, updateCheckingHtml());
+    bindUpdateClose();
+    try {
+      const first = await api("/api/update/check?force=1");
+      const data = first.phase === "checking" ? await waitUpdateResult() : first;
+      openModal("检查更新", UPDATE_SUB, updateResultHtml(data));
+    } catch (error) {
       openModal(
         "检查更新",
-        "发布源：GitHub Releases；只检查，不自动替换本机文件。",
-        `<div class="kv">
-          <dt>当前版本</dt><dd>v${esc(current)}</dd>
-          <dt>最新版本</dt><dd>v${esc(latest)}</dd>
-          <dt>状态</dt><dd>${available ? '<span class="pill amber">有新版本</span>' : '<span class="pill signal">已是最新</span>'}</dd>
-        </div>
-        <div class="modal-actions"><button class="btn primary" id="update-close">关闭</button></div>`
+        "无法完成检查",
+        `<div class="prose"><p>${esc(error.message)}</p></div>` +
+          `<div class="modal-actions"><button class="btn primary" id="update-close">关闭</button></div>`
       );
-      $("#update-close").addEventListener("click", closeModal);
-    } catch (error) {
-      toast(error.message, "error");
     }
+    bindUpdateClose();
   }
 
   function bind() {
@@ -561,6 +618,12 @@
       routeGroups.splice(Number(button.dataset.removeRoute), 1);
       renderGroups();
     });
+    // 托盘「检查更新」以 `?update=1` 打开面板：进来就真实检查一次，
+    // 而不是停在默认视图让用户再手动点一次。
+    if (new URLSearchParams(location.search).get("update") === "1") {
+      update().catch(() => {});
+    }
+
     const view = $("#view-settings");
     if (view) {
       view.addEventListener("input", () => {

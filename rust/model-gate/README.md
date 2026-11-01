@@ -15,7 +15,48 @@ powershell -ExecutionPolicy Bypass -File build-installer.ps1
 ```
 
 开发期用 `cargo build` 迭代更快；release 使用
-`opt-level="z" + lto + codegen-units=1 + strip`。
+`opt-level="s" + lto=false + codegen-units=16 + strip`。
+
+> 之前是 `opt-level="z" + lto=true + codegen-units=1`。那组配置把 10 MB 级二进制的
+> 链接时间推到 3 分钟，换来的只是产物小约 2 MB（安装包 5.29 MB vs 5.20 MB）。
+> 实测对比（同一台机器，改一处源码或前端资源后的重建）：
+>
+> | 配置 | 重建耗时 | exe | 安装包 |
+> | --- | --- | --- | --- |
+> | `z` + `lto=true` + `cgu=1`（旧） | 182 s | 9.24 MB | 4.86 MB |
+> | `s` + `lto="thin"` + `cgu=16` | 96 s | 11.97 MB | 5.29 MB |
+> | `s` + `lto=false` + `cgu=16`（现在） | 35 s | 11.36 MB | 5.20 MB |
+>
+> CI 的 6 MB 安装包闸门仍然通过。代价是少了跨 crate 内联，代理热路径理论上有
+> 百分之十几的吞吐损失——需要极限运行时性能时，把 `lto` 改回 `"thin"` 即可。
+
+## 面板资源：免重编热改
+
+面板 HTML/CSS/JS 由 `src/ui_assets.rs` 统一供给，按构建类型分流：
+
+- **debug 构建**：只读磁盘（默认 crate 下的 `ui/`），改前端**零重建**，刷新浏览器即生效；
+- **release 构建**：`include_str!` 内嵌，保持单文件分发不变；
+- **任意构建**：`--ui-dir <目录>`（或环境变量 `MODEL_GATE_UI_DIR`）强制走磁盘。
+
+```bat
+:: 改面板不重编：debug 跑起来，直接编辑 ui/*.css|js，浏览器刷新即可
+cargo run -- --no-gui --no-browser --port 8911 --ui-dir ui
+```
+
+为什么值得单独抽一个模块：资源原先是 `proxy.rs` 里的 `include_str!`，
+改一行 CSS 就要重编译 190 KB 的 `proxy.rs` 再整包重链接——这是"改面板要等很久"的根因。
+现在 debug 下改 CSS 的重建耗时是 **36 s → 0.8 s**。
+
+## 链接器（可选）
+
+```bat
+powershell -ExecutionPolicy Bypass -File ..\..\scripts\enable-lld.ps1
+powershell -ExecutionPolicy Bypass -File ..\..\scripts\enable-lld.ps1 -Off
+```
+
+用 Rust 工具链自带的 `rust-lld.exe` 顶替 `link.exe`，生成
+`rust/model-gate/.cargo/config.toml`（已在 `.gitignore` 中，按本机路径生成）。
+不跑这一步也能构建，走默认链接器。
 
 ## 能力清单
 

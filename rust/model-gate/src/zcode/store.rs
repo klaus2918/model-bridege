@@ -273,17 +273,14 @@ impl Db {
         );
     }
 
-    /// 账号池选择：启用、active、JWT、未冷却，按「最久未用 + 使用次数少」轮询。
+    /// 账号池选择：启用、JWT、冷却已到期，按「最久未用 + 使用次数少」轮询。
     /// 池规模很小（个人账号池），在内存里筛选/排序比拼接动态 SQL 更直观。
     pub fn zcode_pick_account(&self, exclude: &[String]) -> Option<ZcodeAccount> {
         let now = now_ms();
         let mut candidates: Vec<ZcodeAccount> = self
             .zcode_list_accounts()
             .into_iter()
-            .filter(|a| a.enabled)
-            .filter(|a| a.status == STATUS_ACTIVE)
-            .filter(|a| a.mode == "jwt")
-            .filter(|a| a.cooling_until.map_or(true, |until| until <= now))
+            .filter(|a| pickable(a, now))
             .filter(|a| !exclude.iter().any(|id| id == &a.id))
             .collect();
         candidates.sort_by_key(|a| (a.last_used_at.unwrap_or(0), a.use_count, a.created_at));
@@ -395,6 +392,23 @@ impl Db {
     }
 }
 
+/// 账号能否进入本轮选择池。
+///
+/// 为什么不能只认 `STATUS_ACTIVE`：冷却状态不会被任何后台任务自动回写成 active，
+/// 若只认 active，一次瞬时失败（超时/限流）就会把账号永久踢出池子——面板里账号、
+/// 额度都在，请求却一直 503 `no_available_account`。所以冷却以 `cooling_until`
+/// 为事实源：到期即恢复可用；没有到期时间的陈旧 cooling 也按已到期处理。
+fn pickable(account: &ZcodeAccount, now: i64) -> bool {
+    if !account.enabled || account.mode != "jwt" {
+        return false;
+    }
+    match account.status.as_str() {
+        STATUS_ACTIVE => true,
+        STATUS_COOLING => account.cooling_until.map_or(true, |until| until <= now),
+        _ => false,
+    }
+}
+
 fn row_to_account(row: &Row<'_>) -> rusqlite::Result<ZcodeAccount> {
     Ok(ZcodeAccount {
         id: row.get(0)?,
@@ -449,6 +463,19 @@ mod tests {
         let view = acc.public_view().to_string();
         assert!(!view.contains("a.b.c"));
         assert!(view.contains("secretMasked"));
+    }
+
+    #[test]
+    fn cooling_account_returns_after_cooldown() {
+        let mut acc = ZcodeAccount::new("test", "zai", "jwt", "a.b.c").expect("account");
+        acc.status = STATUS_COOLING.to_string();
+        acc.cooling_until = Some(1_000);
+        assert!(!pickable(&acc, 1_000), "冷却未到期不应可选");
+        assert!(pickable(&acc, 1_001), "冷却到期即应恢复可选");
+        acc.cooling_until = None; // 历史脏数据：冷却态但没有到期时间
+        assert!(pickable(&acc, 0), "缺失到期时间按已到期处理");
+        acc.enabled = false;
+        assert!(!pickable(&acc, 1_001), "停用账号始终不可选");
     }
 
     #[test]

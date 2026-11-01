@@ -2803,7 +2803,7 @@ pub(crate) fn error_json(
         .into_response()
 }
 
-fn ui_page_html(source: &'static str) -> String {
+fn ui_page_html(source: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
     let mut html = source.to_string();
     // 资源带版本号，避免升级后浏览器复用旧 JS/CSS。
@@ -2824,9 +2824,17 @@ fn ui_page_html(source: &'static str) -> String {
     html
 }
 
-async fn ui_index() -> impl IntoResponse {
+async fn ui_index() -> Response {
     // v4 控制台是唯一入口。
-    let html = ui_page_html(include_str!("../ui/v4.html"));
+    let Some(source) = crate::ui_assets::load("v4.html") else {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "面板资源缺失：请检查 ui/ 目录或用 --ui-dir 指定",
+            "server_error",
+            "ui_assets_missing",
+        );
+    };
+    let html = ui_page_html(source.as_ref());
     (
         [
             ("content-type", "text/html; charset=utf-8"),
@@ -2834,6 +2842,7 @@ async fn ui_index() -> impl IntoResponse {
         ],
         html,
     )
+        .into_response()
 }
 
 async fn ui_classic() -> impl IntoResponse {
@@ -2842,56 +2851,28 @@ async fn ui_classic() -> impl IntoResponse {
 }
 
 async fn ui_asset(Path(path): Path<String>) -> Response {
-    // 只允许固定文件名，天然挡住路径穿越。
-    let (content_type, body): (&str, &'static str) = match path.as_str() {
-        "v4-base.css" => ("text/css; charset=utf-8", include_str!("../ui/v4-base.css")),
-        "v4.css" => ("text/css; charset=utf-8", include_str!("../ui/v4.css")),
-        "v4.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/v4.js"),
-        ),
-        "v4-core.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/v4-core.js"),
-        ),
-        "v4-config.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/v4-config.js"),
-        ),
-        "v4-models.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/v4-models.js"),
-        ),
-        "v4-usage.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/v4-usage.js"),
-        ),
-        "v4-prompts.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/v4-prompts.js"),
-        ),
-        "v4-resources.js" => (
-            "application/javascript; charset=utf-8",
-            include_str!("../ui/v4-resources.js"),
-        ),
-        _ => {
-            return error_json(
-                StatusCode::NOT_FOUND,
-                "页面不存在",
-                "invalid_request_error",
-                "not_found",
-            )
-        }
+    // 只允许单层文件名（见 crate::ui_assets::sanitize），天然挡住路径穿越。
+    // release 只认内嵌清单；debug/`--ui-dir` 直接读磁盘，改前端不必重编译。
+    let Some(body) = crate::ui_assets::load(&path) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "页面不存在",
+            "invalid_request_error",
+            "not_found",
+        );
     };
     (
         [
-            (axum::http::header::CONTENT_TYPE, content_type),
+            (
+                axum::http::header::CONTENT_TYPE,
+                crate::ui_assets::content_type(&path),
+            ),
             (
                 axum::http::header::CACHE_CONTROL,
                 "no-store, no-cache, must-revalidate, max-age=0",
             ),
         ],
-        body,
+        body.into_owned(),
     )
         .into_response()
 }

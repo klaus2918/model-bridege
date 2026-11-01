@@ -25,6 +25,11 @@ jobs:
   build:
     name: 构建 Rust 安装包
     runs-on: windows-latest
+    env:
+      # sccache：跨 run 复用编译单元。只靠 rust-cache 缓存 target 的话，
+      # 换依赖或 runner 环境变化后依然会全量重编。
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +40,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust/model-gate
+
+      - name: 安装 sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: 启用 LLD 链接器
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/enable-lld.ps1
 
       - name: 读取版本并校验 tag
         id: meta

@@ -62,10 +62,10 @@ fn pool_summary(accounts: &[ZcodeAccount]) -> Value {
 pub async fn status(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.zcode.config();
     let accounts = state.db.zcode_list_accounts();
-    let active = accounts
-        .iter()
-        .filter(|a| a.enabled && a.status == super::store::STATUS_ACTIVE)
-        .count();
+    // 只保留一处「可用」口径：`accounts.active` 必须与 `pool.active` 一致，
+    // 否则面板说 0 个可用、池子却说 1 个，排查时互相打脸。
+    let pool = pool_summary(&accounts);
+    let active = pool["active"].clone();
     let last_claim = state.db.zcode_recent_claims(1).first().cloned();
     let captcha_available = state.zcode.captcha.available();
     Json(json!({
@@ -84,7 +84,7 @@ pub async fn status(State(state): State<Arc<AppState>>) -> Response {
             "total": accounts.len(),
             "active": active,
         },
-        "pool": pool_summary(&accounts),
+        "pool": pool,
         "models": ["GLM-5.3-Flash", "GLM-5.3"],
         "captcha": {
             "available": captcha_available,

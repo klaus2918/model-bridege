@@ -63,3 +63,6 @@ docs/live-panel/*.mp4
 # ── Rust 构建产物 ──────────────────────────────────────────
 rust/**/target/
 target/
+
+# scripts/enable-lld.ps1 按本机路径生成，不进版本库
+rust/model-gate/.cargo/config.toml

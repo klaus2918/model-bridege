@@ -24,6 +24,7 @@ mod provider_profiles;
 mod proxy;
 mod secret_store;
 mod thinking;
+mod ui_assets;
 mod update;
 mod update_paths;
 mod user_env;
@@ -73,10 +74,17 @@ struct Args {
     /// 输出诊断报告到 data/diagnose.txt 后退出（不启动服务/托盘）
     #[arg(long = "diagnose", default_value_t = false)]
     diagnose: bool,
+    /// 面板资源目录：改 HTML/CSS/JS 免重新编译（默认 debug 用源码 ui/，release 用内嵌副本）
+    #[arg(long = "ui-dir")]
+    ui_dir: Option<PathBuf>,
 }
 
 fn main() {
     let args = Args::parse();
+    // 面板资源目录：写进环境变量后由 src/ui_assets.rs 统一解析，改前端不必重编译 Rust。
+    if let Some(dir) = args.ui_dir.as_ref() {
+        std::env::set_var("MODEL_GATE_UI_DIR", dir);
+    }
     let config_path = args.config.clone().unwrap_or_else(default_config_path);
     // 库路径跟随配置文件所在目录（与 Python 冻结版「exe 同目录 data/」同口径）。
     // 为什么不用 CWD 相对：安装版从快捷方式启动时 CWD 可能是系统目录，
