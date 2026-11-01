@@ -223,6 +223,14 @@ pub async fn chat(
             "zcode_empty_prompt",
         );
     }
+    // 客户端已按模型 thinkingLevelMap 把 UI 等级映射成 wire 值，这里只校验归一后
+    // 透传；解析一次放在重试循环外，不随账号重试重复。
+    let raw_level = payload.get("reasoning_effort").and_then(Value::as_str);
+    let reasoning_level = appserver::resolve_reasoning_level(
+        raw_level,
+        &upstream.compat.reasoning_level_default,
+        &upstream.compat.reasoning_level_allow,
+    );
     let config = state.zcode.config().clone();
     let attempts = config.account_concurrency.clamp(1, 4) as usize;
     let max_attempts = attempts.min(MAX_ATTEMPTS);
@@ -236,7 +244,7 @@ pub async fn chat(
         };
         excluded.push(account.id.clone());
         last_account = Some(account.clone());
-        match appserver::chat(&config, &account, target_model, &prompt).await {
+        match appserver::chat(&config, &account, target_model, &prompt, &reasoning_level).await {
             Ok(response) => {
                 let usage = usage_of(response.usage.as_ref());
                 state.db.zcode_touch_used(&account.id, true);

@@ -32,6 +32,48 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(600);
 /// `builtinProviderModelRules`（modelId + providerId）描述；两条路径都要读。
 const START_PLAN_MODELS: [&str; 3] = ["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"];
 const START_PLAN_REASONING_LEVEL: &str = "max";
+/// app-server `session/setModel` 认识的推理等级词表；未知值会被 schema 拒绝。
+const REASONING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// 解析请求里的 `reasoning_effort`，归一化为 app-server 认识的等级。
+///
+/// 客户端侧（DSH）已按模型 thinkingLevelMap 把 UI 等级映射成 wire 值，
+/// 这里只做校验与归一（trim + 小写），不做二级映射：未知值或不在 `allow`
+/// 白名单内时回退默认并告警，避免 `session/setModel` 被 schema 拒绝后
+/// 整个退回会话默认模型。`config_default` / `allow` 为空时使用内置
+/// `START_PLAN_REASONING_LEVEL` 与全词表。
+pub fn resolve_reasoning_level(
+    raw: Option<&str>,
+    config_default: &str,
+    allow: &[String],
+) -> String {
+    let mut default = config_default.trim().to_ascii_lowercase();
+    if default.is_empty() {
+        default = START_PLAN_REASONING_LEVEL.to_string();
+    } else if !REASONING_LEVELS.contains(&default.as_str()) {
+        tracing::warn!(
+            "ZCode compat.reasoningLevel.default={} 不在词表，回退 {}",
+            brief(config_default, 32),
+            START_PLAN_REASONING_LEVEL
+        );
+        default = START_PLAN_REASONING_LEVEL.to_string();
+    }
+    let Some(value) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    let level = value.to_ascii_lowercase();
+    let in_vocab = REASONING_LEVELS.contains(&level.as_str());
+    let in_allow = allow.is_empty() || allow.iter().any(|a| a.trim().eq_ignore_ascii_case(&level));
+    if in_vocab && in_allow {
+        return level;
+    }
+    tracing::warn!(
+        "ZCode reasoning_effort={} 不在允许范围，回退 {}",
+        brief(value, 32),
+        default
+    );
+    default
+}
 
 #[derive(Debug, Clone)]
 pub struct AppServerResponse {
@@ -283,7 +325,10 @@ impl Rpc {
             .notify("session/stop", json!({"sessionId": session_id}))
             .await
         {
-            tracing::warn!("ZCode 补发 session/stop 失败（{reason}）：{}", brief(&err, 160));
+            tracing::warn!(
+                "ZCode 补发 session/stop 失败（{reason}）：{}",
+                brief(&err, 160)
+            );
         } else {
             tracing::warn!("ZCode 已补发 session/stop（{reason}）");
         }
@@ -598,6 +643,7 @@ pub async fn chat(
     account: &ZcodeAccount,
     requested_model: &str,
     prompt: &str,
+    reasoning_level: &str,
 ) -> Result<AppServerResponse, String> {
     let cli = ZcodeCli::from_config(config, account)?;
     let (mut rpc, builtin_path) = spawn_rpc(&cli, account, config).await?;
@@ -606,6 +652,7 @@ pub async fn chat(
         account,
         requested_model,
         prompt,
+        reasoning_level,
         Path::new(&builtin_path),
     )
     .await;
@@ -622,6 +669,7 @@ async fn run_session(
     account: &ZcodeAccount,
     requested_model: &str,
     prompt: &str,
+    reasoning_level: &str,
     builtin_path: &Path,
 ) -> Result<AppServerResponse, String> {
     // 参考实现实测：启动后立刻 create/send 会被静默丢弃。先等 startup ready
@@ -645,10 +693,11 @@ async fn run_session(
     };
     let revision = builtin_revision(builtin_path);
     tracing::info!(
-        "ZCode patch: provider={} revision={} builtin={}",
+        "ZCode patch: provider={} revision={} builtin={} reasoningLevel={}",
         provider,
         revision,
-        builtin_path.display()
+        builtin_path.display(),
+        reasoning_level
     );
     // 与 GUI 同款：只注入当前账号对应的 Start Plan provider。参考实现确认
     // access 只接受 {type:'zhipu-account', entitled}，states 必须带 current；
@@ -750,7 +799,7 @@ async fn run_session(
                         "model": {
                             "providerId": candidate,
                             "modelId": candidate_model,
-                            "options": {"reasoningLevel": START_PLAN_REASONING_LEVEL},
+                            "options": {"reasoningLevel": reasoning_level},
                         }
                     }),
                     RPC_TIMEOUT,
@@ -826,6 +875,41 @@ mod tests {
     }
 
     #[test]
+    fn resolve_level_without_raw_uses_default() {
+        // 未带 reasoning_effort（或只有空白）：用配置默认，空配置退内置 max。
+        assert_eq!(resolve_reasoning_level(None, "", &[]), "max");
+        assert_eq!(resolve_reasoning_level(None, "low", &[]), "low");
+        assert_eq!(resolve_reasoning_level(Some("  "), "", &[]), "max");
+    }
+
+    #[test]
+    fn resolve_level_normalizes_and_passes_known_value() {
+        assert_eq!(resolve_reasoning_level(Some("low"), "", &[]), "low");
+        assert_eq!(resolve_reasoning_level(Some(" HIGH "), "", &[]), "high");
+    }
+
+    #[test]
+    fn resolve_level_falls_back_on_unknown_value() {
+        assert_eq!(resolve_reasoning_level(Some("bogus"), "", &[]), "max");
+        assert_eq!(resolve_reasoning_level(Some("bogus"), "low", &[]), "low");
+    }
+
+    #[test]
+    fn resolve_level_falls_back_on_invalid_config_default() {
+        assert_eq!(resolve_reasoning_level(None, "ultra", &[]), "max");
+        assert_eq!(resolve_reasoning_level(Some("low"), "ultra", &[]), "low");
+    }
+
+    #[test]
+    fn resolve_level_respects_allow_list() {
+        let allow = vec!["low".to_string(), "high".to_string(), "max".to_string()];
+        assert_eq!(resolve_reasoning_level(Some("max"), "", &allow), "max");
+        // 词表内有但白名单没放行的等级回退默认（默认 max 本身在白名单内）。
+        assert_eq!(resolve_reasoning_level(Some("medium"), "", &allow), "max");
+        assert_eq!(resolve_reasoning_level(Some("low"), "high", &allow), "low");
+    }
+
+    #[test]
     fn builtin_revision_is_stable_shape() {
         let path = std::env::temp_dir().join("mg-zcode-revision-test.json");
         std::fs::write(&path, r#"{"revision":"abc"}"#).unwrap();
@@ -849,10 +933,7 @@ mod tests {
             None
         );
         // 旧版本不带 kind：按正文兼容。
-        assert_eq!(
-            event_text_delta(&json!({"delta":"legacy"})),
-            Some("legacy")
-        );
+        assert_eq!(event_text_delta(&json!({"delta":"legacy"})), Some("legacy"));
     }
 
     #[test]

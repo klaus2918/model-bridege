@@ -206,6 +206,16 @@ fn compat_from_value(value: &Value) -> Compat {
     c.models_path = str_at(&["endpoint", "models"]).to_string();
     c.thinking_passthrough = bool_at(&["thinking", "passthrough"]);
     c.thinking_field = str_at(&["thinking", "field"]).to_string();
+    c.reasoning_level_default = str_at(&["reasoningLevel", "default"]).to_string();
+    c.reasoning_level_allow = get(&["reasoningLevel", "allow"])
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     c.tool_choice_downgrade = bool_at(&["toolChoice", "downgradeForced"]);
     c.max_output_tokens = u64_at(&["limits", "maxOutputTokens"]);
     c.max_context_tokens = u64_at(&["limits", "maxContextTokens"]);

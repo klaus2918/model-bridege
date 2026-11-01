@@ -47,6 +47,10 @@ pub struct Compat {
     pub thinking_passthrough: bool,
     /// 回传时使用的字段/块类型（reasoning_content / thinking）
     pub thinking_field: String,
+    /// zcode 通道 `session/setModel` 的默认推理等级（空 = 内置 max）
+    pub reasoning_level_default: String,
+    /// 允许透传的推理等级白名单（空 = 内置全词表 off/minimal/low/medium/high/xhigh/max）
+    pub reasoning_level_allow: Vec<String>,
     /// 强制 tool_choice 是否降级为 auto（thinking 模式常见限制）
     pub tool_choice_downgrade: bool,
     /// 上游允许的最大输出 token（超过时自动收敛）
@@ -400,6 +404,8 @@ impl Default for Compat {
             models_path: "/v1/models".into(),
             thinking_passthrough: false,
             thinking_field: "reasoning_content".into(),
+            reasoning_level_default: String::new(),
+            reasoning_level_allow: Vec::new(),
             tool_choice_downgrade: false,
             max_output_tokens: None,
             max_context_tokens: None,
