@@ -76,8 +76,14 @@
     if (tab === "evolution") loadEvolution().catch((error) => toast(error.message, "error"));
   }
 
+  // 序号守卫：跨页跳转（如请求抽屉「打开提示词」）会与视图加载器并发查询，
+  // 只让最后一次查询落地，避免旧筛选的响应晚到覆盖新结果。
+  let listSeq = 0;
+
   async function loadList() {
+    const seq = ++listSeq;
     const data = await api(`/api/prompts?${query()}`);
+    if (seq !== listSeq) return;
     p.rows = Array.isArray(data.rows) ? data.rows : [];
     p.total = Number(data.total || p.rows.length);
     p.facets = {
@@ -107,11 +113,14 @@
     }
     const sessionHost = $("#prompt-session");
     if (sessionHost) {
-      sessionHost.innerHTML = `<option value="">全部会话</option>${p.facets.sessions
-        .slice(0, 300)
+      const sessions = p.facets.sessions.slice(0, 300);
+      // 从请求抽屉跳入时，会话可能超出当前时间范围的 facets（如范围是 7d、请求更旧）：
+      // 服务端查询仍按 p.session 过滤，筛选框要把该会话显示出来，保持所见即所查。
+      if (p.session && !sessions.includes(p.session)) sessions.unshift(p.session);
+      sessionHost.innerHTML = `<option value="">全部会话</option>${sessions
         .map((session) => `<option value="${esc(session)}">${esc(session)}</option>`)
         .join("")}`;
-      sessionHost.value = p.facets.sessions.includes(p.session) ? p.session : "";
+      sessionHost.value = sessions.includes(p.session) ? p.session : "";
     }
   }
 
@@ -383,6 +392,24 @@
       toast("评估报告已复制", "ok");
     });
   }
+
+  // 请求抽屉「打开提示词」的落点：清掉会稀释关联的模型/搜索筛选，
+  // 把列表聚焦到该请求的会话。由 v4.js 在切视图后立即调用；
+  // 视图加载器若也在查列表，loadList 的序号守卫保证最终以这里的筛选为准。
+  MG.focusPromptSession = (session) => {
+    p.session = session || "";
+    p.model = "";
+    p.q = "";
+    p.page = 1;
+    if (p.tab !== "list") setTab("list");
+    const sessionHost = $("#prompt-session");
+    if (sessionHost) sessionHost.value = p.session;
+    const modelHost = $("#prompt-model");
+    if (modelHost) modelHost.value = "";
+    const search = $("#prompt-q");
+    if (search) search.value = "";
+    loadList().catch((error) => toast(error.message, "error"));
+  };
 
   MG.registerView("prompts", async () => {
     await MG.refreshConfig();

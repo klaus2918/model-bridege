@@ -549,6 +549,16 @@
     if (!u.autoTimer) applyAutoRefresh();
     await load();
   });
+  // 请求抽屉「打开日志」的落点：只预填搜索框并取消挂起的防抖，
+  // 实际查询交给随后的 logs 视图加载器（go("logs") 必触发），避免重复请求。
+  // access 日志行尾带 req=<请求 ID>，见后端 log_access。
+  MG.filterRuntimeLogs = (q) => {
+    const input = $("#runtime-search");
+    if (!input) return;
+    input.value = q || "";
+    clearTimeout(logs.searchTimer);
+  };
+
   MG.registerView("logs", async () => {
     if (!logs.timer) applyLogAutoRefresh();
     await loadLogs();

@@ -160,6 +160,8 @@
   function issuesFromState() {
     const issues = [];
     for (const item of state.access || []) {
+      // 停用的接入不产生待办：它不参与健康检查，诊断也被后端跳过。
+      if (item.enabled === false) continue;
       if (item.health && item.health.state && item.health.state !== "ok") {
         issues.push({
           level: item.health.state === "error" ? "error" : "warn",
@@ -245,19 +247,44 @@
     history[method](null, "", url);
   }
 
+  // 配置中心顶部菜单：4 个分组下拉。子项仍带 data-config-sub，走通用点击委托导航；
+  // 导航会经 applyChrome 重建 innerHTML，展开中的菜单随之自然收起。
   function renderConfigSubnav() {
     const host = $("#config-subnav");
     if (!host) return;
-    host.innerHTML = CONFIG_GROUPS.map((group) => {
-      const links = group.items
+    const current = v4.page === "config" ? v4.sub : "";
+    host.innerHTML = CONFIG_GROUPS.map((group, index) => {
+      const hasActive = group.items.includes(current);
+      const items = group.items
         .map((id) => {
           const item = CONFIG[id];
-          const active = v4.page === "config" && v4.sub === id ? " active" : "";
-          return `<button class="cs-link${active}" data-config-sub="${id}" title="${esc(item.title)}">${esc(item.title)}</button>`;
+          const active = current === id ? " active" : "";
+          return `<button class="cs-item${active}" role="menuitem" data-config-sub="${id}" title="${esc(item.title)}"><span>${esc(item.title)}</span><span class="cs-item-tag">${esc(item.tag || "")}</span></button>`;
         })
         .join("");
-      return `<span class="cs-group">${esc(group.label)}</span>${links}`;
+      return `<div class="cs-menu-wrap"><button class="cs-toggle${hasActive ? " has-active" : ""}" type="button" data-cs-toggle="${index}" aria-haspopup="menu" aria-expanded="false"><span>${esc(group.label)}</span><span class="cs-count">${group.items.length}</span><span class="cs-caret" aria-hidden="true">▾</span></button><div class="cs-panel" role="menu" hidden>${items}</div></div>`;
     }).join("");
+  }
+
+  // 同一时刻只展开一个下拉；keepIndex 之外的组全部收起（-1 = 全收）
+  function closeCsMenus(keepIndex = -1) {
+    $$("#config-subnav .cs-menu-wrap").forEach((wrap, index) => {
+      const open = index === keepIndex;
+      const toggle = wrap.querySelector(".cs-toggle");
+      if (toggle) {
+        toggle.classList.toggle("open", open);
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      }
+      const panel = wrap.querySelector(".cs-panel");
+      if (panel) panel.hidden = !open;
+    });
+  }
+
+  function toggleCsMenu(index) {
+    const wrap = $$("#config-subnav .cs-menu-wrap")[index];
+    const panel = wrap?.querySelector(".cs-panel");
+    if (!panel) return;
+    closeCsMenus(panel.hidden ? index : -1);
   }
 
   function applyChrome() {
@@ -412,7 +439,10 @@
   function renderOverview() {
     const data = v4.overview;
     if (!data) return;
-    const access = state.access || [];
+    const accessAll = state.access || [];
+    // 停用的接入不进入总览统计：健康计数、待办与请求信息都只看启用的接入。
+    const access = accessAll.filter((item) => item.enabled !== false);
+    const disabledCount = accessAll.length - access.length;
     const totals = data.totals || {};
     const previous = data.previous || {};
     const issues = issuesFromState();
@@ -441,7 +471,7 @@
          <span>监听 <b>${esc(info.host || "127.0.0.1")}:${esc(info.port || 8900)}</b></span>
          <span>版本 <b>v${esc(info.version || "—")}</b></span>
          <span>运行 <b>${uptimeText(data.proxy.uptime_seconds)}</b></span>
-         <span>接入 <b>${access.length}</b></span>
+         <span>接入 <b>${access.length}</b>${disabledCount ? `<small>（停用 ${disabledCount}）</small>` : ""}</span>
          <span>池成员可用 <b>${(state.pools || []).reduce((sum, pool) => sum + Number(pool.available || 0), 0)}</b></span>
        </div>
        <span class="band-right">${new Date().toLocaleTimeString("zh-CN", { hour12: false })} · 自动刷新</span>`
@@ -552,10 +582,11 @@
     const host = $("#ov-health");
     if (!host) return;
     const rows = (state.access || [])
+      .filter((item) => item.enabled !== false)
       .slice()
       .sort((a, b) => (a.health?.state === "ok" ? 1 : 0) - (b.health?.state === "ok" ? 1 : 0));
     if (!rows.length) {
-      host.innerHTML = `<div class="empty-line">还没有接入。点击「添加接入」开始。</div>`;
+      host.innerHTML = `<div class="empty-line">没有启用的接入。点击「添加接入」开始。</div>`;
       return;
     }
     const usage = new Map((v4.overview?.upstreams || []).map((row) => [row.upstream, row]));
@@ -612,7 +643,11 @@
   function renderOverviewRecent() {
     const host = $("#ov-recent");
     if (!host) return;
-    const rows = v4.overview?.recent || [];
+    // 停用接入的历史请求不进总览：列表只保留启用接入的调用记录。
+    const disabled = new Set(
+      (state.access || []).filter((item) => item.enabled === false).map((item) => item.id)
+    );
+    const rows = (v4.overview?.recent || []).filter((row) => !disabled.has(row.upstream));
     if (!rows.length) {
       host.innerHTML = `<div class="empty-line">还没有请求记录。</div>`;
       return;
@@ -1197,7 +1232,10 @@
           <button class="btn ghost sm" data-prompt-side-download="${esc(id)}">下载 JSONL</button>
         </div>`;
     } catch (error) {
-      host.innerHTML = `<div class="empty-line">读取失败：${esc(error.message)}</div>`;
+      host.innerHTML =
+        error.status === 404
+          ? `<div class="empty-line">该请求没有提示词记录（可能未开启提示词采集，或已被清理）。</div>`
+          : `<div class="empty-line">读取失败：${esc(error.message)}</div>`;
     }
   }
 
@@ -1494,6 +1532,7 @@
     if (!row) return;
     const drawer = $("#request-drawer");
     if (!drawer) return;
+    v4.drawerRow = row;
     setHTML("#request-title", esc(row.requested_model || row.upstream_model || "请求详情"));
     setHTML(
       "#request-sub",
@@ -1520,10 +1559,10 @@
       `<div class="kv request-kv">${fields
         .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v == null || v === "" ? "—" : v)}</dd>`)
         .join("")}</div>
-       <div class="inline-note" style="margin-top:14px">脱敏视图：请求头与提示词正文不在此处展示；提示词请到「提示词」页查看。</div>
+       <div class="inline-note" style="margin-top:14px">脱敏视图：请求头与提示词正文不在此处展示；点「打开提示词」直接定位该请求的提示词记录。</div>
        <div class="card-actions wrap" style="margin-top:12px">
-         <button class="btn ghost sm" data-v4-go="prompts">打开提示词</button>
-         <button class="btn ghost sm" data-v4-go="logs">打开日志</button>
+         <button class="btn ghost sm" data-v4-drawer-go="prompts">打开提示词</button>
+         <button class="btn ghost sm" data-v4-drawer-go="logs">打开日志</button>
        </div>`
     );
     drawer.hidden = false;
@@ -1532,6 +1571,34 @@
   }
 
   MG.openRequestDrawer = openRequestDrawer;
+
+  // 请求抽屉「打开提示词」：请求与提示词记录共用同一 id（db 层一一关联），
+  // 先把列表聚焦到该请求的会话，再在右侧详情栏精确打开该请求的提示词正文。
+  function openPromptsForRequest(row) {
+    if (!row) return;
+    go("prompts");
+    MG.focusPromptSession?.(row.session || "");
+    retry(() => {
+      if (!$("#prompt-side-body")) return false;
+      loadPromptSide(row.id);
+      return true;
+    }, 1600);
+  }
+
+  // 请求抽屉「打开日志」：预填请求 ID 再切视图，运行日志加载器会按该 ID 过滤
+  // （access 日志行尾带 req=<id>，见 log_access）。
+  function openLogsForRequest(row) {
+    if (!row) return;
+    MG.filterRuntimeLogs?.(row.id);
+    go("logs");
+  }
+
+  function runDrawerGo(target) {
+    const row = v4.drawerRow;
+    closeRequestDrawer();
+    if (target === "prompts") openPromptsForRequest(row);
+    else if (target === "logs") openLogsForRequest(row);
+  }
 
   function openAccessDrawer(id) {
     go("access");
@@ -1549,6 +1616,24 @@
     document.addEventListener(
       "click",
       (event) => {
+        // 配置中心分组下拉：开合与外点收起，须在捕获阶段先于通用分支处理。
+        const csToggle = event.target.closest(".cs-toggle");
+        if (csToggle) {
+          event.preventDefault();
+          event.stopPropagation();
+          // 菜单已开时移向另一组，mouseover 会先把它切换打开；紧随的点击
+          // 若再 toggle 会把刚打开的面板立刻关掉。刚由 hover 打开的组，
+          // 短时间内点击视为确认展开，不收起。
+          const wrap = csToggle.closest(".cs-menu-wrap");
+          const hoverAt = Number(wrap?.dataset.hoverOpenedAt || 0);
+          if (hoverAt && Date.now() - hoverAt < 400) {
+            delete wrap.dataset.hoverOpenedAt;
+            return;
+          }
+          toggleCsMenu(Number(csToggle.dataset.csToggle));
+          return;
+        }
+        if (!event.target.closest(".cs-menu-wrap")) closeCsMenus();
         const nav = event.target.closest(".nav-item");
         if (nav && nav.dataset.view) {
           event.preventDefault();
@@ -1561,6 +1646,13 @@
           event.preventDefault();
           event.stopPropagation();
           go("config", configLink.dataset.configSub);
+          return;
+        }
+        const drawerGo = event.target.closest("[data-v4-drawer-go]");
+        if (drawerGo) {
+          event.preventDefault();
+          event.stopPropagation();
+          runDrawerGo(drawerGo.dataset.v4DrawerGo);
           return;
         }
         const v4go = event.target.closest("[data-v4-go]");
@@ -1624,6 +1716,32 @@
       },
       true
     );
+
+    // ESC 收起配置中心下拉；有遮罩（弹窗/抽屉/命令面板）时让位给遮罩自身的 ESC 逻辑
+    document.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key !== "Escape" || overlayOpen()) return;
+        if (!$$("#config-subnav .cs-panel").some((panel) => !panel.hidden)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        closeCsMenus();
+      },
+      true
+    );
+
+    // 已有下拉展开时，悬停其他组按钮直接切换；都未展开时不响应扫过（仍需点击）
+    document.addEventListener("mouseover", (event) => {
+      const toggle = event.target.closest(".cs-toggle");
+      if (!toggle) return;
+      const anyOpen = $$("#config-subnav .cs-panel").some((panel) => !panel.hidden);
+      if (anyOpen && toggle.getAttribute("aria-expanded") !== "true") {
+        toggleCsMenu(Number(toggle.dataset.csToggle));
+        // 记下 hover 切换时刻，供 click 分支区分「点击新组」与「点击收起」
+        const wrap = toggle.closest(".cs-menu-wrap");
+        if (wrap) wrap.dataset.hoverOpenedAt = String(Date.now());
+      }
+    });
 
     document.addEventListener(
       "keydown",

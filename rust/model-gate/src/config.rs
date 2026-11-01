@@ -647,6 +647,8 @@ pub struct Upstream {
     pub api_key: String,
     pub key_source: String,
     pub default: bool,
+    /// 停用开关：false 时不参与路由、目录、健康检查与诊断（缺省启用）。
+    pub enabled: bool,
     pub models: Vec<String>,
     pub model_map: HashMap<String, String>,
     pub session_header: bool,
@@ -1038,26 +1040,26 @@ impl Config {
     pub fn default_upstream(&self) -> Option<&Upstream> {
         self.upstreams
             .iter()
-            .find(|u| u.default)
-            .or_else(|| self.upstreams.first())
+            .find(|u| u.enabled && u.default)
+            .or_else(|| self.upstreams.iter().find(|u| u.enabled))
     }
 
     /// 模型名 → 上游：先别名，再按各上游声明清单匹配，再上游级别名，最后默认上游。
+    ///
+    /// 停用的上游不参与解析：请求不会落到停用接入上。
     pub fn pick_upstream(&self, model: Option<&str>) -> Option<&Upstream> {
         let name = model.unwrap_or("");
         let target = self.aliases.get(name).map(String::as_str).unwrap_or(name);
         if !target.is_empty() {
-            if let Some(up) = self
-                .upstreams
-                .iter()
-                .find(|u| u.models.iter().any(|m| m == target))
-            {
+            if let Some(up) = self.upstreams.iter().find(|u| {
+                u.enabled && u.models.iter().any(|m| m == target)
+            }) {
                 return Some(up);
             }
             if let Some(up) = self
                 .upstreams
                 .iter()
-                .find(|u| u.model_map.contains_key(name))
+                .find(|u| u.enabled && u.model_map.contains_key(name))
             {
                 return Some(up);
             }
@@ -1066,9 +1068,14 @@ impl Config {
     }
 
     /// 统一接口允许展示的上游；`visibleUpstreams` 为空表示全部，按配置顺序返回。
+    /// 停用的上游始终不可见。
     pub fn unified_visible_upstreams(&self) -> Vec<&Upstream> {
         if self.unified.visible_upstreams.is_empty() {
-            return self.upstreams.iter().collect();
+            return self
+                .upstreams
+                .iter()
+                .filter(|up| up.enabled)
+                .collect();
         }
         let allowed: HashSet<&str> = self
             .unified
@@ -1145,12 +1152,16 @@ impl Config {
     }
 
     /// 路由组的可路由成员（保持声明顺序；解析失败的成员跳过）。
+    /// 停用的上游不是可用成员。
     pub fn group_targets(&self, group: &RouteGroup) -> Vec<(&Upstream, String)> {
         let mut out: Vec<(&Upstream, String)> = Vec::new();
         for member in &group.members {
             let Some((upstream, model)) = self.resolve_group_member(member) else {
                 continue;
             };
+            if !upstream.enabled {
+                continue;
+            }
             if out.iter().any(|(existing, existing_model)| {
                 existing.name == upstream.name && existing_model == &model
             }) {
@@ -1201,25 +1212,23 @@ impl Config {
         let target = self.aliases.get(name).map(String::as_str).unwrap_or(name);
         if !target.is_empty() {
             if let Some(up) = self.upstreams.iter().find(|up| {
-                allowed.contains(up.name.as_str()) && up.models.iter().any(|m| m == target)
+                allowed.contains(up.name.as_str()) && up.enabled && up.models.iter().any(|m| m == target)
             }) {
                 return Some(up);
             }
-            if let Some(up) = self
-                .upstreams
-                .iter()
-                .find(|up| allowed.contains(up.name.as_str()) && up.model_map.contains_key(name))
-            {
+            if let Some(up) = self.upstreams.iter().find(|up| {
+                allowed.contains(up.name.as_str()) && up.enabled && up.model_map.contains_key(name)
+            }) {
                 return Some(up);
             }
         }
         self.upstreams
             .iter()
-            .find(|up| allowed.contains(up.name.as_str()) && up.default)
+            .find(|up| allowed.contains(up.name.as_str()) && up.enabled && up.default)
             .or_else(|| {
                 self.upstreams
                     .iter()
-                    .find(|up| allowed.contains(up.name.as_str()))
+                    .find(|up| allowed.contains(up.name.as_str()) && up.enabled)
             })
     }
 
@@ -1230,7 +1239,7 @@ impl Config {
             self.models.clone()
         } else {
             let mut ids = Vec::new();
-            for up in &self.upstreams {
+            for up in self.upstreams.iter().filter(|up| up.enabled) {
                 for m in &up.models {
                     if !ids.contains(m) {
                         ids.push(m.clone());
@@ -1246,7 +1255,7 @@ impl Config {
                 }
             }
         }
-        for up in &self.upstreams {
+        for up in self.upstreams.iter().filter(|up| up.enabled) {
             for (alias, target) in &up.model_map {
                 for value in [alias, target] {
                     if !out.contains(value) {
@@ -1304,7 +1313,7 @@ impl Config {
     /// 与 `/上游/v1/models` 同口径：不受顶层 `models` 白名单影响，也不触发
     /// 上游目录拉取；顺序固定为配置顺序 + 声明顺序 + modelMap 排序。
     pub fn qualified_model_list(&self) -> Vec<(String, String)> {
-        self.qualified_model_list_impl(self.upstreams.iter())
+        self.qualified_model_list_impl(self.upstreams.iter().filter(|up| up.enabled))
     }
 
     /// 统一接入清单的可见范围版本：只输出给定上游（通常来自
@@ -1434,6 +1443,7 @@ const UPSTREAM_KEYS: &[&str] = &[
     "modelKeys",
     "anthropicVersion",
     "default",
+    "enabled",
     "fetchModels",
     "autoModels",
     "models",
@@ -1524,6 +1534,7 @@ impl Config {
                     "extraHeaders": headers,
                     "models": u.models,
                     "default": u.default,
+                    "enabled": u.enabled,
                     "keySource": u.display_key_source(),
                     "keyConfigured": u.any_key_configured(),
                     "apiKeyAgent": u.api_key_agent,
@@ -1970,6 +1981,11 @@ impl Config {
         let mut model_owner: HashMap<String, String> = HashMap::new();
         let mut default_upstream_limit: Option<u64> = None;
         for up in &self.upstreams {
+            // 停用的上游不参与健康与诊断检查：面板不为其生成待办，
+            // 保存校验也不再被它的配置错误阻断（重新启用时会重新检查）。
+            if !up.enabled {
+                continue;
+            }
             let prefix = format!("upstreams.{}", up.name);
             let raw_up = declared.get(&up.name).and_then(Value::as_object);
 
@@ -2060,7 +2076,9 @@ impl Config {
                     .unwrap_or(false)
                 {
                     push(
-                        "warn",
+                        // 迁移指引而非缺陷：显式 apiKeyFile 仍然生效，只是不再有内置默认路径。
+                        // 放在 info 级，避免「需要处理」列表被永久占用。
+                        "info",
                         "legacy_api_key_file",
                         &format!("{prefix}.apiKeyFile"),
                         format!("上游「{}」仍使用 apiKeyFile 凭据来源", up.name),
@@ -2287,7 +2305,10 @@ impl Config {
                     "例如 /v1/chat/completions",
                 );
             }
-            if c.models_path.is_empty() || !c.models_path.starts_with('/') {
+            // transport=zcode 走本机账号池 worker，从不请求模型目录端点；
+            // 一键接入时 catalog.path 就是空串，这里不报 invalid_endpoint。
+            let models_path_used = up.transport != "zcode";
+            if models_path_used && (c.models_path.is_empty() || !c.models_path.starts_with('/')) {
                 push(
                     "warn",
                     "invalid_endpoint",
@@ -2994,6 +3015,7 @@ fn normalize_upstream(
         api_key,
         key_source,
         default: u.get("default").and_then(Value::as_bool).unwrap_or(false),
+        enabled: u.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         models: string_list(u.get("models")),
         model_map,
         // 旧字段保留给 API/面板展示；运行时统一读 compat。
@@ -4144,9 +4166,9 @@ mod tests {
             .filter(|d| d.code.starts_with("legacy_"))
             .collect();
         assert!(legacy.iter().any(|d| d.code == "legacy_env_file"));
-        assert!(legacy
-            .iter()
-            .any(|d| d.code == "legacy_api_key_file" && d.path.ends_with(".apiKeyFile")));
+        assert!(legacy.iter().any(|d| {
+            d.code == "legacy_api_key_file" && d.path.ends_with(".apiKeyFile") && d.level == "info"
+        }));
         assert!(legacy
             .iter()
             .any(|d| d.code == "legacy_agent_preset" && d.path.ends_with(".apiKeyAgent")));
@@ -4154,6 +4176,94 @@ mod tests {
         assert!(legacy
             .iter()
             .all(|d| d.level == "warn" || d.level == "info"));
+    }
+
+    #[test]
+    fn zcode_transport_skips_models_endpoint_check() {
+        // 账号型 zcode 上游走本机 worker，从不请求模型目录端点；
+        // 一键接入写入的空 models 路径不应报 invalid_endpoint。
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "zcode": {
+                    "protocol": "anthropic",
+                    "transport": "zcode",
+                    "baseUrl": "https://zcode.z.ai/api/anthropic",
+                    "compat": {
+                        "auth": {"scheme": "none"},
+                        "endpoint": {"chat": "/v1/messages", "models": ""}
+                    }
+                }
+            }
+        }));
+        assert!(cfg
+            .diagnostics()
+            .iter()
+            .all(|d| d.code != "invalid_endpoint"));
+    }
+
+    #[test]
+    fn disabled_upstream_is_skipped_in_routing_catalog_and_diagnostics() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "on": {
+                    "protocol": "openai",
+                    "baseUrl": "https://api.on.dev/v1",
+                    "models": ["m-on"],
+                    "default": true
+                },
+                "off": {
+                    "protocol": "openai",
+                    "baseUrl": "",
+                    "models": ["m-off"],
+                    "enabled": false
+                }
+            }
+        }));
+        assert!(cfg.upstream("on").unwrap().enabled);
+        assert!(!cfg.upstream("off").unwrap().enabled);
+        // 路由：停用上游的模型不命中，回落到启用的默认上游。
+        assert_eq!(
+            cfg.pick_upstream(Some("m-on")).map(|u| u.name.as_str()),
+            Some("on")
+        );
+        assert_eq!(
+            cfg.pick_upstream(Some("m-off")).map(|u| u.name.as_str()),
+            Some("on")
+        );
+        assert_eq!(
+            cfg.default_upstream().map(|u| u.name.as_str()),
+            Some("on")
+        );
+        // 目录与统一入口：停用上游的模型与别名不对外暴露。
+        let list = cfg.model_list();
+        assert!(list.contains(&"m-on".to_string()));
+        assert!(!list.contains(&"m-off".to_string()));
+        assert!(cfg.unified_visible_upstreams().iter().all(|u| u.enabled));
+        assert!(cfg
+            .qualified_model_list()
+            .iter()
+            .all(|(_, up)| up != "off"));
+        // 诊断：停用上游的错误（空 baseUrl）不再生成，也不再阻断保存。
+        assert!(cfg
+            .diagnostics()
+            .iter()
+            .all(|d| !d.path.starts_with("upstreams.off")));
+    }
+
+    #[test]
+    fn group_targets_skip_disabled_members() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "https://a.dev/v1", "models": ["ma"]},
+                "b": {"protocol": "openai", "baseUrl": "https://b.dev/v1", "models": ["mb"], "enabled": false}
+            },
+            "groups": {
+                "mix": ["a/ma", "b/mb"]
+            }
+        }));
+        let group = cfg.route_group("mix").unwrap();
+        let targets = cfg.group_targets(group);
+        assert!(targets.iter().all(|(up, _)| up.name == "a"));
     }
 
     #[test]

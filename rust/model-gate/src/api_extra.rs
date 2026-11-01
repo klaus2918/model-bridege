@@ -1710,6 +1710,16 @@ pub async fn upstreams_health(State(state): State<Arc<AppState>>, uri: Uri) -> R
     let cfg = state.cfg();
     let mut rows = Vec::new();
     for up in &cfg.upstreams {
+        // 停用的上游不做网络探测：批量健康检查只覆盖启用的接入。
+        if !up.enabled {
+            rows.push(json!({
+                "name": up.name,
+                "ok": Value::Null,
+                "skipped": true,
+                "message": "已停用：不参与健康检查",
+            }));
+            continue;
+        }
         rows.push(probe(&state, up, timeout, "").await);
     }
     Json(json!({"checked_at": now(), "rows": rows})).into_response()

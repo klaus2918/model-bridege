@@ -1735,6 +1735,14 @@ fn build_route_plan(
         let upstream = cfg
             .upstream(name)
             .ok_or_else(|| unknown_upstream(state, name))?;
+        if !upstream.enabled {
+            return Err(error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("上游「{name}」已停用；请在接入管理中启用后再试"),
+                "upstream_error",
+                "upstream_disabled",
+            ));
+        }
         let targets = expand_attempt_targets(state, upstream, route_model);
         if targets.is_empty() {
             return Err(pool_unavailable_response(upstream));
@@ -2563,7 +2571,8 @@ pub(crate) fn record_ex(
     log_access(state, &rec, ttft_ms, truncated, paused);
 }
 
-/// 请求调用日志：受 `accessLog` 开关控制，格式对齐 Python 版（模型 -> 上游:目标 状态 耗时 tokens）。
+/// 请求调用日志：受 `accessLog` 开关控制，格式对齐 Python 版（模型 -> 上游:目标 状态 耗时 tokens）；
+/// 行尾追加 `req=<请求 ID>`，面板请求抽屉「打开日志」按它回查该次请求的日志行。
 fn log_access(state: &AppState, rec: &UsageRecord, ttft_ms: i64, truncated: bool, paused: bool) {
     if !state.cfg().access_log {
         return;
@@ -2578,6 +2587,7 @@ fn log_access(state: &AppState, rec: &UsageRecord, ttft_ms: i64, truncated: bool
     if paused {
         extra.push_str(" paused");
     }
+    extra.push_str(&format!(" req={}", rec.id));
     let route = format!(
         "{} -> {}:{}",
         rec.requested_model, rec.upstream, rec.upstream_model

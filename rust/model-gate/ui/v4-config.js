@@ -2,7 +2,7 @@
 (() => {
   "use strict";
   const MG = window.MG;
-  const { $, esc, num, fmtTime, api, toast, state, openModal, closeModal } = MG;
+  const { $, esc, num, fmtTime, api, toast, state, openModal, updateModal, closeModal } = MG;
 
   let unifiedGroups = [];
   let routeGroups = [];
@@ -505,50 +505,228 @@
   // 关键点：`/api/update/status` 只读内存状态——从未检查过时 `latest` 为空，
   // 直接拿它渲染会把「没查过」显示成「已是最新」。所以点击必须走
   // `/api/update/check?force=1` 真正联网查询；`status` 只用于并发检查时轮询兜底。
+  //
+  // 下载 / 安装链路（v3.1 合并旧面板时曾整块丢失，这里接回）：
+  //   下载并安装 = download-install（下载 → SHA256 校验 → 自动静默安装，安装版）
+  //   仅下载     = download，ready 后点「安装并重启」；便携版点「启动安装包」
+  //   安装       = install，弹窗内二次确认——不能拆成独立 confirm 弹窗，
+  //                那会整块重建 #modal-body，把更新弹窗清空。
 
   const UPDATE_PHASE = {
     idle: ["signal", "已是最新"],
+    checking: ["signal", "检查中"],
     available: ["amber", "发现新版本"],
     downloading: ["amber", "正在下载"],
     ready: ["amber", "安装包已就绪"],
     installing: ["amber", "正在安装"],
     error: ["danger", "检查失败"],
   };
-  const UPDATE_SUB = "发布源：GitHub Releases；只检查，不自动替换本机文件。";
+  const UPDATE_SUB =
+    "发布源：GitHub Releases；安装版一键下载并静默安装，便携版下载后启动安装向导。";
 
-  function updateCheckingHtml() {
-    return (
-      `<div class="prose"><p>正在向 GitHub Releases 查询最新版本…</p></div>` +
-      `<div class="modal-actions"><button class="btn primary" id="update-close">关闭</button></div>`
-    );
+  // 弹窗本地状态：跨轮询与重开保持（最近 status / 渲染缓存 / 确认态 / 说明展开态）。
+  const updateUi = {
+    status: null,
+    html: "",
+    timer: 0,
+    busy: false,
+    bound: false,
+    confirmInstall: false,
+    notesOpen: false,
+  };
+
+  function fmtBytes(value) {
+    const n = Number(value || 0);
+    if (!Number.isFinite(n) || n <= 0) return "—";
+    if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} GiB`;
+    if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MiB`;
+    if (n >= 1024) return `${Math.round(n / 1024)} KiB`;
+    return `${Math.round(n)} B`;
   }
 
-  function updateResultHtml(data) {
-    const current = data.current || state.info?.version || "—";
-    const latest = data.latest ? `v${esc(data.latest)}` : "—";
-    const [tone, label] = UPDATE_PHASE[data.phase] || UPDATE_PHASE.idle;
+  function postUpdate(path, body = {}) {
+    return api(path, { method: "POST", body: JSON.stringify(body) });
+  }
+
+  function updateModalHtml(s) {
+    const phase = s.phase || "idle";
+    const [tone, phaseLabel] = UPDATE_PHASE[phase] || UPDATE_PHASE.idle;
+    const label = phase === "idle" && !s.checked_at ? "未检查" : phaseLabel;
+    const latest = s.latest ? `v${esc(s.latest)}` : "—";
+    const portable = s.install_supported === false;
+    const installDir = s.effective_install_dir || s.install_dir || "";
+    const downloadDir = s.installer_dir || s.download_dir || "";
+    const portableHint =
+      '<p class="hint">当前为便携版：下载完成并通过校验后，点「启动安装包」会拉起安装向导（会先请求关闭本应用）；也可以自己到下载目录运行安装包。</p>';
+
     const rows = [
-      `<dt>当前版本</dt><dd>v${esc(current)}</dd>`,
+      `<dt>当前版本</dt><dd>v${esc(s.current || state.info?.version || "—")}</dd>`,
       `<dt>最新版本</dt><dd>${latest}</dd>`,
       `<dt>状态</dt><dd><span class="pill ${tone}">${label}</span></dd>`,
-      `<dt>检查时间</dt><dd>${esc(fmtTime(data.checked_at))}</dd>`,
     ];
-    if (data.release_url) {
+    if (s.asset) {
+      rows.push(`<dt>安装包</dt><dd>${esc(s.asset.name)} · ${fmtBytes(s.asset.size)}</dd>`);
+    }
+    if (s.checked_at) rows.push(`<dt>检查时间</dt><dd>${esc(fmtTime(s.checked_at))}</dd>`);
+    if (s.release_url) {
       rows.push(
-        `<dt>发布说明</dt><dd><a href="${esc(data.release_url)}" target="_blank" rel="noreferrer">${esc(
-          data.tag || "打开 Release"
+        `<dt>发布说明</dt><dd><a href="${esc(s.release_url)}" target="_blank" rel="noreferrer">${esc(
+          s.tag || "打开 Release"
         )}</a></dd>`
       );
     }
+
+    let body = "";
+    if (phase === "checking") {
+      body = `<p>正在检查 GitHub Releases 上的最新版本…</p>`;
+    } else if (phase === "downloading") {
+      const progress = s.progress || {};
+      const percent = progress.percent == null ? 0 : Math.max(0, Math.min(100, Number(progress.percent)));
+      body =
+        `<p>正在下载安装包…</p>` +
+        `<div class="mixbar-track" style="max-width:420px"><i style="width:${percent}%"></i></div>` +
+        `<p class="hint">${fmtBytes(progress.downloaded)}${progress.total ? ` / ${fmtBytes(progress.total)}` : ""} · ${Math.round(percent)}%</p>`;
+    } else if (phase === "installing") {
+      body =
+        `<p>正在关闭应用并安装新版本…</p>` +
+        `<p class="hint">安装位置：<code>${esc(installDir || "—")}</code>。应用会先停止服务再退出，安装完成后自动重启；若未自动打开，请手动启动 Model-Gate。</p>`;
+    } else if (phase === "error") {
+      const message = (s.error && s.error.message) || "更新操作失败";
+      body = `<p style="color:var(--danger)">${esc(message)}</p>`;
+    } else if (phase === "ready") {
+      body =
+        `<p>安装包已下载并通过 SHA256 校验。</p>` +
+        (portable
+          ? portableHint
+          : s.auto_install
+            ? '<p class="hint">已开启「自动安装」：下载完成后会自动开始安装；也可手动点下面的按钮。</p>'
+            : "");
+    } else if (phase === "available" && s.available) {
+      body =
+        `<p>发现新版本 ${latest}。</p>` +
+        (s.installable
+          ? ""
+          : '<p style="color:var(--danger)">该版本缺少可用的安装包或 SHA256SUMS，请前往 Release 页面手动下载。</p>') +
+        (portable ? portableHint : "") +
+        (s.auto_download
+          ? '<p class="hint">已开启「自动下载」：发现新版本后会在后台自动下载并校验。</p>'
+          : "");
+    } else if (s.checked_at) {
+      body = `<p>已是最新版本 ${latest}。</p>`;
+    } else {
+      body = `<p>尚未检查更新。</p>`;
+    }
+
+    // 路径事实：「下到哪」「装到哪」直接可见；「打开」由服务端按枚举推导路径，
+    // 面板不传任意路径（防任意文件打开器）。
+    const paths = `<div class="kv" style="margin-top:10px">
+      <dt>下载位置</dt><dd><code>${esc(downloadDir || "—")}</code> <button class="btn ghost sm" data-update-action="open-download">打开</button></dd>
+      <dt>安装位置</dt><dd><code>${esc(installDir || "—")}</code> <button class="btn ghost sm" data-update-action="open-install">打开</button></dd>
+    </div>`;
+
+    // 下载目录可指定（DB 设置）；下载 / 安装进行中不接受修改。
+    const dirEditor =
+      phase === "downloading" || phase === "installing"
+        ? ""
+        : `<div style="margin-top:10px">
+      <label class="hint" for="update-dir-input">下载目录${s.download_dir_custom ? "（自定义）" : "（默认：Windows 下载文件夹）"}</label>
+      <div style="display:flex;gap:6px;margin-top:4px">
+        <input id="update-dir-input" class="input" type="text" spellcheck="false" style="flex:1" value="${esc(s.download_dir || "")}" placeholder="留空保存 = 恢复默认目录">
+        <button class="btn ghost sm" data-update-action="save-download-dir">保存</button>
+        <button class="btn ghost sm" data-update-action="reset-download-dir">恢复默认</button>
+      </div>
+    </div>`;
+
+    // 自动化开关；便携版无法静默自覆盖，自动安装开关置灰。
+    const settings = `<div style="margin-top:10px;display:flex;flex-direction:column;gap:4px">
+      <label class="check"><input type="checkbox" data-update-setting="autoDownload"${s.auto_download ? " checked" : ""}> 发现新版本后自动在后台下载</label>
+      <label class="check"${portable ? ' title="便携版无法静默自覆盖，此开关不生效"' : ""}><input type="checkbox" data-update-setting="autoInstall"${s.auto_install ? " checked" : ""}${portable ? " disabled" : ""}> 下载完成后自动安装</label>
+    </div>`;
+
+    // Release 说明展开态存在 updateUi：轮询重渲染后不折起。
+    const notes = s.notes
+      ? `<details data-update-notes${updateUi.notesOpen ? " open" : ""} style="margin-top:10px"><summary class="hint" style="cursor:pointer">Release 说明（点开查看完整更新内容）</summary><pre style="white-space:pre-wrap;font-size:11px;margin:6px 0 0;color:var(--faint)">${esc(s.notes)}</pre></details>`
+      : "";
+
+    // 安装二次确认放在更新弹窗内部：独立 confirm 弹窗会重建 #modal-body，
+    // 取消后更新弹窗会被清空。
+    const confirmPanel = updateUi.confirmInstall
+      ? `<div style="margin-top:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px">
+          <p><strong>${portable ? "确认启动安装包向导？" : "确认现在安装并重启？"}</strong></p>
+          <p class="hint">${portable ? "将打开安装向导，按提示完成安装。" : `应用将先停止服务再退出，安装器覆盖 <code>${esc(installDir || "—")}</code> 下的 Model-Gate.exe，完成后自动重启。`}</p>
+          <div class="modal-actions"><button class="btn primary" data-update-action="install-confirm">${portable ? "启动安装包" : "确认安装并重启"}</button><button class="btn ghost" data-update-action="install-cancel">取消</button></div>
+        </div>`
+      : "";
+
+    const actions = [];
+    if (phase !== "downloading" && phase !== "installing") {
+      actions.push(
+        `<button class="btn ghost" data-update-action="check">${s.checked_at ? "重新检查" : "检查更新"}</button>`
+      );
+    }
+    if (phase === "available" && s.installable && !s.installer_ready) {
+      // 一键链路：下载 → 校验 → 自动安装（安装版仍会二次确认，不打招呼不重启）。
+      if (!portable) {
+        actions.push(`<button class="btn primary" data-update-action="download-install">下载并安装</button>`);
+      }
+      actions.push(`<button class="btn ghost" data-update-action="download">仅下载安装包</button>`);
+    }
+    if (phase === "ready") {
+      actions.push(
+        `<button class="btn primary" data-update-action="install">${portable ? "启动安装包" : "安装并重启"}</button>`
+      );
+    }
+    actions.push(`<button class="btn ghost" data-update-action="close">关闭</button>`);
+
     return (
-      `<div class="kv">${rows.join("")}</div>` +
-      `<div class="modal-actions"><button class="btn primary" id="update-close">关闭</button></div>`
+      `<div class="prose"><dl class="kv">${rows.join("")}</dl>${body}` +
+      (confirmPanel || `<div class="modal-actions">${actions.join("")}</div>`) +
+      `</div>` +
+      paths +
+      dirEditor +
+      settings +
+      notes
     );
   }
 
-  // 弹窗内容会被整块替换，关闭按钮每轮都要重新挂一次。
-  function bindUpdateClose() {
-    $("#update-close")?.addEventListener("click", closeModal);
+  // 内容没变就不重建 DOM：轮询每秒重渲染会把展开的说明折起、滚动位置清零。
+  function renderUpdate(view, reopen = false) {
+    const html = updateModalHtml(view || {});
+    if (!reopen && html === updateUi.html) return;
+    updateUi.html = html;
+    (reopen ? openModal : updateModal)("检查更新", UPDATE_SUB, html);
+  }
+
+  // 权威 status（后端返回）：覆盖缓存再渲染。瞬时错误走 renderUpdate，不冲缓存。
+  function applyUpdate(status, reopen = false) {
+    if (status) updateUi.status = status;
+    renderUpdate(updateUi.status, reopen);
+  }
+
+  function stopUpdatePolling() {
+    if (updateUi.timer) {
+      clearInterval(updateUi.timer);
+      updateUi.timer = 0;
+    }
+  }
+
+  // 下载进行中每秒拉一次内存状态；离开 downloading（ready / installing / error）
+  // 就停——installing 的文案已交代「应用即将退出」，进程退出后页面自然失联。
+  function startUpdatePolling() {
+    stopUpdatePolling();
+    updateUi.timer = setInterval(async () => {
+      if ($("#modal").hidden) {
+        stopUpdatePolling();
+        return;
+      }
+      try {
+        const status = await api("/api/update/status");
+        applyUpdate(status);
+        if (status.phase !== "downloading") stopUpdatePolling();
+      } catch {
+        stopUpdatePolling();
+      }
+    }, 1000);
   }
 
   // 并发检查时 `/check` 不会等待，直接回 `checking`；轮询到终态再渲染。
@@ -561,22 +739,123 @@
     return api("/api/update/status");
   }
 
-  async function update() {
-    openModal("检查更新", UPDATE_SUB, updateCheckingHtml());
-    bindUpdateClose();
+  async function runUpdateCheck() {
+    if (updateUi.busy) return;
+    updateUi.busy = true;
+    updateUi.confirmInstall = false;
+    renderUpdate({ ...(updateUi.status || {}), phase: "checking", error: null });
     try {
       const first = await api("/api/update/check?force=1");
-      const data = first.phase === "checking" ? await waitUpdateResult() : first;
-      openModal("检查更新", UPDATE_SUB, updateResultHtml(data));
+      applyUpdate(first.phase === "checking" ? await waitUpdateResult() : first);
     } catch (error) {
-      openModal(
-        "检查更新",
-        "无法完成检查",
-        `<div class="prose"><p>${esc(error.message)}</p></div>` +
-          `<div class="modal-actions"><button class="btn primary" id="update-close">关闭</button></div>`
-      );
+      // 瞬时错误只改渲染不冲缓存状态：否则一次失败的检查会把
+      // 「发现新版本」弄丢，之后「下载并安装」就再也点不了。
+      renderUpdate({ ...(updateUi.status || {}), phase: "error", error: { message: error.message } });
+      toast(error.message, "error");
+    } finally {
+      updateUi.busy = false;
     }
-    bindUpdateClose();
+  }
+
+  async function handleUpdateSetting(name, checked) {
+    try {
+      const body = name === "autoDownload" ? { autoDownload: checked } : { autoInstall: checked };
+      applyUpdate(await postUpdate("/api/update/settings", body));
+      toast(
+        name === "autoDownload"
+          ? checked
+            ? "已开启：发现新版本后自动在后台下载"
+            : "已关闭自动下载"
+          : checked
+            ? "已开启：下载完成后自动安装（仅安装版）"
+            : "已关闭自动安装"
+      );
+    } catch (error) {
+      toast(`保存设置失败：${error.message}`, "error");
+    }
+  }
+
+  async function handleUpdateAction(action) {
+    const s = updateUi.status || {};
+    try {
+      if (action === "check") {
+        await runUpdateCheck();
+      } else if (action === "download-install") {
+        updateUi.confirmInstall = false;
+        applyUpdate(await postUpdate("/api/update/download-install"));
+        startUpdatePolling();
+        toast(s.portable ? "已开始下载；完成后请点「启动安装包」" : "已开始下载，校验通过后自动安装");
+      } else if (action === "download") {
+        updateUi.confirmInstall = false;
+        applyUpdate(await postUpdate("/api/update/download"));
+        startUpdatePolling();
+      } else if (action === "install") {
+        updateUi.confirmInstall = true;
+        renderUpdate(updateUi.status);
+      } else if (action === "install-cancel") {
+        updateUi.confirmInstall = false;
+        renderUpdate(updateUi.status);
+      } else if (action === "install-confirm") {
+        updateUi.confirmInstall = false;
+        const status = await postUpdate("/api/update/install");
+        applyUpdate(status);
+        // 便携版只拉起安装向导（launched），应用继续运行；安装版交给看护脚本后退出。
+        toast(status.launched ? "已启动安装向导，按提示完成安装" : "安装程序已启动，应用即将退出…");
+      } else if (action === "open-download" || action === "open-install") {
+        const result = await postUpdate("/api/update/open-location", {
+          target: action === "open-download" ? "download" : "install",
+        });
+        toast(result.path ? `已打开：${result.path}` : "已打开");
+      } else if (action === "save-download-dir" || action === "reset-download-dir") {
+        const input = $("#update-dir-input");
+        const dir = action === "reset-download-dir" ? "" : input ? input.value.trim() : "";
+        applyUpdate(await postUpdate("/api/update/download-dir", { dir }));
+        toast(
+          action === "reset-download-dir"
+            ? "已恢复默认下载目录"
+            : `下载目录已保存：${updateUi.status.download_dir || "—"}`
+        );
+      } else if (action === "close") {
+        stopUpdatePolling();
+        closeModal();
+      }
+    } catch (error) {
+      renderUpdate({ ...s, phase: "error", error: { message: error.message } });
+      toast(error.message, "error");
+    }
+  }
+
+  // 事件代理挂在 #modal-body 上，绑一次即可：弹窗内容整块替换不影响它。
+  function bindUpdateDelegation() {
+    if (updateUi.bound) return;
+    updateUi.bound = true;
+    const host = $("#modal-body");
+    host.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-update-action]");
+      if (button) handleUpdateAction(button.dataset.updateAction);
+    });
+    host.addEventListener("change", (event) => {
+      const box = event.target.closest("[data-update-setting]");
+      if (box) handleUpdateSetting(box.dataset.updateSetting, box.checked);
+    });
+    // toggle 不冒泡，用捕获阶段监听：轮询重渲染后说明保持展开态。
+    host.addEventListener(
+      "toggle",
+      (event) => {
+        if (event.target.matches?.("details[data-update-notes]")) {
+          updateUi.notesOpen = event.target.open;
+        }
+      },
+      true
+    );
+  }
+
+  async function update() {
+    bindUpdateDelegation();
+    updateUi.confirmInstall = false;
+    // 先画一版缓存状态（没查过就是「未检查」），force 检查完成后整块替换。
+    applyUpdate(updateUi.status || { phase: "idle" }, true);
+    await runUpdateCheck();
   }
 
   function bind() {

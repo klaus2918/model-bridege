@@ -100,7 +100,7 @@
   }
 
   function statusDot(health) {
-    const k = health === "ok" ? "ok" : health === "error" ? "error" : health === "idle" ? "idle" : "warn";
+    const k = health === "ok" ? "ok" : health === "error" ? "error" : health === "disabled" ? "idle" : health === "idle" ? "idle" : "warn";
     return `<span class="dot ${k}" style="width:7px;height:7px"></span>`;
   }
 
@@ -366,14 +366,17 @@
       .map((item) => {
         const pool = item.pool ? `池 ${item.pool.available}/${item.pool.members}` : "";
         const credential = item.auth.mode === "pool" ? pool || "池" : item.auth.configured ? "单 Key" : item.auth.mode === "none" ? "无需" : "待补充";
-        return `<tr data-open="${esc(item.id)}">
-          <td><div class="name-cell">${badge(item.kind)}<b>${esc(item.label || item.id)}</b></div><div class="tiny muted">${esc(item.id)}${item.source && item.source.pluginId ? ` · ${esc(item.source.pluginId)}` : ""}</div></td>
+        const disabled = item.enabled === false;
+        const healthLabel = item.health.state === "ok" ? "正常" : item.health.state === "disabled" ? "已停用" : "待处理";
+        return `<tr data-open="${esc(item.id)}"${disabled ? ' style="opacity:.62"' : ""}>
+          <td><div class="name-cell">${badge(item.kind)}<b>${esc(item.label || item.id)}</b>${disabled ? '<span class="pill">已停用</span>' : ""}</div><div class="tiny muted">${esc(item.id)}${item.source && item.source.pluginId ? ` · ${esc(item.source.pluginId)}` : ""}</div></td>
           <td><div>${esc(item.protocol)}</div><div class="addr" title="${esc(item.baseUrl)}">${esc(item.baseUrl || "—")}</div></td>
           <td><div>${item.models ? item.models.declared : 0} 声明</div><div class="tiny muted">${item.models ? item.models.aliases : 0} 别名</div></td>
           <td><span class="pill ${item.auth.configured ? "signal" : "amber"}">${esc(credential)}</span></td>
-          <td><span class="status-line">${statusDot(item.health.state)}${esc(item.health.state === "ok" ? "正常" : "待处理")}</span></td>
+          <td><span class="status-line">${statusDot(item.health.state)}${esc(healthLabel)}</span></td>
           <td class="num">${num(item.usage && item.usage.todayRequests)}</td>
           <td class="right"><span class="actions">
+            <button class="btn ghost sm" data-toggle-enabled="${esc(item.id)}">${disabled ? "启用" : "停用"}</button>
             <button class="btn ghost sm" data-probe="${esc(item.id)}">测试</button>
             <button class="btn ghost sm" data-open="${esc(item.id)}">详情</button>
           </span></td>
@@ -387,6 +390,28 @@
       button.addEventListener("click", async (event) => {
         event.stopPropagation();
         await probeAccess(button.dataset.probe);
+      });
+    });
+    $$("[data-toggle-enabled]", tbody).forEach((button) => {
+      button.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        const id = button.dataset.toggleEnabled;
+        const item = state.access.find((row) => row.id === id);
+        const next = !(item && item.enabled !== false);
+        button.disabled = true;
+        try {
+          await api(`/api/access/${encodeURIComponent(id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({ enabled: next }),
+          });
+          toast(next ? `已启用 ${id}` : `已停用 ${id}`, "ok");
+          await Promise.all([refreshAccess(), refreshConfig().catch(() => {})]);
+          renderDrawer();
+          renderAccess();
+        } catch (error) {
+          toast(error.message, "error");
+          button.disabled = false;
+        }
       });
     });
   }
@@ -448,7 +473,11 @@
       badge(item.kind),
       `<span class="pill">${esc(item.protocol)}</span>`,
       item.source && item.source.id ? `<span class="pill">${esc(item.source.id)}</span>` : "",
-      item.health.state === "ok" ? `<span class="pill signal">正常</span>` : `<span class="pill amber">待处理</span>`,
+      item.enabled === false
+        ? `<span class="pill">已停用</span>`
+        : item.health.state === "ok"
+          ? `<span class="pill signal">正常</span>`
+          : `<span class="pill amber">待处理</span>`,
     ].join("");
     $$(".drawer-tab").forEach((tab) => {
       tab.classList.toggle("active", tab.dataset.dtab === state.drawerTab);
@@ -470,7 +499,11 @@
   }
 
   function drawerOverview(item) {
-    return `<dl class="kv">
+    return `${item.enabled === false
+      ? `<div class="callout warn">该接入已停用：不参与路由、模型清单、健康检查，总览也不再统计它的请求。</div>`
+      : ""}
+    <dl class="kv">
+      <dt>状态</dt><dd>${item.enabled === false ? "已停用" : "启用中"}</dd>
       <dt>标识</dt><dd class="mono">${esc(item.id)}</dd>
       <dt>地址</dt><dd class="mono">${esc(item.baseUrl || "—")}</dd>
       <dt>协议</dt><dd>${esc(item.protocol)}${item.transport ? ` · transport ${esc(item.transport)}` : ""}</dd>
@@ -481,6 +514,7 @@
       <dt>隐私</dt><dd>${esc(privacyText(item.privacy))}</dd>
       <dt>路由</dt><dd>${item.routing.default ? "默认接入" : "非默认"}${item.routing.groups.length ? ` · 组 ${esc(item.routing.groups.join("、"))}` : ""}</dd>
     </dl>
+    <div class="modal-actions"><button class="btn ghost sm" id="toggle-enabled">${item.enabled === false ? "启用该接入" : "停用该接入"}</button></div>
     ${item.privacy && item.privacy.notice ? `<div class="callout warn">${esc(item.privacy.notice)}</div>` : ""}
     ${item.pool ? `<div class="section-title">凭据池</div>${poolSummaryHtml(item.pool)}` : ""}`;
   }
@@ -603,6 +637,26 @@
   }
 
   function bindDrawerActions(item) {
+    const toggleEnabled = $("#toggle-enabled");
+    if (toggleEnabled) {
+      toggleEnabled.addEventListener("click", async () => {
+        const next = item.enabled === false;
+        toggleEnabled.disabled = true;
+        try {
+          await api(`/api/access/${encodeURIComponent(item.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({ enabled: next }),
+          });
+          toast(next ? `已启用 ${item.id}` : `已停用 ${item.id}`, "ok");
+          await Promise.all([refreshAccess(), refreshConfig().catch(() => {})]);
+          renderDrawer();
+          renderAccess();
+        } catch (error) {
+          toast(error.message, "error");
+          toggleEnabled.disabled = false;
+        }
+      });
+    }
     const saveConnection = $("#save-connection");
     if (saveConnection) {
       saveConnection.addEventListener("click", async () => {

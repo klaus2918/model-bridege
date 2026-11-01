@@ -628,11 +628,18 @@ pub fn build_attach(
         upstream.insert("transport".into(), json!(source.transport));
     }
     upstream.insert("baseUrl".into(), json!(source.base_url));
+    // 模型端点为空（账号型来源目录固定）时不写 endpoint.models，
+    // 避免空串被诊断判成 invalid_endpoint。
+    let mut endpoint = Map::new();
+    endpoint.insert("chat".into(), json!(source.chat_path));
+    if !source.catalog_path.is_empty() {
+        endpoint.insert("models".into(), json!(source.catalog_path));
+    }
     upstream.insert(
         "compat".into(),
         json!({
             "auth": {"scheme": source.auth_scheme()},
-            "endpoint": {"chat": source.chat_path, "models": source.catalog_path},
+            "endpoint": endpoint,
         }),
     );
     // 账号型来源（ZCode）的模型是固定清单，不做运行期目录拉取。
@@ -1076,6 +1083,8 @@ mod tests {
         assert_eq!(up["fetchModels"], json!(false));
         assert_eq!(up["autoModels"], json!(false));
         assert_eq!(up["compat"]["auth"]["scheme"], "none");
+        // 账号型来源目录固定：catalog.path 为空时不得写 endpoint.models 空串。
+        assert!(up["compat"]["endpoint"].get("models").is_none());
         // 账号型来源即使顶层 models 为空也写固定模型清单（路由需要）。
         assert!(out.models_written);
         assert_eq!(up["models"], json!(["GLM-5.3-Flash", "GLM-5.3"]));

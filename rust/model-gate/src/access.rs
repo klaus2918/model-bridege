@@ -343,7 +343,10 @@ pub fn access_object(cfg: &Config, up: &Upstream, cooling: bool) -> Value {
     let privacy = up.compat.privacy.to_json();
     let zdr_support = adapter_support(&up.compat.privacy.zdr_adapter);
     let training_support = adapter_support(&up.compat.privacy.training_deny_adapter);
-    let health = if cooling {
+    // 停用的接入不表达健康状态：它既不参与健康检查，也不该被算进“待处理”。
+    let health = if !up.enabled {
+        "disabled"
+    } else if cooling {
         "warn"
     } else if configured {
         "ok"
@@ -377,6 +380,7 @@ pub fn access_object(cfg: &Config, up: &Upstream, cooling: bool) -> Value {
         "id": up.name,
         "label": label,
         "kind": kind,
+        "enabled": up.enabled,
         "source": {
             "type": if pool_id.is_some() { "pool" } else if template_id == "custom" { "custom" } else { "template" },
             "id": template_id,
@@ -957,6 +961,7 @@ pub async fn update(
         "pauseTurn",
         "default",
         "sessionHeader",
+        "enabled",
     ] {
         if let Some(value) = body.get(key).and_then(Value::as_bool) {
             entry.insert(key.to_string(), json!(value));
