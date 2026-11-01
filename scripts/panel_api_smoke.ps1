@@ -1,4 +1,4 @@
-﻿# Rust 面板接口冒烟：启动 --no-gui 实例，检查 /api/info、/api/update/status 与 /ui/ 资产。
+# Rust 面板接口冒烟：启动 --no-gui 实例，检查 /api/info、/api/update/status 与 /ui/ 资产。
 # 用法：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe -Port 18941
@@ -104,10 +104,18 @@ try {
         if ($Body -notmatch 'v4-base\.css') { throw "首页不是 v4 控制台" }
     }
 
+    # v4 把面板拆成多个模块：core 只放外壳与接入/池/插件，用量接口在 v4-usage.js。
     Assert-PanelCheck "ui-v4-core" "/ui/v4-core.js" {
         param($Body)
-        foreach ($Marker in @("/api/access", "/api/usage/list", "/api/pools")) {
+        foreach ($Marker in @("/api/access", "/api/pools", "/api/plugins")) {
             if ($Body -notmatch [regex]::Escape($Marker)) { throw "v4-core.js 缺少 $Marker" }
+        }
+    }
+
+    Assert-PanelCheck "ui-v4-usage" "/ui/v4-usage.js" {
+        param($Body)
+        foreach ($Marker in @("/api/usage/list", "/api/usage/models")) {
+            if ($Body -notmatch [regex]::Escape($Marker)) { throw "v4-usage.js 缺少 $Marker" }
         }
     }
 
