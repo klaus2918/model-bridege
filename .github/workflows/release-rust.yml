@@ -59,6 +59,9 @@ jobs:
           } else {
             Write-Host "sccache 可用"
           }
+          # GitHub 会在这段脚本尾部注入 `exit $LASTEXITCODE`；探测失败时的非零退出码
+          # 不清掉，会把“回退成功”也判成步骤失败（第三次就栽在这一行）。
+          $global:LASTEXITCODE = 0
 
       - name: 启用 LLD 链接器
         shell: pwsh
