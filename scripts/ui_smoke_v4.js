@@ -637,7 +637,13 @@ async function main() {
       mobile: true,
     });
     await navigate("overview");
-    await sleep(600);
+    // 大库冷缓存下首次聚合要数秒；本断言测的是布局而非 API 延迟，
+    // 显式等 KPI 出现再量溢出，避免把后端速度误判成布局失败。
+    await waitFor(
+      () => evaluate(`document.querySelectorAll("#ov-kpis .ov-kpi").length > 0`),
+      12000,
+      "窄屏总览 KPI"
+    );
     const metrics = await evaluate(`({
       inner: window.innerWidth,
       scroll: document.documentElement.scrollWidth,

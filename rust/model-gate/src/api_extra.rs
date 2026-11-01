@@ -13,6 +13,20 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// 把同步 SQLite 查询挪出 tokio worker：面板统计在 GB 级库上是秒级操作，
+/// 直接在 async fn 里跑会占死 worker 线程，连 chat 转发一起卡住。
+/// JoinError 按取消传播（resume_unwind），与 `.expect` 语义一致。
+pub(crate) async fn run_blocking<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(err) => std::panic::resume_unwind(err.into_panic()),
+    }
+}
+
 fn params(uri: &Uri) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     if let Some(query) = uri.query() {
@@ -77,7 +91,7 @@ pub async fn usage_clear(State(state): State<Arc<AppState>>, Json(body): Json<Va
             _ => filters.since_ts = Some(now() - 86400),
         }
     }
-    let removed = state.db.clear_usage(&filters);
+    let removed = run_blocking(move || state.db.clear_usage(&filters)).await;
     Json(json!({"ok": true, "removed": removed})).into_response()
 }
 
@@ -86,12 +100,18 @@ pub async fn retention_apply(
     Json(body): Json<Value>,
 ) -> Response {
     let days = body.get("days").and_then(Value::as_i64).unwrap_or(0);
-    let before = state.db.usage_count_and_size();
-    let removed = state.db.delete_older_than(days);
-    if removed > 0 {
-        state.db.vacuum();
-    }
-    let after = state.db.usage_count_and_size();
+    // 「删除 + VACUUM」在 GB 级库上以分钟计，整个流程放阻塞线程池。
+    let payload = run_blocking(move || {
+        let before = state.db.usage_count_and_size();
+        let removed = state.db.delete_older_than(days);
+        if removed > 0 {
+            state.db.vacuum();
+        }
+        let after = state.db.usage_count_and_size();
+        (before, removed, after)
+    })
+    .await;
+    let (before, removed, after) = payload;
     Json(json!({"ok": true, "removed": removed, "before": before, "after": after})).into_response()
 }
 
@@ -108,9 +128,13 @@ pub async fn usage_export(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
         filters.session = Some(session.clone());
     }
     if query.get("group").map(String::as_str) == Some("session") {
-        let sort = query.get("sort").map(String::as_str).unwrap_or("last_ts");
-        let order = query.get("order").map(String::as_str).unwrap_or("desc");
-        let rows = state.db.session_usage(&filters, 1000, sort, order);
+        let sort = query
+            .get("sort")
+            .cloned()
+            .unwrap_or_else(|| "last_ts".into());
+        let order = query.get("order").cloned().unwrap_or_else(|| "desc".into());
+        let rows =
+            run_blocking(move || state.db.session_usage(&filters, 1000, &sort, &order)).await;
         let columns = [
             "session",
             "requests",
@@ -132,7 +156,7 @@ pub async fn usage_export(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
         return csv_attachment("modelgate-sessions", &columns, &rows);
     }
     let limit = 100_000_i64;
-    let rows = state.db.list_usage(&filters, limit, 0, "ts", "asc");
+    let rows = run_blocking(move || state.db.list_usage(&filters, limit, 0, "ts", "asc")).await;
     let count = rows.len();
     let format = query.get("format").cloned().unwrap_or_else(|| "csv".into());
     if format == "json" {
@@ -260,25 +284,62 @@ pub async fn prompts_list(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0)
         .max(0);
-    let sort = query.get("sort").map(String::as_str).unwrap_or("ts");
-    let order = query.get("order").map(String::as_str).unwrap_or("desc");
-    let total = state.db.count_prompts(&filters);
-    let rows = state.db.list_prompts(&filters, limit, offset, sort, order);
+    let sort = query.get("sort").cloned().unwrap_or_else(|| "ts".into());
+    let order = query.get("order").cloned().unwrap_or_else(|| "desc".into());
+    // count/list/stats/facets 全部是同步 SQLite 查询；GB 级库上任何一次
+    // 都可能上百毫秒，整体挪进阻塞线程池，别占住 tokio worker。
+    let inner_state = Arc::clone(&state);
+    let payload = run_blocking(move || {
+        let total = inner_state.db.count_prompts(&filters);
+        let rows = inner_state
+            .db
+            .list_prompts(&filters, limit, offset, &sort, &order);
+        (
+            total,
+            rows,
+            inner_state.db.prompt_count_and_size(),
+            inner_state.db.prompt_facets(),
+        )
+    })
+    .await;
+    let (total, rows, stats, facets) = payload;
     Json(json!({
         "total": total,
         "rows": rows,
         "limit": limit,
         "offset": offset,
         "capture": state.cfg().prompt_capture,
-        "stats": state.db.prompt_count_and_size(),
-        "facets": state.db.prompt_facets(),
+        "stats": stats,
+        "facets": facets,
+    }))
+    .into_response()
+}
+
+/// 提示词统计概览：capture 开关 + 全表统计 + 筛选项。
+/// 总览页只需要这一份轻量信息（列表查询对它毫无意义）；
+/// 统计本体走 stale-while-revalidate 缓存，GB 级库上也恒为毫秒级。
+pub async fn prompts_stats(State(state): State<Arc<AppState>>) -> Response {
+    let inner_state = Arc::clone(&state);
+    let payload = run_blocking(move || {
+        (
+            inner_state.db.prompt_count_and_size(),
+            inner_state.db.prompt_facets(),
+        )
+    })
+    .await;
+    let (stats, facets) = payload;
+    Json(json!({
+        "capture": state.cfg().prompt_capture,
+        "stats": stats,
+        "facets": facets,
     }))
     .into_response()
 }
 
 pub async fn prompt_detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match state.db.get_prompt(&id) {
-        Some(mut value) => {
+    // messages 是单条可达数百 KB～1MB 的大字段，载入 + JSON 解析放阻塞线程池。
+    let found = run_blocking(move || {
+        state.db.get_prompt(&id).map(|mut value| {
             value["neighbors"] = state.db.prompt_neighbors(&id);
             let messages = value
                 .get("messages")
@@ -286,8 +347,12 @@ pub async fn prompt_detail(State(state): State<Arc<AppState>>, Path(id): Path<St
                 .cloned()
                 .unwrap_or_default();
             value["call_chain"] = crate::prompt::summarize_call_chain(&messages);
-            Json(value).into_response()
-        }
+            value
+        })
+    })
+    .await;
+    match found {
+        Some(value) => Json(value).into_response(),
         None => error_json(
             StatusCode::NOT_FOUND,
             "提示词记录不存在",
@@ -327,7 +392,7 @@ pub async fn prompt_download(
 
 pub async fn prompts_export(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let filters = prompt_filters(&uri);
-    let rows = state.db.export_prompts(&filters, 100_000);
+    let rows = run_blocking(move || state.db.export_prompts(&filters, 100_000)).await;
     let mut body = String::new();
     for row in &rows {
         if let Ok(line) = serde_json::to_string(row) {
@@ -400,6 +465,9 @@ pub async fn prompts_clear(
             let after = db.vacuum();
             vacuumed = (before as i64 - after as i64).max(0);
         }
+        // 清空/回收后统计已失真：同步重算（本操作已在阻塞线程池，
+        // 且用户刚做过重活，理应立刻看到准确数字）。
+        db.recompute_prompt_stats();
         (removed, before, vacuumed)
     })
     .await
@@ -421,6 +489,7 @@ pub async fn prompts_vacuum(State(state): State<Arc<AppState>>) -> Response {
     let (before, after) = tokio::task::spawn_blocking(move || {
         let before = std::fs::metadata(&db.path).map(|m| m.len()).unwrap_or(0);
         let after = db.vacuum();
+        db.recompute_prompt_stats();
         (before, after)
     })
     .await
@@ -489,19 +558,24 @@ pub async fn prompts_evolution(State(state): State<Arc<AppState>>, uri: Uri) -> 
         session: Some(session.clone()),
         ..Default::default()
     };
-    let mut rows = state.db.list_prompts(&filters, limit, 0, "ts", "desc");
-    rows.reverse();
-    let timeline: Vec<Value> = rows
-        .iter()
-        .filter_map(|row| row.get("id").and_then(Value::as_str))
-        .filter_map(|id| prompt_timeline_row(&state, id))
-        .collect();
+    // N+1：时间线每一行都要完整载入 messages 做摘要，GB 级库上整体放阻塞线程池。
+    let timeline = run_blocking(move || {
+        let mut rows = state.db.list_prompts(&filters, limit, 0, "ts", "desc");
+        rows.reverse();
+        rows.iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str))
+            .filter_map(|id| prompt_timeline_row(&state, id))
+            .collect::<Vec<Value>>()
+    })
+    .await;
     Json(json!({"session": session, "rows": timeline})).into_response()
 }
 
 pub async fn prompts_diff(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let query = params(&uri);
-    let (Some(base_id), Some(target_id)) = (query.get("base"), query.get("target")) else {
+    let (Some(base_id), Some(target_id)) =
+        (query.get("base").cloned(), query.get("target").cloned())
+    else {
         return error_json(
             StatusCode::BAD_REQUEST,
             "缺少 base/target 参数",
@@ -509,34 +583,42 @@ pub async fn prompts_diff(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
             "diff_params_required",
         );
     };
-    let Some(base) = state.db.get_prompt(base_id) else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "基准提示词记录不存在",
-            "invalid_request_error",
-            "prompt_not_found",
-        );
-    };
-    let Some(target) = state.db.get_prompt(target_id) else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "目标提示词记录不存在",
-            "invalid_request_error",
-            "prompt_not_found",
-        );
-    };
-    let role = query.get("role").map(String::as_str);
+    let role = query.get("role").cloned();
     let context = query
         .get("context")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(3)
         .min(20);
+    // 两条全文记录载入内存做 diff，放阻塞线程池。
+    let payload = run_blocking(move || {
+        let base = state.db.get_prompt(&base_id);
+        let target = state.db.get_prompt(&target_id);
+        (base, target)
+    })
+    .await;
+    let (Some(base), Some(target)) = payload else {
+        let (base_missing, target_missing) = match &payload {
+            (None, _) => (true, false),
+            (_, None) => (false, true),
+            _ => (false, false),
+        };
+        return error_json(
+            StatusCode::NOT_FOUND,
+            if base_missing {
+                "基准提示词记录不存在"
+            } else {
+                "目标提示词记录不存在"
+            },
+            "invalid_request_error",
+            "prompt_not_found",
+        );
+    };
     let base_messages = role_filtered(
         base.get("messages")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]),
-        role,
+        role.as_deref(),
     );
     let target_messages = role_filtered(
         target
@@ -544,7 +626,7 @@ pub async fn prompts_diff(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]),
-        role,
+        role.as_deref(),
     );
     let diff = crate::prompt::diff_messages(&base_messages, &target_messages, context);
     Json(json!({
@@ -567,34 +649,35 @@ pub async fn prompts_diff_download(State(state): State<Arc<AppState>>, uri: Uri)
             "diff_params_required",
         );
     };
-    let Some(base) = state.db.get_prompt(base_id) else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "基准提示词记录不存在",
-            "invalid_request_error",
-            "prompt_not_found",
-        );
-    };
-    let Some(target) = state.db.get_prompt(target_id) else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "目标提示词记录不存在",
-            "invalid_request_error",
-            "prompt_not_found",
-        );
-    };
-    let role = query.get("role").map(String::as_str);
+    let role = query.get("role").cloned();
     let context = query
         .get("context")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(3)
         .min(20);
+    let base_id = base_id.to_string();
+    let target_id = target_id.to_string();
+    let payload = run_blocking(move || {
+        let base = state.db.get_prompt(&base_id);
+        let target = state.db.get_prompt(&target_id);
+        (base, target, base_id, target_id)
+    })
+    .await;
+    let (base, target, base_id, target_id) = payload;
+    let (Some(base), Some(target)) = (base, target) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "提示词记录不存在",
+            "invalid_request_error",
+            "prompt_not_found",
+        );
+    };
     let base_messages = role_filtered(
         base.get("messages")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]),
-        role,
+        role.as_deref(),
     );
     let target_messages = role_filtered(
         target
@@ -602,10 +685,10 @@ pub async fn prompts_diff_download(State(state): State<Arc<AppState>>, uri: Uri)
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or(&[]),
-        role,
+        role.as_deref(),
     );
     let diff = crate::prompt::diff_messages(&base_messages, &target_messages, context);
-    let body = crate::prompt::unified_diff(base_id, target_id, &diff);
+    let body = crate::prompt::unified_diff(&base_id, &target_id, &diff);
     let filename = format!("modelgate-prompt-diff-{base_id}-{target_id}.diff");
     (
         StatusCode::OK,
@@ -629,9 +712,12 @@ pub async fn usage_sessions(State(state): State<Arc<AppState>>, uri: Uri) -> Res
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(100)
         .clamp(1, 1000);
-    let sort = query.get("sort").map(String::as_str).unwrap_or("last_ts");
-    let order = query.get("order").map(String::as_str).unwrap_or("desc");
-    let rows = state.db.session_usage(&filters, limit, sort, order);
+    let sort = query
+        .get("sort")
+        .cloned()
+        .unwrap_or_else(|| "last_ts".into());
+    let order = query.get("order").cloned().unwrap_or_else(|| "desc".into());
+    let rows = run_blocking(move || state.db.session_usage(&filters, limit, &sort, &order)).await;
     Json(json!({"rows": rows, "limit": limit})).into_response()
 }
 

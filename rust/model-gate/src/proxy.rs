@@ -589,6 +589,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/usage/export", get(crate::api_extra::usage_export))
         .route("/api/usage/sessions", get(crate::api_extra::usage_sessions))
         .route("/api/prompts", get(crate::api_extra::prompts_list))
+        .route("/api/prompts/stats", get(crate::api_extra::prompts_stats))
         .route("/api/prompts/export", get(crate::api_extra::prompts_export))
         .route(
             "/api/prompts/evolution",
@@ -1022,7 +1023,14 @@ async fn chat_unified_group(
     headers: HeaderMap,
     body: ChatBody,
 ) -> Response {
-    chat_scoped(state, None, Some(UnifiedScope::Group(group)), headers, body.0).await
+    chat_scoped(
+        state,
+        None,
+        Some(UnifiedScope::Group(group)),
+        headers,
+        body.0,
+    )
+    .await
 }
 
 async fn chat_inner(
@@ -2818,8 +2826,14 @@ fn ui_page_html(source: &str) -> String {
         "v4-resources.js",
         "v4.js",
     ] {
-        html = html.replace(&format!("href=\"{file}\""), &format!("href=\"{file}?v={version}\""));
-        html = html.replace(&format!("src=\"{file}\""), &format!("src=\"{file}?v={version}\""));
+        html = html.replace(
+            &format!("href=\"{file}\""),
+            &format!("href=\"{file}?v={version}\""),
+        );
+        html = html.replace(
+            &format!("src=\"{file}\""),
+            &format!("src=\"{file}?v={version}\""),
+        );
     }
     html
 }
@@ -4736,26 +4750,39 @@ fn scoped_filters(uri: &Uri) -> Filters {
 
 async fn api_usage_totals(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let f = scoped_filters(&uri);
-    let mut payload = json!({"totals": state.db.totals(&f)});
     // compare=1：与「上一等长区间」对比，前端据此展示 KPI 环比箭头。
     // 口径与 Python 版一致（range=all 无可比区间时跳过）。
-    if query_map(&uri).get("compare").is_some() {
-        let now = chrono::Utc::now().timestamp();
-        if let Some((prev_since, prev_until)) = previous_window(uri.query().unwrap_or(""), now) {
+    let prev_window = if query_map(&uri).get("compare").is_some() {
+        previous_window(uri.query().unwrap_or(""), chrono::Utc::now().timestamp())
+    } else {
+        None
+    };
+    // totals 在大区间上是全范围窗口扫描，放阻塞线程池，别占住 tokio worker。
+    let payload = crate::api_extra::run_blocking(move || {
+        let mut payload = json!({"totals": state.db.totals(&f)});
+        if let Some((prev_since, prev_until)) = prev_window {
             let mut prev = f.clone();
             prev.since_ts = Some(prev_since);
             prev.until_ts = Some(prev_until);
             payload["previous"] = state.db.totals(&prev);
         }
-    }
+        payload
+    })
+    .await;
     Json(payload).into_response()
 }
 
 async fn api_usage_summary(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     let params = query_map(&uri);
-    let group = params.get("group_by").map(String::as_str).unwrap_or("day");
+    let group = params
+        .get("group_by")
+        .cloned()
+        .unwrap_or_else(|| "day".into());
     let f = scoped_filters(&uri);
-    match state.db.summary(&f, group) {
+    let group_for_query = group.clone();
+    let result =
+        crate::api_extra::run_blocking(move || state.db.summary(&f, &group_for_query)).await;
+    match result {
         Ok(rows) => Json(json!({"group_by": group, "rows": rows})).into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response(),
     }
@@ -4780,8 +4807,17 @@ async fn api_usage_list(State(state): State<Arc<AppState>>, uri: Uri) -> Respons
         .unwrap_or_else(|| "desc".into());
     let mut f = scoped_filters(&uri);
     f.only = params.get("only").filter(|v| !v.is_empty()).cloned();
-    let rows = state.db.list_usage(&f, limit, offset, &sort, &order);
-    let total = state.db.count_usage(&f);
+    let only = f.only.clone();
+    let (list_sort, list_order) = (sort.clone(), order.clone());
+    let (rows, total) = crate::api_extra::run_blocking(move || {
+        (
+            state
+                .db
+                .list_usage(&f, limit, offset, &list_sort, &list_order),
+            state.db.count_usage(&f),
+        )
+    })
+    .await;
     Json(json!({
         "rows": rows,
         "total": total,
@@ -4789,7 +4825,7 @@ async fn api_usage_list(State(state): State<Arc<AppState>>, uri: Uri) -> Respons
         "offset": offset,
         "sort": sort,
         "order": order,
-        "only": f.only.unwrap_or_default(),
+        "only": only.unwrap_or_default(),
     }))
     .into_response()
 }
@@ -4802,7 +4838,8 @@ async fn api_usage_models(State(state): State<Arc<AppState>>, uri: Uri) -> Respo
         .unwrap_or(100)
         .clamp(1, 500);
     let f = scoped_filters(&uri);
-    let rows = state.db.model_usage(&f, limit);
+    let inner_state = Arc::clone(&state);
+    let rows = crate::api_extra::run_blocking(move || inner_state.db.model_usage(&f, limit)).await;
     let pricing = state.cfg().pricing.clone();
     // 附带该模型的单价信息：额度制条目让面板显示「额度制」而不是 ¥0
     let rows: Vec<Value> = rows
@@ -4838,7 +4875,7 @@ async fn api_usage_upstreams(State(state): State<Arc<AppState>>, uri: Uri) -> Re
         .unwrap_or(200)
         .clamp(1, 500);
     let f = scoped_filters(&uri);
-    let rows = state.db.upstream_usage(&f, limit);
+    let rows = crate::api_extra::run_blocking(move || state.db.upstream_usage(&f, limit)).await;
     Json(json!({
         "rows": rows,
         "models": [],

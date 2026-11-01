@@ -635,6 +635,15 @@
             <thead><tr><th>时间</th><th>会话</th><th>模型</th><th class="num">消息数</th><th class="num">字符数</th><th>预览</th><th class="right">操作</th></tr></thead>
             <tbody></tbody>
           </table></div>
+          <div class="table-foot" style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid var(--line)">
+            <button class="btn ghost sm" data-prompt-page="first">« 首页</button>
+            <button class="btn ghost sm" data-prompt-page="prev">上一页</button>
+            <span class="hint" id="prompt-page-info">—</span>
+            <button class="btn ghost sm" data-prompt-page="next">下一页</button>
+            <button class="btn ghost sm" data-prompt-page="last">末页 »</button>
+            <span class="spacer" style="flex:1"></span>
+            <select class="input select" id="prompt-page-size" title="每页条数"><option value="25">25 条/页</option><option value="50" selected>50 条/页</option><option value="100">100 条/页</option><option value="200">200 条/页</option></select>
+          </div>
         </div>
       </div>
       <div id="prompt-evolution-view" hidden>

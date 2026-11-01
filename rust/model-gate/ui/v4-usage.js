@@ -156,6 +156,21 @@
     }
   }
 
+  // 翻页 / 每页条数 / 状态筛选只影响请求明细；聚合卡片无需重查。
+  async function loadListOnly() {
+    if (u.loading) return;
+    u.loading = true;
+    try {
+      const pageParams = query({ limit: u.pageSize, offset: (u.page - 1) * u.pageSize, only: u.only });
+      const listData = await api(`/api/usage/list?${pageParams}`);
+      u.rows = Array.isArray(listData.rows) ? listData.rows : [];
+      u.total = Number(listData.total || u.rows.length);
+      renderDetails();
+    } finally {
+      u.loading = false;
+    }
+  }
+
   function renderKpis() {
     const t = u.totals || {};
     $("#usage-kpis").innerHTML = `
@@ -447,7 +462,7 @@
     $("#usage-only").addEventListener("change", () => {
       u.only = $("#usage-only").value;
       u.page = 1;
-      load().catch((error) => toast(error.message, "error"));
+      loadListOnly().catch((error) => toast(error.message, "error"));
     });
     $("#usage-currency").addEventListener("change", () => {
       u.currency = $("#usage-currency").value;
@@ -470,7 +485,7 @@
     $("#usage-page-size").addEventListener("change", () => {
       u.pageSize = Number($("#usage-page-size").value) || 50;
       u.page = 1;
-      load().catch((error) => toast(error.message, "error"));
+      loadListOnly().catch((error) => toast(error.message, "error"));
     });
     $$("[data-usage-page]").forEach((button) =>
       button.addEventListener("click", () => {
@@ -479,7 +494,7 @@
         if (button.dataset.usagePage === "prev") u.page = Math.max(1, u.page - 1);
         if (button.dataset.usagePage === "next") u.page = Math.min(pages, u.page + 1);
         if (button.dataset.usagePage === "last") u.page = pages;
-        load().catch((error) => toast(error.message, "error"));
+        loadListOnly().catch((error) => toast(error.message, "error"));
       })
     );
     $("#usage-detail-table").addEventListener("click", (event) => {

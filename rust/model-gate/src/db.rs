@@ -2,8 +2,9 @@
 //!
 //! 读写分离：一条写连接 + 一组只读连接（WAL）。百分位在 SQLite 侧用窗口函数
 //! 取两个边界样本，避免把全表 `duration_ms` 搬进内存。
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::Local;
 use rusqlite::types::Value as SqlValue;
@@ -260,9 +261,32 @@ pub struct Db {
     pub path: PathBuf,
     write: Mutex<Connection>,
     readers: Vec<Mutex<Connection>>,
-    /// 全表聚合（prompt_count_and_size）的短 TTL 缓存；只用于面板提示行，
-    /// 宁可短暂陈旧也不在每次列表刷新时全表扫描。
-    prompt_stats_cache: Mutex<Option<(std::time::Instant, Value)>>,
+    /// 提示词全表统计的共享缓存：跨线程后台重算时通过 Arc 克隆，
+    /// 缓存本体不随 Db 移动。
+    prompt_stats: Arc<PromptStats>,
+    /// 聚合查询短 TTL 缓存（面板监控口径）。
+    agg_cache: Arc<AggregateCache>,
+}
+
+/// 全表聚合（prompt_count_and_size）的短 TTL 缓存；只用于面板提示行，
+/// 宁可短暂陈旧也不在每次列表刷新时全表扫描。过期后立即返回旧值并
+/// 在后台线程重算（stale-while-revalidate），请求路径永不等待全表扫描。
+#[derive(Default)]
+struct PromptStats {
+    cache: Mutex<Option<(std::time::Instant, Value)>>,
+    /// 后台重算去重标记：同一时刻只允许一个线程在做全表统计。
+    refreshing: std::sync::atomic::AtomicBool,
+}
+
+/// 面板聚合查询（totals/summary/model/upstream/session 用量）的短 TTL 缓存。
+/// 这些查询在百万行级用量表上是一次全范围扫描；筛选切换、总览重载、
+/// 自动刷新在 TTL 内直接命中缓存。属监控口径，10 秒陈旧可接受；
+/// 清理/删除操作会显式失效。
+const AGG_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Default)]
+struct AggregateCache {
+    entries: Mutex<HashMap<String, (std::time::Instant, Value)>>,
 }
 
 impl Db {
@@ -276,19 +300,21 @@ impl Db {
         )?;
         write.execute_batch(SCHEMA)?;
         migrate(&write);
-        let readers = (0..2)
+        let readers = (0..READER_POOL_SIZE)
             .map(|_| connect(path).map(Mutex::new))
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             path: path.to_path_buf(),
             write: Mutex::new(write),
             readers,
-            prompt_stats_cache: Mutex::new(None),
+            prompt_stats: Arc::new(PromptStats::default()),
+            agg_cache: Arc::new(AggregateCache::default()),
         })
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
-        // 轮转使用只读连接；两条连接足够覆盖面板的并发统计请求。
+        // 轮转使用只读连接；面板一次并发拉 6+ 个统计接口，
+        // 连接数要覆盖并发度，否则请求会在读锁上排队、整页被最慢的查询拖住。
         let idx = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.readers.len();
         self.readers[idx].lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -301,6 +327,58 @@ impl Db {
     /// ZCode 账号读取连接（只读，轮转）。
     pub(crate) fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.reader()
+    }
+
+    /// 聚合缓存命中取值：TTL 内直接返回，过期条目顺手清掉。
+    fn agg_cache_get(&self, key: &str) -> Option<Value> {
+        let mut entries = self
+            .agg_cache
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((at, value)) = entries.get(key) {
+            if at.elapsed() < AGG_TTL {
+                return Some(value.clone());
+            }
+        }
+        entries.retain(|_, (at, _)| at.elapsed() < AGG_TTL);
+        None
+    }
+
+    fn agg_cache_put(&self, key: &str, value: Value) {
+        let mut entries = self
+            .agg_cache
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        entries.insert(key.to_string(), (std::time::Instant::now(), value));
+    }
+
+    /// 清理/删除类操作后失效聚合缓存：用户清空数据后面板必须立刻反映。
+    fn invalidate_agg_cache(&self) {
+        let mut entries = self
+            .agg_cache
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        entries.clear();
+    }
+
+    /// 聚合缓存的筛选键：把过滤参数拼成稳定字符串。
+    /// 时间边界按 5 分钟量化——面板的 since_ts 形如 `now-30d`，每秒都在变，
+    /// 不量化的话键永远不重复、缓存永远不命中。实际查询仍用原始边界。
+    fn agg_key(kind: &str, f: &Filters, extra: &str) -> String {
+        const BUCKET: i64 = 300;
+        let q = |v: Option<i64>| v.map(|t| t / BUCKET * BUCKET);
+        format!(
+            "{kind}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{extra}",
+            q(f.since_ts),
+            q(f.until_ts),
+            f.upstream,
+            f.model,
+            f.session,
+            f.only
+        )
     }
 
     /// 把 WAL 日志落盘并截断：退出前调用，确保用量数据真正写进主库文件。
@@ -710,55 +788,92 @@ impl Db {
     }
 
     pub fn prompt_count_and_size(&self) -> Value {
-        // 全表 SUM/COUNT 在 GB 级库上是秒级操作，而它只服务于提示词页的
-        // 一行提示文案；缓存 5 秒，面板的高频刷新不再反复全表扫描。
-        {
+        // 全表 SUM/COUNT 在 GB 级库上是秒级（实测 9GB 库 15s）操作，而它只服务于
+        // 提示词页的一行提示文案与总览卡片。策略：缓存新鲜直接返回；过期则
+        // 立即返回旧值（没有旧值就返回零值）并在后台线程重算——请求路径
+        // 永不等待全表扫描。
+        let snapshot = {
             let cache = self
-                .prompt_stats_cache
+                .prompt_stats
+                .cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some((at, value)) = cache.as_ref() {
-                if at.elapsed() < std::time::Duration::from_secs(5) {
-                    return value.clone();
-                }
+            cache.clone()
+        };
+        match snapshot {
+            Some((at, value)) if at.elapsed() < PROMPT_STATS_TTL => value,
+            _ => {
+                self.spawn_prompt_stats_refresh();
+                snapshot.map(|(_, value)| value).unwrap_or_else(|| {
+                    json!({
+                        "records": 0, "bytes": 0, "truncated": 0,
+                        "redacted_records": 0, "redactions": 0,
+                        "max_bytes": 0, "avg_bytes": 0,
+                        "stale": true,
+                    })
+                })
             }
         }
-        let conn = self.reader();
-        let value = conn
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0),
-                        COALESCE(SUM(CASE WHEN truncated != 0 THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN redactions > 0 THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(redactions), 0),
-                        COALESCE(MAX(size_bytes), 0),
-                        COALESCE(CAST(AVG(size_bytes) AS INTEGER), 0)
-                 FROM prompt_records",
-                [],
-                |r| {
-                    Ok(json!({
-                        "records": r.get::<_, i64>(0)?,
-                        "bytes": r.get::<_, i64>(1)?,
-                        "truncated": r.get::<_, i64>(2)?,
-                        "redacted_records": r.get::<_, i64>(3)?,
-                        "redactions": r.get::<_, i64>(4)?,
-                        "max_bytes": r.get::<_, i64>(5)?,
-                        "avg_bytes": r.get::<_, i64>(6)?,
-                    }))
-                },
-            )
-            .unwrap_or_else(|_| {
-                json!({
-                    "records": 0, "bytes": 0, "truncated": 0,
-                    "redacted_records": 0, "redactions": 0,
-                    "max_bytes": 0, "avg_bytes": 0,
-                })
+    }
+
+    /// 在独立线程重算提示词全表统计并写入共享缓存；已有重算在跑时直接返回。
+    /// 由 prompt_count_and_size 的过期路径与清理/回收之后的显式刷新调用。
+    pub fn spawn_prompt_stats_refresh(&self) {
+        use std::sync::atomic::Ordering;
+        if self
+            .prompt_stats
+            .refreshing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        // 后台线程自己开一条只读连接：Db 里的连接池被 Mutex 保护无法跨线程共享，
+        // 而统计查询只读、错开运行也不抢业务读锁。
+        let path = self.path.clone();
+        let stats = Arc::clone(&self.prompt_stats);
+        let result = std::thread::Builder::new()
+            .name("prompt-stats".into())
+            .spawn(move || {
+                let value = compute_prompt_stats_path(&path).unwrap_or_else(|err| {
+                    tracing::warn!("提示词统计后台重算失败: {err}");
+                    zero_prompt_stats()
+                });
+                let mut cache = stats.cache.lock().unwrap_or_else(|e| e.into_inner());
+                *cache = Some((std::time::Instant::now(), value));
+                stats.refreshing.store(false, Ordering::Release);
             });
+        if result.is_err() {
+            // 线程创建失败：复位标记，下次过期路径再试。
+            self.prompt_stats.refreshing.store(false, Ordering::Release);
+        }
+    }
+
+    /// 同步重算提示词全表统计并写入缓存。
+    /// 供清理/回收接口收尾（操作本身已是慢操作，不差这一次扫描）、
+    /// 后台刷新线程与测试调用；请求路径不要直接用它。
+    pub fn recompute_prompt_stats(&self) {
+        let value = compute_prompt_stats_path(&self.path).unwrap_or_else(|err| {
+            tracing::warn!("提示词统计重算失败: {err}");
+            zero_prompt_stats()
+        });
         let mut cache = self
-            .prompt_stats_cache
+            .prompt_stats
+            .cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *cache = Some((std::time::Instant::now(), value.clone()));
-        value
+        *cache = Some((std::time::Instant::now(), value));
+    }
+
+    /// 清理/回收后使统计缓存失效：下一次读取会触发后台重算，
+    /// 避免面板继续展示清理前的旧总量。
+    pub fn invalidate_prompt_stats(&self) {
+        let mut cache = self
+            .prompt_stats
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = None;
     }
 
     /// 提示词页的筛选项：只取非空值，避免把 `(无会话)` 当作可选会话。
@@ -926,6 +1041,10 @@ impl Db {
     }
 
     pub fn totals(&self, f: &Filters) -> Value {
+        let key = Self::agg_key("totals", f, "");
+        if let Some(hit) = self.agg_cache_get(&key) {
+            return hit;
+        }
         let (where_sql, args) = where_clause(f, f.only.as_deref());
         let sql = format!(
             "WITH ranked AS (
@@ -987,7 +1106,7 @@ impl Db {
                 "max_duration_ms": max_d.unwrap_or(0) as f64,
             }))
         });
-        row.unwrap_or_else(|_| {
+        let value = row.unwrap_or_else(|_| {
             json!({
                 "requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
                 "cache_read_tokens": 0, "cache_write_tokens": 0, "cost": 0.0, "errors": 0,
@@ -995,11 +1114,21 @@ impl Db {
                 "avg_duration_ms": 0.0, "avg_ttft_ms": 0.0, "ttft_samples": 0,
                 "p50_duration_ms": 0.0, "p95_duration_ms": 0.0, "max_duration_ms": 0.0
             })
-        })
+        });
+        self.agg_cache_put(&key, value.clone());
+        value
     }
 
     /// 今日（本地日期）请求数与缓存命中率，供托盘轻量刷新。
     pub fn today_stats(&self) -> Value {
+        // 用本地零点的 epoch 秒做范围过滤，让 idx_usage_ts 可用；
+        // 旧的 substr(created_at,1,10) 写法把索引废掉，每次都是全表扫。
+        let midnight = Local::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|d| d.and_local_timezone(Local).single().map(|t| t.timestamp()))
+            .flatten()
+            .unwrap_or(0);
         let conn = self.reader();
         let row = conn.query_row(
             "SELECT COUNT(*) AS requests,
@@ -1007,8 +1136,8 @@ impl Db {
                     COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
                     COALESCE(SUM(prompt_tokens),0) AS prompt_tokens
              FROM usage_records
-             WHERE substr(created_at,1,10) = date('now','localtime')",
-            [],
+             WHERE ts >= ?1",
+            [midnight],
             |row| {
                 let requests: i64 = row.get(0)?;
                 let ok: i64 = row.get(1)?;
@@ -1033,6 +1162,10 @@ impl Db {
     }
 
     pub fn summary(&self, f: &Filters, group_by: &str) -> Result<Vec<Value>, String> {
+        let cache_key = format!("summary|{group_by}|{}", Self::agg_key("g", f, ""));
+        if let Some(hit) = self.agg_cache_get(&cache_key) {
+            return Ok(serde_json::from_value(hit).unwrap_or_default());
+        }
         let bucket = match group_by {
             "day" => "substr(created_at,1,10)",
             "hour" => "substr(created_at,1,13)",
@@ -1091,6 +1224,7 @@ impl Db {
             }
             out.push(value);
         }
+        self.agg_cache_put(&cache_key, Value::Array(out.clone()));
         Ok(out)
     }
 
@@ -1104,6 +1238,13 @@ impl Db {
 
     /// 按会话聚合；排序只接受白名单，其余回退到最近活跃时间。
     pub fn session_usage(&self, f: &Filters, limit: i64, sort: &str, order: &str) -> Vec<Value> {
+        let cache_key = format!(
+            "session|{}|{limit}|{sort}|{order}",
+            Self::agg_key("s", f, "")
+        );
+        if let Some(hit) = self.agg_cache_get(&cache_key) {
+            return serde_json::from_value(hit).unwrap_or_default();
+        }
         let (where_sql, args) = where_clause(f, f.only.as_deref());
         let expr = "COALESCE(NULLIF(session,''),'(无会话)')";
         let column = match sort {
@@ -1163,12 +1304,20 @@ impl Db {
             Ok(Value::Object(map))
         });
         match rows {
-            Ok(iter) => iter.filter_map(Result::ok).map(finish_group_row).collect(),
+            Ok(iter) => {
+                let out: Vec<Value> = iter.filter_map(Result::ok).map(finish_group_row).collect();
+                self.agg_cache_put(&cache_key, Value::Array(out.clone()));
+                out
+            }
             Err(_) => Vec::new(),
         }
     }
 
     fn grouped_usage(&self, f: &Filters, limit: i64, kind: &str) -> Vec<Value> {
+        let cache_key = format!("grouped|{kind}|{limit}|{}", Self::agg_key("g", f, ""));
+        if let Some(hit) = self.agg_cache_get(&cache_key) {
+            return serde_json::from_value(hit).unwrap_or_default();
+        }
         let (where_sql, args) = where_clause(f, f.only.as_deref());
         let (expr, alias) = if kind == "model" {
             ("COALESCE(requested_model,'(unknown)')", "model")
@@ -1224,7 +1373,11 @@ impl Db {
             Ok(Value::Object(map))
         });
         match rows {
-            Ok(iter) => iter.flatten().map(finish_group_row).collect(),
+            Ok(iter) => {
+                let out: Vec<Value> = iter.flatten().map(finish_group_row).collect();
+                self.agg_cache_put(&cache_key, Value::Array(out.clone()));
+                out
+            }
             Err(_) => Vec::new(),
         }
     }
@@ -1238,12 +1391,18 @@ impl Db {
     pub fn clear_usage(&self, f: &Filters) -> i64 {
         let (where_sql, args) = where_clause(f, f.only.as_deref());
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            &format!("DELETE FROM usage_records{where_sql}"),
-            params_from_iter(args.iter()),
-        )
-        .map(|n| n as i64)
-        .unwrap_or(0)
+        let removed = conn
+            .execute(
+                &format!("DELETE FROM usage_records{where_sql}"),
+                params_from_iter(args.iter()),
+            )
+            .map(|n| n as i64)
+            .unwrap_or(0);
+        drop(conn);
+        if removed > 0 {
+            self.invalidate_agg_cache();
+        }
+        removed
     }
 
     pub fn delete_older_than(&self, days: i64) -> i64 {
@@ -1251,10 +1410,28 @@ impl Db {
             return 0;
         }
         let cutoff = chrono::Utc::now().timestamp() - days * 86400;
+        // 与提示词清理同样的批处理：避免在百万行级表上单事务长锁。
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute("DELETE FROM usage_records WHERE ts < ?1", [cutoff])
-            .map(|n| n as i64)
-            .unwrap_or(0)
+        let mut removed = 0i64;
+        loop {
+            let n = conn
+                .execute(
+                    "DELETE FROM usage_records WHERE rowid IN (\
+                     SELECT rowid FROM usage_records WHERE ts < ?1 LIMIT ?2)",
+                    rusqlite::params![cutoff, PROMPT_DELETE_BATCH],
+                )
+                .map(|n| n as i64)
+                .unwrap_or(0);
+            removed += n;
+            if n < PROMPT_DELETE_BATCH {
+                break;
+            }
+        }
+        drop(conn);
+        if removed > 0 {
+            self.invalidate_agg_cache();
+        }
+        removed
     }
 
     pub fn vacuum(&self) -> i64 {
@@ -1268,14 +1445,71 @@ impl Db {
 
 static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// 只读连接池大小：面板一次并发拉 6+ 个统计接口（总览页 9 个），
+/// 读连接数要覆盖并发度，否则会在读锁上排队、整页被最慢的查询拖住。
+const READER_POOL_SIZE: usize = 6;
+
 /// 提示词批量删除的批大小：把「清空百万行」拆成独立小事务，
 /// 避免长时间占住写锁与一次性撑大 WAL。
 const PROMPT_DELETE_BATCH: i64 = 5000;
 
+/// 提示词统计（全表聚合）缓存 TTL：过期后返回旧值并后台重算，
+/// 请求路径永不等待 GB 级库上的秒级全表扫描。TTL 取 5 分钟：
+/// 统计只是提示行文案，不值得让它常态化吃掉一个核心做全表扫描。
+const PROMPT_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn connect(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    // temp_store=MEMORY：面板分位数查询的窗口排序会落临时文件，
+    // 实测 30 万行排序 5.4s -> 1.5s。cache/mmap 提升大库扫描的页命中。
+    // 都是连接级 PRAGMA，不落盘、不改变数据语义。
+    conn.execute_batch(
+        "PRAGMA busy_timeout=5000; \
+         PRAGMA temp_store=MEMORY; \
+         PRAGMA cache_size=-32000; \
+         PRAGMA mmap_size=134217728;",
+    )?;
     Ok(conn)
+}
+
+/// 后台统计线程用的独立连接：不参与连接池轮转。
+fn compute_prompt_stats_path(path: &Path) -> rusqlite::Result<Value> {
+    let conn = Connection::open(path)?;
+    let _ = conn.execute_batch(
+        "PRAGMA busy_timeout=5000; \
+         PRAGMA temp_store=MEMORY; \
+         PRAGMA cache_size=-32000; \
+         PRAGMA mmap_size=134217728;",
+    );
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0),
+                COALESCE(SUM(CASE WHEN truncated != 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN redactions > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(redactions), 0),
+                COALESCE(MAX(size_bytes), 0),
+                COALESCE(CAST(AVG(size_bytes) AS INTEGER), 0)
+         FROM prompt_records",
+        [],
+        |r| {
+            Ok(json!({
+                "records": r.get::<_, i64>(0)?,
+                "bytes": r.get::<_, i64>(1)?,
+                "truncated": r.get::<_, i64>(2)?,
+                "redacted_records": r.get::<_, i64>(3)?,
+                "redactions": r.get::<_, i64>(4)?,
+                "max_bytes": r.get::<_, i64>(5)?,
+                "avg_bytes": r.get::<_, i64>(6)?,
+            }))
+        },
+    )
+}
+
+fn zero_prompt_stats() -> Value {
+    json!({
+        "records": 0, "bytes": 0, "truncated": 0,
+        "redacted_records": 0, "redactions": 0,
+        "max_bytes": 0, "avg_bytes": 0,
+    })
 }
 
 fn migrate(conn: &Connection) {
@@ -1366,6 +1600,14 @@ fn prompt_row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         .get::<_, Option<String>>("role_counts")?
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| json!({}));
+    // policy_version 按 INTEGER 写入，但从 Python 版迁移的历史库可能存过文本；
+    // 单行类型异常不该让整页列表被 flatten 静默吞掉，回退 0。
+    let policy_version: i64 = match row.get::<_, SqlValue>("policy_version") {
+        Ok(SqlValue::Integer(value)) => value,
+        Ok(SqlValue::Real(value)) => value as i64,
+        Ok(SqlValue::Text(value)) => value.trim().parse().unwrap_or(0),
+        _ => 0,
+    };
     Ok(json!({
         "id": row.get::<_, String>("id")?,
         "ts": row.get::<_, i64>("ts")?,
@@ -1384,7 +1626,7 @@ fn prompt_row_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "content_hash": row.get::<_, Option<String>>("content_hash")?,
         "system_hash": row.get::<_, Option<String>>("system_hash")?,
         "role_counts": role_counts,
-        "policy_version": row.get::<_, i64>("policy_version")?,
+        "policy_version": policy_version,
         "usage": {
             "prompt_tokens": row.get::<_, Option<i64>>("prompt_tokens")?,
             "completion_tokens": row.get::<_, Option<i64>>("completion_tokens")?,
@@ -1900,6 +2142,9 @@ mod tests {
         old.ts = Local::now().timestamp() - 10 * 86400;
         db.record_prompt(&old);
         db.record_prompt(&sample_prompt("new", "m", "s", "new"));
+        // 请求路径的 prompt_count_and_size 是 stale-while-revalidate（首调返回占位值），
+        // 断言前先同步重算一次，与清理接口收尾的口径一致。
+        db.recompute_prompt_stats();
         let stats = db.prompt_count_and_size();
         assert_eq!(stats["records"], 2);
         assert!(stats["bytes"].as_i64().unwrap_or(0) > 0);

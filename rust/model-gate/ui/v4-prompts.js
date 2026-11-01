@@ -10,6 +10,8 @@
     model: "",
     session: "",
     q: "",
+    page: 1,
+    pageSize: 50,
     rows: [],
     total: 0,
     facets: { models: [], sessions: [] },
@@ -20,8 +22,43 @@
   };
   let bound = false;
 
+  // 作用域持久化：分页位置与每页条数刷新后保持。
+  const SCOPE_KEY = "mg.v4.prompts.scope";
+
+  function saveScope() {
+    try {
+      localStorage.setItem(
+        SCOPE_KEY,
+        JSON.stringify({ pageSize: p.pageSize, range: p.range })
+      );
+    } catch {
+      /* 隐私模式下不可写，忽略 */
+    }
+  }
+
+  function restoreScope() {
+    let saved = {};
+    try {
+      saved = JSON.parse(localStorage.getItem(SCOPE_KEY) || "{}") || {};
+    } catch {
+      saved = {};
+    }
+    if (Number(saved.pageSize)) p.pageSize = Number(saved.pageSize);
+    if (typeof saved.range === "string" && saved.range) p.range = saved.range;
+    const size = $("#prompt-page-size");
+    if (size) size.value = String(p.pageSize);
+  }
+
+  function pages() {
+    return Math.max(1, Math.ceil(p.total / p.pageSize));
+  }
+
   function query(extra = {}) {
-    const params = new URLSearchParams({ range: p.range, limit: 50, offset: 0 });
+    const params = new URLSearchParams({
+      range: p.range,
+      limit: p.pageSize,
+      offset: (p.page - 1) * p.pageSize,
+    });
     if (p.model) params.set("model", p.model);
     if (p.session) params.set("session", p.session);
     if (p.q) params.set("q", p.q);
@@ -52,6 +89,13 @@
     $("#prompt-hint").textContent = data.stats
       ? `${data.stats.records || 0} 条 · ${((data.stats.bytes || 0) / 1024 / 1024).toFixed(1)} MB · 脱敏 ${data.stats.redactions || 0} 处`
       : `共 ${p.total} 条`;
+    // 翻页越界时回正：总数在别的会话被清理后 offset 可能超过最后一页。
+    const totalPages = pages();
+    if (p.page > totalPages && totalPages > 0) {
+      p.page = totalPages;
+      return loadList();
+    }
+    $("#prompt-page-info").textContent = `第 ${p.page} / ${totalPages} 页 · 共 ${num(p.total)} 条`;
     renderList();
   }
 
@@ -255,6 +299,7 @@
   function bind() {
     if (bound) return;
     bound = true;
+    restoreScope();
     $("#prompts-refresh").addEventListener("click", () => {
       if (p.tab === "list") loadList().catch((error) => toast(error.message, "error"));
       else loadEvolution().catch((error) => toast(error.message, "error"));
@@ -262,21 +307,42 @@
     $$("#prompt-tabs .seg-tab").forEach((button) => button.addEventListener("click", () => setTab(button.dataset.promptTab)));
     $("#prompt-range").addEventListener("change", () => {
       p.range = $("#prompt-range").value;
+      p.page = 1;
+      saveScope();
       loadList().catch((error) => toast(error.message, "error"));
     });
     $("#prompt-model").addEventListener("change", () => {
       p.model = $("#prompt-model").value;
+      p.page = 1;
       loadList().catch((error) => toast(error.message, "error"));
     });
     $("#prompt-session").addEventListener("change", () => {
       p.session = $("#prompt-session").value;
+      p.page = 1;
       loadList().catch((error) => toast(error.message, "error"));
     });
     $("#prompt-q").addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         p.q = $("#prompt-q").value.trim();
+        p.page = 1;
         loadList().catch((error) => toast(error.message, "error"));
       }
+    });
+    $$("[data-prompt-page]").forEach((button) =>
+      button.addEventListener("click", () => {
+        const totalPages = pages();
+        if (button.dataset.promptPage === "first") p.page = 1;
+        if (button.dataset.promptPage === "prev") p.page = Math.max(1, p.page - 1);
+        if (button.dataset.promptPage === "next") p.page = Math.min(totalPages, p.page + 1);
+        if (button.dataset.promptPage === "last") p.page = totalPages;
+        loadList().catch((error) => toast(error.message, "error"));
+      })
+    );
+    $("#prompt-page-size").addEventListener("change", () => {
+      p.pageSize = Number($("#prompt-page-size").value) || 50;
+      p.page = 1;
+      saveScope();
+      loadList().catch((error) => toast(error.message, "error"));
     });
     $("#prompt-table").addEventListener("click", (event) => {
       const download = event.target.closest("[data-prompt-download]");
@@ -288,7 +354,8 @@
       const row = event.target.closest("[data-prompt-id]");
       if (row) showDetail(row.dataset.promptId);
     });
-    $("#prompt-export").addEventListener("click", () => window.open(`/api/prompts/export?${query({ limit: 100000 })}`, "_blank"));
+    // 导出按筛选范围全量导出，不带分页 offset。
+    $("#prompt-export").addEventListener("click", () => window.open(`/api/prompts/export?${query({ limit: 100000, offset: 0 })}`, "_blank"));
     $("#prompt-clear").addEventListener("click", clearPrompts);
     $("#prompt-vacuum").addEventListener("click", vacuum);
     $("#evolution-session").addEventListener("change", () => {

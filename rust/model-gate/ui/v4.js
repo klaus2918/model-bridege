@@ -356,7 +356,6 @@
       enhanceAccess();
       setTimeout(enhanceAccessTable, 60);
     }
-    if (page === "traffic") setTimeout(enhanceUsage, 60);
     if (page === "prompts") setTimeout(enhancePrompts, 60);
     if (page === "settings") buildSettingsLayout();
   }
@@ -378,7 +377,8 @@
         api(`/api/usage/list?limit=6`).catch(() => ({ rows: [] })),
         api(`/api/usage/upstreams?range=${rangeParam}`).catch(() => ({ rows: [] })),
         api("/api/proxy/status").catch(() => ({})),
-        api("/api/prompts?limit=1").catch(() => ({})),
+        // 轻量统计接口：不带列表查询；全表统计走后台缓存，GB 级库也毫秒级返回。
+        api("/api/prompts/stats").catch(() => ({})),
         api("/api/ai/audit").catch(() => ({ items: [] })),
       ];
       const [, , totals, summary, recent, upstreams, proxy, prompts, audit] = await Promise.all(requests);
@@ -655,8 +655,8 @@
       return;
     }
     const stats = prompts.stats || {};
-    host.innerHTML = `<div class="prompt-line"><span class="big">${compactNum(prompts.total)}</span><span class="hint">条记录</span></div>
-      <div class="hint" style="margin-top:6px">占用 ${(Number(stats.size_bytes || 0) / 1024 / 1024).toFixed(1)} MB · 最近 ${prompts.rows?.[0] ? relTime(prompts.rows[0].ts) : "—"}</div>`;
+    host.innerHTML = `<div class="prompt-line"><span class="big">${compactNum(stats.records)}</span><span class="hint">条记录</span></div>
+      <div class="hint" style="margin-top:6px">占用 ${(Number(stats.bytes || 0) / 1024 / 1024).toFixed(1)} MB${stats.stale ? " · 统计中" : ""}</div>`;
   }
 
   // ───────────────────────── 配置中心 ─────────────────────────
@@ -1130,76 +1130,14 @@
 
   // ───────────────────────── 用量分析 v4 结构 ─────────────────────────
 
-  function enhanceUsage() {
-    const view = $("#view-traffic");
-    if (!view || view.dataset.usageReady === "1") return;
-    const toolbar = view.querySelector(".toolbar");
-    const kpis = $("#usage-kpis");
-    if (!toolbar) return;
-    view.dataset.usageReady = "1";
-    toolbar.classList.add("usage-scope");
-    if (kpis) kpis.classList.add("usage-kpis");
-
-    const cards = $$("#view-traffic .card");
-    const byTitle = (title) => cards.find((card) => card.querySelector(".card-head h2")?.textContent.trim() === title);
-    const trend = byTitle("趋势");
-    if (trend) trend.classList.add("usage-trend-card");
-    const mix = byTitle("Token 构成");
-    if (mix) mix.classList.add("usage-mini-card");
-    const latency = byTitle("耗时分布");
-    if (latency) latency.classList.add("usage-mini-card");
-    const pie = byTitle("分布");
-    if (pie) pie.classList.add("usage-mini-card");
-
-    const upstream = byTitle("上游用量");
-    const models = byTitle("模型用量");
-    const sessions = byTitle("会话统计");
-    const requests = byTitle("请求明细");
-    const retention = byTitle("数据保留与清理");
-    if (!upstream || !requests) return;
-
-    const tabs = document.createElement("div");
-    tabs.className = "seg-tabs usage-tabs";
-    tabs.id = "usage-tabs";
-    tabs.innerHTML = [
-      ["upstreams", "上游"],
-      ["models", "模型"],
-      ["sessions", "会话"],
-      ["requests", "请求"],
-    ]
-      .map(([id, label]) => `<button class="seg-tab ${id === "upstreams" ? "active" : ""}" data-usage-tab="${id}">${label}</button>`)
-      .join("");
-    upstream.parentNode.insertBefore(tabs, upstream);
-
-    const panels = document.createElement("div");
-    panels.className = "usage-panels";
-    upstream.parentNode.insertBefore(panels, upstream);
-    const map = new Map([
-      [upstream, "upstreams"],
-      [models, "models"],
-      [sessions, "sessions"],
-      [requests, "requests"],
-      [retention, "requests"],
-    ]);
-    for (const [card, panel] of map) {
-      if (!card) continue;
-      card.classList.add("usage-panel");
-      card.dataset.usagePanel = panel;
-      panels.appendChild(card);
-    }
-    tabs.addEventListener("click", (event) => {
-      const button = event.target.closest("[data-usage-tab]");
-      if (!button) return;
-      setUsagePanel(button.dataset.usageTab);
-    });
-    setUsagePanel("upstreams");
-  }
-
+  // 面板结构在 v4.html 里是静态的（#usage-tabs + #usage-panel-*），
+  // 这里只负责切换：按静态 ID 收敛，别再依赖运行时注入的 dataset。
   function setUsagePanel(panel) {
-    const target = panel || "upstreams";
+    const target = ["upstream", "model", "session", "request"].includes(panel) ? panel : "upstream";
     $$("#usage-tabs [data-usage-tab]").forEach((button) => button.classList.toggle("active", button.dataset.usageTab === target));
-    $$("#view-traffic .usage-panel").forEach((card) => {
-      card.hidden = card.dataset.usagePanel !== target;
+    ["upstream", "model", "session", "request"].forEach((name) => {
+      const panelEl = $(`#usage-panel-${name}`);
+      if (panelEl) panelEl.hidden = name !== target;
     });
   }
 
@@ -1595,17 +1533,6 @@
 
   MG.openRequestDrawer = openRequestDrawer;
 
-  function setUsageTab(tab) {
-    const target = ["upstream", "model", "session", "request"].includes(tab) ? tab : "upstream";
-    $$("#usage-tabs [data-usage-tab]").forEach((button) => {
-      button.classList.toggle("active", button.dataset.usageTab === target);
-    });
-    ["upstream", "model", "session", "request"].forEach((name) => {
-      const panel = $(`#usage-panel-${name}`);
-      if (panel) panel.hidden = name !== target;
-    });
-  }
-
   function openAccessDrawer(id) {
     go("access");
     retry(() => {
@@ -1675,7 +1602,7 @@
         if (usageTab) {
           event.preventDefault();
           event.stopPropagation();
-          setUsageTab(usageTab.dataset.usageTab);
+          setUsagePanel(usageTab.dataset.usageTab);
           return;
         }
         const legacyGo = event.target.closest("[data-go]");
