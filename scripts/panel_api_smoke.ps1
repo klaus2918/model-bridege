@@ -1,4 +1,4 @@
-# Rust 面板接口冒烟：启动 --no-gui 实例，检查 /api/info、/api/update/status 与 /ui/ 资产。
+﻿# Rust 面板接口冒烟：启动 --no-gui 实例，检查 /api/info、/api/update/status 与 /ui/ 资产。
 # 用法：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel_api_smoke.ps1 -Exe dist\Model-Gate-rust.exe -Port 18941
