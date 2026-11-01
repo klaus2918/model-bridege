@@ -45,6 +45,19 @@ function Exit-WithProblems {
     exit 1
 }
 
+# 调用原生命令：git 会把进度写到 stderr（如 "To https://..."），在 $ErrorActionPreference=Stop
+# 下配合 2>&1 会被当作 NativeCommandError 直接终止脚本。原生调用一律走这里。
+function Invoke-Native([string]$exe, [string[]]$argv) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = & $exe @argv 2>&1
+        return [pscustomobject]@{ Output = @($out); Code = $LASTEXITCODE }
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
 # ── 依赖探测（不内置密钥、不跳过门禁）─────────────────────────
 function Resolve-Python {
     if ($env:MG_PYTHON -and (Test-Path -LiteralPath $env:MG_PYTHON)) { return @($env:MG_PYTHON) }
@@ -54,7 +67,6 @@ function Resolve-Python {
     if ($c) { return @($c.Source, '-3') }
     return @()
 }
-
 function Resolve-GateScript([string]$name) {
     $candidates = @()
     if ($env:MG_GATES) { $candidates += (Join-Path $env:MG_GATES $name) }
@@ -193,12 +205,11 @@ Good "已提交 $sha"
 
 # ── 8. 推送 ────────────────────────────────────────────────
 Step "推送"
-$pushArgs = @("push", "origin", "HEAD")
 $pushed = $false
 for ($i = 1; $i -le 6; $i++) {
-    $out = & git -c http.version=HTTP/1.1 @pushArgs 2>&1
-    if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
-    Write-Host ("  第 {0} 次推送失败：{1}" -f $i, ($out -join " "))
+    $r = Invoke-Native "git" @("-c", "http.version=HTTP/1.1", "push", "origin", "HEAD")
+    if ($r.Code -eq 0) { $pushed = $true; break }
+    Write-Host ("  第 {0} 次推送失败：{1}" -f $i, ($r.Output -join " "))
     if ($i -lt 6) { Start-Sleep -Seconds 6 }
 }
 if (-not $pushed) { throw "推送失败（重试 6 次）" }
@@ -214,12 +225,13 @@ if ($Tag) {
     if ($Tag -ne "v$cargoVersion") {
         throw "tag $Tag 与 Cargo.toml 版本 v$cargoVersion 不一致（版本唯一源在 Cargo.toml）"
     }
-    git tag -f $Tag $sha | Out-Null
+    $tagResult = Invoke-Native "git" @("tag", "-f", $Tag, $sha)
+    if ($tagResult.Code -ne 0) { throw ("创建 tag 失败：" + ($tagResult.Output -join " ")) }
     $tagPushed = $false
     for ($i = 1; $i -le 6; $i++) {
-        $out = & git -c http.version=HTTP/1.1 push --force origin "refs/tags/$Tag" 2>&1
-        if ($LASTEXITCODE -eq 0) { $tagPushed = $true; break }
-        Write-Host ("  第 {0} 次 tag 推送失败：{1}" -f $i, ($out -join " "))
+        $r = Invoke-Native "git" @("-c", "http.version=HTTP/1.1", "push", "--force", "origin", "refs/tags/$Tag")
+        if ($r.Code -eq 0) { $tagPushed = $true; break }
+        Write-Host ("  第 {0} 次 tag 推送失败：{1}" -f $i, ($r.Output -join " "))
         if ($i -lt 6) { Start-Sleep -Seconds 6 }
     }
     if (-not $tagPushed) { throw "tag 推送失败（重试 6 次）" }
