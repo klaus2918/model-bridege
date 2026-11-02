@@ -226,6 +226,7 @@
 
   async function boot() {
     initTheme();
+    renderThemeUI();
     bindEvents();
     try {
       await Promise.all([
@@ -303,6 +304,7 @@
       settings: async () => {
         await Promise.all([refreshConfig(), refreshTemplates(), refreshAISettings(), refreshAccess()]);
         renderSettings();
+        renderThemeUI();
       },
     };
     const loader = externalViews.get(view) || loaders[view];
@@ -329,15 +331,78 @@
     $("#modal-body").innerHTML = html || "";
   }
 
-  function initTheme() {
-    const saved = localStorage.getItem("mg-v4-theme") || localStorage.getItem("mg-v3-theme");
-    document.documentElement.dataset.theme = saved === "light" ? "light" : "dark";
+  // ───────────────────────── 主题配色 ─────────────────────────
+  // 与 v4-base.css 的 html[data-theme] 块一一对应；swatch 取 [bg, surface, signal] 做预览。
+
+  const THEMES = [
+    { id: "dark", label: "石墨琥珀", mode: "深色", swatch: ["#0b0d10", "#12151a", "#f0a020"] },
+    { id: "light", label: "冷灰白", mode: "浅色", swatch: ["#f2f3f5", "#ffffff", "#b26a00"] },
+    { id: "ocean", label: "海洋蓝", mode: "深色", swatch: ["#0a0e14", "#101820", "#3ba7e8"] },
+    { id: "emerald", label: "翡翠绿", mode: "深色", swatch: ["#0a0f0c", "#111813", "#43c878"] },
+    { id: "dusk", label: "暮紫", mode: "深色", swatch: ["#0e0b15", "#151022", "#a78bfa"] },
+    { id: "paper", label: "暖纸", mode: "浅色", swatch: ["#f6f2ea", "#fffdf9", "#b26a00"] },
+  ];
+
+  function currentTheme() {
+    const id = document.documentElement.dataset.theme;
+    return THEMES.some((theme) => theme.id === id) ? id : "dark";
   }
 
-  function toggleTheme() {
-    const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
-    document.documentElement.dataset.theme = next;
-    localStorage.setItem("mg-v4-theme", next);
+  function initTheme() {
+    const saved = localStorage.getItem("mg-v4-theme") || localStorage.getItem("mg-v3-theme");
+    document.documentElement.dataset.theme = THEMES.some((theme) => theme.id === saved) ? saved : "dark";
+  }
+
+  function setTheme(id) {
+    if (!THEMES.some((theme) => theme.id === id) || id === currentTheme()) return;
+    document.documentElement.dataset.theme = id;
+    localStorage.setItem("mg-v4-theme", id);
+    renderThemeUI();
+    toast(`主题已切换：${THEMES.find((theme) => theme.id === id).label}`, "ok");
+  }
+
+  function themeItemHtml(theme, current) {
+    const active = theme.id === current;
+    return `<button class="theme-item${active ? " active" : ""}" data-theme-pick="${theme.id}" role="option" aria-selected="${active}">
+      <span class="theme-swatches">${theme.swatch.map((color) => `<i style="background:${color}"></i>`).join("")}</span>
+      <span>${esc(theme.label)}</span>
+      <span class="tiny muted">${esc(theme.mode)}</span>
+      ${active ? '<span class="theme-check">✓</span>' : ""}
+    </button>`;
+  }
+
+  function renderThemeUI() {
+    const current = currentTheme();
+    const menu = $("#theme-menu");
+    if (menu) menu.innerHTML = THEMES.map((theme) => themeItemHtml(theme, current)).join("");
+    const cards = $("#theme-cards");
+    if (cards) {
+      cards.innerHTML = THEMES.map(
+        (theme) => `<button class="theme-card${theme.id === current ? " active" : ""}" data-theme-pick="${theme.id}">
+          <span class="theme-preview" style="background:${theme.swatch[0]}"><i class="soft" style="background:${theme.swatch[1]}"></i><i style="background:${theme.swatch[2]}"></i></span>
+          <span class="theme-name">${esc(theme.label)}${theme.id === current ? '<span class="theme-check">✓</span>' : ""}</span>
+          <span class="theme-mode">${esc(theme.mode)}</span>
+        </button>`
+      ).join("");
+    }
+  }
+
+  function toggleThemeMenu() {
+    const menu = $("#theme-menu");
+    if (!menu) return;
+    if (menu.hidden) {
+      renderThemeUI();
+      menu.hidden = false;
+    } else {
+      menu.hidden = true;
+    }
+  }
+
+  function closeThemeMenu(event) {
+    const menu = $("#theme-menu");
+    if (!menu || menu.hidden) return;
+    if (event && (menu.contains(event.target) || event.target.closest("#theme-toggle"))) return;
+    menu.hidden = true;
   }
 
   // ───────────────────────── 接入列表 ─────────────────────────
@@ -2057,7 +2122,21 @@
     $$("[data-go]").forEach((button) => {
       button.addEventListener("click", () => navigate(button.dataset.go));
     });
-    $("#theme-toggle").addEventListener("click", toggleTheme);
+    $("#theme-toggle").addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleThemeMenu();
+    });
+    document.addEventListener("click", closeThemeMenu);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeThemeMenu();
+    });
+    document.addEventListener("click", (event) => {
+      const pick = event.target.closest("[data-theme-pick]");
+      if (pick) {
+        setTheme(pick.dataset.themePick);
+        closeThemeMenu();
+      }
+    });
     $("#config-help-btn").addEventListener("click", () => window.MG_HELP && window.MG_HELP());
     $("#update-btn").addEventListener("click", () => window.MG_UPDATE && window.MG_UPDATE());
     $("#quick-add").addEventListener("click", () => openAddModal("official"));

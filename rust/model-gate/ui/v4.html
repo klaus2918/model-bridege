@@ -36,11 +36,12 @@
       <kbd>⌘K</kbd>
     </button>
     <button class="btn ghost sm icon-btn" id="config-help-btn" title="配置说明与常用写法">?</button>
-    <button class="btn ghost sm icon-btn" id="theme-toggle" title="切换深色 / 浅色">◐</button>
+    <button class="btn ghost sm icon-btn" id="theme-toggle" title="主题配色">◐</button>
     <button class="btn ghost sm" id="update-btn" title="检查 GitHub 新版本" hidden>更新</button>
     <button class="btn primary sm" id="quick-add">+ 添加接入</button>
   </div>
 </header>
+<div class="theme-menu" id="theme-menu" hidden></div>
 
 <div class="shell">
   <aside class="sidebar">
@@ -752,6 +753,11 @@
               <label class="check"><input type="checkbox" id="set-zcode-panel"> 显示 ZCode</label>
             </div>
           </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>外观主题</h2><span class="hint">选择即生效并记住</span></div>
+          <div id="theme-cards" class="theme-cards"></div>
+          <div class="inline-note">配色只保存在本机浏览器（localStorage），不影响代理服务配置。</div>
         </div>
         <div class="card">
           <div class="card-head"><h2>提示词记录</h2><span class="pill">默认关闭</span></div>

@@ -54,6 +54,7 @@
 
   const SETTINGS_SECTIONS = [
     { id: "service", label: "服务与全局", hint: "监听、模型、保留" },
+    { id: "appearance", label: "外观", hint: "主题配色" },
     { id: "privacy", label: "隐私与记录", hint: "提示词与 AI 接口" },
     { id: "routes", label: "统一入口", hint: "可见性、分组、路由组" },
     { id: "templates", label: "模板", hint: "官方与自定义默认值" },
@@ -1074,6 +1075,7 @@
   function cardSection(card) {
     const title = card.querySelector(".card-head h2")?.textContent?.trim() || "";
     if (title === "服务与全局") return "service";
+    if (title === "外观主题") return "appearance";
     if (title === "提示词记录" || title === "AI 配置接口") return "privacy";
     if (title === "统一接入可见性" || title === "统一入口分组" || title === "路由组") return "routes";
     if (title === "模板") return "templates";

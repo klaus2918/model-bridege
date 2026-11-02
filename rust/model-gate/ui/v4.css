@@ -6,24 +6,17 @@ html[data-ui="v4"] {
   --v4-sidebar: 216px;
   --v4-top: 56px;
   --v4-radius: 12px;
-  --v4-accent: #f0a020;
-  --v4-accent-ink: #14100a;
+  --v4-accent: var(--signal);
+  --v4-accent-ink: var(--accent-ink, #14100a);
   --v4-line-soft: color-mix(in srgb, var(--line) 72%, transparent);
 }
 
 html[data-ui="v4"] body {
   background:
-    radial-gradient(980px 460px at 18% -8%, rgba(240, 160, 32, 0.055), transparent 62%),
-    radial-gradient(900px 520px at 92% 0%, rgba(52, 208, 216, 0.04), transparent 58%),
+    radial-gradient(980px 460px at 18% -8%, var(--bg-glow-a), transparent 62%),
+    radial-gradient(900px 520px at 92% 0%, var(--bg-glow-b), transparent 58%),
     var(--bg);
   font-size: 13.5px;
-}
-
-html[data-ui="v4"][data-theme="light"] body {
-  background:
-    radial-gradient(980px 460px at 18% -8%, rgba(178, 106, 0, 0.05), transparent 62%),
-    radial-gradient(900px 520px at 92% 0%, rgba(10, 127, 136, 0.04), transparent 58%),
-    var(--bg);
 }
 
 html[data-ui="v4"] ::selection { background: var(--signal-dim); color: var(--text); }
@@ -1141,3 +1134,58 @@ html[data-ui="v4"] .request-kv dd { font-family: var(--mono); font-size: 11px; }
   html[data-ui="v4"] .free-summary { grid-template-columns: 1fr; }
   html[data-ui="v4"] .v4-hero h1 { font-size: 22px; }
 }
+
+/* ── 主题选择（顶栏菜单 + 设置外观卡片） ───────────────── */
+html[data-ui="v4"] .theme-menu {
+  position: fixed; top: 50px; right: 14px; z-index: 70;
+  min-width: 208px; padding: 6px;
+  background: var(--surface); border: 1px solid var(--line-strong);
+  border-radius: var(--v4-radius); box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 2px;
+}
+html[data-ui="v4"] .theme-item {
+  display: flex; align-items: center; gap: 10px;
+  border: 0; border-radius: 8px; padding: 8px 10px;
+  background: transparent; color: var(--text);
+  font-size: 12.5px; text-align: left;
+  transition: background 120ms ease, color 120ms ease;
+}
+html[data-ui="v4"] .theme-item:hover { background: var(--surface-2); }
+html[data-ui="v4"] .theme-item.active { background: var(--signal-dim); color: var(--signal); }
+html[data-ui="v4"] .theme-swatches {
+  display: inline-flex; flex: 0 0 auto;
+  border-radius: 4px; overflow: hidden; border: 1px solid var(--line-strong);
+}
+html[data-ui="v4"] .theme-swatches i { width: 11px; height: 16px; }
+html[data-ui="v4"] .theme-check { margin-left: auto; font-family: var(--mono); font-size: 11px; }
+html[data-ui="v4"] .theme-cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 8px;
+}
+html[data-ui="v4"] .theme-card {
+  display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--line); border-radius: var(--v4-radius);
+  background: var(--surface-2); padding: 10px; color: var(--text);
+  text-align: left; transition: border-color 120ms ease, background 120ms ease;
+}
+html[data-ui="v4"] .theme-card:hover { border-color: var(--line-strong); }
+html[data-ui="v4"] .theme-card.active {
+  border-color: var(--signal); background: var(--signal-dim);
+  box-shadow: 0 0 0 2px var(--signal-dim);
+}
+html[data-ui="v4"] .theme-card .theme-preview {
+  height: 44px; border-radius: 6px; border: 1px solid var(--line);
+  position: relative; overflow: hidden;
+}
+html[data-ui="v4"] .theme-card .theme-preview i {
+  position: absolute; width: 14px; height: 14px; border-radius: 4px;
+  right: 8px; bottom: 8px;
+}
+html[data-ui="v4"] .theme-card .theme-preview i.soft {
+  right: auto; left: 8px; bottom: 8px; opacity: 0.55;
+}
+html[data-ui="v4"] .theme-card .theme-name {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12.5px; font-weight: 550;
+}
+html[data-ui="v4"] .theme-card .theme-name .theme-check { margin-left: auto; }
+html[data-ui="v4"] .theme-card .theme-mode { color: var(--faint); font-size: 10.5px; }

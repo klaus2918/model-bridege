@@ -27,7 +27,10 @@ _tmp_*
 # 手动测试实例、旧版副本与冒烟截图等临时产物
 /temp/
 /.tmp/
+**/.tmp/
 /run-*/
+# 安全扫描插件（Mimosa）的本地状态
+.mimosa/
 /e2e.config.json
 *.out
 *.err

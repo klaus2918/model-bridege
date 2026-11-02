@@ -1,5 +1,8 @@
 /* Model-Gate v4 控制台：沿用 3.0 之前「工业仪表盘」配色——石墨底 + 琥珀主色；浅色为冷灰白。
-   配色源自 2.x 面板 style.css 的 token 体系；布局与结构仍遵循 docs/design/refactor-2026/05-ui-redesign.md。 */
+   配色源自 2.x 面板 style.css 的 token 体系；布局与结构仍遵循 docs/design/refactor-2026/05-ui-redesign.md。
+   主题通过 html[data-theme] 切换，可选：dark / light / ocean / emerald / dusk / paper；
+   每套主题必须提供完整 token，另含 --accent-ink（signal 底上的文字色）与
+   --bg-glow-a / --bg-glow-b（v4 壳层 body 光晕）。 */
 :root {
   --bg: #0b0d10;
   --surface: #12151a;
@@ -20,6 +23,9 @@
   --info-dim: rgba(52, 208, 216, 0.13);
   --violet: #b07cff;
   --shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+  --accent-ink: #14100a;
+  --bg-glow-a: rgba(240, 160, 32, 0.055);
+  --bg-glow-b: rgba(52, 208, 216, 0.04);
   --radius: 10px;
   --radius-sm: 8px;
   --radius-xs: 4px;
@@ -47,6 +53,113 @@ html[data-theme="light"] {
   --info-dim: rgba(10, 127, 136, 0.1);
   --violet: #7a4ddb;
   --shadow: 0 18px 50px rgba(16, 24, 40, 0.18);
+  --accent-ink: #fff8ec;
+  --bg-glow-a: rgba(178, 106, 0, 0.05);
+  --bg-glow-b: rgba(10, 127, 136, 0.04);
+}
+
+/* 海洋蓝：深蓝灰底 + 青蓝主色 */
+html[data-theme="ocean"] {
+  --bg: #0a0e14;
+  --surface: #101820;
+  --surface-2: #142029;
+  --surface-3: #1a2833;
+  --line: #223140;
+  --line-strong: #35485c;
+  --text: #e3ebf3;
+  --muted: #94a9bb;
+  --faint: #64798d;
+  --signal: #3ba7e8;
+  --signal-dim: rgba(59, 167, 232, 0.13);
+  --amber: #e5b453;
+  --amber-dim: rgba(229, 180, 83, 0.13);
+  --danger: #ff7a7a;
+  --danger-dim: rgba(255, 122, 122, 0.13);
+  --info: #35d0c8;
+  --info-dim: rgba(53, 208, 200, 0.13);
+  --violet: #a78bfa;
+  --shadow: 0 18px 60px rgba(2, 10, 20, 0.5);
+  --accent-ink: #06121d;
+  --bg-glow-a: rgba(59, 167, 232, 0.06);
+  --bg-glow-b: rgba(53, 208, 200, 0.04);
+}
+
+/* 翡翠绿：墨绿底 + 翠绿主色，终端仪表盘气质 */
+html[data-theme="emerald"] {
+  --bg: #0a0f0c;
+  --surface: #111813;
+  --surface-2: #151e18;
+  --surface-3: #1b2620;
+  --line: #24312a;
+  --line-strong: #37493e;
+  --text: #e4efe7;
+  --muted: #9bb5a3;
+  --faint: #6c8373;
+  --signal: #43c878;
+  --signal-dim: rgba(67, 200, 120, 0.13);
+  --amber: #d9c34d;
+  --amber-dim: rgba(217, 195, 77, 0.13);
+  --danger: #ff7a7a;
+  --danger-dim: rgba(255, 122, 122, 0.13);
+  --info: #38bdf8;
+  --info-dim: rgba(56, 189, 248, 0.13);
+  --violet: #c084fc;
+  --shadow: 0 18px 60px rgba(0, 12, 4, 0.5);
+  --accent-ink: #06170c;
+  --bg-glow-a: rgba(67, 200, 120, 0.055);
+  --bg-glow-b: rgba(56, 189, 248, 0.035);
+}
+
+/* 暮紫：暗紫底 + 紫罗兰主色；violet 槽位换青色以保持区分 */
+html[data-theme="dusk"] {
+  --bg: #0e0b15;
+  --surface: #151022;
+  --surface-2: #1a1430;
+  --surface-3: #211a38;
+  --line: #2e2447;
+  --line-strong: #453768;
+  --text: #ece7f6;
+  --muted: #ab9ec8;
+  --faint: #7a6d99;
+  --signal: #a78bfa;
+  --signal-dim: rgba(167, 139, 250, 0.14);
+  --amber: #e5b453;
+  --amber-dim: rgba(229, 180, 83, 0.13);
+  --danger: #fb7185;
+  --danger-dim: rgba(251, 113, 133, 0.13);
+  --info: #38bdf8;
+  --info-dim: rgba(56, 189, 248, 0.13);
+  --violet: #67e8f9;
+  --shadow: 0 18px 60px rgba(8, 2, 20, 0.5);
+  --accent-ink: #140b26;
+  --bg-glow-a: rgba(167, 139, 250, 0.06);
+  --bg-glow-b: rgba(56, 189, 248, 0.04);
+}
+
+/* 暖纸：米白底 + 暖琥珀主色的浅色主题 */
+html[data-theme="paper"] {
+  --bg: #f6f2ea;
+  --surface: #fffdf9;
+  --surface-2: #f8f4ec;
+  --surface-3: #f1ecdf;
+  --line: #e6dfd1;
+  --line-strong: #d0c7b4;
+  --text: #2b2721;
+  --muted: #6f6759;
+  --faint: #99907e;
+  --signal: #b26a00;
+  --signal-dim: rgba(178, 106, 0, 0.1);
+  --amber: #a86b00;
+  --amber-dim: rgba(168, 107, 0, 0.1);
+  --danger: #c0392f;
+  --danger-dim: rgba(192, 57, 47, 0.1);
+  --info: #0a7f88;
+  --info-dim: rgba(10, 127, 136, 0.1);
+  --violet: #7a4ddb;
+  --shadow: 0 18px 50px rgba(48, 38, 20, 0.16);
+  --accent-ink: #fffdf9;
+  --bg-glow-a: rgba(178, 106, 0, 0.05);
+  --bg-glow-b: rgba(10, 127, 136, 0.04);
 }
 
 * { box-sizing: border-box; }
@@ -80,7 +193,7 @@ code, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .brand-mark {
   width: 28px; height: 28px; border-radius: 7px;
   display: grid; place-items: center;
-  background: var(--signal); color: #14100a;
+  background: var(--signal); color: var(--accent-ink);
   font-family: var(--mono); font-weight: 700; font-size: 12px;
   letter-spacing: 0.5px;
 }
@@ -271,8 +384,8 @@ code, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 }
 .btn:hover { border-color: var(--line-strong); background: var(--surface-3); }
 .btn.sm { padding: 5px 10px; font-size: 12px; border-radius: 7px; }
-.btn.primary { background: var(--signal); border-color: var(--signal); color: #14100a; font-weight: 600; }
-.btn.primary:hover { filter: brightness(1.06); color: #14100a; }
+.btn.primary { background: var(--signal); border-color: var(--signal); color: var(--accent-ink); font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.06); color: var(--accent-ink); }
 .btn.ghost { background: transparent; }
 .btn.ghost:hover { background: var(--surface-2); }
 .btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); background: transparent; }
