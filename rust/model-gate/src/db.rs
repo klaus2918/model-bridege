@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS credential_members (
 );
 CREATE INDEX IF NOT EXISTS idx_credential_members_pool ON credential_members(pool_id);
 -- 已安装插件：安装只写本表，不执行 DDL、不直接写 bridge.config.json。
+-- removed=1 仅用于内置插件「移除」：登记保留、入口隐藏，可在内置库重装。
 CREATE TABLE IF NOT EXISTS plugins (
     id            TEXT PRIMARY KEY,
     version       TEXT NOT NULL,
@@ -138,6 +139,7 @@ CREATE TABLE IF NOT EXISTS plugins (
     name          TEXT,
     manifest_json TEXT NOT NULL,
     enabled       INTEGER NOT NULL DEFAULT 1,
+    removed       INTEGER NOT NULL DEFAULT 0,
     source        TEXT NOT NULL DEFAULT 'local',
     installed_at  TEXT NOT NULL,
     updated_at    TEXT NOT NULL
@@ -169,6 +171,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "prompt_records",
         "policy_version INTEGER NOT NULL DEFAULT 0",
     ),
+    ("plugins", "removed INTEGER NOT NULL DEFAULT 0"),
 ];
 
 #[derive(Debug, Clone, Default)]

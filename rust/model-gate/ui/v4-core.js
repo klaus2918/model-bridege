@@ -36,12 +36,14 @@
   const externalViews = new Map();
 
   const state = {
-    view: "overview",
+    view: "usage",
     access: [],
     templates: [],
     pools: [],
     poolDetails: {},
     plugins: [],
+    pluginLibrary: [],
+    accessTab: "list",
     config: null,
     info: null,
     aiSettings: { enabled: true, allowApply: false, allowPoolStats: true },
@@ -202,6 +204,7 @@
   async function refreshPlugins() {
     const data = await api("/api/plugins");
     state.plugins = Array.isArray(data.items) ? data.items : [];
+    state.pluginLibrary = Array.isArray(data.library) ? data.library : [];
   }
 
   async function refreshConfig() {
@@ -247,30 +250,85 @@
 
   // ───────────────────────── 导航 / 主题 ─────────────────────────
 
+  // 旧地址兼容：v4.1 及以前的视图名 → 新 IA（用量/会话/接入/插件/设置）。
+  const LEGACY_VIEWS = {
+    overview: "usage",
+    traffic: "usage",
+    prompts: "sessions",
+    models: "access",
+    credentials: "access",
+    free: "access",
+    templates: "access",
+    routes: "settings",
+    logs: "settings",
+    zcode: "plugins",
+    config: "settings",
+  };
+
   function initialView() {
     const allowed = [
-      "overview",
+      "usage",
+      "sessions",
       "access",
-      "models",
-      "routes",
-      "credentials",
       "plugins",
-      "traffic",
-      "prompts",
-      "logs",
-      "free",
-      "zcode",
       "settings",
       ...externalViews.keys(),
     ];
     const value = new URLSearchParams(location.search).get("view");
-    return allowed.includes(value) ? value : "overview";
+    if (allowed.includes(value)) return value;
+    if (LEGACY_VIEWS[value]) return LEGACY_VIEWS[value];
+    return "usage";
+  }
+
+  const viewLoaders = {
+    access: async () => {
+      await refreshAccess();
+      renderAccess();
+      runAccessPane();
+    },
+    models: async () => {
+      await refreshAccess();
+      renderModels();
+    },
+    routes: async () => {
+      await refreshConfig();
+      renderRoutes();
+    },
+    credentials: async () => {
+      await Promise.all([refreshPools(), refreshAccess()]);
+      await refreshPoolDetails();
+      renderPools();
+    },
+    plugins: async () => {
+      await Promise.all([refreshPlugins(), refreshAccess()]);
+      renderPlugins();
+    },
+    settings: async () => {
+      await Promise.all([refreshConfig(), refreshTemplates(), refreshAISettings(), refreshAccess()]);
+      renderSettings();
+      renderRoutes();
+      renderThemeUI();
+    },
+  };
+
+  // 接入页次级页签的懒加载：切到哪个 pane 就刷新哪个模块的数据。
+  function runAccessPane() {
+    const map = { pools: "credentials", models: "models", free: "free", templates: "templates" };
+    const name = map[state.accessTab || "list"];
+    if (!name) return;
+    const loader = externalViews.get(name) || viewLoaders[name];
+    if (loader) Promise.resolve(loader()).catch((error) => toast(error.message, "error"));
+  }
+
+  function runView(name) {
+    const loader = externalViews.get(name) || viewLoaders[name];
+    if (loader) Promise.resolve(loader()).catch((error) => toast(error.message, "error"));
   }
 
   function navigate(view) {
     state.view = view;
     const url = new URL(location.href);
-    if (view === "overview") url.searchParams.delete("view");
+    if (view === "usage") url.searchParams.delete("view");
     else url.searchParams.set("view", view);
     history.replaceState(null, "", url);
     $$(".nav-item").forEach((button) => {
@@ -279,35 +337,7 @@
     $$(".view").forEach((section) => {
       section.classList.toggle("active", section.id === `view-${view}`);
     });
-    const loaders = {
-      access: async () => {
-        await refreshAccess();
-        renderAccess();
-      },
-      models: async () => {
-        await refreshAccess();
-        renderModels();
-      },
-      routes: async () => {
-        await refreshConfig();
-        renderRoutes();
-      },
-      credentials: async () => {
-        await Promise.all([refreshPools(), refreshAccess()]);
-        await refreshPoolDetails();
-        renderPools();
-      },
-      plugins: async () => {
-        await Promise.all([refreshPlugins(), refreshAccess()]);
-        renderPlugins();
-      },
-      settings: async () => {
-        await Promise.all([refreshConfig(), refreshTemplates(), refreshAISettings(), refreshAccess()]);
-        renderSettings();
-        renderThemeUI();
-      },
-    };
-    const loader = externalViews.get(view) || loaders[view];
+    const loader = externalViews.get(view) || viewLoaders[view];
     if (loader) {
       Promise.resolve(loader()).catch((error) => toast(error.message, "error"));
     }
@@ -425,39 +455,53 @@
   }
 
   function renderAccess() {
+    const host = $("#access-cards");
+    if (!host) return;
     const rows = filteredAccess();
-    const tbody = $("#access-table tbody");
-    tbody.innerHTML = rows
+    // 异常置顶：待处理 → 已停用 → 正常。
+    const weight = (item) => (item.health.state === "ok" ? 2 : item.health.state === "disabled" ? 1 : 0);
+    const sorted = [...rows].sort((a, b) => weight(a) - weight(b));
+    host.innerHTML = sorted
       .map((item) => {
         const pool = item.pool ? `池 ${item.pool.available}/${item.pool.members}` : "";
         const credential = item.auth.mode === "pool" ? pool || "池" : item.auth.configured ? "单 Key" : item.auth.mode === "none" ? "无需" : "待补充";
         const disabled = item.enabled === false;
         const healthLabel = item.health.state === "ok" ? "正常" : item.health.state === "disabled" ? "已停用" : "待处理";
-        return `<tr data-open="${esc(item.id)}"${disabled ? ' style="opacity:.62"' : ""}>
-          <td><div class="name-cell">${badge(item.kind)}<b>${esc(item.label || item.id)}</b>${disabled ? '<span class="pill">已停用</span>' : ""}</div><div class="tiny muted">${esc(item.id)}${item.source && item.source.pluginId ? ` · ${esc(item.source.pluginId)}` : ""}</div></td>
-          <td><div>${esc(item.protocol)}</div><div class="addr" title="${esc(item.baseUrl)}">${esc(item.baseUrl || "—")}</div></td>
-          <td><div>${item.models ? item.models.declared : 0} 声明</div><div class="tiny muted">${item.models ? item.models.aliases : 0} 别名</div></td>
-          <td><span class="pill ${item.auth.configured ? "signal" : "amber"}">${esc(credential)}</span></td>
-          <td><span class="status-line">${statusDot(item.health.state)}${esc(healthLabel)}</span></td>
-          <td class="num">${num(item.usage && item.usage.todayRequests)}</td>
-          <td class="right"><span class="actions">
-            <button class="btn ghost sm" data-toggle-enabled="${esc(item.id)}">${disabled ? "启用" : "停用"}</button>
+        const healthClass = item.health.state === "ok" ? "ok" : item.health.state === "disabled" ? "" : "warn";
+        return `<article class="acc-card${disabled ? " off" : ""}${item.health.state !== "ok" ? " attn" : ""}" data-open="${esc(item.id)}">
+          <div class="acc-r1">
+            <b>${esc(item.label || item.id)}</b>
+            ${badge(item.kind)}
+            <span class="status-line ${healthClass}">${statusDot(item.health.state)}${esc(healthLabel)}</span>
+            ${disabled ? '<span class="pill">已停用</span>' : ""}
+            <span class="grow"></span>
+            <span class="acc-today">${num(item.usage && item.usage.todayRequests)} <i>今日</i></span>
+          </div>
+          <div class="acc-r2 mono" title="${esc(item.baseUrl || "")}">${esc(item.protocol || "—")} · ${esc(item.baseUrl || "—")}</div>
+          <div class="acc-r3">
+            <span class="pill ${item.auth.configured ? "signal" : "amber"}">${esc(credential)}</span>
+            <span class="pill">${item.models ? item.models.declared : 0} 模型</span>
+            ${item.models && item.models.aliases ? `<span class="pill">${item.models.aliases} 别名</span>` : ""}
+            ${item.source && item.source.pluginId ? `<span class="pill">插件 ${esc(item.source.pluginId)}</span>` : ""}
+            <span class="tiny muted mono">${esc(item.id)}</span>
+          </div>
+          <div class="acc-r4">
             <button class="btn ghost sm" data-probe="${esc(item.id)}">测试</button>
+            <button class="btn ghost sm" data-toggle-enabled="${esc(item.id)}">${disabled ? "启用" : "停用"}</button>
             <button class="btn ghost sm" data-open="${esc(item.id)}">详情</button>
-          </span></td>
-        </tr>`;
+          </div>
+        </article>`;
       })
       .join("");
     $("#access-empty").hidden = rows.length > 0;
-    $("#access-table").hidden = rows.length === 0;
-    bindRowOpeners(tbody);
-    $$("[data-probe]", tbody).forEach((button) => {
+    bindRowOpeners(host);
+    $$("[data-probe]", host).forEach((button) => {
       button.addEventListener("click", async (event) => {
         event.stopPropagation();
         await probeAccess(button.dataset.probe);
       });
     });
-    $$("[data-toggle-enabled]", tbody).forEach((button) => {
+    $$("[data-toggle-enabled]", host).forEach((button) => {
       button.addEventListener("click", async (event) => {
         event.stopPropagation();
         const id = button.dataset.toggleEnabled;
@@ -1401,45 +1445,58 @@
 
   // ───────────────────────── 插件 ─────────────────────────
 
+  function pluginCard(plugin, inLibrary) {
+    const attached = Array.isArray(plugin.attached) ? plugin.attached : [];
+    const name = plugin.name || plugin.id;
+    const initials = String(name).slice(0, 2).toUpperCase();
+    const kindLabel = { free: "免费来源", "free-source": "免费来源", account: "账号池", provider: "Provider", aggregator: "聚合", tool: "工具" }[plugin.kind] || plugin.kind || "插件";
+    const sourceLabel = inLibrary ? "内置包" : plugin.builtin ? "内置包" : plugin.source === "import" ? "导入包" : "本地包";
+    const zcodeBtn = plugin.id === "modelgate.account.zcode" && !inLibrary
+      ? `<button class="btn ghost sm" data-open-zcode="1">账号池 · 领取记录</button>`
+      : "";
+    return `<article class="plugin-card ${plugin.enabled && !inLibrary ? "on" : "off"}${inLibrary ? " removed" : ""}" data-plugin="${esc(plugin.id)}">
+      <div class="plugin-head">
+        <span class="plugin-avatar">${esc(initials)}</span>
+        <div class="grow"><div class="plugin-name">${esc(name)}</div><div class="plugin-sub mono">${esc(plugin.id)} · v${esc(plugin.version)}</div></div>
+        ${inLibrary ? '<span class="pill">已移除</span>' : `<span class="pill ${plugin.enabled ? "signal" : ""}">${plugin.enabled ? "启用" : "停用"}</span>`}
+      </div>
+      <div class="plugin-chips">
+        <span class="chip">${esc(kindLabel)}</span>
+        ${plugin.tier ? `<span class="chip">${esc(plugin.tier)}</span>` : ""}
+        <span class="chip">${esc(sourceLabel)}</span>
+        ${plugin.builtin ? `<span class="chip on">内置</span>` : `<span class="chip">已安装</span>`}
+      </div>
+      <p class="plugin-desc">${esc(plugin.description || "未提供描述。")}</p>
+      <div class="plugin-meta">${attached.length ? `已接入 ${esc(attached.join("、"))}` : inLibrary ? "已移除：入口隐藏，重装即恢复" : "未接入上游 · 安装只登记，接入才创建上游"}</div>
+      <div class="plugin-foot">
+        ${inLibrary
+          ? `<button class="btn primary sm" data-plugin-restore="${esc(plugin.id)}">重装</button>`
+          : `<button class="btn primary sm" data-plugin-attach="${esc(plugin.id)}">${plugin.enabled ? "接入" : "先启用"}</button>
+            ${attached.length ? `<button class="btn ghost sm" data-plugin-detach="${esc(plugin.id)}" data-name="${esc(attached[0])}">解绑</button>` : ""}
+            <button class="btn ghost sm" data-plugin-toggle="${esc(plugin.id)}" data-enabled="${plugin.enabled ? "0" : "1"}">${plugin.enabled ? "停用" : "启用"}</button>
+            ${zcodeBtn}
+            <button class="btn danger sm" data-plugin-remove="${esc(plugin.id)}" data-builtin="${plugin.builtin ? "1" : "0"}">移除</button>`}
+      </div>
+    </article>`;
+  }
+
   function renderPlugins() {
     const host = $("#plugin-list");
-    host.innerHTML = state.plugins
-      .map((plugin) => {
-        const attached = Array.isArray(plugin.attached) ? plugin.attached : [];
-        const mode = plugin.detail && plugin.detail.auth ? plugin.detail.auth.mode : "";
-        const name = plugin.name || plugin.id;
-        const initials = String(name).slice(0, 2).toUpperCase();
-        const kindLabel = { free: "免费来源", "free-source": "免费来源", account: "账号池", provider: "Provider", aggregator: "聚合", tool: "工具" }[plugin.kind] || plugin.kind || "插件";
-        return `<article class="plugin-card ${plugin.enabled ? "on" : "off"}" data-plugin="${esc(plugin.id)}">
-          <div class="plugin-head">
-            <span class="plugin-avatar">${esc(initials)}</span>
-            <div class="grow"><div class="plugin-name">${esc(name)}</div><div class="plugin-sub mono">${esc(plugin.id)} · v${esc(plugin.version)}</div></div>
-            <span class="pill ${plugin.enabled ? "signal" : ""}">${plugin.enabled ? "启用" : "停用"}</span>
-          </div>
-          <div class="plugin-chips">
-            <span class="chip">${esc(kindLabel)}</span>
-            ${plugin.tier ? `<span class="chip">${esc(plugin.tier)}</span>` : ""}
-            ${mode ? `<span class="chip">auth ${esc(mode)}</span>` : ""}
-            ${plugin.builtin ? `<span class="chip on">内置</span>` : `<span class="chip">已安装</span>`}
-          </div>
-          <p class="plugin-desc">${esc(plugin.description || "未提供描述。")}</p>
-          <div class="plugin-meta">${attached.length ? `已接入 ${esc(attached.join("、"))}` : "未接入上游 · 安装只登记，接入才创建上游"}</div>
-          <div class="plugin-foot">
-            <button class="btn primary sm" data-plugin-attach="${esc(plugin.id)}">${plugin.enabled ? "接入" : "先启用"}</button>
-            ${attached.length ? `<button class="btn ghost sm" data-plugin-detach="${esc(plugin.id)}" data-name="${esc(attached[0])}">解绑</button>` : ""}
-            <button class="btn ghost sm" data-plugin-toggle="${esc(plugin.id)}" data-enabled="${plugin.enabled ? "0" : "1"}">${plugin.enabled ? "禁用" : "启用"}</button>
-            ${plugin.builtin ? "" : `<button class="btn danger sm" data-plugin-remove="${esc(plugin.id)}">卸载</button>`}
-          </div>
-        </article>`;
-      })
-      .join("");
-    $$("[data-plugin-attach]").forEach((button) =>
+    if (host) host.innerHTML = state.plugins.map((plugin) => pluginCard(plugin, false)).join("") || '<div class="empty-line">没有插件</div>';
+    const lib = $("#plugin-library");
+    if (lib) {
+      lib.innerHTML = state.pluginLibrary.map((plugin) => pluginCard(plugin, true)).join("");
+      const wrap = $("#plugin-library-wrap");
+      if (wrap) wrap.hidden = state.pluginLibrary.length === 0;
+    }
+    const root = $("#view-plugins") || document;
+    $$("[data-plugin-attach]", root).forEach((button) =>
       button.addEventListener("click", () => attachPlugin(button.dataset.pluginAttach))
     );
-    $$("[data-plugin-detach]").forEach((button) =>
+    $$("[data-plugin-detach]", root).forEach((button) =>
       button.addEventListener("click", () => detachPlugin(button.dataset.pluginDetach, button.dataset.name))
     );
-    $$("[data-plugin-toggle]").forEach((button) =>
+    $$("[data-plugin-toggle]", root).forEach((button) =>
       button.addEventListener("click", async () => {
         try {
           await api(`/api/plugins/${encodeURIComponent(button.dataset.pluginToggle)}`, {
@@ -1454,14 +1511,30 @@
         }
       })
     );
-    $$("[data-plugin-remove]").forEach((button) =>
+    $$("[data-plugin-remove]", root).forEach((button) =>
       button.addEventListener("click", async () => {
-        if (!confirm("卸载插件？已创建的上游与凭据会保留。")) return;
+        const builtin = button.dataset.builtin === "1";
+        const message = builtin
+          ? "移除内置插件？入口将隐藏，已接入的上游需先解绑；之后可在「内置库」一键重装。"
+          : "卸载插件？已创建的上游与凭据会保留。";
+        if (!confirm(message)) return;
         try {
           await api(`/api/plugins/${encodeURIComponent(button.dataset.pluginRemove)}`, { method: "DELETE" });
           await refreshPlugins();
           renderPlugins();
-          toast("插件已卸载", "ok");
+          toast(builtin ? "已移除；可在「内置库」重装" : "插件已卸载", "ok");
+        } catch (error) {
+          toast(error.message, "error");
+        }
+      })
+    );
+    $$("[data-plugin-restore]", root).forEach((button) =>
+      button.addEventListener("click", async () => {
+        try {
+          await api(`/api/plugins/${encodeURIComponent(button.dataset.pluginRestore)}/restore`, { method: "POST" });
+          await refreshPlugins();
+          renderPlugins();
+          toast("已从内置库重装并启用", "ok");
         } catch (error) {
           toast(error.message, "error");
         }
@@ -2082,13 +2155,69 @@
 
   function openInstallPluginModal() {
     openInfoModal(
-      "安装本地插件",
-      `<div class="inline-note">只接受 manifest（modelgate.plugin/v1）。安装只登记，不修改配置、不执行 DDL。</div>
-      <label class="field"><span>manifest JSON</span>
-        <textarea class="input mono" id="plugin-manifest" rows="14" style="width:100%;resize:vertical" placeholder='{"schema":"modelgate.plugin/v1","id":"example.provider","kind":"provider","tier":"declarative","auth":{"mode":"single"},"upstream":{"protocol":"openai","baseUrl":"https://api.example.com/v1"}}'></textarea>
+      "导入插件包",
+      `<div class="inline-note">三种方式任选其一；导入即登记并与内置包同权（可停用 / 移除 / 重装）。安装只登记，不修改配置、不执行 DDL。</div>
+      <label class="field"><span>方式一：选择 manifest.json 文件</span>
+        <input class="input" id="plugin-import-file" type="file" accept=".json,application/json">
+      </label>
+      <label class="field"><span>方式二：插件目录路径（内含 manifest.json）</span>
+        <div class="row"><input class="input mono grow" id="plugin-import-path" placeholder="D:\\plugins\\my-provider">
+        <button class="btn primary sm" id="plugin-import-submit">导入</button></div>
+      </label>
+      <label class="field"><span>方式三：粘贴 manifest JSON</span>
+        <textarea class="input mono" id="plugin-manifest" rows="10" style="width:100%;resize:vertical" placeholder='{"schema":"modelgate.plugin/v1","id":"example.provider","kind":"provider","tier":"declarative","auth":{"mode":"single"},"upstream":{"protocol":"openai","baseUrl":"https://api.example.com/v1"}}'></textarea>
       </label>
       <div class="modal-actions"><button class="btn primary" id="install-plugin-submit">校验并登记</button></div>`
     );
+    const submitJson = async (manifest, note) => {
+      try {
+        await api("/api/plugins/install", { method: "POST", body: JSON.stringify({ manifest }) });
+        closeModal();
+        await refreshPlugins();
+        renderPlugins();
+        toast(note || "插件已登记；接入请点击「接入」", "ok");
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    };
+    const file = $("#plugin-import-file");
+    if (file) {
+      file.addEventListener("change", () => {
+        const selected = file.files && file.files[0];
+        if (!selected) return;
+        const reader = new FileReader();
+        reader.onload = async () => {
+          let manifest;
+          try {
+            manifest = JSON.parse(String(reader.result));
+          } catch {
+            toast("manifest 不是合法 JSON", "error");
+            return;
+          }
+          await submitJson(manifest, "已从文件导入；接入请点击「接入」");
+        };
+        reader.readAsText(selected);
+      });
+    }
+    const pathSubmit = $("#plugin-import-submit");
+    if (pathSubmit) {
+      pathSubmit.addEventListener("click", async () => {
+        const path = ($("#plugin-import-path").value || "").trim();
+        if (!path) {
+          toast("请填写插件目录路径", "error");
+          return;
+        }
+        try {
+          await api("/api/plugins/import", { method: "POST", body: JSON.stringify({ path }) });
+          closeModal();
+          await refreshPlugins();
+          renderPlugins();
+          toast("已从目录导入；接入请点击「接入」", "ok");
+        } catch (error) {
+          toast(error.message, "error");
+        }
+      });
+    }
     const submit = $("#install-plugin-submit");
     if (submit) {
       submit.addEventListener("click", async () => {
@@ -2099,15 +2228,7 @@
           toast("manifest 不是合法 JSON", "error");
           return;
         }
-        try {
-          await api("/api/plugins/install", { method: "POST", body: JSON.stringify({ manifest }) });
-          closeModal();
-          await refreshPlugins();
-          renderPlugins();
-          toast("插件已登记；接入请点击「接入」", "ok");
-        } catch (error) {
-          toast(error.message, "error");
-        }
+        await submitJson(manifest);
       });
     }
   }
@@ -2139,12 +2260,10 @@
     });
     $("#config-help-btn").addEventListener("click", () => window.MG_HELP && window.MG_HELP());
     $("#update-btn").addEventListener("click", () => window.MG_UPDATE && window.MG_UPDATE());
-    $("#quick-add").addEventListener("click", () => openAddModal("official"));
     $("#access-add").addEventListener("click", () => openAddModal("official"));
     $$("[data-add]").forEach((button) => button.addEventListener("click", () => openAddModal(button.dataset.add)));
-    $("#quick-add").addEventListener("click", () => openAddModal("official"));
 
-    $("#overview-probe").addEventListener("click", async () => {
+    $("#access-probe-all").addEventListener("click", async () => {
       const host = $("#health-results");
       host.hidden = false;
       host.innerHTML = `<span class="spin"></span> 正在逐个测试…`;
@@ -2173,11 +2292,6 @@
     $("#access-kind").addEventListener("change", renderAccess);
     $("#access-health").addEventListener("change", renderAccess);
 
-    $("#routes-refresh").addEventListener("click", async () => {
-      await refreshConfig();
-      renderRoutes();
-    });
-
     $("#pools-refresh").addEventListener("click", async () => {
       await Promise.all([refreshPools(), refreshAccess()]);
       await refreshPoolDetails();
@@ -2190,6 +2304,7 @@
       renderPlugins();
     });
     $("#plugin-install-open").addEventListener("click", openInstallPluginModal);
+    $("#plugin-import-open").addEventListener("click", openInstallPluginModal);
 
     $("#settings-save").addEventListener("click", saveSettings);
     $("#settings-backups").addEventListener("click", showBackups);
@@ -2264,6 +2379,7 @@
     state,
     registerView,
     navigate,
+    runView,
     openModal,
     updateModal,
     closeModal,

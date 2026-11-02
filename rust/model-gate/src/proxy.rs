@@ -552,15 +552,17 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
                 .delete(crate::credential_pool::delete_member),
         )
         .route("/api/pools/{id}/probe", post(crate::credential_pool::probe))
-        // 插件：登记、启停、幂等接入/解绑。
+        // 插件：登记、导入、启停、移除/重装、幂等接入/解绑。
         .route("/api/plugins", get(crate::plugin::list))
         .route("/api/plugins/install", post(crate::plugin::install))
+        .route("/api/plugins/import", post(crate::plugin::import))
         .route(
             "/api/plugins/{id}",
             get(crate::plugin::detail)
                 .patch(crate::plugin::set_enabled)
                 .delete(crate::plugin::uninstall),
         )
+        .route("/api/plugins/{id}/restore", post(crate::plugin::restore))
         .route("/api/plugins/{id}/attach", post(crate::plugin::attach))
         .route("/api/plugins/{id}/detach", post(crate::plugin::detach))
         // AI 可读配置：只读 + 草案 + 人工确认应用。

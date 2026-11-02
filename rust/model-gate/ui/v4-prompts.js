@@ -1,438 +1,605 @@
-/* v4 提示词列表、详情、会话演进与差异/工具分析。依赖 window.MG。 */
-(() => {
-  "use strict";
+// 会话页（M2）：会话列表（含单会话费用）→ 中栏三页签（轨迹流 / 提示词演进 / 工具评估）→ 右节点详情。
+// 提示词即轨迹：user / 思考 / 工具调用都是轨迹节点；费用与 token 由 usage_records 按 id join 进来。
+(function () {
   const MG = window.MG;
-  const { $, $$, esc, num, fmtTime, api, toast, openModal, closeModal } = MG;
+  const { $, $$, api, esc, num, compactNum, fmtTime, fmtMs, toast } = MG;
 
-  const p = {
-    tab: "list",
+  const s = {
     range: "7d",
-    model: "",
-    session: "",
     q: "",
-    page: 1,
-    pageSize: 50,
-    rows: [],
-    total: 0,
-    facets: { models: [], sessions: [] },
-    evolution: [],
-    baseId: "",
-    targetId: "",
-    diff: null,
+    sessions: [],
+    titles: {},
+    active: null,
+    rows: [], // evolution 行（升序）
+    usageById: new Map(),
+    rounds: [],
+    roundIndex: 0,
+    tab: "trace",
+    detailTab: "overview",
+    detailId: null,
+    detail: null,
+    diff: { base: "", target: "", role: "", only: true, data: null },
+    captureOff: false,
   };
-  let bound = false;
 
-  // 作用域持久化：分页位置与每页条数刷新后保持。
-  const SCOPE_KEY = "mg.v4.prompts.scope";
+  const PICK_KEY = "mg.v4.sessions.pick";
 
-  function saveScope() {
-    try {
-      localStorage.setItem(
-        SCOPE_KEY,
-        JSON.stringify({ pageSize: p.pageSize, range: p.range })
-      );
-    } catch {
-      /* 隐私模式下不可写，忽略 */
+  function fmtCost(value) {
+    const n = Number(value || 0);
+    if (!n) return "—";
+    if (Math.abs(n) < 0.01) return `¥${n.toFixed(4)}`;
+    return `¥${n.toFixed(2)}`;
+  }
+
+  function sessionLabel(key) {
+    return s.titles[key] || (key && key.length > 22 ? `${key.slice(0, 21)}…` : key) || "(无会话)";
+  }
+
+  // ───────────────────────── 列表 ─────────────────────────
+
+  async function load() {
+    const listParams = new URLSearchParams({ range: s.range, limit: "200" });
+    if (s.q) listParams.set("q", s.q);
+    const [sessionsData, promptsData] = await Promise.all([
+      api(`/api/usage/sessions?${new URLSearchParams({ range: s.range, limit: "200", sort: "last_ts", order: "desc" })}`),
+      api(`/api/prompts?${listParams}`),
+    ]);
+    s.sessions = Array.isArray(sessionsData.rows) ? sessionsData.rows : [];
+    s.captureOff = Boolean(promptsData.capture && promptsData.capture.enabled === false);
+    // 会话标题：取该会话最新一条提示词的 preview（服务端只存哈希键时的可读名）。
+    s.titles = {};
+    const promptRows = Array.isArray(promptsData.rows) ? promptsData.rows.slice().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0)) : [];
+    for (const row of promptRows) {
+      const key = row.session || "";
+      if (key && !s.titles[key]) s.titles[key] = row.preview || "";
     }
-  }
-
-  function restoreScope() {
-    let saved = {};
-    try {
-      saved = JSON.parse(localStorage.getItem(SCOPE_KEY) || "{}") || {};
-    } catch {
-      saved = {};
-    }
-    if (Number(saved.pageSize)) p.pageSize = Number(saved.pageSize);
-    if (typeof saved.range === "string" && saved.range) p.range = saved.range;
-    const size = $("#prompt-page-size");
-    if (size) size.value = String(p.pageSize);
-  }
-
-  function pages() {
-    return Math.max(1, Math.ceil(p.total / p.pageSize));
-  }
-
-  function query(extra = {}) {
-    const params = new URLSearchParams({
-      range: p.range,
-      limit: p.pageSize,
-      offset: (p.page - 1) * p.pageSize,
-    });
-    if (p.model) params.set("model", p.model);
-    if (p.session) params.set("session", p.session);
-    if (p.q) params.set("q", p.q);
-    Object.entries(extra).forEach(([key, value]) => {
-      if (value !== "" && value != null) params.set(key, String(value));
-    });
-    return params;
-  }
-
-  function setTab(tab) {
-    p.tab = tab;
-    $$("#prompt-tabs .seg-tab").forEach((button) => button.classList.toggle("active", button.dataset.promptTab === tab));
-    $("#prompt-list-view").hidden = tab !== "list";
-    $("#prompt-evolution-view").hidden = tab !== "evolution";
-    if (tab === "evolution") loadEvolution().catch((error) => toast(error.message, "error"));
-  }
-
-  // 序号守卫：跨页跳转（如请求抽屉「打开提示词」）会与视图加载器并发查询，
-  // 只让最后一次查询落地，避免旧筛选的响应晚到覆盖新结果。
-  let listSeq = 0;
-
-  async function loadList() {
-    const seq = ++listSeq;
-    const data = await api(`/api/prompts?${query()}`);
-    if (seq !== listSeq) return;
-    p.rows = Array.isArray(data.rows) ? data.rows : [];
-    p.total = Number(data.total || p.rows.length);
-    p.facets = {
-      models: Array.isArray(data.facets?.models) ? data.facets.models : p.facets.models,
-      sessions: Array.isArray(data.facets?.sessions) ? data.facets.sessions : p.facets.sessions,
-    };
-    fillFacets();
-    $("#prompt-disabled").hidden = Boolean(data.capture);
-    $("#prompt-hint").textContent = data.stats
-      ? `${data.stats.records || 0} 条 · ${((data.stats.bytes || 0) / 1024 / 1024).toFixed(1)} MB · 脱敏 ${data.stats.redactions || 0} 处`
-      : `共 ${p.total} 条`;
-    // 翻页越界时回正：总数在别的会话被清理后 offset 可能超过最后一页。
-    const totalPages = pages();
-    if (p.page > totalPages && totalPages > 0) {
-      p.page = totalPages;
-      return loadList();
-    }
-    $("#prompt-page-info").textContent = `第 ${p.page} / ${totalPages} 页 · 共 ${num(p.total)} 条`;
+    const captureNote = $("#ses-capture-off");
+    if (captureNote) captureNote.hidden = !s.captureOff;
+    const meta = $("#ses-meta");
+    if (meta) meta.textContent = `${s.sessions.length} 个会话 · ${promptRows.length} 条提示词记录`;
     renderList();
-  }
-
-  function fillFacets() {
-    const modelHost = $("#prompt-model");
-    if (modelHost) {
-      modelHost.innerHTML = `<option value="">全部模型</option>${p.facets.models.map((model) => `<option value="${esc(model)}">${esc(model)}</option>`).join("")}`;
-      modelHost.value = p.facets.models.includes(p.model) ? p.model : "";
+    // 选中：外部跳转指定 > 本地记忆 > 第一个。
+    const pending = MG.pendingSession;
+    if (pending != null && pending !== "") {
+      MG.pendingSession = null;
+      try { localStorage.setItem(PICK_KEY, pending); } catch { /* 忽略 */ }
+      await openSession(pending);
+      return;
     }
-    const sessionHost = $("#prompt-session");
-    if (sessionHost) {
-      const sessions = p.facets.sessions.slice(0, 300);
-      // 从请求抽屉跳入时，会话可能超出当前时间范围的 facets（如范围是 7d、请求更旧）：
-      // 服务端查询仍按 p.session 过滤，筛选框要把该会话显示出来，保持所见即所查。
-      if (p.session && !sessions.includes(p.session)) sessions.unshift(p.session);
-      sessionHost.innerHTML = `<option value="">全部会话</option>${sessions
-        .map((session) => `<option value="${esc(session)}">${esc(session)}</option>`)
-        .join("")}`;
-      sessionHost.value = sessions.includes(p.session) ? p.session : "";
+    if (!s.active || !s.sessions.some((row) => row.session === s.active)) {
+      let pick = null;
+      try { pick = localStorage.getItem(PICK_KEY); } catch { /* 忽略 */ }
+      pick = pick && s.sessions.some((row) => row.session === pick) ? pick : (s.sessions[0] && s.sessions[0].session) || null;
+      await openSession(pick);
+    } else {
+      renderList();
+      await refreshActive();
     }
   }
 
   function renderList() {
-    const tbody = $("#prompt-table tbody");
-    tbody.innerHTML = p.rows.length
-      ? p.rows
-          .map(
-            (row) => `<tr class="clickable" data-prompt-id="${esc(row.id)}">
-              <td>${fmtTime(row.ts)}</td><td><code>${esc(row.session || "—")}</code></td><td>${esc(row.requested_model || "—")}</td>
-              <td class="num">${num(row.message_count)}</td><td class="num">${num(row.size_bytes)}</td>
-              <td class="preview-cell">${esc((row.preview || "").slice(0, 120))}${row.truncated ? ' <span class="pill amber">截断</span>' : ""}</td>
-              <td class="right"><button class="btn ghost sm" data-prompt-download="${esc(row.id)}">下载</button></td>
-            </tr>`
-          )
-          .join("")
-      : `<tr><td colspan="7"><div class="empty-line">没有提示词记录。</div></td></tr>`;
+    const host = $("#ses-list");
+    if (!host) return;
+    host.innerHTML =
+      s.sessions
+        .map((row) => {
+          const key = row.session || "";
+          const active = key === s.active;
+          const fail = Number(row.errors || 0);
+          return `<button class="ses-item${active ? " sel" : ""}" data-ses-key="${esc(key)}">
+            <span class="t1">${esc(sessionLabel(key))}</span>
+            <span class="t2">${num(row.requests)} 请求 · ${fmtCost(row.cost)} · ${compactNum(row.total_tokens)} tok · ${esc(fmtTime(row.last_ts))}${fail ? ` <span class="pill danger">${fail} 失败</span>` : ""}</span>
+          </button>`;
+        })
+        .join("") || '<div class="empty-line">区间内没有会话</div>';
+    const count = $("#ses-count");
+    if (count) count.textContent = `${s.sessions.length} 个`;
   }
 
-  async function showDetail(id) {
-    try {
-      const data = await api(`/api/prompts/${encodeURIComponent(id)}`);
-      const messages = Array.isArray(data.messages) ? data.messages : [];
-      openModal(
-        "提示词详情",
-        `${data.requested_model || "—"} · ${data.session || "—"} · ${fmtTime(data.ts)}`,
-        `<div class="kv">
-          <dt>消息数</dt><dd>${num(data.message_count)}</dd>
-          <dt>大小</dt><dd>${num(data.size_bytes)} 字符</dd>
-          <dt>角色</dt><dd>${esc(JSON.stringify(data.role_counts || {}))}</dd>
-          <dt>脱敏</dt><dd>${num(data.redactions)} 处</dd>
-        </div>
-        <div class="section-title">消息</div>
-        <div class="prompt-messages">${messages
-          .map(
-            (message, index) => `<details class="message-block" ${index === 0 ? "open" : ""}>
-              <summary><span class="pill">${esc(message.role || "?")}</span><span class="muted">#${index + 1} · ${num(String(message.content || "").length)} 字符</span></summary>
-              <pre>${esc(message.content || "")}</pre>
-            </details>`
-          )
-          .join("") || '<div class="empty-line">没有消息。</div>'}</div>
-        <div class="modal-actions"><button class="btn ghost" id="prompt-download">下载 JSONL</button><button class="btn primary" id="prompt-close">关闭</button></div>`
+  // ───────────────────────── 会话明细 ─────────────────────────
+
+  async function openSession(key) {
+    s.active = key || null;
+    try { localStorage.setItem(PICK_KEY, key || ""); } catch { /* 忽略 */ }
+    renderList();
+    if (!key) {
+      s.rows = [];
+      s.rounds = [];
+      renderRounds();
+      renderTrace();
+      return;
+    }
+    const [evo, usage] = await Promise.all([
+      api(`/api/prompts/evolution?session=${encodeURIComponent(key)}&limit=50`),
+      api(`/api/usage/list?${new URLSearchParams({ range: s.range, session: key, limit: "500" })}`),
+    ]);
+    s.rows = (Array.isArray(evo.rows) ? evo.rows : []).slice().sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+    s.usageById = new Map((Array.isArray(usage.rows) ? usage.rows : []).map((row) => [String(row.id), row]));
+    buildRounds();
+    s.roundIndex = Math.max(0, s.rounds.length - 1);
+    fillDiffSelects();
+    renderLanes();
+    renderRounds();
+    renderTools();
+    renderTrace();
+    if (!s.diff.data) setTab(s.tab);
+    // 打开会话即选中最新一条记录，右侧详情立刻有内容。
+    const newest = s.rows[s.rows.length - 1];
+    if (newest && String(s.detailId || "") !== String(newest.id)) {
+      openNode(newest.id).catch(() => {});
+    }
+  }
+
+  async function refreshActive() {
+    if (s.active) await openSession(s.active);
+  }
+
+  function usageOf(row) {
+    return s.usageById.get(String(row.id)) || {};
+  }
+
+  // 轮次：call_chain.user_turns 累积值增长 = 新一轮用户输入进入上下文。
+  function buildRounds() {
+    const rounds = [];
+    let prevTurns = 0;
+    for (const row of s.rows) {
+      const turns = Number(row.call_chain?.user_turns ?? 0);
+      if (!rounds.length || turns > prevTurns) {
+        rounds.push({ index: rounds.length + 1, rows: [], startId: row.id, endId: row.id, user: row.call_chain?.first_user || row.preview || "" });
+      }
+      const current = rounds[rounds.length - 1];
+      current.rows.push(row);
+      current.endId = row.id;
+      if (turns > prevTurns) current.user = row.call_chain?.first_user || row.preview || current.user;
+      prevTurns = Math.max(prevTurns, turns);
+    }
+    s.rounds = rounds;
+  }
+
+  function renderLanes() {
+    const host = $("#ses-lanes");
+    if (!host) return;
+    if (!s.rows.length) {
+      host.innerHTML = "";
+      return;
+    }
+    const maxIn = Math.max(...s.rows.map((row) => Number(usageOf(row).prompt_tokens || 0)), 1);
+    const maxOut = Math.max(...s.rows.map((row) => Number(usageOf(row).completion_tokens || 0)), 1);
+    const maxTool = Math.max(...s.rows.map((row) => Number(row.call_chain?.tool_call_count || 0)), 1);
+    const lane = (name, cellsHtml) =>
+      `<div class="ses-lane"><span class="ses-lane-name">${esc(name)}</span><span class="ses-lane-dots">${cellsHtml}</span></div>`;
+    const cells = (values) =>
+      values
+        .slice(-60)
+        .map((value) => `<i class="ses-dot${value.bad ? " bad" : ""}" style="width:${value.width}px" title="${esc(value.title)}"></i>`)
+        .join("");
+    const inputDots = s.rows.map((row) => {
+      const tokens = Number(usageOf(row).prompt_tokens || 0);
+      return { width: 4 + Math.round((tokens / maxIn) * 9), title: `${fmtTime(row.ts)} · 入 ${compactNum(tokens)} tok` };
+    });
+    const modelDots = s.rows.map((row) => {
+      const usage = usageOf(row);
+      const out = Number(usage.completion_tokens || 0);
+      const bad = Number(usage.status || 200) >= 400;
+      return { width: 4 + Math.round((out / maxOut) * 9), bad, title: `${fmtTime(row.ts)} · 出 ${compactNum(out)} tok · ${usage.status || "—"}` };
+    });
+    const toolDots = s.rows.map((row) => {
+      const calls = Number(row.call_chain?.tool_call_count || 0);
+      return { width: calls ? 6 + Math.round((calls / maxTool) * 8) : 3, title: `${fmtTime(row.ts)} · 工具 ${calls} 次` };
+    });
+    host.innerHTML = [lane("输入", cells(inputDots)), lane("模型", cells(modelDots)), lane("工具", cells(toolDots))].join("");
+  }
+
+  function currentRound() {
+    return s.rounds[s.roundIndex] || null;
+  }
+
+  function roundCost(round) {
+    return round.rows.reduce((sum, row) => sum + Number(usageOf(row).cost || 0), 0);
+  }
+
+  function renderRounds() {
+    const round = currentRound();
+    const head = $("#ses-round");
+    const meta = $("#ses-round-meta");
+    const cost = $("#ses-round-cost");
+    if (!round) {
+      if (head) head.textContent = s.active ? "该会话没有提示词记录" : "选择会话";
+      if (meta) meta.textContent = "";
+      if (cost) cost.textContent = "";
+      return;
+    }
+    if (head) head.textContent = `第 ${round.index} 轮 · ${round.rows.length} 请求`;
+    if (meta) {
+      const nav = s.rounds.length > 1
+        ? `<button class="linklike" data-ses-round="prev" ${s.roundIndex === 0 ? "disabled" : ""}>‹ 上一轮</button> <button class="linklike" data-ses-round="next" ${s.roundIndex === s.rounds.length - 1 ? "disabled" : ""}>下一轮 ›</button>`
+        : "";
+      meta.innerHTML = `${esc(fmtTime(round.rows[0].ts))} 起 · ${nav}`;
+    }
+    if (cost) cost.textContent = `本轮 ${fmtCost(roundCost(round))} · 会话累计 ${fmtCost(s.rounds.reduce((sum, item) => sum + roundCost(item), 0))}`;
+  }
+
+  function nodeHtml(id, icon, title, sub, bad, tab) {
+    return `<button class="ses-node${bad ? " bad" : ""}" data-ses-node="${esc(id)}" data-ses-dtab="${esc(tab || "overview")}">
+      <span class="ses-ico ${esc(icon)}">${icon === "user" ? "U" : icon === "think" ? "✦" : "⚒"}</span>
+      <span class="grow"><span class="n1">${esc(title)}</span>${sub ? `<span class="n2">${esc(sub)}</span>` : ""}</span>
+    </button>`;
+  }
+
+  function renderTrace() {
+    const host = $("#ses-nodes");
+    if (!host) return;
+    const round = currentRound();
+    if (!round) {
+      host.innerHTML = '<div class="empty-line">左侧选择一个会话</div>';
+      return;
+    }
+    const parts = [];
+    if (round.user) parts.push(nodeHtml(round.rows[0]?.id || "", "user", `user ·「${round.user}」`, "", false, "overview"));
+    for (const row of round.rows) {
+      const usage = usageOf(row);
+      const chain = row.call_chain || {};
+      const bad = Number(usage.status || 200) >= 400;
+      const thinkText = chain.last_assistant_preview || row.preview || "(无文本输出)";
+      const tools = Number(chain.tool_call_count || 0);
+      parts.push(
+        nodeHtml(
+          row.id,
+          "think",
+          `${fmtTime(row.ts)} · ${thinkText}`,
+          `入 ${compactNum(usage.prompt_tokens)} / 出 ${compactNum(usage.completion_tokens)} · ${fmtCost(usage.cost)} · ${fmtMs(usage.duration_ms)}${tools ? ` · 工具 ${tools}` : ""}${bad ? ` · ${usage.status}` : ""}`,
+          bad,
+          "overview"
+        )
       );
-      $("#prompt-close").addEventListener("click", closeModal);
-      $("#prompt-download").addEventListener("click", () => window.open(`/api/prompts/${encodeURIComponent(id)}/download`, "_blank"));
+      for (const pair of Array.isArray(chain.pairs) ? chain.pairs : []) {
+        const ok = Boolean(pair.has_result);
+        const result = pair.result_preview || (ok ? "" : "未匹配到工具结果");
+        parts.push(nodeHtml(row.id, "tool", `${pair.name} ${(pair.arguments_preview || "").slice(0, 90)}`, `→ ${result.slice(0, 140)}`, !ok, "preview"));
+      }
+    }
+    host.innerHTML = parts.join("") || '<div class="empty-line">该轮没有记录</div>';
+  }
+
+  // ───────────────────────── 节点详情 ─────────────────────────
+
+  async function openNode(id, tab) {
+    s.detailId = id;
+    if (tab) setDetailTab(tab, true);
+    try {
+      s.detail = await api(`/api/prompts/${encodeURIComponent(id)}`);
     } catch (error) {
       toast(error.message, "error");
-    }
-  }
-
-  async function loadEvolution() {
-    const session = $("#evolution-session").value || p.session || p.facets.sessions[0] || "";
-    if (!session) {
-      p.evolution = [];
-      renderTimeline();
       return;
     }
-    const data = await api(`/api/prompts/evolution?session=${encodeURIComponent(session)}&limit=100`);
-    p.evolution = Array.isArray(data.rows) ? data.rows : [];
-    p.session = session;
-    if (!p.baseId && p.evolution.length >= 2) {
-      p.baseId = p.evolution[p.evolution.length - 2].id;
-      p.targetId = p.evolution[p.evolution.length - 1].id;
-    }
-    renderTimeline();
-    renderEvolutionStats();
-    if (p.baseId && p.targetId) loadDiff().catch(() => {});
+    renderDetail();
   }
 
-  function renderTimeline() {
-    const host = $("#evolution-timeline");
-    host.innerHTML = p.evolution.length
-      ? p.evolution
-          .slice()
-          .reverse()
-          .map(
-            (row, index) => `<div class="timeline-row ${row.id === p.baseId ? "is-base" : ""} ${row.id === p.targetId ? "is-target" : ""}" data-evolution-id="${esc(row.id)}">
-              <div class="timeline-time">${fmtTime(row.ts)}</div>
-              <div class="timeline-main">
-                <div><code>${esc(row.requested_model || "—")}</code> <span class="muted">· ${num(row.message_count)} 条 · ${num(row.size_bytes)} 字符</span></div>
-                <div class="timeline-preview">${esc((row.preview || "").slice(0, 100))}</div>
-              </div>
-              <div class="timeline-actions">
-                <button class="btn ghost sm" data-evolution-base="${esc(row.id)}">基准</button>
-                <button class="btn ghost sm" data-evolution-target="${esc(row.id)}">对比</button>
-              </div>
+  function setDetailTab(tab, silent) {
+    s.detailTab = tab;
+    $$("#ses-detail-tabs [data-ses-dtab]").forEach((button) => button.classList.toggle("active", button.dataset.sesDtab === tab));
+    if (!silent) renderDetail();
+  }
+
+  function detailUsage() {
+    return s.detail ? s.usageById.get(String(s.detail.id)) || {} : {};
+  }
+
+  function renderDetail() {
+    const body = $("#ses-detail-body");
+    const title = $("#ses-detail-title");
+    const sub = $("#ses-detail-sub");
+    const foot = $("#ses-detail-meta");
+    if (!body) return;
+    if (!s.detail) {
+      body.innerHTML = '<div class="empty-line">点击轨迹节点查看详情</div>';
+      return;
+    }
+    const detail = s.detail;
+    const usage = detailUsage();
+    const badges = [];
+    if (detail.truncated) badges.push('<span class="pill amber">已截断</span>');
+    if (Number(detail.redactions || 0) > 0) badges.push(`<span class="pill amber">脱敏 ${detail.redactions} 处</span>`);
+    if (title) title.textContent = "节点详情";
+    if (sub) sub.innerHTML = `${esc(detail.requested_model || "—")} ${badges.join(" ")}`;
+
+    if (s.detailTab === "overview") {
+      const fields = [
+        ["时间", fmtTime(detail.ts)],
+        ["上游", detail.upstream],
+        ["协议", detail.protocol],
+        ["状态", usage.status || detail.status],
+        ["输入 / 输出", `${compactNum(usage.prompt_tokens)} / ${compactNum(usage.completion_tokens)} tok`],
+        ["缓存读取", usage.cache_read_tokens ? compactNum(usage.cache_read_tokens) : "—"],
+        ["费用", fmtCost(usage.cost)],
+        ["耗时 / 首 Token", `${fmtMs(usage.duration_ms)} / ${usage.ttft_ms ? fmtMs(usage.ttft_ms) : "—"}`],
+        ["消息数 / 字符", `${detail.message_count} / ${num(detail.size_bytes)}`],
+        ["会话", detail.session || "—"],
+      ];
+      const chain = detail.call_chain || {};
+      body.innerHTML = `<div class="kv ses-kv">${fields
+        .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v == null || v === "" ? "—" : v)}</dd>`)
+        .join("")}</div>
+        ${chain.last_user_preview ? `<div class="ses-quote"><span class="bt">最新 user</span>${esc(chain.last_user_preview)}</div>` : ""}
+        ${chain.last_assistant_preview ? `<div class="ses-quote a"><span class="bt">最新 assistant</span>${esc(chain.last_assistant_preview)}</div>` : ""}
+        ${detail.neighbors && (detail.neighbors.prev || detail.neighbors.next)
+          ? `<div class="card-actions wrap" style="margin-top:10px">
+              ${detail.neighbors.prev ? `<button class="btn ghost sm" data-ses-neighbor="${esc(detail.neighbors.prev.id)}">‹ 上一请求</button>` : ""}
+              ${detail.neighbors.next ? `<button class="btn ghost sm" data-ses-neighbor="${esc(detail.neighbors.next.id)}">下一请求 ›</button>` : ""}
             </div>`
-          )
-          .join("")
-      : `<div class="empty-line">该会话还没有记录。</div>`;
-    $("#evolution-count").textContent = `${p.evolution.length} 轮`;
+          : ""}`;
+    } else if (s.detailTab === "preview") {
+      const chain = detail.call_chain || {};
+      const previews = Array.isArray(chain.message_previews) ? chain.message_previews : [];
+      body.innerHTML = previews.length
+        ? previews
+            .map(
+              (item) =>
+                `<div class="ses-quote ${esc(item.role)}"><span class="bt">#${item.index} ${esc(item.role)} · ${item.chars} 字符</span>${esc(item.preview || "")}</div>`
+            )
+            .join("") + (chain._gap ? '<div class="hint" style="padding:4px 0">…中间消息已省略…</div>' : "")
+        : '<div class="empty-line">没有消息预览</div>';
+    } else if (s.detailTab === "raw") {
+      const messages = Array.isArray(detail.messages) ? detail.messages : [];
+      body.innerHTML = `<pre class="code-block ses-raw">${esc(JSON.stringify(messages, null, 2))}</pre>`;
+    } else {
+      const chain = detail.call_chain || {};
+      const think = [chain.last_assistant_preview, detail.preview].filter(Boolean).join("\n\n");
+      body.innerHTML = think
+        ? `<div class="ses-quote a"><span class="bt">assistant 输出 / 最近用户消息（脱敏视图）</span>${esc(think)}</div>`
+        : '<div class="empty-line">该节点没有可展示的思考文本</div>';
+    }
+    if (foot) {
+      foot.innerHTML = `该请求 ${compactNum(usage.prompt_tokens)} 入 / ${compactNum(usage.completion_tokens)} 出 · ${fmtCost(usage.cost)} · ${fmtMs(usage.duration_ms)} · <button class="linklike" data-ses-in-usage="1">在用量页查看 ›</button>`;
+    }
   }
 
-  function renderEvolutionStats() {
-    const target = p.evolution.find((row) => row.id === p.targetId);
-    if (!target) {
-      $("#evolution-stats").innerHTML = "";
+  // ───────────────────────── 演进对比 ─────────────────────────
+
+  function fillDiffSelects() {
+    const base = $("#ses-diff-base");
+    const target = $("#ses-diff-target");
+    if (!base || !target) return;
+    const options = s.rounds
+      .map((round) => `<option value="${esc(round.endId)}">第 ${round.index} 轮 · ${round.rows.length} 请求 · ${esc(fmtTime(round.rows[round.rows.length - 1].ts))}</option>`)
+      .join("");
+    base.innerHTML = options || '<option value="">（会话不足两轮）</option>';
+    target.innerHTML = options || '<option value="">（会话不足两轮）</option>';
+    if (s.rounds.length >= 2) {
+      if (!s.diff.base || !s.rounds.some((round) => round.endId === s.diff.base)) s.diff.base = s.rounds[s.rounds.length - 2].endId;
+      if (!s.diff.target || !s.rounds.some((round) => round.endId === s.diff.target)) s.diff.target = s.rounds[s.rounds.length - 1].endId;
+    }
+    base.value = s.diff.base;
+    target.value = s.diff.target;
+  }
+
+  async function runDiff() {
+    if (!s.diff.base || !s.diff.target) {
+      toast("会话至少需要两轮才能对比", "error");
       return;
     }
-    const summary = target.summary || {};
-    $("#evolution-stats").innerHTML = `
-      <div class="stat"><span class="k">消息</span><span class="v">${num(summary.message_count)}</span></div>
-      <div class="stat"><span class="k">字符</span><span class="v">${num(summary.char_count)}</span></div>
-      <div class="stat"><span class="k">工具调用</span><span class="v">${num(summary.tool_call_count)}</span></div>
-      <div class="stat"><span class="k">系统提示词</span><span class="v">${num(summary.system_chars)}</span></div>`;
-    $("#evolution-tool-meta").textContent = `${num(summary.tool_call_count)} 次调用 · ${num(summary.tool_result_count)} 条结果`;
-    const chain = target.call_chain || {};
-    const calls = Array.isArray(chain.tool_calls) ? chain.tool_calls : [];
-    const byTool = {};
-    calls.forEach((call) => {
-      byTool[call.name] = byTool[call.name] || { name: call.name, calls: 0, unmatched: 0, chars: 0, max: 0 };
-      byTool[call.name].calls += 1;
-    });
-    const rows = Object.values(byTool).sort((a, b) => b.calls - a.calls);
-    $("#evolution-tool-table tbody").innerHTML = rows.length
-      ? rows
-          .map(
-            (row) => `<tr><td><code>${esc(row.name)}</code></td><td class="num">${num(row.calls)}</td><td class="num">${num(row.unmatched)}</td><td class="num">0</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>`
-          )
-          .join("")
-      : `<tr><td colspan="7"><div class="empty-line">没有工具调用。</div></td></tr>`;
-    $("#evolution-tool-report").textContent = `会话：${p.session}\n消息：${summary.message_count || 0}\n工具调用：${summary.tool_call_count || 0}\n工具：${rows.map((row) => `${row.name}×${row.calls}`).join(", ") || "无"}`;
+    const params = new URLSearchParams({ base: s.diff.base, target: s.diff.target, context: "3" });
+    if (s.diff.role) params.set("role", s.diff.role);
+    const meta = $("#ses-diff-meta");
+    if (meta) meta.textContent = "对比中…";
+    try {
+      s.diff.data = await api(`/api/prompts/diff?${params}`);
+      renderDiff();
+    } catch (error) {
+      toast(error.message, "error");
+      if (meta) meta.textContent = "对比失败";
+    }
   }
 
-  async function loadDiff() {
-    if (!p.baseId || !p.targetId) return;
-    const [meta, base, target] = await Promise.all([
-      api(`/api/prompts/diff?base=${encodeURIComponent(p.baseId)}&target=${encodeURIComponent(p.targetId)}`),
-      api(`/api/prompts/${encodeURIComponent(p.baseId)}`),
-      api(`/api/prompts/${encodeURIComponent(p.targetId)}`),
-    ]);
-    p.diff = meta.diff || {};
-    const baseMessages = Array.isArray(base.messages) ? base.messages : [];
-    const targetMessages = Array.isArray(target.messages) ? target.messages : [];
-    const stats = p.diff.stats || {};
-    $("#evolution-compare").innerHTML = `<span class="mono">${esc(p.baseId.slice(0, 8))}</span> → <span class="mono">${esc(p.targetId.slice(0, 8))}</span>
-      <span class="hint">${stats.changed ?? "—"} 处变化 · +${num(stats.added)} / -${num(stats.removed)}</span>
-      <a class="ghost tiny" href="/api/prompts/diff/download?base=${encodeURIComponent(p.baseId)}&target=${encodeURIComponent(p.targetId)}" download>下载 diff</a>`;
-    const role = $("#evolution-role").value;
-    const onlyDiff = $("#evolution-only-diff").checked;
-    const messages = (p.diff.messages || []).filter((message) => !role || message.role === role).filter((message) => !onlyDiff || message.status !== "same");
-    $("#prompt-diff").innerHTML = messages.length
-      ? messages
-          .map((message) => {
-            const index = message.target_index ?? message.base_index ?? 0;
-            const before = baseMessages[message.base_index]?.content || "";
-            const after = targetMessages[message.target_index]?.content || "";
-            return `<details class="diff-block ${message.status}" ${message.status !== "same" ? "open" : ""}>
-              <summary><span class="pill ${message.status === "same" ? "" : message.status === "added" ? "signal" : "amber"}">${esc(message.status)}</span>
-                <span class="pill">${esc(message.role)}</span><span class="muted">#${index + 1} · ${num(message.base_chars)} → ${num(message.target_chars)} 字符</span></summary>
-              <div class="diff-pair">
-                <div><div class="section-title">基准</div><pre>${esc(before.slice(0, 4000))}</pre></div>
-                <div><div class="section-title">对比</div><pre>${esc(after.slice(0, 4000))}</pre></div>
-              </div>
-            </details>`;
+  function renderDiff() {
+    const host = $("#ses-diff");
+    const stats = $("#ses-diff-stats");
+    const meta = $("#ses-diff-meta");
+    const data = s.diff.data;
+    if (!host) return;
+    if (!data || !data.diff) {
+      host.innerHTML = '<div class="empty-line">选择基准与对比轮次后点「对比」</div>';
+      return;
+    }
+    const stat = data.diff.stats || {};
+    if (stats) {
+      stats.innerHTML = [
+        ["+ 新增", stat.added],
+        ["− 删除", stat.removed],
+        ["~ 修改", stat.modified],
+        ["= 相同", stat.same],
+        ["变化", `${stat.delta_percent ?? 0}%`],
+      ]
+        .map(([label, value]) => `<span class="pill">${esc(label)} ${num(value)}</span>`)
+        .join("") + (stat.system_changed ? '<span class="pill amber">system 有变更</span>' : "");
+    }
+    if (meta) meta.textContent = `${data.base?.ts ? fmtTime(data.base.ts) : ""} → ${data.target?.ts ? fmtTime(data.target.ts) : ""}`;
+    const rows = Array.isArray(data.diff.messages) ? data.diff.messages : [];
+    const visible = rows.filter((row) => (s.diff.only ? row.status !== "same" : true));
+    host.innerHTML = visible.length
+      ? visible
+          .map((row) => {
+            const tone = row.status === "added" ? "add" : row.status === "removed" ? "del" : row.status === "modified" ? "mod" : "ctx";
+            const mark = { added: "+", removed: "−", modified: "~", same: "=" }[row.status] || " ";
+            const content = row.status === "modified" && Array.isArray(row.diff)
+              ? row.diff.map((op) => `${op.op === "add" ? "+" : op.op === "del" ? "−" : " "} ${op.text || ""}`).join("\n")
+              : row.content || "";
+            return `<div class="ses-diff-row ${tone}"><span class="mark">${mark}</span><span class="role">${esc(row.role)}${row.target_index != null ? ` #${row.target_index}` : ""}</span><pre class="grow">${esc(String(content)).slice(0, 2000)}</pre></div>`;
           })
           .join("")
-      : `<div class="empty-line">当前筛选没有差异。</div>`;
+      : '<div class="empty-line">所选范围内没有差异</div>';
   }
 
-  async function clearPrompts() {
-    if (!confirm("清空当前筛选范围的提示词记录？不可撤销。")) return;
-    try {
-      const data = await api("/api/prompts/clear", {
-        method: "POST",
-        body: JSON.stringify({ range: p.range, model: p.model, session: p.session, q: p.q }),
-      });
-      toast(`已清空 ${data.removed || 0} 条`, "ok");
-      await loadList();
-    } catch (error) {
-      toast(error.message, "error");
+  // ───────────────────────── 工具评估 ─────────────────────────
+
+  function renderTools() {
+    const tbody = $("#ses-tools-table tbody");
+    const meta = $("#ses-tools-meta");
+    if (!tbody) return;
+    const tools = new Map();
+    const seen = new Set();
+    for (const row of s.rows) {
+      const chain = row.call_chain || {};
+      for (const pair of Array.isArray(chain.pairs) ? chain.pairs : []) {
+        const tool = tools.get(pair.name) || { calls: 0, unmatched: 0, dup: 0, results: 0, chars: 0, max: 0 };
+        tool.calls += 1;
+        if (pair.has_result) {
+          tool.results += 1;
+          const text = pair.result_preview || "";
+          tool.chars += text.length;
+          tool.max = Math.max(tool.max, text.length);
+        } else {
+          tool.unmatched += 1;
+        }
+        const key = `${pair.name}::${pair.arguments_preview || ""}`;
+        if (seen.has(key)) tool.dup += 1;
+        seen.add(key);
+        tools.set(pair.name, tool);
+      }
+    }
+    const rows = [...tools.entries()].sort((a, b) => b[1].calls - a[1].calls);
+    tbody.innerHTML = rows
+      .map(
+        ([name, tool]) => `<tr>
+          <td class="mono">${esc(name)}</td>
+          <td class="num">${tool.calls}</td>
+          <td class="num${tool.unmatched ? " bad" : ""}">${tool.unmatched}</td>
+          <td class="num">${tool.dup}</td>
+          <td class="num">${tool.results}</td>
+          <td class="num">${compactNum(tool.chars)}</td>
+          <td class="num">${compactNum(tool.max)}</td>
+        </tr>`
+      )
+      .join("") || '<tr><td colspan="7"><div class="empty-line">该会话没有工具调用</div></td></tr>';
+    if (meta) meta.textContent = `基于 ${s.rows.length} 条提示词记录（结果字符合计为预览长度，供横向比较）`;
+    const report = $("#ses-tools-report");
+    if (report) {
+      report.textContent = ["| 工具 | 调用 | 未匹配 | 重复 | 结果 | 字符合计 | 单次最大 |", "| --- | --- | --- | --- | --- | --- | --- |"]
+        .concat(rows.map(([name, t]) => `| ${name} | ${t.calls} | ${t.unmatched} | ${t.dup} | ${t.results} | ${t.chars} | ${t.max} |`))
+        .join("\n");
     }
   }
 
-  async function vacuum() {
-    if (!confirm("回收 SQLite 空闲空间？大库可能耗时较久。")) return;
-    try {
-      const data = await api("/api/prompts/vacuum", { method: "POST", body: "{}" });
-      toast(`回收完成${data.before?.bytes && data.after?.bytes ? `：${(data.before.bytes / 1024 / 1024).toFixed(0)} → ${(data.after.bytes / 1024 / 1024).toFixed(0)} MB` : ""}`, "ok");
-    } catch (error) {
-      toast(error.message, "error");
-    }
+  // ───────────────────────── 页签 ─────────────────────────
+
+  function setTab(tab) {
+    s.tab = tab;
+    $$("#ses-tabs [data-ses-tab]").forEach((button) => button.classList.toggle("active", button.dataset.sesTab === tab));
+    const trace = $("#ses-pane-trace");
+    const diff = $("#ses-pane-diff");
+    const tools = $("#ses-pane-tools");
+    if (trace) trace.hidden = tab !== "trace";
+    if (diff) diff.hidden = tab !== "diff";
+    if (tools) tools.hidden = tab !== "tools";
   }
+
+  // ───────────────────────── 绑定 ─────────────────────────
+
+  let bound = false;
 
   function bind() {
     if (bound) return;
     bound = true;
-    restoreScope();
-    $("#prompts-refresh").addEventListener("click", () => {
-      if (p.tab === "list") loadList().catch((error) => toast(error.message, "error"));
-      else loadEvolution().catch((error) => toast(error.message, "error"));
+    $("#ses-range").addEventListener("change", () => {
+      s.range = $("#ses-range").value;
+      load().catch((error) => toast(error.message, "error"));
     });
-    $$("#prompt-tabs .seg-tab").forEach((button) => button.addEventListener("click", () => setTab(button.dataset.promptTab)));
-    $("#prompt-range").addEventListener("change", () => {
-      p.range = $("#prompt-range").value;
-      p.page = 1;
-      saveScope();
-      loadList().catch((error) => toast(error.message, "error"));
+    let searchTimer = null;
+    $("#ses-q").addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        s.q = $("#ses-q").value.trim();
+        load().catch(() => {});
+      }, 250);
     });
-    $("#prompt-model").addEventListener("change", () => {
-      p.model = $("#prompt-model").value;
-      p.page = 1;
-      loadList().catch((error) => toast(error.message, "error"));
+    $("#ses-refresh").addEventListener("click", () => load().catch((error) => toast(error.message, "error")));
+    $("#ses-export").addEventListener("click", () => {
+      const params = new URLSearchParams({ range: s.range });
+      if (s.q) params.set("q", s.q);
+      window.open(`/api/prompts/export?${params}`);
     });
-    $("#prompt-session").addEventListener("change", () => {
-      p.session = $("#prompt-session").value;
-      p.page = 1;
-      loadList().catch((error) => toast(error.message, "error"));
+
+    $("#ses-list").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-ses-key]");
+      if (item) openSession(item.dataset.sesKey).catch((error) => toast(error.message, "error"));
     });
-    $("#prompt-q").addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        p.q = $("#prompt-q").value.trim();
-        p.page = 1;
-        loadList().catch((error) => toast(error.message, "error"));
-      }
+    $("#ses-tabs").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-ses-tab]");
+      if (button) setTab(button.dataset.sesTab);
     });
-    $$("[data-prompt-page]").forEach((button) =>
-      button.addEventListener("click", () => {
-        const totalPages = pages();
-        if (button.dataset.promptPage === "first") p.page = 1;
-        if (button.dataset.promptPage === "prev") p.page = Math.max(1, p.page - 1);
-        if (button.dataset.promptPage === "next") p.page = Math.min(totalPages, p.page + 1);
-        if (button.dataset.promptPage === "last") p.page = totalPages;
-        loadList().catch((error) => toast(error.message, "error"));
-      })
-    );
-    $("#prompt-page-size").addEventListener("change", () => {
-      p.pageSize = Number($("#prompt-page-size").value) || 50;
-      p.page = 1;
-      saveScope();
-      loadList().catch((error) => toast(error.message, "error"));
+    $("#ses-detail-tabs").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-ses-dtab]");
+      if (button) setDetailTab(button.dataset.sesDtab);
     });
-    $("#prompt-table").addEventListener("click", (event) => {
-      const download = event.target.closest("[data-prompt-download]");
-      if (download) {
-        event.stopPropagation();
-        window.open(`/api/prompts/${encodeURIComponent(download.dataset.promptDownload)}/download`, "_blank");
-        return;
-      }
-      const row = event.target.closest("[data-prompt-id]");
-      if (row) showDetail(row.dataset.promptId);
+    $("#ses-nodes").addEventListener("click", (event) => {
+      const node = event.target.closest("[data-ses-node]");
+      if (node) openNode(node.dataset.sesNode, node.dataset.sesDtab).catch((error) => toast(error.message, "error"));
     });
-    // 导出按筛选范围全量导出，不带分页 offset。
-    $("#prompt-export").addEventListener("click", () => window.open(`/api/prompts/export?${query({ limit: 100000, offset: 0 })}`, "_blank"));
-    $("#prompt-clear").addEventListener("click", clearPrompts);
-    $("#prompt-vacuum").addEventListener("click", vacuum);
-    $("#evolution-session").addEventListener("change", () => {
-      p.baseId = "";
-      p.targetId = "";
-      loadEvolution().catch((error) => toast(error.message, "error"));
+    $("#ses-detail-body").addEventListener("click", (event) => {
+      const neighbor = event.target.closest("[data-ses-neighbor]");
+      if (neighbor) openNode(neighbor.dataset.sesNeighbor).catch((error) => toast(error.message, "error"));
+      if (event.target.closest("[data-ses-in-usage]")) MG.navigate("usage");
     });
-    $("#evolution-mode").addEventListener("change", renderTimeline);
-    $("#evolution-refresh").addEventListener("click", () => loadEvolution().catch((error) => toast(error.message, "error")));
-    $("#evolution-timeline").addEventListener("click", (event) => {
-      const base = event.target.closest("[data-evolution-base]");
-      const target = event.target.closest("[data-evolution-target]");
-      if (base) p.baseId = base.dataset.evolutionBase;
-      if (target) p.targetId = target.dataset.evolutionTarget;
-      if (base || target) {
-        renderTimeline();
-        renderEvolutionStats();
-        loadDiff().catch((error) => toast(error.message, "error"));
-      }
+    $("#ses-round-meta").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-ses-round]");
+      if (!button || button.disabled) return;
+      if (button.dataset.sesRound === "prev") s.roundIndex = Math.max(0, s.roundIndex - 1);
+      else s.roundIndex = Math.min(s.rounds.length - 1, s.roundIndex + 1);
+      renderRounds();
+      renderTrace();
     });
-    $("#evolution-role").addEventListener("change", () => p.diff && loadDiff().catch(() => {}));
-    $("#evolution-only-diff").addEventListener("change", () => p.diff && loadDiff().catch(() => {}));
-    $("#copy-tool-report").addEventListener("click", async () => {
-      await navigator.clipboard.writeText($("#evolution-tool-report").textContent);
+
+    $("#ses-diff-base").addEventListener("change", () => {
+      s.diff.base = $("#ses-diff-base").value;
+    });
+    $("#ses-diff-target").addEventListener("change", () => {
+      s.diff.target = $("#ses-diff-target").value;
+    });
+    $("#ses-diff-role").addEventListener("change", () => {
+      s.diff.role = $("#ses-diff-role").value;
+      if (s.diff.data) renderDiff();
+    });
+    $("#ses-diff-only").addEventListener("change", () => {
+      s.diff.only = $("#ses-diff-only").checked;
+      if (s.diff.data) renderDiff();
+    });
+    $("#ses-diff-run").addEventListener("click", () => runDiff());
+    $("#ses-tools-copy").addEventListener("click", async () => {
+      await navigator.clipboard.writeText($("#ses-tools-report").textContent || "");
       toast("评估报告已复制", "ok");
     });
+
+    // 记录维护按钮位于「设置 → 维护」。
+    $("#prompt-clear").addEventListener("click", async () => {
+      if (!confirm("清空全部提示词记录？不可恢复。")) return;
+      try {
+        await api("/api/prompts/clear", { method: "POST", body: "{}" });
+        toast("提示词记录已清空", "ok");
+        await load();
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    });
+    $("#prompt-vacuum").addEventListener("click", async () => {
+      try {
+        await api("/api/prompts/vacuum", { method: "POST", body: "{}" });
+        toast("已回收数据库空间", "ok");
+      } catch (error) {
+        toast(error.message, "error");
+      }
+    });
+
+    // 供请求抽屉 / 用量页跳转：定位指定会话。
+    MG.focusPromptSession = (key) => {
+      MG.pendingSession = key || "";
+      MG.navigate("sessions");
+    };
   }
 
-  // 请求抽屉「打开提示词」的落点：清掉会稀释关联的模型/搜索筛选，
-  // 把列表聚焦到该请求的会话。由 v4.js 在切视图后立即调用；
-  // 视图加载器若也在查列表，loadList 的序号守卫保证最终以这里的筛选为准。
-  MG.focusPromptSession = (session) => {
-    p.session = session || "";
-    p.model = "";
-    p.q = "";
-    p.page = 1;
-    if (p.tab !== "list") setTab("list");
-    const sessionHost = $("#prompt-session");
-    if (sessionHost) sessionHost.value = p.session;
-    const modelHost = $("#prompt-model");
-    if (modelHost) modelHost.value = "";
-    const search = $("#prompt-q");
-    if (search) search.value = "";
-    loadList().catch((error) => toast(error.message, "error"));
-  };
-
-  MG.registerView("prompts", async () => {
-    await MG.refreshConfig();
-    const capture = stateCaptureEnabled();
-    $("#prompt-disabled").hidden = capture;
-    if (!capture) {
-      $("#prompt-table tbody").innerHTML = `<tr><td colspan="7"><div class="empty-line">提示词记录未开启。</div></td></tr>`;
-      return;
-    }
-    await loadList();
-    const evoHost = $("#evolution-session");
-    if (evoHost) {
-      evoHost.innerHTML = `<option value="">选择会话</option>${p.facets.sessions
-        .slice(0, 300)
-        .map((session) => `<option value="${esc(session)}" ${session === p.session ? "selected" : ""}>${esc(session)}</option>`)
-        .join("")}`;
-    }
-    if (p.tab === "evolution") await loadEvolution();
+  MG.registerView("sessions", async () => {
+    if (!bound) bind();
+    await load();
   });
-
-  function stateCaptureEnabled() {
-    return Boolean(MG.state?.config?.promptCapture);
-  }
 
   document.addEventListener("DOMContentLoaded", bind);
 })();

@@ -1,11 +1,12 @@
 //! 插件登记、manifest 校验与幂等接入。
 //!
-//! 五条规则（docs/architecture/plugin-system.md）：
+//! 包化规则（控制台重构定稿）：插件的意义是「可导入生效」，内置也不例外。
 //! 1. 安装/卸载不执行 DDL；
 //! 2. 插件不直接写 bridge.config.json，接入必须经 attach；
 //! 3. 插件不接管自己的配置存储；
-//! 4. 卸载默认保留用户资产与上游条目；
-//! 5. native 插件不可卸载，只能禁用。
+//! 4. 卸载前必须先分离插件创建的上游（防悬空引用）；
+//! 5. 内置插件可停用、可移除：移除 = `removed=1`（登记保留、入口隐藏，内置库可重装）；
+//!    导入插件移除 = 删除登记行。卸载默认保留用户资产与凭据。
 //!
 //! 设计增量（docs/design/refactor-2026/03-plugin-token-pool.md）：
 //! - manifest 可声明 `auth.mode = pool` 与池默认值；
@@ -23,6 +24,7 @@ use serde_json::{json, Map, Value};
 
 use crate::access;
 use crate::config::Config;
+use crate::db::Db;
 use crate::proxy::{error_json, AppState};
 
 /// AI/面板共用的计划输出。
@@ -239,22 +241,39 @@ fn validate_manifest(manifest: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn stored_plugins(state: &AppState) -> Vec<(String, Value, bool)> {
-    let conn = state.db.read_conn();
+/// plugins 表中的一行登记。removed=1 只会出现在内置插件上：入口隐藏但定义保留，可重装。
+struct StoredPlugin {
+    id: String,
+    manifest: Value,
+    enabled: bool,
+    removed: bool,
+    source: String,
+}
+
+fn stored_plugins(db: &Db) -> Vec<StoredPlugin> {
+    let conn = db.read_conn();
     let mut out = Vec::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT id, manifest_json, enabled FROM plugins ORDER BY installed_at")
-    {
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, manifest_json, enabled, removed, source FROM plugins ORDER BY installed_at",
+    ) {
         if let Ok(rows) = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, String>(4)?,
             ))
         }) {
-            for (id, text, enabled) in rows.flatten() {
+            for (id, text, enabled, removed, source) in rows.flatten() {
                 if let Ok(manifest) = serde_json::from_str::<Value>(&text) {
-                    out.push((id, manifest, enabled));
+                    out.push(StoredPlugin {
+                        id,
+                        manifest,
+                        enabled,
+                        removed,
+                        source,
+                    });
                 }
             }
         }
@@ -262,27 +281,42 @@ fn stored_plugins(state: &AppState) -> Vec<(String, Value, bool)> {
     out
 }
 
+fn stored_row(db: &Db, id: &str) -> Option<StoredPlugin> {
+    stored_plugins(db).into_iter().find(|p| p.id == id)
+}
+
+fn is_builtin(id: &str) -> bool {
+    builtin_manifests()
+        .iter()
+        .any(|m| m.get("id").and_then(Value::as_str) == Some(id))
+}
+
+fn is_removed(db: &Db, id: &str) -> bool {
+    stored_row(db, id).map(|p| p.removed).unwrap_or(false)
+}
+
 fn find_manifest(state: &AppState, id: &str) -> Option<(Value, bool, bool)> {
     if let Some(manifest) = builtin_manifests()
         .into_iter()
         .find(|manifest| manifest["id"] == id)
     {
-        let stored = stored_plugins(state);
-        let (enabled, installed) = stored
-            .iter()
-            .find(|(stored_id, _, _)| stored_id == id)
-            .map(|(_, _, enabled)| (*enabled, true))
-            .unwrap_or((true, false));
+        let (enabled, installed) = match stored_row(&state.db, id) {
+            Some(row) => (row.enabled, true),
+            None => (true, false),
+        };
         return Some((manifest, enabled, installed));
     }
-    stored_plugins(state)
+    stored_plugins(&state.db)
         .into_iter()
-        .find(|(stored_id, _, _)| stored_id == id)
-        .map(|(_, manifest, enabled)| (manifest, enabled, true))
+        .find(|p| p.id == id && !p.removed)
+        .map(|p| (p.manifest, p.enabled, true))
 }
 
-/// 供 AI 计划注入 manifest：只返回 manifest 本身（已禁止密钥字段）。
+/// 供 AI 计划注入 manifest：只返回 manifest 本身（已禁止密钥字段）；已移除的内置插件不再参与计划。
 pub fn manifest_for(state: &AppState, id: &str) -> Option<Value> {
+    if is_removed(&state.db, id) {
+        return None;
+    }
     find_manifest(state, id).map(|(manifest, _, _)| manifest)
 }
 
@@ -304,6 +338,7 @@ fn attached_upstreams(state: &AppState, plugin_id: &str) -> Vec<String> {
 
 fn plugin_summary(state: &AppState, manifest: &Value, enabled: bool, installed: bool) -> Value {
     let id = manifest.get("id").and_then(Value::as_str).unwrap_or("");
+    let row = stored_row(&state.db, id);
     json!({
         "id": id,
         "name": manifest.get("name").and_then(Value::as_str).unwrap_or(id),
@@ -313,7 +348,10 @@ fn plugin_summary(state: &AppState, manifest: &Value, enabled: bool, installed: 
         "tier": manifest.get("tier").and_then(Value::as_str).unwrap_or("declarative"),
         "enabled": enabled,
         "installed": installed,
-        "builtin": !installed,
+        "builtin": is_builtin(id),
+        "removed": row.as_ref().map(|r| r.removed).unwrap_or(false),
+        "source": row.as_ref().map(|r| r.source.as_str()).unwrap_or("builtin"),
+        "removable": true,
         "attached": attached_upstreams(state, id),
     })
 }
@@ -704,24 +742,27 @@ pub fn apply_detach(state: &AppState, output: &Value) -> Result<Value, Response>
 // ─────────────────────────── HTTP API ───────────────────────────
 
 pub async fn list(State(state): State<Arc<AppState>>) -> Response {
-    let mut items: Vec<Value> = builtin_manifests()
-        .iter()
-        .map(|manifest| plugin_summary(&state, manifest, true, false))
-        .collect();
-    for (id, manifest, enabled) in stored_plugins(&state) {
-        if let Some(existing) = items
-            .iter_mut()
-            .find(|row| row.get("id").and_then(Value::as_str) == Some(id.as_str()))
-        {
-            *existing = plugin_summary(&state, &manifest, enabled, true);
-        } else {
-            items.push(plugin_summary(&state, &manifest, enabled, true));
+    let stored = stored_plugins(&state.db);
+    let mut items: Vec<Value> = Vec::new();
+    let mut library: Vec<Value> = Vec::new();
+    for manifest in builtin_manifests().iter() {
+        let id = manifest.get("id").and_then(Value::as_str).unwrap_or("");
+        match stored.iter().find(|row| row.id == id) {
+            Some(row) if row.removed => {
+                library.push(plugin_summary(&state, manifest, false, true));
+            }
+            Some(row) => items.push(plugin_summary(&state, manifest, row.enabled, true)),
+            None => items.push(plugin_summary(&state, manifest, true, false)),
         }
+    }
+    for row in stored.iter().filter(|row| !row.removed && !is_builtin(&row.id)) {
+        items.push(plugin_summary(&state, &row.manifest, row.enabled, true));
     }
     Json(json!({
         "items": items,
+        "library": library,
         "total": items.len(),
-        "note": "安装不会修改你的配置；接入才会创建上游。",
+        "note": "安装只登记不生效；接入才会创建上游。内置插件可停用/移除，移除后在内置库重装。",
     }))
     .into_response()
 }
@@ -739,12 +780,15 @@ pub async fn detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
     Json(json!({ "plugin": value })).into_response()
 }
 
-pub async fn install(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let manifest = body.get("manifest").cloned().unwrap_or(body);
-    if let Err(message) = validate_manifest(&manifest) {
-        return plugin_error(StatusCode::BAD_REQUEST, message, "invalid_manifest");
-    }
-    let id = manifest["id"].as_str().unwrap_or("");
+/// 统一登记入口：install / 内置启停 / 移除 / 重装 / 导入 都落到这里。
+fn register_manifest(
+    db: &Db,
+    manifest: &Value,
+    source: &str,
+    enabled: bool,
+    removed: bool,
+) -> Result<(), String> {
+    let id = manifest.get("id").and_then(Value::as_str).unwrap_or("");
     let version = manifest
         .get("version")
         .and_then(Value::as_str)
@@ -758,9 +802,9 @@ pub async fn install(State(state): State<Arc<AppState>>, Json(body): Json<Value>
         .and_then(Value::as_str)
         .unwrap_or("declarative");
     let now = now_text();
-    let conn = state.db.write_conn();
+    let conn = db.write_conn();
     let result = conn.execute(
-        "INSERT INTO plugins (id, version, kind, tier, name, manifest_json, enabled, source, installed_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 'local', ?7, ?7) ON CONFLICT(id) DO UPDATE SET version = excluded.version, kind = excluded.kind, tier = excluded.tier, name = excluded.name, manifest_json = excluded.manifest_json, updated_at = excluded.updated_at",
+        "INSERT INTO plugins (id, version, kind, tier, name, manifest_json, enabled, removed, source, installed_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10) ON CONFLICT(id) DO UPDATE SET version = excluded.version, kind = excluded.kind, tier = excluded.tier, name = excluded.name, manifest_json = excluded.manifest_json, enabled = excluded.enabled, removed = excluded.removed, source = excluded.source, updated_at = excluded.updated_at",
         rusqlite::params![
             id,
             version,
@@ -768,35 +812,146 @@ pub async fn install(State(state): State<Arc<AppState>>, Json(body): Json<Value>
             tier,
             manifest.get("name").and_then(Value::as_str).unwrap_or(id),
             manifest.to_string(),
+            if enabled { 1 } else { 0 },
+            if removed { 1 } else { 0 },
+            source,
             now,
         ],
     );
     drop(conn);
-    match result {
-        Ok(_) => {
-            let _ = crate::credential_pool::record_audit(
-                &state,
-                "ui",
-                "plugin_install",
-                None,
-                &format!("plugins.{id}"),
-                &["manifest".to_string()],
-                "ok",
-                None,
-            );
-            Json(json!({
-                "ok": true,
-                "plugin": plugin_summary(&state, &manifest, true, true),
-                "note": "已登记；接入请调用 attach。",
-            }))
-            .into_response()
-        }
-        Err(err) => plugin_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("插件登记失败: {err}"),
-            "plugin_write_failed",
-        ),
+    result.map(|_| ()).map_err(|err| format!("插件登记失败: {err}"))
+}
+
+pub async fn install(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let manifest = body.get("manifest").cloned().unwrap_or(body);
+    if let Err(message) = validate_manifest(&manifest) {
+        return plugin_error(StatusCode::BAD_REQUEST, message, "invalid_manifest");
     }
+    let id = manifest["id"].as_str().unwrap_or("").to_string();
+    if let Err(message) = register_manifest(&state.db, &manifest, "local", true, false) {
+        return plugin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "plugin_write_failed",
+        );
+    }
+    let _ = crate::credential_pool::record_audit(
+        &state,
+        "ui",
+        "plugin_install",
+        None,
+        &format!("plugins.{id}"),
+        &["manifest".to_string()],
+        "ok",
+        None,
+    );
+    Json(json!({
+        "ok": true,
+        "plugin": plugin_summary(&state, &manifest, true, true),
+        "note": "已登记并启用；接入请调用 attach。",
+    }))
+    .into_response()
+}
+
+/// 从本地目录导入插件包：读取 <path>/manifest.json，校验后以 source=import 登记。
+pub async fn import(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if path.is_empty() {
+        return plugin_error(
+            StatusCode::BAD_REQUEST,
+            "缺少 path：插件目录（内含 manifest.json）",
+            "missing_path",
+        );
+    }
+    let manifest_path = std::path::Path::new(path).join("manifest.json");
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return plugin_error(
+                StatusCode::BAD_REQUEST,
+                format!("读取 {} 失败: {err}", manifest_path.display()),
+                "manifest_unreadable",
+            );
+        }
+    };
+    let manifest: Value = match serde_json::from_str(&text) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return plugin_error(
+                StatusCode::BAD_REQUEST,
+                format!("manifest.json 解析失败: {err}"),
+                "invalid_manifest",
+            );
+        }
+    };
+    if let Err(message) = validate_manifest(&manifest) {
+        return plugin_error(StatusCode::BAD_REQUEST, message, "invalid_manifest");
+    }
+    let id = manifest["id"].as_str().unwrap_or("").to_string();
+    if let Err(message) = register_manifest(&state.db, &manifest, "import", true, false) {
+        return plugin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "plugin_write_failed",
+        );
+    }
+    let _ = crate::credential_pool::record_audit(
+        &state,
+        "ui",
+        "plugin_import",
+        None,
+        &format!("plugins.{id}"),
+        &[path.to_string()],
+        "ok",
+        None,
+    );
+    Json(json!({
+        "ok": true,
+        "plugin": plugin_summary(&state, &manifest, true, true),
+        "note": "导入完成并启用；接入请调用 attach。",
+    }))
+    .into_response()
+}
+
+/// 内置库重装：清除 removed 标记并重新启用。
+pub async fn restore(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Some(manifest) = builtin_manifests()
+        .into_iter()
+        .find(|manifest| manifest["id"] == id)
+    else {
+        return plugin_error(
+            StatusCode::BAD_REQUEST,
+            "只有内置插件支持从内置库重装",
+            "not_builtin",
+        );
+    };
+    if let Err(message) = register_manifest(&state.db, &manifest, "builtin", true, false) {
+        return plugin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            "plugin_write_failed",
+        );
+    }
+    let _ = crate::credential_pool::record_audit(
+        &state,
+        "ui",
+        "plugin_restore",
+        None,
+        &format!("plugins.{id}"),
+        &[],
+        "ok",
+        None,
+    );
+    Json(json!({
+        "ok": true,
+        "plugin": plugin_summary(&state, &manifest, true, true),
+        "note": "已从内置库重装并启用。",
+    }))
+    .into_response()
 }
 
 pub async fn set_enabled(
@@ -812,65 +967,106 @@ pub async fn set_enabled(
             "plugin_not_found",
         );
     };
-    if !installed {
+    if is_removed(&state.db, &id) {
         return plugin_error(
-            StatusCode::BAD_REQUEST,
-            "内置插件不能修改状态；native 插件只能整体禁用配置",
-            "builtin_immutable",
+            StatusCode::CONFLICT,
+            "插件已移除；请先在内置库重装",
+            "plugin_removed",
         );
     }
-    let conn = state.db.write_conn();
-    let changed = conn.execute(
-        "UPDATE plugins SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
-        rusqlite::params![id, if enabled { 1 } else { 0 }, now_text()],
-    );
-    drop(conn);
-    match changed {
-        Ok(0) => plugin_error(StatusCode::NOT_FOUND, "插件不存在", "plugin_not_found"),
-        Ok(_) => Json(json!({
-            "ok": true,
-            "plugin": plugin_summary(&state, &manifest, enabled, true),
-        }))
-        .into_response(),
-        Err(err) => plugin_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("更新失败: {err}"),
-            "plugin_write_failed",
-        ),
+    if installed {
+        let conn = state.db.write_conn();
+        let changed = conn.execute(
+            "UPDATE plugins SET enabled = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id, if enabled { 1 } else { 0 }, now_text()],
+        );
+        drop(conn);
+        if let Err(err) = changed {
+            return plugin_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("更新失败: {err}"),
+                "plugin_write_failed",
+            );
+        }
+    } else {
+        // 内置插件未登记过：先以当前内置 manifest 登记一行，再落到目标状态。
+        if let Err(message) = register_manifest(&state.db, &manifest, "builtin", enabled, false) {
+            return plugin_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                "plugin_write_failed",
+            );
+        }
     }
+    Json(json!({
+        "ok": true,
+        "plugin": plugin_summary(&state, &manifest, enabled, true),
+    }))
+    .into_response()
 }
 
 pub async fn uninstall(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let Some((manifest, _, installed)) = find_manifest(&state, &id) else {
+    let Some((manifest, _, _)) = find_manifest(&state, &id) else {
         return plugin_error(
             StatusCode::NOT_FOUND,
             format!("插件「{id}」不存在"),
             "plugin_not_found",
         );
     };
-    if !installed {
+    let attached = attached_upstreams(&state, &id);
+    if !attached.is_empty() {
         return plugin_error(
-            StatusCode::BAD_REQUEST,
-            "内置插件不可卸载",
-            "builtin_immutable",
+            StatusCode::CONFLICT,
+            format!("请先分离插件创建的上游：{}", attached.join("、")),
+            "plugin_attached",
         );
     }
-    if manifest.get("tier").and_then(Value::as_str) == Some("native") {
-        return plugin_error(
-            StatusCode::BAD_REQUEST,
-            "native 插件不可卸载，只能禁用",
-            "native_not_removable",
+    if is_builtin(&id) {
+        // 内置插件：登记保留、入口隐藏，可在内置库重装。
+        if let Err(message) = register_manifest(&state.db, &manifest, "builtin", false, true) {
+            return plugin_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                "plugin_write_failed",
+            );
+        }
+        let _ = crate::credential_pool::record_audit(
+            &state,
+            "ui",
+            "plugin_remove",
+            None,
+            &format!("plugins.{id}"),
+            &[],
+            "ok",
+            None,
         );
+        Json(json!({
+            "ok": true,
+            "removed": id,
+            "note": "已移除内置插件；可在插件页「内置库」重装。",
+        }))
+        .into_response()
+    } else {
+        let conn = state.db.write_conn();
+        let _ = conn.execute("DELETE FROM plugins WHERE id = ?1", [&id]);
+        drop(conn);
+        let _ = crate::credential_pool::record_audit(
+            &state,
+            "ui",
+            "plugin_remove",
+            None,
+            &format!("plugins.{id}"),
+            &[],
+            "ok",
+            None,
+        );
+        Json(json!({
+            "ok": true,
+            "removed": id,
+            "note": "已卸载插件；已创建的上游与凭据按规则保留。",
+        }))
+        .into_response()
     }
-    let conn = state.db.write_conn();
-    let _ = conn.execute("DELETE FROM plugins WHERE id = ?1", [&id]);
-    drop(conn);
-    Json(json!({
-        "ok": true,
-        "removed": id,
-        "note": "已卸载插件；已创建的上游与凭据按规则保留。",
-    }))
-    .into_response()
 }
 
 /// 面板直接接入（内部仍走同一装配与保存管线）。
@@ -886,6 +1082,13 @@ pub async fn attach(
             "plugin_not_found",
         );
     };
+    if is_removed(&state.db, &id) {
+        return plugin_error(
+            StatusCode::CONFLICT,
+            "插件已移除；请先在内置库重装",
+            "plugin_removed",
+        );
+    }
     if !enabled {
         return plugin_error(
             StatusCode::BAD_REQUEST,
@@ -942,6 +1145,59 @@ pub async fn detach(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_plugin_db() -> Db {
+        let dir = std::env::temp_dir().join(format!("mg-plugin-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Db::open(&dir.join("modelgate.db")).unwrap()
+    }
+
+    /// 包化生命周期：内置插件 停用 → 移除 → 重装 全程不丢定义。
+    #[test]
+    fn builtin_plugin_package_lifecycle() {
+        let db = temp_plugin_db();
+        let manifest = builtin_manifests()
+            .into_iter()
+            .find(|m| m["id"] == "modelgate.free.kilo")
+            .unwrap();
+
+        // 停用未登记的内置插件：登记一行 enabled=0（不再是 builtin_immutable）。
+        register_manifest(&db, &manifest, "builtin", false, false).unwrap();
+        let row = stored_row(&db, "modelgate.free.kilo").expect("停用应登记一行");
+        assert!(!row.enabled && !row.removed);
+
+        // 移除：removed=1，定义保留在登记行里。
+        register_manifest(&db, &manifest, "builtin", false, true).unwrap();
+        let row = stored_row(&db, "modelgate.free.kilo").unwrap();
+        assert!(row.removed, "移除后应标记 removed");
+
+        // 重装：removed 清零并重新启用。
+        register_manifest(&db, &manifest, "builtin", true, false).unwrap();
+        let row = stored_row(&db, "modelgate.free.kilo").unwrap();
+        assert!(!row.removed && row.enabled, "重装后应恢复启用");
+    }
+
+    /// 卸载守卫：native 内置不再被 native_not_removable 拦截（由调用层按 is_builtin 走 removed 路径）；
+    /// 已登记的导入插件卸载走删除。这里直接验证存储层语义。
+    #[test]
+    fn imported_plugin_uninstall_deletes_row() {
+        let db = temp_plugin_db();
+        let manifest = json!({
+            "schema": "modelgate.plugin/v1",
+            "id": "test.imported",
+            "kind": "provider",
+            "tier": "declarative",
+            "auth": {"mode": "single"},
+            "upstream": {"protocol": "openai", "baseUrl": "https://x"}
+        });
+        register_manifest(&db, &manifest, "import", true, false).unwrap();
+        assert!(stored_row(&db, "test.imported").is_some());
+        let conn = db.write_conn();
+        conn.execute("DELETE FROM plugins WHERE id = ?1", ["test.imported"])
+            .unwrap();
+        drop(conn);
+        assert!(stored_row(&db, "test.imported").is_none(), "导入插件卸载即删行");
+    }
 
     #[test]
     fn builtin_manifests_are_valid_and_secret_free() {
