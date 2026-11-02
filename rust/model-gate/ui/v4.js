@@ -562,6 +562,7 @@
 
   function bindEvents() {
     $("#global-search").addEventListener("click", openCmdk);
+    let gPending = false;
     document.addEventListener("keydown", (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
@@ -570,6 +571,24 @@
       if (event.key === "Escape") {
         closeCmdk();
         closeRequestDrawer();
+      }
+      // g→键位跳转：g u/s/a/p/e = 用量/会话/接入/插件/设置。
+      const target = event.target;
+      const typing = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable);
+      if (typing || event.ctrlKey || event.metaKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "g" && !gPending) {
+        gPending = true;
+        setTimeout(() => { gPending = false; }, 1200);
+        return;
+      }
+      if (gPending) {
+        gPending = false;
+        const map = { u: "usage", s: "sessions", a: "access", p: "plugins", e: "settings" };
+        if (map[key]) {
+          event.preventDefault();
+          MG.navigate(map[key]);
+        }
       }
     });
 

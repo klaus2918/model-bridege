@@ -6,13 +6,15 @@
  *   node scripts/ui_smoke_v4.js --base http://127.0.0.1:8913
  *   node scripts/ui_smoke_v4.js --base http://127.0.0.1:8913 --screenshot-dir .tmp/v4-shots
  *
- * 前置：base 指向一个已启动的 Model-Gate 实例（v4 为唯一入口，/ui/ 直接是 v4）。
- * 覆盖：页面无 JS 异常、六项一级导航、总览、命令面板、配置中心任务板、
- *       模型目录/单价表、统一入口与路由组、接入列表与详情抽屉、用量分析、
- *       提示词、日志与诊断、设置、凭据池/插件/免费来源/模板/ZCode、快捷键与截图。
+ * 前置：base 指向一个已启动的 Model-Gate 实例（/ui/ 即控制台）。
+ * 覆盖：页面无 JS 异常、五项一级导航（用量/会话/接入/插件/设置）、用量页
+ *       （范围/KPI/统计卡/明细 + localStorage 记忆）、命令面板、会话页三页签、
+ *       接入卡片与详情抽屉、次级页签（模型/定价/凭据池/免费来源/模板）、
+ *       插件包管理与 ZCode 面板、路由与入口、设置与校验、维护页日志诊断、
+ *       g→快捷键、窄屏布局与截图。
  *
- * 说明：v4 把低频配置收进「配置中心」，因此这里的视图校验按 v4 信息架构进行，
- *       不再按 v3 的十二个一级导航逐项点击。
+ * 说明：冒烟按 4.3 新信息架构断言；干净实例（无请求、promptCapture=false）
+ *       与有数据实例都必须通过，空态与数据态同等校验。
  */
 "use strict";
 
@@ -311,7 +313,7 @@ async function main() {
   await cdp.send("Page.navigate", { url: `${base}/ui/` });
   await Promise.race([loaded, sleep(12000).then(() => { throw new Error("页面加载超时"); })]);
   await waitFor(
-    () => evaluate(`document.documentElement.dataset.ui === "v4" && !!document.querySelector("#view-overview.active")`),
+    () => evaluate(`document.documentElement.dataset.ui === "v4" && !!document.querySelector("#view-usage.active")`),
     15000,
     "v4 前端初始化"
   );
@@ -322,33 +324,34 @@ async function main() {
     return "0 个错误";
   });
 
-  await check("一级导航 6 项 / 4 组", async () => {
+  await check("一级导航 5 项（用量/会话/接入/插件/设置）", async () => {
     const data = await evaluate(`({
       views: Array.from(document.querySelectorAll(".nav-item")).map((b) => b.dataset.view),
-      groups: Array.from(document.querySelectorAll(".nav-label")).map((el) => el.textContent.trim()),
+      labels: document.querySelectorAll(".nav-label").length,
     })`);
-    const expected = ["overview", "traffic", "prompts", "access", "logs", "config"];
-    for (const view of expected) {
-      if (!data.views.includes(view)) throw new Error(`缺少一级导航 ${view}`);
+    const expected = ["usage", "sessions", "access", "plugins", "settings"];
+    if (JSON.stringify(data.views) !== JSON.stringify(expected)) {
+      throw new Error(`导航异常：${data.views.join("/")}`);
     }
-    if (data.views.length !== 6) throw new Error(`一级导航数量异常：${data.views.length}`);
-    if (data.groups.length !== 4) throw new Error(`导航分组异常：${data.groups.join("/")}`);
-    return `${data.views.length} 项 / ${data.groups.length} 组`;
+    if (data.labels !== 0) throw new Error(`不应再有侧栏分组标签：${data.labels}`);
+    return "5 项 / 顶部单行导航";
   });
 
-  await check("总览：状态带 + 4 KPI + 健康表 + 最近请求", async () => {
-    await waitFor(() => evaluate(`document.querySelectorAll("#ov-kpis .ov-kpi").length === 4`), 8000, "总览 KPI");
-    const stats = await evaluate(`({
-      kpis: document.querySelectorAll("#ov-kpis .ov-kpi").length,
-      health: document.querySelectorAll("#ov-health .health-row").length,
-      recent: document.querySelectorAll("#ov-recent .mini-row").length,
-      snapshot: (document.querySelector("#ov-snapshot")?.textContent || "").trim().length,
-      hero: (document.querySelector("#ov-hero")?.textContent || "").trim(),
+  await check("用量页：范围 / KPI / 统计卡 / 明细", async () => {
+    await waitFor(() => evaluate(`document.querySelectorAll("#usage-kpis > div").length >= 5`), 8000, "用量 KPI");
+    const data = await evaluate(`({
+      kpis: document.querySelectorAll("#usage-kpis > div").length,
+      ranges: document.querySelectorAll("#usage-range [data-usage-range]").length,
+      statModels: (document.querySelector("#usage-stat-models")?.textContent || "").trim().length,
+      statUpstreams: (document.querySelector("#usage-stat-upstreams")?.textContent || "").trim().length,
+      detailRows: document.querySelectorAll("#usage-detail-table tbody tr").length,
+      detailEmpty: !!document.querySelector("#usage-detail-table .empty-line"),
     })`);
-    if (!stats.health) throw new Error("接入健康表为空");
-    if (!stats.snapshot) throw new Error("用量快照为空");
-    await screenshot("v4-01-overview");
-    return `${stats.kpis} KPI / ${stats.health} 接入 / ${stats.recent} 请求 / 「${stats.hero}」`;
+    if (data.ranges !== 6) throw new Error(`时间范围档位异常：${data.ranges}`);
+    if (!data.statModels || !data.statUpstreams) throw new Error("统计卡为空（既无数据也无空态）");
+    if (!data.detailRows && !data.detailEmpty) throw new Error("明细既没有行也没有空态");
+    await screenshot("v4-01-usage");
+    return `${data.kpis} KPI / ${data.ranges} 档范围 / ${data.detailRows || "空态"} 明细`;
   });
 
   await check("命令面板（⌘K）可搜索并跳转", async () => {
@@ -356,7 +359,7 @@ async function main() {
     await waitFor(() => evaluate(`!!document.querySelector("#v4-cmdk") && !document.querySelector("#v4-cmdk").hidden`), 3000, "命令面板");
     await evaluate(`(() => {
       const input = document.querySelector("#v4-cmdk-input");
-      input.value = "模型";
+      input.value = "接入";
       input.dispatchEvent(new Event("input", { bubbles: true }));
     })()`);
     await waitFor(() => evaluate(`document.querySelectorAll("#v4-cmdk-list [data-cmdk]").length > 0`), 3000, "命令面板结果");
@@ -367,180 +370,115 @@ async function main() {
     return `${n} 条结果`;
   });
 
-  await check("配置中心：四张域卡片 + 常用任务", async () => {
-    await navigate("config");
-    await waitFor(() => evaluate(`document.querySelectorAll("#config-domains [data-domain]").length === 4`), 8000, "配置域卡片");
-    const data = await evaluate(`({
-      domains: document.querySelectorAll("#config-domains [data-domain]").length,
-      tasks: document.querySelectorAll("#config-tasks [data-task]").length,
-      changes: document.querySelectorAll("#config-changes .change-row, #config-changes .row, #config-changes li").length,
-    })`);
-    if (!data.tasks) throw new Error("常用任务为空");
-    await screenshot("v4-03-config");
-    return `${data.domains} 个域 / ${data.tasks} 个任务 / ${data.changes} 条变更`;
-  });
-
-  const openConfig = async (sub, view) => {
-    await navigate("config");
-    await waitFor(() => evaluate(`!document.querySelector("#config-subbar").hidden`), 4000, "配置中心子导航");
-    const link = `#config-subnav [data-config-sub="${sub}"]`;
-    const exists = await evaluate(`!!document.querySelector(${JSON.stringify(link)})`);
-    if (!exists) throw new Error(`配置中心缺少子页 ${sub}`);
-    await click(link);
+  await check("会话页：三页签与列表（空态/数据态）", async () => {
+    await navigate("sessions");
+    await waitFor(() => evaluate(`document.querySelectorAll("#ses-tabs .seg-tab").length === 3`), 6000, "会话页签");
     await waitFor(
-      () => evaluate(`document.querySelector("#view-${view}")?.classList.contains("active")`),
-      6000,
-      `${sub} 视图`
+      () => evaluate(`document.querySelectorAll("#ses-list .ses-item").length > 0 || !!document.querySelector("#ses-list .empty-line")`),
+      8000,
+      "会话列表"
     );
-  };
-
-  await check("模型目录与单价表", async () => {
-    await openConfig("models", "models");
-    await waitFor(() => evaluate(`!document.querySelector("#model-catalog-panel").hidden`), 5000, "模型目录面板");
-    await waitFor(() => evaluate(`document.querySelectorAll("#model-catalog-table tbody tr").length > 0`), 6000, "模型表格");
-    const rows = await evaluate(`document.querySelectorAll("#model-catalog-table tbody tr").length`);
-    const kpis = await evaluate(`document.querySelectorAll("#model-kpis .stat, #model-kpis .model-kpi").length`);
-    await screenshot("v4-04-models");
-    await click(`#model-tabs [data-model-tab="pricing"]`);
-    await waitFor(() => evaluate(`!document.querySelector("#model-pricing-panel").hidden`), 4000, "单价表面板");
-    await screenshot("v4-05-pricing");
-    return `${rows} 行模型 / ${kpis} 个 KPI`;
+    const data = await evaluate(`({
+      items: document.querySelectorAll("#ses-list .ses-item").length,
+      empty: (document.querySelector("#ses-list .empty-line")?.textContent || "").trim(),
+      lanes: document.querySelectorAll("#ses-lanes .ses-lane").length,
+      traceVisible: !document.getElementById("ses-pane-trace").hidden,
+    })`);
+    for (const tab of ["diff", "tools"]) {
+      await click(`#ses-tabs [data-ses-tab="${tab}"]`);
+      await waitFor(() => evaluate(`!document.querySelector("#ses-pane-${tab}").hidden`), 4000, `页签 ${tab}`);
+    }
+    await click(`#ses-tabs [data-ses-tab="trace"]`);
+    await screenshot("v4-03-sessions");
+    return `${data.items || data.empty} / ${data.lanes || 0} 条 lanes / 三页签可切换`;
   });
 
-  await check("统一入口与路由组", async () => {
-    await openConfig("routes", "routes");
-    const matrix = await evaluate(`document.querySelectorAll("#unified-matrix .matrix-row").length`);
-    await evaluate(`(() => {
-      const input = document.querySelector("#route-preview-input");
-      input.value = "group/fast";
-      document.querySelector("#route-preview-run").click();
-    })()`);
-    await sleep(400);
-    const preview = await evaluate(`(document.querySelector("#route-preview-result")?.textContent || "").trim().length`);
-    if (!preview) throw new Error("生效预览没有输出");
-    return `${matrix} 行可见矩阵 / 预览 ${preview} 字符`;
-  });
-
-  await check("接入列表与详情抽屉（6 页签）", async () => {
+  await check("接入页：卡片网格与详情抽屉", async () => {
     await navigate("access");
-    await waitFor(() => evaluate(`document.querySelectorAll("#access-table tbody tr").length > 0`), 8000, "接入表格");
-    const rows = await evaluate(`document.querySelectorAll("#access-table tbody tr").length`);
-    await screenshot("v4-06-access");
-    await evaluate(`(() => {
-      const row = document.querySelector("#access-table tbody tr");
-      (row.querySelector("button, td") || row).click();
-    })()`);
+    await waitFor(() => evaluate(`document.querySelectorAll("#access-cards .acc-card").length >= 1`), 8000, "接入卡片");
+    const data = await evaluate(`({
+      cards: document.querySelectorAll("#access-cards .acc-card").length,
+      tabs: document.querySelectorAll("#access-tabs .seg-tab").length,
+    })`);
+    if (data.tabs !== 5) throw new Error(`次级页签数量异常：${data.tabs}`);
+    await evaluate(`document.querySelector("#access-cards .acc-card").click()`);
     await waitFor(() => evaluate(`!document.querySelector("#drawer").hidden`), 4000, "接入详情抽屉");
     const tabs = await evaluate(`Array.from(document.querySelectorAll(".drawer-tab")).map((b) => b.dataset.dtab)`);
     if (tabs.length < 6) throw new Error(`抽屉页签不足：${tabs.join("/")}`);
     await click('.drawer-tab[data-dtab="connection"]');
     await click('.drawer-tab[data-dtab="models"]');
     await click('.drawer-tab[data-dtab="advanced"]');
-    await screenshot("v4-07-drawer");
+    await screenshot("v4-04-access-drawer");
     await evaluate(`document.querySelector("#drawer-close").click()`);
     await waitFor(() => evaluate(`document.querySelector("#drawer").hidden`), 3000, "关闭抽屉");
-    return `${rows} 行接入 / 页签 ${tabs.join("·")}`;
-  });
-
-  await check("用量分析：KPI / 趋势 / 明细 / 请求抽屉", async () => {
-    await navigate("traffic");
-    await waitFor(() => evaluate(`document.querySelectorAll("#usage-kpis .usage-kpi").length === 5`), 8000, "用量 KPI");
-    const kpis = await evaluate(`document.querySelectorAll("#usage-kpis .usage-kpi").length`);
-    const bars = await evaluate(`document.querySelectorAll("#usage-trend .bar-col").length`);
-    const pie = await evaluate(`document.querySelectorAll("#usage-pie .pie-row").length`);
-    await screenshot("v4-08-usage");
-    // 24 小时范围应切换到小时粒度：柱子在 24 根上下，刻度形如 08:00。
-    await evaluate(`(() => {
-      const select = document.querySelector("#usage-range");
-      select.value = "24h";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
-    })()`);
-    await waitFor(() => evaluate(`document.querySelector("#usage-range").value === "24h"`), 3000, "切换 24h");
-    await sleep(900);
-    const hourBars = await evaluate(`document.querySelectorAll("#usage-trend .bar-col").length`);
-    const hourLabels = await evaluate(
-      `Array.from(document.querySelectorAll("#usage-trend .bar-col > span")).map((el) => el.textContent).filter(Boolean)`
-    );
-    // CI 的干净实例没有任何请求：空态同样要验（趋势空态 + 明细空态 + 24h 切换生效）
-    if (hourBars === 0) {
-      const trendEmpty = await evaluate(`!!document.querySelector("#usage-trend .empty-line")`);
-      if (!trendEmpty) throw new Error("24h 趋势既没有柱子也没有空态");
-      await click(`#usage-tabs [data-usage-tab="request"]`);
-      await waitFor(() => evaluate(`!document.querySelector("#usage-panel-request").hidden`), 4000, "请求明细面板");
-      const detailEmpty = await evaluate(`!!document.querySelector("#usage-detail-table .empty-line")`);
-      if (!detailEmpty) throw new Error("请求明细既没有行也没有空态");
-      return `空数据实例：趋势空态 / 24h 切换生效 / 明细空态 / ${kpis} KPI`;
-    }
-    if (hourBars > 25) throw new Error(`24h 趋势柱子数异常：${hourBars}`);
-    if (hourLabels.length && !hourLabels.every((label) => label.includes(":"))) {
-      throw new Error(`24h 趋势刻度不是小时格式：${hourLabels.slice(0, 3).join(",")}`);
-    }
-    await click(`#usage-tabs [data-usage-tab="request"]`);
-    await waitFor(() => evaluate(`!document.querySelector("#usage-panel-request").hidden`), 4000, "请求明细面板");
-    await waitFor(() => evaluate(`document.querySelectorAll("#usage-detail-table tbody tr").length > 0`), 6000, "请求明细行");
-    const rows = await evaluate(`document.querySelectorAll("#usage-detail-table tbody tr").length`);
-    await evaluate(`document.querySelector("#usage-detail-table tbody tr").click()`);
-    await waitFor(() => evaluate(`!document.querySelector("#request-drawer").hidden`), 4000, "请求详情抽屉");
-    await screenshot("v4-09-request-drawer");
-    await click("#request-close");
-    await waitFor(() => evaluate(`document.querySelector("#request-drawer").hidden`), 3000, "请求抽屉关闭");
-    if (!bars) throw new Error("趋势图为空");
-    return `${kpis} KPI / ${bars} 趋势柱 / 24h ${hourBars} 柱 / ${pie} 分布行 / ${rows} 明细行`;
+    return `${data.cards} 张接入卡 / 页签 ${tabs.join("·")}`;
   });
 
   await check("用量筛选刷新后保留（localStorage）", async () => {
-    await navigate("traffic");
-    await evaluate(`(() => {
-      const select = document.querySelector("#usage-range");
-      select.value = "30d";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
-    })()`);
+    await evaluate(`document.querySelector('#usage-range [data-usage-range="30d"]').click()`);
+    await waitFor(
+      () => evaluate(`document.querySelector('#usage-range [data-usage-range].active')?.dataset.usageRange === "30d"`),
+      3000,
+      "切换 30 天"
+    );
     await sleep(900);
     const reloaded = new Promise((resolve) => cdp.once("Page.loadEventFired", resolve));
     await cdp.send("Page.reload", { ignoreCache: true });
     await Promise.race([reloaded, sleep(12000).then(() => { throw new Error("刷新超时"); })]);
     await waitFor(() => evaluate(`document.documentElement.dataset.ui === "v4"`), 15000, "刷新后初始化");
-    await navigate("traffic");
+    await navigate("usage");
     await sleep(500);
-    const value = await evaluate(`document.querySelector("#usage-range").value`);
+    const value = await evaluate(
+      `document.querySelector('#usage-range [data-usage-range].active')?.dataset.usageRange`
+    );
     if (value !== "30d") throw new Error(`刷新后时间范围未保留：${value}`);
+    // 复位到「今天」，避免影响后续断言的可读性。
+    await evaluate(`document.querySelector('#usage-range [data-usage-range="today"]').click()`);
+    await sleep(600);
     return `刷新后 range=${value}`;
   });
 
-  await check("提示词：列表、详情与会话演进", async () => {
-    await navigate("prompts");
-    // 干净实例默认 promptCapture=false：列表是空态而不是记录，两种形态都要验
-    await waitFor(
-      () =>
-        evaluate(
-          `document.querySelectorAll("#prompt-table tbody tr[data-prompt-id]").length > 0 || !!document.querySelector("#prompt-table tbody .empty-line")`
-        ),
-      10000,
-      "提示词列表"
-    );
-    const rows = await evaluate(`document.querySelectorAll("#prompt-table tbody tr[data-prompt-id]").length`);
-    if (rows === 0) {
-      const emptyText = await evaluate(`(document.querySelector("#prompt-table tbody .empty-line")?.textContent || "").trim()`);
-      if (!emptyText) throw new Error("提示词列表既无记录也无空态");
-      return `空数据实例：${emptyText}`;
-    }
-    await evaluate(`document.querySelector("#prompt-table tbody tr[data-prompt-id]").click()`);
-    await waitFor(
-      () => evaluate(`document.querySelectorAll("#prompt-side-body .message-block").length > 0`),
-      6000,
-      "提示词详情侧栏"
-    );
-    const sideMessages = await evaluate(`document.querySelectorAll("#prompt-side-body .message-block").length`);
-    await screenshot("v4-10-prompt-detail");
-    await click(`#prompt-tabs [data-prompt-tab="evolution"]`);
-    await waitFor(() => evaluate(`!document.querySelector("#prompt-evolution-view").hidden`), 4000, "会话演进视图");
-    return `${rows} 行提示词 / 详情 ${sideMessages} 条消息`;
+  await check("插件页：包管理与 ZCode 账号池面板", async () => {
+    await navigate("plugins");
+    await waitFor(() => evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length >= 3`), 6000, "插件卡片");
+    const data = await evaluate(`({
+      plugins: document.querySelectorAll("#plugin-list .plugin-card").length,
+      libraryHidden: document.getElementById("plugin-library-wrap")?.hidden,
+      library: document.querySelectorAll("#plugin-library .plugin-card").length,
+    })`);
+    await evaluate(`document.querySelector("[data-open-zcode]").click()`);
+    await waitFor(() => evaluate(`!document.querySelector("#zcode-panel").hidden`), 4000, "ZCode 面板");
+    await waitFor(() => evaluate(`document.querySelectorAll("#zcode-status .stat").length >= 4`), 6000, "ZCode 状态");
+    const zcode = await evaluate(`document.querySelectorAll("#zcode-status .stat").length`);
+    await screenshot("v4-06-plugins");
+    await evaluate(`document.querySelector("#zcode-panel-close").click()`);
+    return `插件 ${data.plugins} / 内置库 ${data.libraryHidden ? "隐藏" : data.library} / ZCode ${zcode}`;
   });
 
-  await check("日志与诊断：尾部日志 + 诊断分组", async () => {
-    await navigate("logs");
+  await check("设置：子导航、未保存提示与配置校验", async () => {
+    await navigate("settings");
+    await waitFor(() => evaluate(`document.querySelectorAll("#settings-subnav [data-settings-pane]").length === 6`), 4000, "设置子导航");
+    await waitFor(() => evaluate(`!!document.querySelector("#set-host")?.value`), 6000, "设置表单");
+    const host = await evaluate(`document.querySelector("#set-host").value`);
+    await evaluate(`(() => {
+      const input = document.querySelector("#set-timeout");
+      input.value = String(Number(input.value || 600) + 1);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    })()`);
+    const dirty = await evaluate(`!document.querySelector("#settings-dirty").hidden`);
+    await click(`#settings-subnav [data-settings-pane="update"]`);
+    await waitFor(() => evaluate(`!document.querySelector("#spane-update").hidden`), 4000, "更新子页");
+    await click("#settings-validate");
+    await waitFor(() => evaluate(`(document.querySelector("#settings-issues")?.textContent || "").trim().length > 0`), 8000, "配置校验结果");
+    const issues = await evaluate(`document.querySelector("#settings-issues").textContent.trim()`);
+    await screenshot("v4-07-settings");
+    if (!host) throw new Error("监听地址为空");
+    if (!dirty) throw new Error("修改后未出现未保存提示");
+    return `${host} / 校验：${issues.slice(0, 24)}`;
+  });
+
+  await check("维护页：运行日志 + 诊断分组", async () => {
+    await click(`#settings-subnav [data-settings-pane="maintain"]`);
     await waitFor(() => evaluate(`(document.querySelector("#runtime-viewer")?.textContent || "").trim().length > 0`), 8000, "运行日志渲染");
     const meta = await evaluate(`(document.querySelector("#runtime-meta")?.textContent || "").trim()`);
     if (!/\d+ \/ \d+ 行/.test(meta)) throw new Error(`日志元信息格式异常：${meta}`);
@@ -555,55 +493,16 @@ async function main() {
       return viewer.scrollHeight <= viewer.clientHeight || viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 4;
     })()`);
     if (!atBottom) throw new Error("「跳到末尾」未把日志视图滚到底部");
-    await screenshot("v4-11-logs");
     await click(`#observe-tabs [data-observe-tab="diag"]`);
     await waitFor(() => evaluate(`!document.querySelector("#observe-diag").hidden`), 4000, "诊断视图");
     await waitFor(
-      () => evaluate(`document.querySelectorAll("#diag-groups .diag-card, #diag-groups .diag-row").length > 0`),
+      () => evaluate(`document.querySelectorAll("#diag-groups .diag-group .diag-item").length > 0`),
       6000,
       "诊断分组"
     );
-    const groups = await evaluate(`document.querySelectorAll("#diag-groups .diag-card").length`);
-    await screenshot("v4-12-diag");
+    const groups = await evaluate(`document.querySelectorAll("#diag-groups .diag-group").length`);
+    await screenshot("v4-08-maintain");
     return `${meta} / ${groups} 组诊断`;
-  });
-
-  await check("设置：表单、未保存提示与校验", async () => {
-    await openConfig("settings", "settings");
-    await waitFor(() => evaluate(`!!document.querySelector("#set-host")?.value`), 6000, "设置表单");
-    const host = await evaluate(`document.querySelector("#set-host").value`);
-    await evaluate(`(() => {
-      const input = document.querySelector("#set-timeout");
-      input.value = String(Number(input.value || 600) + 1);
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    })()`);
-    const dirty = await evaluate(`!document.querySelector("#settings-dirty").hidden`);
-    await click("#settings-validate");
-    await waitFor(() => evaluate(`(document.querySelector("#settings-issues")?.textContent || "").trim().length > 0`), 8000, "配置校验结果");
-    const issues = await evaluate(`document.querySelector("#settings-issues").textContent.trim()`);
-    await screenshot("v4-13-settings");
-    if (!host) throw new Error("监听地址为空");
-    if (!dirty) throw new Error("修改后未出现未保存提示");
-    return `${host} / 校验：${issues.slice(0, 24)}`;
-  });
-
-  await check("凭据池 / 插件 / 免费来源 / 模板 / ZCode", async () => {
-    await openConfig("pools", "credentials");
-    const pools = await evaluate(`document.querySelectorAll("#pool-list .card").length`);
-    await openConfig("plugins", "plugins");
-    await waitFor(() => evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length >= 3`), 6000, "插件卡片");
-    const plugins = await evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length`);
-    await openConfig("free", "free");
-    await waitFor(() => evaluate(`document.querySelectorAll("#free-sources .card").length >= 1`), 6000, "免费来源卡片");
-    const free = await evaluate(`document.querySelectorAll("#free-sources .card").length`);
-    await openConfig("templates", "templates");
-    await waitFor(() => evaluate(`document.querySelectorAll("#template-table tbody tr").length >= 5`), 6000, "模板行");
-    const templates = await evaluate(`document.querySelectorAll("#template-table tbody tr").length`);
-    await openConfig("zcode", "zcode");
-    await waitFor(() => evaluate(`document.querySelectorAll("#zcode-status .stat").length >= 4`), 6000, "ZCode 状态");
-    const zcode = await evaluate(`document.querySelectorAll("#zcode-status .stat").length`);
-    await screenshot("v4-14-zcode");
-    return `池 ${pools} / 插件 ${plugins} / 免费来源 ${free} / 模板 ${templates} / ZCode ${zcode}`;
   });
 
   await check("快捷键 g→u / g→a 跳转", async () => {
@@ -620,7 +519,7 @@ async function main() {
     await pressG();
     await press("u");
     await sleep(600);
-    const usage = await evaluate(`document.querySelector("#view-traffic")?.classList.contains("active")`);
+    const usage = await evaluate(`document.querySelector("#view-usage")?.classList.contains("active")`);
     await pressG();
     await press("a");
     await sleep(600);
@@ -636,21 +535,21 @@ async function main() {
       deviceScaleFactor: 1,
       mobile: true,
     });
-    await navigate("overview");
+    await navigate("usage");
     // 大库冷缓存下首次聚合要数秒；本断言测的是布局而非 API 延迟，
     // 显式等 KPI 出现再量溢出，避免把后端速度误判成布局失败。
     await waitFor(
-      () => evaluate(`document.querySelectorAll("#ov-kpis .ov-kpi").length > 0`),
+      () => evaluate(`document.querySelectorAll("#usage-kpis > div").length > 0`),
       12000,
-      "窄屏总览 KPI"
+      "窄屏用量 KPI"
     );
     const metrics = await evaluate(`({
       inner: window.innerWidth,
       scroll: document.documentElement.scrollWidth,
-      kpis: document.querySelectorAll("#ov-kpis .ov-kpi").length,
+      kpis: document.querySelectorAll("#usage-kpis > div").length,
       navVisible: document.querySelectorAll(".nav-item").length,
     })`);
-    await screenshot("v4-15-mobile");
+    await screenshot("v4-09-mobile");
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: 1440,
       height: 1000,
@@ -661,7 +560,7 @@ async function main() {
     if (metrics.scroll > metrics.inner + 12) {
       throw new Error(`窄屏横向溢出：scrollWidth=${metrics.scroll} > innerWidth=${metrics.inner}`);
     }
-    if (!metrics.kpis) throw new Error("窄屏下总览 KPI 未渲染");
+    if (!metrics.kpis) throw new Error("窄屏下用量 KPI 未渲染");
     return `${metrics.inner}px 视口 / ${metrics.kpis} KPI / 横向 ${metrics.scroll}px`;
   });
 
