@@ -332,6 +332,12 @@ struct UpdateState {
     installer_path: Option<PathBuf>,
     installer_sha256: Option<String>,
     installer_size: Option<u64>,
+    /// 已下载安装包对应的 tag。
+    ///
+    /// 没有它就无法判断「重新检查后这个包还算不算最新」：检查成功会把
+    /// phase 改回 `Available`，面板于是既不给下载按钮（`installer_ready`）
+    /// 也不给安装按钮（phase 不是 `Ready`），用户就会卡在「下载完了装不上」。
+    installer_tag: Option<String>,
     /// 一次性标记：本次下载完成后自动触发安装（「下载并安装」按钮）。
     /// 与持久化的 `update.auto_install` 设置无关，只影响下一次下载。
     install_after_download: bool,
@@ -444,8 +450,26 @@ impl UpdateService {
                     .set_setting("update.last_check_at", &checked_at.timestamp().to_string());
                 let newer = release.version > self.current;
                 let mut state = self.state.lock().await;
+                let same_tag = state.installer_tag.as_deref() == Some(release.tag.as_str());
+                // 已下载的安装包属于更早的版本时作废：否则它会一直占着
+                // `installer_ready`，新版本既不能下载也不能安装。
+                if state.installer_tag.is_some() && !same_tag {
+                    state.installer_path = None;
+                    state.installer_sha256 = None;
+                    state.installer_size = None;
+                    state.installer_tag = None;
+                }
+                // 安装包就是最新版时保持 Ready：重新检查不能把「装得上」
+                // 冲成「可下载」，否则面板只剩「关闭」，用户卡在下载完装不上。
+                let ready = newer && same_tag;
                 state.latest = Some(release);
-                state.phase = if newer { Phase::Available } else { Phase::Idle };
+                state.phase = if ready {
+                    Phase::Ready
+                } else if newer {
+                    Phase::Available
+                } else {
+                    Phase::Idle
+                };
                 state.checked_at = Some(checked_at);
                 state.error = None;
                 Ok(self.status_json(&state))
@@ -461,7 +485,7 @@ impl UpdateService {
     }
 
     pub async fn download(self: &Arc<Self>) -> Result<Value, UpdateError> {
-        let (setup, sums) = {
+        let (setup, sums, tag) = {
             let state = self.state.lock().await;
             if state.phase != Phase::Available {
                 return Err(UpdateError::conflict("当前没有可下载的新版本"));
@@ -478,7 +502,7 @@ impl UpdateService {
                 .sums
                 .clone()
                 .ok_or_else(UpdateError::asset_missing)?;
-            (setup, sums)
+            (setup, sums, release.tag.clone())
         };
 
         {
@@ -498,7 +522,7 @@ impl UpdateService {
 
         let service = self.clone();
         tokio::spawn(async move {
-            match service.run_download(setup, sums).await {
+            match service.run_download(setup, sums, tag).await {
                 Ok(()) => {
                     // 「下载并安装」一次性标记 / 「自动安装」设置：
                     // 下载校验通过后直接走静默安装（便携版无法自覆盖，只记日志）。
@@ -627,7 +651,7 @@ impl UpdateService {
         Ok(status)
     }
 
-    async fn run_download(&self, setup: Asset, sums: Asset) -> Result<(), UpdateError> {
+    async fn run_download(&self, setup: Asset, sums: Asset, tag: String) -> Result<(), UpdateError> {
         let sums_text = self.fetch_text(&sums.url, MAX_SUMS_BYTES).await?;
         let expected_sha = parse_sha256sums(&sums_text, &setup.name)?;
 
@@ -714,6 +738,7 @@ impl UpdateService {
         state.installer_path = Some(path);
         state.installer_sha256 = Some(actual_sha);
         state.installer_size = Some(downloaded);
+        state.installer_tag = Some(tag);
         state.error = None;
         state.progress = Some(Progress {
             downloaded,
@@ -965,6 +990,7 @@ impl UpdateService {
             "auto_install": self.auto_install_enabled(),
             "installer_ready": state.installer_path.is_some(),
             "installer_size": state.installer_size,
+            "installer_tag": state.installer_tag.clone(),
             // ── 路径事实：让用户看得见「下到哪」「装到哪」 ──
             "installer_path": state.installer_path.as_ref().map(|path| path.display().to_string()),
             "installer_dir": state

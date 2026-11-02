@@ -161,6 +161,11 @@ html[data-ui="v4"] .btn.sm { font-size: 10.5px; padding: 4px 8px; min-height: 26
 html[data-ui="v4"] .btn.primary:hover { filter: brightness(1.04); }
 html[data-ui="v4"] .btn.ghost:hover { background: var(--surface-2); }
 html[data-ui="v4"] .btn.danger:hover { background: var(--danger-dim); }
+/* 顶栏「更新」按钮发现新版本时高亮（2.x 旧面板的 update-available 行为）。 */
+html[data-ui="v4"] .btn.update-available {
+  color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, var(--line));
+  background: var(--amber-dim);
+}
 html[data-ui="v4"] .card {
   border-radius: var(--v4-radius); padding: 16px;
   border-color: var(--v4-line-soft); background: var(--surface);

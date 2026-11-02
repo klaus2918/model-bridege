@@ -196,6 +196,12 @@ pub fn installer_args(plan: &InstallPlan) -> String {
 /// **脚本正文一律用 ASCII**：Windows PowerShell 5.1 读取无 BOM 的 .ps1 时按
 /// 系统 ANSI 代码页解码，UTF-8 中文注释会被误解码，甚至把换行吞掉导致语法错误。
 pub fn build_watch_script(plan: &InstallPlan) -> String {
+    // 进程名（不含 .exe）：安装成功后用它确认新版本真的起来了。
+    let proc_name = plan
+        .new_exe
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Model-Gate");
     format!(
         r#"$ErrorActionPreference = 'SilentlyContinue'
 $installer = '{installer}'
@@ -218,11 +224,18 @@ $p = Start-Process -FilePath $installer -ArgumentList $argLine -PassThru -Wait
 # 3) relaunch the new version
 if ($p -and $p.ExitCode -eq 0) {{
     Start-Process -FilePath $newExe
-    "install-ok exit=0" | Out-File -FilePath $log -Encoding UTF8 -Append
+    # installer exit code alone is not enough: confirm the app is really running
+    Start-Sleep -Seconds 2
+    if (Get-Process -Name '{proc_name}' -ErrorAction SilentlyContinue) {{
+        "install-ok exit=0 relaunch=ok" | Out-File -FilePath $log -Encoding UTF8 -Append
+    }} else {{
+        "install-ok exit=0 relaunch=failed" | Out-File -FilePath $log -Encoding UTF8 -Append
+    }}
 }} else {{
     $code = if ($p) {{ $p.ExitCode }} else {{ 'unknown' }}
     "install-failed exit=$code" | Out-File -FilePath $log -Encoding UTF8 -Append
 }}
+Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 "#,
         installer = ps_escape(&plan.installer.display().to_string()),
@@ -231,6 +244,7 @@ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
         log = ps_escape(&plan.log_file.display().to_string()),
         marker = ps_escape(&plan.exit_marker.display().to_string()),
         pid = plan.parent_pid,
+        proc_name = ps_escape(proc_name),
     )
 }
 
@@ -463,6 +477,27 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_script_reports_relaunch_result_and_cleans_marker() {
+        // 安装失败时应用已经退出，用户看不到任何界面；日志是唯一线索。
+        let script = build_watch_script(&sample_plan());
+        assert!(script.contains("Get-Process -Name 'Model-Gate'"), "{script}");
+        assert!(script.contains("relaunch=ok"), "{script}");
+        assert!(script.contains("relaunch=failed"), "{script}");
+        assert!(
+            script.contains("Remove-Item -LiteralPath $marker"),
+            "{script}"
+        );
+        // 清理必须在安装之后，否则脚本可能在安装前就把信号删掉。
+        let install = script
+            .find("Start-Process -FilePath $installer")
+            .expect("缺少安装步骤");
+        let cleanup = script
+            .find("Remove-Item -LiteralPath $marker")
+            .expect("缺少清理步骤");
+        assert!(install < cleanup, "{script}");
     }
 
     #[test]

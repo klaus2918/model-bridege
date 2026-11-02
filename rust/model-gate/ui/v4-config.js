@@ -535,6 +535,43 @@
     notesOpen: false,
   };
 
+  // 顶栏「更新」按钮：3.0 之前旧面板就靠它提示「有新版本 vX」。
+  // v4 重写时只留了设置页入口，按钮带着 `hidden` 永远不出现——
+  // 用户因此完全看不到新版本，也点不到一键下载安装。这里按旧面板行为恢复。
+  function updateButtonLabel(s) {
+    if (!s) return "检查更新";
+    if (s.phase === "downloading") return "下载中…";
+    if (s.phase === "ready") return "安装包已就绪";
+    if (s.phase === "installing") return "关闭并安装中…";
+    if (s.available && s.latest) return `有新版本 v${s.latest}`;
+    return "检查更新";
+  }
+
+  function refreshUpdateButton(s) {
+    const button = $("#update-btn");
+    if (!button) return;
+    button.hidden = false;
+    button.textContent = updateButtonLabel(s);
+    button.classList.toggle(
+      "update-available",
+      Boolean(s && s.available && s.phase !== "ready" && s.phase !== "installing")
+    );
+  }
+
+  // 只读当前状态（不联网）：面板启动时用它点亮顶栏按钮。
+  async function loadUpdateStatus() {
+    try {
+      const status = await api("/api/update/status");
+      updateUi.status = status;
+      refreshUpdateButton(status);
+      return status;
+    } catch {
+      // 状态接口失败也要让按钮可用：否则面板连更新入口都没有。
+      refreshUpdateButton(null);
+      return null;
+    }
+  }
+
   function fmtBytes(value) {
     const n = Number(value || 0);
     if (!Number.isFinite(n) || n <= 0) return "—";
@@ -676,6 +713,9 @@
         `<button class="btn primary" data-update-action="install">${portable ? "启动安装包" : "安装并重启"}</button>`
       );
     }
+    if (s.release_url) {
+      actions.push(`<button class="btn ghost" data-update-action="release">打开 Release 页面</button>`);
+    }
     actions.push(`<button class="btn ghost" data-update-action="close">关闭</button>`);
 
     return (
@@ -700,6 +740,7 @@
   // 权威 status（后端返回）：覆盖缓存再渲染。瞬时错误走 renderUpdate，不冲缓存。
   function applyUpdate(status, reopen = false) {
     if (status) updateUi.status = status;
+    refreshUpdateButton(updateUi.status);
     renderUpdate(updateUi.status, reopen);
   }
 
@@ -815,6 +856,9 @@
             ? "已恢复默认下载目录"
             : `下载目录已保存：${updateUi.status.download_dir || "—"}`
         );
+      } else if (action === "release") {
+        const url = updateUi.status && updateUi.status.release_url;
+        if (url) window.open(url, "_blank", "noopener");
       } else if (action === "close") {
         stopUpdatePolling();
         closeModal();
@@ -897,11 +941,14 @@
       routeGroups.splice(Number(button.dataset.removeRoute), 1);
       renderGroups();
     });
-    // 托盘「检查更新」以 `?update=1` 打开面板：进来就真实检查一次，
-    // 而不是停在默认视图让用户再手动点一次。
-    if (new URLSearchParams(location.search).get("update") === "1") {
-      update().catch(() => {});
-    }
+    // 面板启动先读一次状态（不联网）：顶栏按钮据此显示「检查更新 / 有新版本 vX」。
+    loadUpdateStatus().then(() => {
+      // 托盘「检查更新」以 `?update=1` 打开面板：进来就真实检查一次，
+      // 而不是停在默认视图让用户再手动点一次。
+      if (new URLSearchParams(location.search).get("update") === "1") {
+        update().catch(() => {});
+      }
+    });
 
     const view = $("#view-settings");
     if (view) {
