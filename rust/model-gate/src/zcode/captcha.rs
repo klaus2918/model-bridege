@@ -18,6 +18,9 @@ const PAGE_HTML: &str = include_str!("../../assets/zcode_captcha.html");
 pub const POOL_MAX: usize = 2;
 /// 验证码参数 TTL：上游校验窗口约 100s，这里留 5s 余量。
 pub const POOL_TTL: Duration = Duration::from_secs(95);
+/// 阿里云无感验证偶发 `fail`（同机实测约 1/4 概率）；求解不产生业务副作用，直接重试。
+const SOLVE_ATTEMPTS: usize = 3;
+const SOLVE_RETRY_DELAY: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone)]
 pub struct CaptchaToken {
@@ -93,7 +96,7 @@ impl CaptchaPool {
         count
     }
 
-    /// 取一个验证码：池内有新鲜参数直接复用，否则求解一次。
+    /// 取一个验证码：池内有新鲜参数直接复用，否则求解（失败自动重试）。
     ///
     /// 求解锁保证同一时刻只有一个浏览器实例；等到锁后再次检查池，
     /// 避免并发请求重复求解。
@@ -105,7 +108,7 @@ impl CaptchaPool {
         if let Some(token) = self.take_fresh() {
             return Ok(token);
         }
-        solver.solve().await
+        solve_with_retry(&solver).await
     }
 
     /// 预先求解 `want` 个参数（上限 POOL_MAX），供批量 claim 使用。
@@ -118,7 +121,7 @@ impl CaptchaPool {
             if current >= target {
                 return Ok(current);
             }
-            let token = solver.solve().await?;
+            let token = solve_with_retry(&solver).await?;
             let mut entries = self.lock_entries();
             self.prune_locked(&mut entries);
             if entries.len() < POOL_MAX {
@@ -226,26 +229,38 @@ impl ZcodeCaptcha {
   return await new Promise((resolve) => {{
     let done = false;
     const finish = (v) => {{ if (!done) {{ done = true; resolve(v || null); }} }};
+    const describe = (e) => {{
+      try {{
+        if (e && typeof e === "object") {{
+          const picked = {{}};
+          for (const key of ["code", "msg", "message", "name", "desc", "description"]) {{
+            if (e[key] !== undefined) picked[key] = String(e[key]);
+          }}
+          if (Object.keys(picked).length > 0) return JSON.stringify(picked);
+        }}
+        return String(e);
+      }} catch {{ return String(e); }}
+    }};
     try {{
       window.initAliyunCaptcha({{
         SceneId: "{scene}",
         mode: "popup",
-        language: "zh-CN",
+        language: "zh",
         showErrorTip: false,
         element: "#cap-holder",
         button: "#cap-btn",
         getInstance: (instance) => {{
           try {{ instance.startTracelessVerification(); }}
-          catch (e) {{ window.__zcodeError = "getInstance: " + String(e); finish(null); }}
+          catch (e) {{ window.__zcodeError = "getInstance: " + describe(e); finish(null); }}
         }},
         success: (p) => {{
           const v = typeof p === "string" ? p : (p && p.captchaVerifyParam);
           finish(v);
         }},
-        fail: (e) => {{ window.__zcodeError = "fail: " + String(e); finish(null); }},
-        onError: (e) => {{ window.__zcodeError = "onError: " + String(e); finish(null); }},
+        fail: (e) => {{ window.__zcodeError = "fail: " + describe(e); finish(null); }},
+        onError: (e) => {{ window.__zcodeError = "onError: " + describe(e); finish(null); }},
       }});
-    }} catch (e) {{ window.__zcodeError = "init: " + String(e); finish(null); }}
+    }} catch (e) {{ window.__zcodeError = "init: " + describe(e); finish(null); }}
     setTimeout(() => finish(null), 20000);
   }});
 }})()"##,
@@ -287,6 +302,29 @@ impl ZcodeCaptcha {
             .await
             .map_err(|err| format!("验证码任务失败：{err}"))?
     }
+}
+
+/// 求解验证码并按固定次数重试；只有最终失败才把错误交给调用方。
+async fn solve_with_retry(solver: &ZcodeCaptcha) -> Result<CaptchaToken, String> {
+    let mut last_error = String::new();
+    for attempt in 0..SOLVE_ATTEMPTS {
+        match solver.solve().await {
+            Ok(token) => return Ok(token),
+            Err(err) => {
+                last_error = err;
+                if attempt + 1 < SOLVE_ATTEMPTS {
+                    tracing::warn!(
+                        "ZCode 验证码求解失败（第 {} 次），{}ms 后重试：{}",
+                        attempt + 1,
+                        SOLVE_RETRY_DELAY.as_millis(),
+                        last_error
+                    );
+                    tokio::time::sleep(SOLVE_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(last_error)
 }
 
 pub fn default_scene() -> String {

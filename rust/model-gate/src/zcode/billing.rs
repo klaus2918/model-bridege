@@ -3,6 +3,7 @@
 //!
 //! 这里只做 HTTP 与数据归一化；验证码由 `captcha` 模块提供，账号状态由 `store` 落库。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -12,7 +13,11 @@ use super::captcha::CaptchaToken;
 use super::store::{ZcodeAccount, STATUS_EXHAUSTED, STATUS_INVALID};
 
 const BILLING_BASE: &str = "https://zcode.z.ai/api/v1/zcode-plan";
-const APP_VERSION: &str = "3.16.3";
+const MARKETING_TOUCH: &str = "https://zcode.z.ai/api/v1/marketing/touch";
+/// 营销活动接口的防缓存序号；与客户端一致，进程内递增即可。
+static MARKETING_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 与已安装 ZCode 客户端保持同一版本口径；领取资格与客户端版本有关。
+const APP_VERSION: &str = "3.17.2";
 const RELEASE_CHANNEL: &str = "production";
 
 #[derive(Debug, Clone)]
@@ -101,6 +106,143 @@ pub async fn preview(client: &Client, account: &ZcodeAccount) -> Result<Vec<Plan
     Ok(plans)
 }
 
+/// 已生效套餐（含余额口径的 Start Plan）；仅用于面板展示，不参与 claim 选择。
+pub async fn balance_plans(
+    client: &Client,
+    account: &ZcodeAccount,
+) -> Result<Vec<Plan>, BillingError> {
+    let response = client
+        .get(format!(
+            "{BILLING_BASE}/billing/balance?app_version={APP_VERSION}&platform={}",
+            profile_platform(account)
+        ))
+        .headers(headers(account, None)?)
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await
+        .map_err(|err| BillingError::Network(err.to_string()))?;
+    let status = response.status().as_u16();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|err| BillingError::Network(format!("响应不是 JSON：{err}")))?;
+    if status == 401 || status == 403 {
+        return Err(BillingError::Auth("ZCode 登录失效，请重新授权".to_string()));
+    }
+    let code = business_code(&body);
+    if code != 0 {
+        return Err(BillingError::Business {
+            code,
+            message: body
+                .get("msg")
+                .or_else(|| body.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            next_at: None,
+        });
+    }
+    let plans = body
+        .get("data")
+        .and_then(|d| d.get("plans"))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(parse_plan).collect())
+        .unwrap_or_default();
+    Ok(plans)
+}
+
+/// 从营销活动（`marketing/touch`）里找当前可领取的 Start Plan。
+///
+/// `billing/preview` 为空时，活动卡片仍可能带 `claim_zcode_plan` 动作；它的
+/// `args.plan_id` 才是领取接口接受的 campaign plan（例如 `...-1103`），
+/// 客户端配置里的 `zcode-v3-start-plan` 只是展示占位。
+pub async fn marketing_claim_plan(
+    client: &Client,
+    account: &ZcodeAccount,
+) -> Result<Option<Plan>, BillingError> {
+    let seq = MARKETING_SEQ.fetch_add(1, Ordering::Relaxed);
+    let response = client
+        .get(format!("{MARKETING_TOUCH}?seq={seq}"))
+        .headers(headers(account, None)?)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|err| BillingError::Network(err.to_string()))?;
+    let status = response.status().as_u16();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|err| BillingError::Network(format!("响应不是 JSON：{err}")))?;
+    if status == 401 || status == 403 {
+        return Err(BillingError::Auth("ZCode 登录失效，请重新授权".to_string()));
+    }
+    let code = business_code(&body);
+    if code != 0 {
+        return Err(BillingError::Business {
+            code,
+            message: body
+                .get("msg")
+                .or_else(|| body.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            next_at: None,
+        });
+    }
+    let root = body.get("data").unwrap_or(&body);
+    let Some(plan_id) = find_claim_plan_id(root) else {
+        return Ok(None);
+    };
+    Ok(Some(find_zcode_plan(root, &plan_id).unwrap_or(Plan {
+        plan_id,
+        name: "Start Plan".to_string(),
+        priority: 0,
+        grants: Vec::new(),
+    })))
+}
+
+/// 深度查找 `claim_zcode_plan` 动作里的 plan_id。
+fn find_claim_plan_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(action) = map.get("action") {
+                if action.get("type").and_then(Value::as_str) == Some("claim_zcode_plan") {
+                    if let Some(plan_id) = action
+                        .get("args")
+                        .and_then(|args| args.get("plan_id"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                    {
+                        return Some(plan_id.to_string());
+                    }
+                }
+            }
+            map.values().find_map(find_claim_plan_id)
+        }
+        Value::Array(items) => items.iter().find_map(find_claim_plan_id),
+        _ => None,
+    }
+}
+
+/// 深度查找与 plan_id 对应的 `zcode_plan` 展示对象。
+fn find_zcode_plan(value: &Value, plan_id: &str) -> Option<Plan> {
+    match value {
+        Value::Object(map) => {
+            if let Some(plan) = map.get("zcode_plan") {
+                if let Some(parsed) = parse_plan(plan) {
+                    if parsed.plan_id == plan_id {
+                        return Some(parsed);
+                    }
+                }
+            }
+            map.values().find_map(|item| find_zcode_plan(item, plan_id))
+        }
+        Value::Array(items) => items.iter().find_map(|item| find_zcode_plan(item, plan_id)),
+        _ => None,
+    }
+}
+
 pub async fn claim(
     client: &Client,
     account: &ZcodeAccount,
@@ -146,11 +288,12 @@ pub async fn claim(
         return Err(BillingError::Auth("ZCode 登录失效，请重新授权".to_string()));
     }
     let code = business_code(&body);
-    if code == 0 {
-        let plan = body
-            .get("data")
-            .and_then(|d| d.get("plan"))
-            .unwrap_or(&Value::Null);
+    let plan = body
+        .get("data")
+        .and_then(|d| d.get("plan"))
+        .filter(|value| value.is_object());
+    if code == 0 && plan.is_some() {
+        let plan = plan.unwrap_or(&Value::Null);
         return Ok(ClaimOutcome {
             plan_id,
             plan_name: plan
@@ -178,10 +321,12 @@ pub async fn claim(
         code: Some(code),
         ok: false,
         next_at: next_at(&body),
-        message: Some(if message.is_empty() {
-            claim_fail_text(code)
-        } else {
+        message: Some(if !message.is_empty() {
             message
+        } else if code == 0 {
+            "领取响应缺少套餐信息".to_string()
+        } else {
+            claim_fail_text(code)
         }),
         starts_at: None,
         ends_at: None,
@@ -302,7 +447,12 @@ fn parse_grant(raw: &Value) -> Option<Value> {
 }
 
 fn business_code(body: &Value) -> i64 {
-    body.get("code").and_then(Value::as_i64).unwrap_or(-1)
+    match body.get("code") {
+        Some(Value::Number(value)) => value.as_i64().unwrap_or(-1),
+        // 上游偶发把 code 序列化成字符串；客户端同样兼容。
+        Some(Value::String(value)) => value.trim().parse().unwrap_or(-1),
+        _ => -1,
+    }
 }
 
 fn next_at(body: &Value) -> Option<i64> {
@@ -341,6 +491,10 @@ pub fn status_after_claim(account: &ZcodeAccount, outcome: &ClaimOutcome) -> Str
     }
     match outcome.code {
         Some(401) | Some(403) => STATUS_INVALID.to_string(),
+        // 验证码失败是瞬时错误，不能把账号标成额度耗尽。
+        Some(3007) => super::store::STATUS_COOLING.to_string(),
+        // 活动/套餐已下架不代表账号没有额度，保持原状态等待下一轮活动。
+        Some(1001) | Some(1002) | Some(1004) => account.status.clone(),
         Some(1005) => account.status.clone(),
         _ => STATUS_EXHAUSTED.to_string(),
     }
@@ -373,6 +527,84 @@ mod tests {
         assert!(claim_fail_text(1005).contains("名额"));
         assert!(claim_fail_text(3007).contains("验证码"));
         assert!(claim_fail_text(401).contains("登录"));
+    }
+
+    #[test]
+    fn business_code_accepts_numeric_string() {
+        assert_eq!(business_code(&json!({"code": 0})), 0);
+        assert_eq!(business_code(&json!({"code": "3007"})), 3007);
+        assert_eq!(business_code(&json!({"msg": "no code"})), -1);
+    }
+
+    #[test]
+    fn marketing_touch_plan_is_extracted_from_banner_action() {
+        let root = json!({
+            "deliveries": [{
+                "campaign_id": "c1",
+                "resource_position": "banner",
+                "banner": {
+                    "buttons": [
+                        {"action": {"type": "close", "args": null}},
+                        {"action": {"type": "claim_zcode_plan", "args": {"plan_id": "zcode-v3-start-plan-1103"}}}
+                    ],
+                    "background": {
+                        "type": "bundle",
+                        "args": {"zcode_plan": {
+                            "plan_id": "zcode-v3-start-plan-1103",
+                            "name": "ZCODE GLOBAL BUILD",
+                            "priority": 111,
+                            "entitlements": [{
+                                "show_name": "GLM-5.3-Flash",
+                                "meter": "model_usage",
+                                "unit_type": "token",
+                                "grant_units": 300000000,
+                                "period": "one_time"
+                            }]
+                        }}
+                    }
+                }
+            }]
+        });
+        let plan_id = find_claim_plan_id(&root).expect("claim plan id");
+        assert_eq!(plan_id, "zcode-v3-start-plan-1103");
+        let plan = find_zcode_plan(&root, &plan_id).expect("plan");
+        assert_eq!(plan.name, "ZCODE GLOBAL BUILD");
+        assert_eq!(plan.grants[0]["units"], 300_000_000.0);
+    }
+
+    #[test]
+    fn captcha_failure_cools_down_instead_of_exhausting() {
+        let acc = ZcodeAccount::new("t", "zai", "jwt", "a.b.c").unwrap();
+        let outcome = ClaimOutcome {
+            plan_id: "p".into(),
+            plan_name: "plan".into(),
+            code: Some(3007),
+            ok: false,
+            next_at: None,
+            message: Some("验证码校验失败".into()),
+            starts_at: None,
+            ends_at: None,
+        };
+        assert_eq!(
+            status_after_claim(&acc, &outcome),
+            super::super::store::STATUS_COOLING
+        );
+    }
+
+    #[test]
+    fn stale_campaign_keeps_account_status() {
+        let acc = ZcodeAccount::new("t", "zai", "jwt", "a.b.c").unwrap();
+        let outcome = ClaimOutcome {
+            plan_id: "zcode-v3-start-plan".into(),
+            plan_name: "Start Plan".into(),
+            code: Some(1001),
+            ok: false,
+            next_at: None,
+            message: Some("target not found".into()),
+            starts_at: None,
+            ends_at: None,
+        };
+        assert_eq!(status_after_claim(&acc, &outcome), acc.status);
     }
 
     #[test]

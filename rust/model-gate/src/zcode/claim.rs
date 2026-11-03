@@ -76,13 +76,53 @@ fn plans_json(plans: &[Plan]) -> Value {
     })
 }
 
+/// `billing/preview` 只返回「可手动领取」列表；活动领取的 plan_id 来自营销卡片，
+/// 列表为空时先查营销活动，避免「实际可领却提示没有套餐」。
+async fn apply_marketing_fallback(
+    state: &AppState,
+    account: &ZcodeAccount,
+    plans: &mut Vec<Plan>,
+) -> bool {
+    if !plans.is_empty() {
+        return false;
+    }
+    match billing::marketing_claim_plan(&state.client, account).await {
+        Ok(Some(plan)) => {
+            tracing::info!(
+                "ZCode billing 预览为空，使用营销活动 Start Plan：{}",
+                plan.plan_id
+            );
+            plans.push(plan);
+            true
+        }
+        Ok(None) => false,
+        Err(err) => {
+            tracing::warn!("ZCode 营销活动读取失败：{}", err.message());
+            false
+        }
+    }
+}
+
 /// 拉取单个账号的可领套餐并回写展示数据；不做 claim。
 pub async fn preview_account(
     state: &AppState,
     account: &ZcodeAccount,
 ) -> Result<Vec<Plan>, String> {
     match billing::preview(&state.client, account).await {
-        Ok(plans) => {
+        Ok(mut plans) => {
+            match billing::balance_plans(&state.client, account).await {
+                Ok(active) => {
+                    let mut merged = active;
+                    for plan in plans.drain(..) {
+                        if !merged.iter().any(|item| item.plan_id == plan.plan_id) {
+                            merged.push(plan);
+                        }
+                    }
+                    plans = merged;
+                }
+                Err(err) => tracing::warn!("ZCode 余额读取失败：{}", err.message()),
+            }
+            apply_marketing_fallback(state, account, &mut plans).await;
             let quota = plans_json(&plans).to_string();
             let best = plans
                 .iter()
@@ -133,7 +173,7 @@ pub async fn claim_account(state: &AppState, account: &ZcodeAccount) -> ClaimRep
         next_at: None,
         status: account.status.clone(),
     };
-    let plans = match billing::preview(&state.client, account).await {
+    let mut plans = match billing::preview(&state.client, account).await {
         Ok(plans) => plans,
         Err(BillingError::Auth(message)) => {
             state.db.zcode_update_quota(
@@ -163,6 +203,7 @@ pub async fn claim_account(state: &AppState, account: &ZcodeAccount) -> ClaimRep
             return report;
         }
     };
+    apply_marketing_fallback(state, account, &mut plans).await;
     let best = plans.iter().max_by_key(|p| p.priority).cloned();
     let quota = plans_json(&plans).to_string();
     let Some(best) = best else {
@@ -181,72 +222,96 @@ pub async fn claim_account(state: &AppState, account: &ZcodeAccount) -> ClaimRep
     report.plan_id = Some(best.plan_id.clone());
     report.plan_name = Some(best.name.clone());
 
-    let captcha = match state
-        .zcode
-        .captcha
-        .acquire(state.zcode.captcha_solver())
-        .await
-    {
-        Ok(token) => token,
-        Err(message) => {
-            let message = format!("验证码不可用：{message}");
-            state.db.zcode_update_quota(
-                &account.id,
-                Some(&plan_json(&best).to_string()),
-                Some(&quota),
-                None,
-                Some(&message),
-                None,
-            );
-            report.message = Some(message);
-            return report;
-        }
-    };
+    // 验证码是 100 秒级的短凭据，首次 3007 多半是池内参数过期/上游瞬断；
+    // 废弃池后重试一次，避免用户看到「明明能领却失败」。
+    let mut outcome = None;
+    for attempt in 0..2 {
+        let captcha = match state
+            .zcode
+            .captcha
+            .acquire(state.zcode.captcha_solver())
+            .await
+        {
+            Ok(token) => token,
+            Err(message) => {
+                let message = format!("验证码不可用：{message}");
+                state.db.zcode_update_quota(
+                    &account.id,
+                    Some(&plan_json(&best).to_string()),
+                    Some(&quota),
+                    None,
+                    Some(&message),
+                    None,
+                );
+                report.message = Some(message);
+                return report;
+            }
+        };
 
-    let outcome = match billing::claim(&state.client, account, &captcha, Some(&best.plan_id)).await
-    {
-        Ok(outcome) => outcome,
-        Err(BillingError::Auth(message)) => {
-            state.db.zcode_update_quota(
-                &account.id,
-                Some(&plan_json(&best).to_string()),
-                Some(&quota),
-                Some(STATUS_INVALID),
-                Some(&message),
-                None,
-            );
-            report.message = Some(message);
-            report.status = STATUS_INVALID.to_string();
-            return report;
+        match billing::claim(&state.client, account, &captcha, Some(&best.plan_id)).await {
+            Ok(value) => {
+                if value.code == Some(3007) && attempt == 0 {
+                    state.zcode.captcha.invalidate_all();
+                    tracing::warn!("ZCode 领取验证码校验失败，废弃验证码池后重试一次");
+                    continue;
+                }
+                outcome = Some(value);
+                break;
+            }
+            Err(BillingError::Auth(message)) => {
+                state.db.zcode_update_quota(
+                    &account.id,
+                    Some(&plan_json(&best).to_string()),
+                    Some(&quota),
+                    Some(STATUS_INVALID),
+                    Some(&message),
+                    None,
+                );
+                report.message = Some(message);
+                report.status = STATUS_INVALID.to_string();
+                return report;
+            }
+            Err(BillingError::Business {
+                code,
+                message,
+                next_at,
+            }) => {
+                if code == 3007 && attempt == 0 {
+                    state.zcode.captcha.invalidate_all();
+                    tracing::warn!("ZCode 领取验证码校验失败，废弃验证码池后重试一次");
+                    continue;
+                }
+                outcome = Some(ClaimOutcome {
+                    plan_id: best.plan_id.clone(),
+                    plan_name: best.name.clone(),
+                    code: Some(code),
+                    ok: false,
+                    next_at,
+                    message: Some(message),
+                    starts_at: None,
+                    ends_at: None,
+                });
+                break;
+            }
+            Err(err) => {
+                let message = err.message();
+                state.db.zcode_update_quota(
+                    &account.id,
+                    Some(&plan_json(&best).to_string()),
+                    Some(&quota),
+                    Some(STATUS_COOLING),
+                    Some(&message),
+                    Some(now_ms() + TRANSIENT_COOLDOWN_MS),
+                );
+                report.message = Some(message);
+                report.status = STATUS_COOLING.to_string();
+                return report;
+            }
         }
-        Err(BillingError::Business {
-            code,
-            message,
-            next_at,
-        }) => ClaimOutcome {
-            plan_id: best.plan_id.clone(),
-            plan_name: best.name.clone(),
-            code: Some(code),
-            ok: false,
-            next_at,
-            message: Some(message),
-            starts_at: None,
-            ends_at: None,
-        },
-        Err(err) => {
-            let message = err.message();
-            state.db.zcode_update_quota(
-                &account.id,
-                Some(&plan_json(&best).to_string()),
-                Some(&quota),
-                Some(STATUS_COOLING),
-                Some(&message),
-                Some(now_ms() + TRANSIENT_COOLDOWN_MS),
-            );
-            report.message = Some(message);
-            report.status = STATUS_COOLING.to_string();
-            return report;
-        }
+    }
+    let Some(outcome) = outcome else {
+        report.message = Some("领取未产生结果，请重试".to_string());
+        return report;
     };
 
     let status = billing::status_after_claim(account, &outcome);
