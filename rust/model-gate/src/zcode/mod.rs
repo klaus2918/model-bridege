@@ -11,6 +11,7 @@ pub mod claim;
 pub mod client;
 pub mod config;
 pub mod credentials;
+pub mod direct;
 pub mod oauth;
 pub mod secret;
 pub mod service;

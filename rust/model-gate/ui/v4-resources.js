@@ -83,13 +83,15 @@
           .map((model) => {
             const result = freeResult(model.id);
             const meta = stateMeta(result.state);
+            // 探测载荷的拒因字段是 reasonLabel/advice（与插件弹窗同款）；raw 兜底。
+            const reason = [result.reasonLabel, result.advice].filter(Boolean).join("：") || result.raw || "—";
             return `<tr>
               <td><div class="name-cell"><code>${esc(model.id)}</code>${model.mayTrainOnYourPrompts ? '<span class="pill danger">可能训练</span>' : ""}</div><div class="hint">${esc(model.name || "")}</div></td>
               <td><span class="pill ${meta.tone === "ok" ? "signal" : meta.tone === "bad" ? "danger" : meta.tone === "warn" ? "amber" : "info"}">${esc(meta.label)}</span></td>
               <td class="num">${model.contextLength ? compactNum(model.contextLength) : "—"}</td>
               <td>${(model.reasoningEfforts || []).join(" / ") || "—"}</td>
               <td class="num">${result.latencyMs ? fmtMs(result.latencyMs) : "—"}</td>
-              <td>${esc(result.reason || result.suggestion || result.message || "—")}</td>
+              <td>${esc(reason)}</td>
               <td class="right"><div class="actions">
                 <button class="btn ghost sm" data-free-action="probe-one" data-source="${esc(free.current)}" data-model="${esc(model.id)}">探测</button>
                 <button class="btn ghost sm" data-free-action="globalize" data-model="${esc(model.id)}">加入全局</button>
@@ -151,6 +153,134 @@
       toast(error.message, "error");
     }
   }
+
+  // ───────────────────────── 插件页「模型 · 检测」 ─────────────────────────
+  // 插件卡片 → 各自的免费来源（manifest.freeSource → 注册表条目）。
+  // 目录端点/免费判定/探测参数都在后端注册表；这里只渲染与触发探测。
+  // 状态（pm）独立于免费来源子页的 free 对象，互不干扰。
+
+  const pm = { plugin: "", source: "", models: [], states: [], results: {}, filter: "" };
+
+  function pmStateMeta(id) {
+    return pm.states.find((state) => state.id === id) || { id, label: id || "未探测", tone: "info" };
+  }
+
+  function pmPill(state) {
+    const meta = pmStateMeta(state);
+    return `<span class="pill ${meta.tone === "ok" ? "signal" : meta.tone === "bad" ? "danger" : meta.tone === "warn" ? "amber" : "info"}">${esc(meta.label)}</span>`;
+  }
+
+  function renderPmTable() {
+    const body = $("#pm-table tbody");
+    if (!body) return;
+    const rows = pm.models.filter((model) => !pm.filter || (pm.results[model.id] || {}).state === pm.filter);
+    body.innerHTML = rows.length
+      ? rows
+          .map((model) => {
+            const result = pm.results[model.id] || {};
+            const reason = [result.reasonLabel, result.advice].filter(Boolean).join("：") || result.raw || "—";
+            return `<tr>
+              <td><div class="name-cell"><code>${esc(model.id)}</code>${model.mayTrainOnYourPrompts ? '<span class="pill danger">可能训练</span>' : ""}</div><div class="hint">${esc(model.name || "")}</div></td>
+              <td>${pmPill(result.state)}</td>
+              <td class="num">${model.contextLength ? compactNum(model.contextLength) : "—"}</td>
+              <td>${(model.reasoningEfforts || []).join(" / ") || "—"}</td>
+              <td class="num">${result.latencyMs ? fmtMs(result.latencyMs) : "—"}</td>
+              <td>${esc(reason)}</td>
+              <td class="right"><div class="actions">
+                <button class="btn ghost sm" data-pm-action="probe" data-model="${esc(model.id)}">探测</button>
+              </div></td>
+            </tr>`;
+          })
+          .join("")
+      : `<tr><td colspan="7"><div class="empty-line">没有匹配的模型。</div></td></tr>`;
+    const count = $("#pm-count");
+    if (count) {
+      const available = pm.models.filter((model) => (pm.results[model.id] || {}).state === "available").length;
+      count.textContent = `${pm.models.length} 个候选 · 可用 ${available}`;
+    }
+  }
+
+  function pmToolbar() {
+    const options = [{ id: "", label: "全部状态" }]
+      .concat(pm.states.map((state) => ({ id: state.id, label: state.label })))
+      .map((state) => `<option value="${esc(state.id)}">${esc(state.label)}</option>`)
+      .join("");
+    return `<div class="toolbar">
+      <select class="input select" id="pm-state">${options}</select>
+      <button class="btn ghost sm" id="pm-probe-all">全部探测</button>
+      <span class="hint" id="pm-count">—</span>
+      <span class="hint" id="pm-hint">探测会真实调用上游，消耗免费额度。</span>
+    </div>`;
+  }
+
+  async function probePmOne(model) {
+    const data = await api(`/api/plugins/${encodeURIComponent(pm.plugin)}/probe`, {
+      method: "POST",
+      body: JSON.stringify({ model }),
+    });
+    pm.results[model] = data.result || {};
+    renderPmTable();
+    toast(`${model}：${pmStateMeta(pm.results[model].state).label}`, pm.results[model].state === "available" ? "ok" : "");
+  }
+
+  async function probePmAll() {
+    const button = $("#pm-probe-all");
+    if (button) button.disabled = true;
+    const hint = $("#pm-hint");
+    if (hint) hint.textContent = "正在逐个探测，会消耗免费额度…";
+    try {
+      const data = await api(`/api/plugins/${encodeURIComponent(pm.plugin)}/probe-all`, { method: "POST", body: "{}" });
+      pm.results = {};
+      (data.results || []).forEach((result) => {
+        pm.results[result.model] = result;
+      });
+      renderPmTable();
+      const available = (data.results || []).filter((result) => result.state === "available").length;
+      if (hint) hint.textContent = `探测完成：${available} 个可用`;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function openPluginModels(pluginId) {
+    const plugin = (MG.state.plugins || []).find((item) => item.id === pluginId);
+    const data = await api(`/api/plugins/${encodeURIComponent(pluginId)}/models`, { method: "POST", body: "{}" });
+    pm.plugin = pluginId;
+    pm.source = data.source || "";
+    pm.models = Array.isArray(data.models) ? data.models : [];
+    pm.states = Array.isArray(data.states) ? data.states : [];
+    pm.results = {};
+    pm.filter = "";
+    openModal(
+      `${plugin?.name || pluginId} · 模型`,
+      `来源 ${pm.source} · ${pm.models.length} 个免费候选 · 状态由真实探测判定`,
+      `${pmToolbar()}
+       <div class="table-wrap"><table class="table" id="pm-table">
+         <thead><tr><th>模型</th><th>状态</th><th class="num">上下文</th><th>思考档位</th><th class="num">延迟</th><th>拒因与建议</th><th class="right">操作</th></tr></thead>
+         <tbody></tbody>
+       </table></div>`
+    );
+    $("#pm-state").addEventListener("change", (event) => {
+      pm.filter = event.target.value;
+      renderPmTable();
+    });
+    $("#pm-probe-all").addEventListener("click", () => {
+      probePmAll().catch((error) => {
+        const hint = $("#pm-hint");
+        if (hint) hint.textContent = "探测失败";
+        toast(error.message, "error");
+      });
+    });
+    $("#pm-table").addEventListener("click", (event) => {
+      const button = event.target.closest("[data-pm-action]");
+      if (button && button.dataset.pmAction === "probe") {
+        probePmOne(button.dataset.model).catch((error) => toast(error.message, "error"));
+      }
+    });
+    renderPmTable();
+  }
+
+  MG.openPluginModels = openPluginModels;
 
   async function loadZcode() {
     const [status, config, accounts] = await Promise.all([

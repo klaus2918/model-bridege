@@ -408,10 +408,23 @@ async function main() {
     await click('.drawer-tab[data-dtab="connection"]');
     await click('.drawer-tab[data-dtab="models"]');
     await click('.drawer-tab[data-dtab="advanced"]');
-    await screenshot("v4-04-access-drawer");
+    // 查询清单（成功路径，走 zen 上游：transport=opencode，本机可达）：
+    // 断言勾选网格渲染且已声明模型（big-pickle）默认勾上。
+    await evaluate(`document.querySelector('[data-open="zen"]').click()`);
+    await waitFor(() => evaluate(`!document.querySelector("#drawer").hidden`), 4000, "zen 抽屉");
+    await click('.drawer-tab[data-dtab="models"]');
+    await click("#fetch-upstream-models");
+    await waitFor(() => evaluate(`document.querySelectorAll("#fetched-model-grid input").length > 0`), 15000, "查询清单勾选网格");
+    const fetched = await evaluate(`({
+      count: document.querySelectorAll("#fetched-model-grid input").length,
+      bigPickleChecked: document.querySelector('#fetched-model-grid input[data-fetched-model="big-pickle"]')?.checked,
+      meta: (document.querySelector("#fetch-models-meta")?.textContent || "").trim(),
+    })`);
+    if (!fetched.bigPickleChecked) throw new Error(`已声明模型未默认勾选：${JSON.stringify(fetched)}`);
+    await screenshot("v4-04b-drawer-fetch-models");
     await evaluate(`document.querySelector("#drawer-close").click()`);
     await waitFor(() => evaluate(`document.querySelector("#drawer").hidden`), 3000, "关闭抽屉");
-    return `${data.cards} 张接入卡 / 页签 ${tabs.join("·")}`;
+    return `${data.cards} 张接入卡 / 页签 ${tabs.join("·")} / 查询清单 ${fetched.count} 个 · big-pickle 默认勾选`;
   });
 
   await check("用量筛选刷新后保留（localStorage）", async () => {
@@ -453,6 +466,36 @@ async function main() {
     await screenshot("v4-06-plugins");
     await evaluate(`document.querySelector("#zcode-panel-close").click()`);
     return `插件 ${data.plugins} / 内置库 ${data.libraryHidden ? "隐藏" : data.library} / ZCode ${zcode}`;
+  });
+
+  await check("插件页：免费插件「模型 · 检测」入口与弹窗", async () => {
+    await navigate("plugins");
+    await waitFor(() => evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length >= 3`), 6000, "插件卡片");
+    // kilo/zen 卡片必须带「模型 · 检测」；zcode 账号池插件沿用专属面板，不提供免费模型目录。
+    const buttons = await evaluate(`({
+      kilo: !!document.querySelector('[data-plugin-models="modelgate.free.kilo"]'),
+      zen: !!document.querySelector('[data-plugin-models="modelgate.free.opencode"]'),
+      zcode: !!document.querySelector('[data-plugin-models="modelgate.account.zcode"]'),
+    })`);
+    if (!buttons.kilo || !buttons.zen) throw new Error(`Kilo/Zen 缺少「模型 · 检测」按钮：${JSON.stringify(buttons)}`);
+    if (buttons.zcode) throw new Error("账号池插件不应提供免费模型目录入口");
+    // 像真实用户一样点 zen 卡片按钮打开弹窗（kilo 目录在本机可能不可达，
+    // 点按钮走绑定链路：拉取失败会 toast，等待「弹窗或提示」二选一即可）。
+    await click('[data-plugin-models="modelgate.free.opencode"]');
+    await waitFor(
+      () => evaluate(`!!document.querySelector("#pm-table") || (document.querySelector("#toast") && !document.querySelector("#toast").hidden)`),
+      12000,
+      "模型弹窗或错误提示"
+    );
+    const modal = await evaluate(`({
+      open: !document.querySelector("#modal").hidden && !!document.querySelector("#pm-table"),
+      rows: document.querySelectorAll("#pm-table tbody tr").length,
+      count: (document.querySelector("#pm-count")?.textContent || "").trim(),
+    })`);
+    await screenshot("v4-06b-plugin-models");
+    await evaluate(`document.querySelector("#modal-close")?.click()`);
+    if (!modal.open) return "目录拉取失败（网络/上游），入口与触发链路正常";
+    return `zen 弹窗：${modal.count || "0 个候选"} / ${modal.rows} 行`;
   });
 
   await check("设置：子导航、未保存提示与配置校验", async () => {

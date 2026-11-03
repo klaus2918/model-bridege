@@ -22,8 +22,9 @@
 >
 > **ZCode 账号池（v2.28.0）**：新增「ZCode」页签，支持从本机 ZCode 导入、OAuth 登录、粘贴 JWT/API Key；
 > JWT 只存本机加密库（Windows DPAPI），不写配置文件、不回显。插件内置无头浏览器验证码池，
-> 可预览/领取 Start Plan、维护额度与冷却状态；`transport=zcode` 通过本机 ZCode app-server
-> 走 `GLM-5.3-Flash` / `GLM-5.3`，请求在账号池内轮询、失败自动换号。旧的 OpenAI/Anthropic/
+> 可预览/领取 Start Plan、维护额度与冷却状态；`transport=zcode` 默认走 **direct 直连**
+> （账号 JWT 直调 Anthropic 兼容端点，SSE 透传，首字节通常几百毫秒），
+> 也可切回本机 ZCode app-server 兼容模式；请求在账号池内轮询、失败自动换号。旧的 OpenAI/Anthropic/
 > CommandCode/opencode 上游与配置保持兼容。
 
 ## v4 控制台（默认面板）
@@ -72,7 +73,7 @@ model-bridge
    ├─ cch         (Anthropic 协议)   → 127.0.0.1:15721 → CCH → DeepSeek
    ├─ go          (OpenAI 协议)      → opencode.ai/zen/go/v1  ← Go 订阅套餐
    ├─ zen         (OpenAI + opencode) → opencode.ai/zen/v1     ← 免费模型
-   ├─ zcode       (Anthropic 协议)   → 本机 ZCode app-server   ← Start Plan GLM 账号池
+   ├─ zcode       (Anthropic 协议)   → zcode.z.ai coding-plan 直连 ← Start Plan GLM 账号池
    └─ commandcode (CommandCode 协议) → api.commandcode.ai/alpha/generate ← CommandCode 订阅
 ```
 
@@ -353,11 +354,12 @@ set OPENAI_API_KEY=any-key
 - 这是 OpenCode 未公开的客户端契约，可能随上游升级失效；只用于免费层，不涉及 `go` 订阅、登录或付费。
 - 配置校验：`transport=opencode` 必须搭配 `protocol=openai`；面板可直接选择「opencode 免费层」。
 
-### 免费来源：免密免费模型（面板第 6 页「免费来源」）
+### 免费来源：免密免费模型（接入 → 免费来源；插件页同款入口）
 
 不登录、不注册、不填 API Key，就能用上免费模型——并且**看清此刻到底哪个模型真能用**。
 
-面板新增第 6 页「**免费来源**」，提供两条免密通道，以及一个账号型来源：
+面板「**接入 → 免费来源**」子页签（五页信息架构后由原一级页收进接入页），
+提供两条免密通道，以及一个账号型来源：
 
 | 来源 | 端点 | 鉴权 | 隐私级别 |
 |------|------|------|----------|
@@ -404,7 +406,16 @@ set OPENAI_API_KEY=any-key
 > **隐私红线**：Kilo 免密池 20 个模型中 **19 个 `mayTrainOnYourPrompts=true`**，NVIDIA 免费端点
 > 官方明示会记录会话用于改进产品。免费池**不适合承载机密或敏感内容**，面板会常驻警示。
 
-接口：`GET /api/free-sources`、`POST /api/free-sources/{catalog,probe,probe-all,attach}`。
+**插件页同款入口**：Kilo 与 OpenCode Zen 在「插件」页各带「**模型 · 检测**」按钮——
+每个插件用自己的一套：`manifest.freeSource` 指向免费来源注册表条目
+（kilo → `kilo-free`、zen → `zen-free`），目录端点、免费判定与探测参数仍由
+`free_sources.json` 单一事实源承载，不随插件复制一份。Kilo 打 OpenRouter 公共目录
+按 `:free`/`isFree`/零价筛选；Zen 打指纹头免密层目录按 `-free`/固定集合筛选。
+账号池插件（ZCode）沿用专属「账号池 · 领取记录」面板，不提供免费模型目录；
+未声明 `freeSource` 的插件一律没有该能力（接口返回 400 `plugin_not_free_source`）。
+
+接口：`GET /api/free-sources`、`POST /api/free-sources/{catalog,probe,probe-all,attach}`；
+插件页：`POST /api/plugins/{id}/{models,probe,probe-all}`（与 free-sources 共享退避缓存）。
 完整设计见 [`docs/architecture/free-sources.md`](docs/architecture/free-sources.md)。
 
 ### commandcode（CommandCode 订阅，复用你已登录的凭据）
@@ -512,16 +523,18 @@ curl http://127.0.0.1:8900/go/v1/chat/completions -H "Content-Type: application/
 
 ### 想自己核对上游到底有哪些模型
 
-**面板一键查询（推荐）**：配置页 → 上游 →「编辑」→ 模型清单旁点「**查询清单**」。
+**面板一键查询（推荐）**：接入页卡片 → 详情抽屉 →「**模型**」页签 → 模型列表上方点「**⇣ 查询清单**」。
+每个上游查自己的目录（transport 感知：`transport=opencode` 自动带客户端指纹并改写路径，
+commandcode 读本机 models.md，其余按 OpenAI 兼容约定）。
 
 - 后端按 OpenAI 兼容约定拉 `GET {baseUrl}/v1/models`（路径可用 `compat.endpoint.models` 改），
-  解析 `data` / `models` 数组里的 `id` / `slug` / `model`，**去重且保持上游顺序**。
+  解析 `data` / `models` 数组里的 `id` / `slug` / `model`，**去重且保持上游顺序**；
+  也可直接 `POST /api/upstreams/{name}/models`（程序化调用）。
 - 弹出的面板里**多选**即可，写入方式二选一：
   - **替换**：用勾选结果整体覆盖该上游的 `models`；
   - **追加**：把勾选结果并入现有 `models`（去重）。
 - 已配置的模型默认勾上，方便一眼看出「哪些已生效」；支持检索、全选、取消选择。
-- 写入只改面板表单，**不立即落盘**——点页面底部「保存配置」才写进 `bridge.config.json`。
-- 改了 `baseUrl` 但还没保存也能查：查询用**表单当前值**，打的是新地址。
+- 写入只改抽屉表单，**不立即落盘**——点「保存模型与目录」才写进 `bridge.config.json`。
 - 查询失败会说明原因（401 / 超时 / 返回体不是 JSON）与修复提示，不会伪装成「没有模型」。
 
 命令行同样可以查：

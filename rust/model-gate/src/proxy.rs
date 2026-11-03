@@ -595,6 +595,19 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/plugins/{id}/restore", post(crate::plugin::restore))
         .route("/api/plugins/{id}/attach", post(crate::plugin::attach))
         .route("/api/plugins/{id}/detach", post(crate::plugin::detach))
+        // 插件页「模型 · 检测」：freeSource 指向注册表条目，目录零生成、探测显式触发。
+        .route(
+            "/api/plugins/{id}/models",
+            post(crate::free_sources_api::plugin_models),
+        )
+        .route(
+            "/api/plugins/{id}/probe",
+            post(crate::free_sources_api::plugin_probe),
+        )
+        .route(
+            "/api/plugins/{id}/probe-all",
+            post(crate::free_sources_api::plugin_probe_all),
+        )
         // AI 可读配置：只读 + 草案 + 人工确认应用。
         .route("/llms.txt", get(crate::ai_api::llms_txt))
         .route("/api/ai/manifest", get(crate::ai_api::manifest))
@@ -1200,7 +1213,7 @@ async fn chat_scoped(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let response = crate::zcode::transport::chat(
-                &state,
+                Arc::clone(&state),
                 upstream,
                 &payload,
                 &requested_model,

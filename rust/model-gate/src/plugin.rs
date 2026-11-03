@@ -90,6 +90,9 @@ fn builtin_manifests() -> Vec<Value> {
                 "advancedFields": ["models"],
                 "privacy": { "support": "request", "zdrDefault": true }
             },
+            // freeSource：指向 free_sources.json 注册表条目。插件页「模型 · 检测」
+            // 据此复用该来源自己的目录端点、免费判定与探测参数（单一事实源）。
+            "freeSource": "kilo-free",
             "upstream": {
                 "protocol": "openai",
                 "baseUrl": "https://api.kilo.ai/api/openrouter",
@@ -111,6 +114,8 @@ fn builtin_manifests() -> Vec<Value> {
                 "advancedFields": ["models"],
                 "privacy": { "support": "account", "zdrDefault": true }
             },
+            // zen 走指纹头免密层：目录与探测参数同样以注册表 zen-free 为准。
+            "freeSource": "zen-free",
             "upstream": {
                 "protocol": "openai",
                 "transport": "opencode",
@@ -346,6 +351,8 @@ fn plugin_summary(state: &AppState, manifest: &Value, enabled: bool, installed: 
         "version": manifest.get("version").and_then(Value::as_str).unwrap_or("0.0.0"),
         "kind": manifest.get("kind").and_then(Value::as_str).unwrap_or("provider"),
         "tier": manifest.get("tier").and_then(Value::as_str).unwrap_or("declarative"),
+        // 免费来源插件携带自己的注册表条目 id；账号池/Provider 插件为 null。
+        "freeSource": manifest.get("freeSource").and_then(Value::as_str).unwrap_or(""),
         "enabled": enabled,
         "installed": installed,
         "builtin": is_builtin(id),
@@ -354,6 +361,24 @@ fn plugin_summary(state: &AppState, manifest: &Value, enabled: bool, installed: 
         "removable": true,
         "attached": attached_upstreams(state, id),
     })
+}
+
+/// 插件声明的免费来源：`manifest.freeSource` → 注册表条目。
+///
+/// 「模型 · 检测」的单一事实源在 `free_sources.json`：每个免费插件指向自己的
+/// 条目（kilo→kilo-free、zen→zen-free），目录端点、免费判定与探测参数都由
+/// 注册表承载，这里只做指针解析。仅 `kind=free` 且已声明的插件有该能力；
+/// 已移除的插件一律视为没有。
+pub fn free_source_for(state: &AppState, plugin_id: &str) -> Option<crate::free_sources::FreeSource> {
+    if is_removed(&state.db, plugin_id) {
+        return None;
+    }
+    let (manifest, _, _) = find_manifest(state, plugin_id)?;
+    if manifest.get("kind").and_then(Value::as_str) != Some("free") {
+        return None;
+    }
+    let source_id = manifest.get("freeSource").and_then(Value::as_str)?;
+    crate::free_sources::source(source_id)
 }
 
 fn plugin_json(state: &AppState, manifest: &Value) -> Value {
@@ -1150,6 +1175,75 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mg-plugin-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         Db::open(&dir.join("modelgate.db")).unwrap()
+    }
+
+    fn temp_state() -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("mg-plugin-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("modelgate.db")).unwrap());
+        Arc::new(AppState::new(
+            crate::config::Config::from_value(json!({})),
+            db,
+            dir.join("bridge.config.json"),
+        ))
+    }
+
+    /// 免费插件自带 freeSource 指针，且能在注册表解析到各自的来源。
+    #[test]
+    fn free_plugins_declare_resolvable_free_source() {
+        let state = temp_state();
+        let kilo = free_source_for(&state, "modelgate.free.kilo").expect("kilo 应有免费来源");
+        assert_eq!(kilo.id, "kilo-free");
+        assert_eq!(kilo.transport, "", "kilo 走标准免鉴权端点");
+        let zen = free_source_for(&state, "modelgate.free.opencode").expect("zen 应有免费来源");
+        assert_eq!(zen.id, "zen-free");
+        assert_eq!(zen.transport, "opencode", "zen 走指纹头免密层");
+        // 账号池插件没有免费模型目录：zcode 保留专属账号面板。
+        assert!(free_source_for(&state, "modelgate.account.zcode").is_none());
+        // 摘要透传 freeSource，供插件卡片判断是否渲染「模型 · 检测」。
+        let summary = plugin_summary(
+            &state,
+            &json!({"id": "modelgate.free.kilo", "kind": "free", "freeSource": "kilo-free"}),
+            true,
+            true,
+        );
+        assert_eq!(summary["freeSource"], json!("kilo-free"));
+        let summary = plugin_summary(
+            &state,
+            &json!({"id": "modelgate.account.zcode", "kind": "account"}),
+            true,
+            true,
+        );
+        assert_eq!(summary["freeSource"], json!(""));
+    }
+
+    /// 已移除的插件不再提供模型获取与检测。
+    #[test]
+    fn removed_plugin_has_no_free_source() {
+        let state = temp_state();
+        let manifest = builtin_manifests()
+            .into_iter()
+            .find(|m| m["id"] == "modelgate.free.kilo")
+            .unwrap();
+        register_manifest(&state.db, &manifest, "builtin", true, true).unwrap();
+        assert!(free_source_for(&state, "modelgate.free.kilo").is_none());
+    }
+
+    /// 未知插件与未声明 freeSource 的插件都没有模型能力。
+    #[test]
+    fn unknown_or_unlinked_plugin_has_no_free_source() {
+        let state = temp_state();
+        assert!(free_source_for(&state, "no.such.plugin").is_none());
+        let manifest = json!({
+            "schema": "modelgate.plugin/v1",
+            "id": "test.provider",
+            "kind": "provider",
+            "tier": "declarative",
+            "auth": {"mode": "single"},
+            "upstream": {"protocol": "openai", "baseUrl": "https://x"}
+        });
+        register_manifest(&state.db, &manifest, "import", true, false).unwrap();
+        assert!(free_source_for(&state, "test.provider").is_none());
     }
 
     /// 包化生命周期：内置插件 停用 → 移除 → 重装 全程不丢定义。

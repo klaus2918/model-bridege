@@ -691,6 +691,11 @@
     const overrides = raw.modelOverrides && typeof raw.modelOverrides === "object" ? raw.modelOverrides : {};
     return `<div class="section-title">模型声明</div>
       <div class="inline-note">每行一个模型 id；留空时由上游目录自动拉取。这里的声明会参与 /v1/models 与路由匹配。</div>
+      <div class="modal-actions" style="margin:0 0 8px">
+        <button class="btn ghost sm" id="fetch-upstream-models">⇣ 查询清单</button>
+        <span class="hint" id="fetch-models-meta"></span>
+      </div>
+      <div id="upstream-models-result" hidden style="margin-bottom:12px"></div>
       <label class="field"><span>模型列表</span><textarea class="input code-area" id="edit-models" rows="5" spellcheck="false" placeholder="deepseek-chat&#10;deepseek-reasoner">${esc(models)}</textarea></label>
       <div class="form-grid">
         <label class="field"><span>模型别名映射（JSON）</span><textarea class="input code-area" id="edit-model-map" rows="5" spellcheck="false" placeholder='{"gpt-4o-mini":"deepseek-chat"}'>${esc(Object.keys(aliases).length ? JSON.stringify(aliases, null, 2) : "")}</textarea></label>
@@ -745,7 +750,118 @@
     </div>`;
   }
 
+  // ───────────────────────── 抽屉：查询上游模型清单 ─────────────────────────
+  // 后端 /api/upstreams/{name}/models 是 transport 感知的（opencode 指纹头、
+  // commandcode 本地 models.md、普通 OpenAI 目录各走各的）；多选结果只写入
+  // 表单（替换/追加），点「保存模型与目录」才落盘。
+
+  function renderFetchedModels(item) {
+    const host = $("#upstream-models-result");
+    const meta = $("#fetch-models-meta");
+    const fetched = state.fetchedModels;
+    if (!host || !meta || !fetched || fetched.id !== item.id) return;
+    const declared = $("#edit-models")
+      .value.split(/[\n,，]+/)
+      .map((model) => model.trim())
+      .filter(Boolean);
+    if (!fetched.models.length) {
+      host.hidden = true;
+      meta.textContent = "上游返回了空清单：检查目录端点或改用手动声明。";
+      return;
+    }
+    host.hidden = false;
+    meta.textContent = `拉取到 ${fetched.models.length} 个可用模型 · 已生效的默认勾选`;
+    host.innerHTML = `
+      <div class="toolbar">
+        <input class="input search" id="fetched-model-search" placeholder="检索模型 id">
+        <button class="btn ghost sm" id="fetched-select-all">全选</button>
+        <button class="btn ghost sm" id="fetched-clear">取消选择</button>
+      </div>
+      <div class="check-grid" id="fetched-model-grid">
+        ${fetched.models
+          .map(
+            (model) =>
+              `<label class="check"><input type="checkbox" data-fetched-model="${esc(model)}" ${declared.includes(model) ? "checked" : ""}> <span class="mono tiny">${esc(model)}</span></label>`
+          )
+          .join("")}
+      </div>
+      <div class="modal-actions">
+        <button class="btn primary sm" id="replace-fetched-models">替换清单</button>
+        <button class="btn ghost sm" id="append-fetched-models">追加到清单</button>
+        <span class="hint">只改下方表单；点「保存模型与目录」才写入配置。</span>
+      </div>`;
+    const pickedModels = () =>
+      $$("#fetched-model-grid input:checked").map((input) => input.dataset.fetchedModel);
+    const currentModels = () =>
+      $("#edit-models")
+        .value.split(/[\n,，]+/)
+        .map((model) => model.trim())
+        .filter(Boolean);
+    $("#fetched-model-search").addEventListener("input", (event) => {
+      const query = event.target.value.trim().toLowerCase();
+      $$("#fetched-model-grid label").forEach((label) => {
+        const id = (label.querySelector("input")?.dataset.fetchedModel || "").toLowerCase();
+        label.style.display = !query || id.includes(query) ? "" : "none";
+      });
+    });
+    $("#fetched-select-all").addEventListener("click", () => {
+      $$("#fetched-model-grid input").forEach((input) => {
+        input.checked = true;
+      });
+    });
+    $("#fetched-clear").addEventListener("click", () => {
+      $$("#fetched-model-grid input").forEach((input) => {
+        input.checked = false;
+      });
+    });
+    $("#replace-fetched-models").addEventListener("click", () => {
+      const picked = pickedModels();
+      if (!picked.length) {
+        toast("先勾选要写入的模型", "error");
+        return;
+      }
+      $("#edit-models").value = picked.join("\n");
+      toast(`已用 ${picked.length} 个模型替换清单，记得点「保存模型与目录」`, "ok");
+    });
+    $("#append-fetched-models").addEventListener("click", () => {
+      const picked = pickedModels();
+      if (!picked.length) {
+        toast("先勾选要追加的模型", "error");
+        return;
+      }
+      const current = currentModels();
+      const added = picked.filter((model) => !current.includes(model));
+      $("#edit-models").value = current.concat(added).join("\n");
+      toast(added.length ? `已追加 ${added.length} 个模型，记得点「保存模型与目录」` : "勾选的模型都已在清单里", added.length ? "ok" : "");
+    });
+  }
+
   function bindDrawerActions(item) {
+    // 模型页：从上游拉取可用清单（GET /api/upstreams/{name}/models，transport 感知）。
+    if (state.fetchedModels && state.fetchedModels.id === item.id && $("#upstream-models-result")) {
+      renderFetchedModels(item);
+    }
+    const fetchUpstreamModels = $("#fetch-upstream-models");
+    if (fetchUpstreamModels) {
+      fetchUpstreamModels.addEventListener("click", async () => {
+        const meta = $("#fetch-models-meta");
+        const host = $("#upstream-models-result");
+        if (!meta || !host) return;
+        fetchUpstreamModels.disabled = true;
+        host.hidden = true;
+        meta.textContent = "正在向上游查询清单…";
+        try {
+          const data = await api(`/api/upstreams/${encodeURIComponent(item.id)}/models`);
+          state.fetchedModels = { id: item.id, models: Array.isArray(data.models) ? data.models : [] };
+          renderFetchedModels(item);
+        } catch (error) {
+          state.fetchedModels = null;
+          meta.textContent = `查询失败：${error.message}`;
+        } finally {
+          fetchUpstreamModels.disabled = false;
+        }
+      });
+    }
     const toggleEnabled = $("#toggle-enabled");
     if (toggleEnabled) {
       toggleEnabled.addEventListener("click", async () => {
@@ -1454,6 +1570,11 @@
     const zcodeBtn = plugin.id === "modelgate.account.zcode" && !inLibrary
       ? `<button class="btn ghost sm" data-open-zcode="1">账号池 · 领取记录</button>`
       : "";
+    // 免费来源插件（kilo/zen）自带模型获取与检测：目录端点、免费判定与探测
+    // 参数由插件 freeSource 指向的注册表条目承载，每个插件各用自己的一套。
+    const modelsBtn = plugin.freeSource && !inLibrary
+      ? `<button class="btn ghost sm" data-plugin-models="${esc(plugin.id)}">模型 · 检测</button>`
+      : "";
     return `<article class="plugin-card ${plugin.enabled && !inLibrary ? "on" : "off"}${inLibrary ? " removed" : ""}" data-plugin="${esc(plugin.id)}">
       <div class="plugin-head">
         <span class="plugin-avatar">${esc(initials)}</span>
@@ -1473,6 +1594,7 @@
           ? `<button class="btn primary sm" data-plugin-restore="${esc(plugin.id)}">重装</button>`
           : `<button class="btn primary sm" data-plugin-attach="${esc(plugin.id)}">${plugin.enabled ? "接入" : "先启用"}</button>
             ${attached.length ? `<button class="btn ghost sm" data-plugin-detach="${esc(plugin.id)}" data-name="${esc(attached[0])}">解绑</button>` : ""}
+            ${modelsBtn}
             <button class="btn ghost sm" data-plugin-toggle="${esc(plugin.id)}" data-enabled="${plugin.enabled ? "0" : "1"}">${plugin.enabled ? "停用" : "启用"}</button>
             ${zcodeBtn}
             <button class="btn danger sm" data-plugin-remove="${esc(plugin.id)}" data-builtin="${plugin.builtin ? "1" : "0"}">移除</button>`}
@@ -1538,6 +1660,15 @@
         } catch (error) {
           toast(error.message, "error");
         }
+      })
+    );
+    $$("[data-plugin-models]", root).forEach((button) =>
+      button.addEventListener("click", () => {
+        // 处理器在 v4-resources.js（免费来源域逻辑所在），加载顺序晚于本文件，
+        // 因此点击时才解引用，缺失时提示而不是抛错。
+        const opener = MG.openPluginModels;
+        if (opener) opener(button.dataset.pluginModels).catch((error) => toast(error.message, "error"));
+        else toast("模型检测模块未加载", "error");
       })
     );
   }

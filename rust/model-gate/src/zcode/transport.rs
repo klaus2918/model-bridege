@@ -7,6 +7,7 @@
 //! 账号池：按 `last_used_at`/`use_count` 轮询；失败按错误语义标 invalid/冷却，
 //! 换下一个账号。任何路径都不记录 JWT、验证码或完整上游错误。
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -36,7 +37,7 @@ fn now_ms() -> i64 {
 /// 归一化 CLI 错误：决定账号状态与冷却时间。
 ///
 /// 只做文本分类（CLI 不一定暴露 HTTP 状态）；分类错误不会泄露 token。
-pub fn classify_failure(text: &str, fail_count: i64) -> (&'static str, Option<i64>) {
+pub(crate) fn classify_failure(text: &str, fail_count: i64) -> (&'static str, Option<i64>) {
     let lower = text.to_lowercase();
     let auth = [
         "401",
@@ -64,7 +65,7 @@ pub fn classify_failure(text: &str, fail_count: i64) -> (&'static str, Option<i6
     (STATUS_COOLING, Some(now_ms() + SHORT_COOLDOWN_MS))
 }
 
-fn brief(text: &str, max_chars: usize) -> String {
+pub(crate) fn brief(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
     let mut out: String = trimmed.chars().take(max_chars).collect();
     if trimmed.chars().count() > max_chars {
@@ -129,7 +130,7 @@ fn stream_body(text: &str, model: &str, usage: &Value) -> String {
     format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n")
 }
 
-fn upstream_headers(response: &mut Response, upstream: &Upstream, model: &str) {
+pub(crate) fn upstream_headers(response: &mut Response, upstream: &Upstream, model: &str) {
     if let Ok(value) = header::HeaderValue::from_str(&upstream.name) {
         response.headers_mut().insert("x-bridge-upstream", value);
     }
@@ -160,7 +161,7 @@ fn record_attempt(
 
 /// 主入口：由 `proxy::chat_inner` 在识别 `transport=zcode` 后调用。
 pub async fn chat(
-    state: &AppState,
+    state: Arc<AppState>,
     upstream: &Upstream,
     payload: &Value,
     requested_model: &str,
@@ -170,11 +171,23 @@ pub async fn chat(
     stream: bool,
 ) -> Response {
     let backend = state.zcode.config().backend.clone();
-    if backend != "appserver" {
-        // direct 已实测 405/3012；不做自动回退，避免把风控噪音当正常路由。
-        let message = "ZCode backend=direct 已实测被上游拒绝（405/3012），请改用 backend=appserver";
-        record_attempt(
+    if backend == "direct" {
+        return super::direct::chat(
             state,
+            upstream,
+            payload,
+            requested_model,
+            target_model,
+            ctx,
+            started,
+            stream,
+        )
+        .await;
+    }
+    if backend != "appserver" {
+        let message = "ZCode backend 只能是 appserver 或 direct";
+        record_attempt(
+            &state,
             upstream,
             requested_model,
             target_model,
@@ -189,13 +202,13 @@ pub async fn chat(
             StatusCode::NOT_IMPLEMENTED,
             message,
             "upstream_error",
-            "zcode_direct_unavailable",
+            "zcode_backend_invalid",
         );
     }
     if !state.zcode.config().enabled {
         let message = "ZCode 插件未启用：请先在 ZCode 面板启用插件";
         record_attempt(
-            state,
+            &state,
             upstream,
             requested_model,
             target_model,
@@ -257,7 +270,7 @@ pub async fn chat(
                     None,
                 );
                 record_attempt(
-                    state,
+                    &state,
                     upstream,
                     requested_model,
                     target_model,
@@ -331,7 +344,7 @@ pub async fn chat(
         StatusCode::SERVICE_UNAVAILABLE
     };
     record_attempt(
-        state,
+        &state,
         upstream,
         requested_model,
         target_model,

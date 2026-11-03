@@ -333,6 +333,13 @@ pub async fn claim(
     })
 }
 
+/// direct transport 复用：账号鉴权 + ZCode 客户端头（不含验证码）。
+pub(crate) fn client_headers(
+    account: &ZcodeAccount,
+) -> Result<reqwest::header::HeaderMap, BillingError> {
+    headers(account, None)
+}
+
 fn headers(
     account: &ZcodeAccount,
     captcha: Option<&CaptchaToken>,

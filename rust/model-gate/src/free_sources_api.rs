@@ -7,6 +7,12 @@
 //! - `POST /api/free-sources/probe-all` 批量探测（受退避与并发上限保护）
 //! - `POST /api/free-sources/attach`  一键接入（写配置到 bridge.config.json）
 //!
+//! 插件页「模型 · 检测」端点（`manifest.freeSource` → 注册表条目，每个插件
+//! 复用自己的目录端点/免费判定/探测参数，单一事实源在 `free_sources.json`）：
+//! - `POST /api/plugins/{id}/models`     目录拉取（零生成）
+//! - `POST /api/plugins/{id}/probe`      单模型探测
+//! - `POST /api/plugins/{id}/probe-all`  批量探测（与 free-sources 共享退避缓存）
+//!
 //! 设计约束（plan.md D3 / D6）：
 //! - **不泄露**：响应体不含上游请求头、指纹头、会话 ID 或任何凭据。
 //! - **不消耗（默认）**：目录与水位查询不产生任何生成请求。
@@ -15,7 +21,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -220,6 +226,32 @@ fn model_card(source: &fs::FreeSource, id: &str, entry: &Value) -> Value {
     })
 }
 
+/// 目录载荷组装（free-sources 与插件端点共用）。
+async fn catalog_payload(source: &fs::FreeSource) -> Result<Value, Response> {
+    match fetch_catalog(source).await {
+        Ok(models) => {
+            let cards: Vec<Value> = models
+                .iter()
+                .map(|(mid, entry)| model_card(source, mid, entry))
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "source": source.id,
+                "count": cards.len(),
+                "models": cards,
+                "level": level_of(cards.len(), 0),
+                "checkedAt": chrono::Utc::now().to_rfc3339(),
+            }))
+        }
+        Err(message) => Err(error_json(
+            StatusCode::BAD_GATEWAY,
+            format!("拉取免费来源目录失败：{message}"),
+            "upstream_error",
+            "free_source_catalog_failed",
+        )),
+    }
+}
+
 /// `POST /api/free-sources/catalog`：拉目录 + 筛免费候选（零生成）。
 pub async fn free_sources_catalog(Json(body): Json<Value>) -> Response {
     let id = body.get("source").and_then(Value::as_str).unwrap_or("");
@@ -231,28 +263,9 @@ pub async fn free_sources_catalog(Json(body): Json<Value>) -> Response {
             "unknown_free_source",
         );
     };
-    match fetch_catalog(&source).await {
-        Ok(models) => {
-            let cards: Vec<Value> = models
-                .iter()
-                .map(|(mid, entry)| model_card(&source, mid, entry))
-                .collect();
-            Json(json!({
-                "ok": true,
-                "source": source.id,
-                "count": cards.len(),
-                "models": cards,
-                "level": level_of(cards.len(), 0),
-                "checkedAt": chrono::Utc::now().to_rfc3339(),
-            }))
-            .into_response()
-        }
-        Err(message) => error_json(
-            StatusCode::BAD_GATEWAY,
-            format!("拉取免费来源目录失败：{message}"),
-            "upstream_error",
-            "free_source_catalog_failed",
-        ),
+    match catalog_payload(&source).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(response) => response,
     }
 }
 
@@ -435,13 +448,47 @@ fn probe_payload(source: &fs::FreeSource, model: &str, result: &ProbeResult) -> 
     })
 }
 
+/// 单模型探测载荷（free-sources 与插件端点共用）。
+///
+/// `model` 必须是该来源的免费候选：探测会真实消耗额度，
+/// 不给付费模型留任何被误打的可能。
+async fn probe_one_payload(
+    state: &Arc<AppState>,
+    source: &fs::FreeSource,
+    model: &str,
+    timeout: f64,
+) -> Result<Value, Response> {
+    if model.is_empty() {
+        return Err(error_json(
+            StatusCode::BAD_REQUEST,
+            "缺少 model 字段",
+            "invalid_request_error",
+            "model_required",
+        ));
+    }
+    if !fs::is_free_entry(source, model, None) {
+        return Err(error_json(
+            StatusCode::BAD_REQUEST,
+            format!("模型 {model} 不是 {} 的免费候选", source.label),
+            "invalid_request_error",
+            "model_not_free",
+        ));
+    }
+    let result = probe_model(state, source, model, timeout).await;
+    Ok(json!({"ok": true, "result": probe_payload(source, model, &result)}))
+}
+
 /// `POST /api/free-sources/probe`：单模型真实对话探测。
 pub async fn free_sources_probe(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Response {
     let id = body.get("source").and_then(Value::as_str).unwrap_or("");
-    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let timeout = body
         .get("timeout")
         .and_then(Value::as_f64)
@@ -455,66 +502,37 @@ pub async fn free_sources_probe(
             "unknown_free_source",
         );
     };
-    if model.is_empty() {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            "缺少 model 字段",
-            "invalid_request_error",
-            "model_required",
-        );
+    match probe_one_payload(&state, &source, &model, timeout).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(response) => response,
     }
-    if !fs::is_free_entry(&source, model, None) {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            format!("模型 {model} 不是 {} 的免费候选", source.label),
-            "invalid_request_error",
-            "model_not_free",
-        );
-    }
-    let result = probe_model(&state, &source, model, timeout).await;
-    Json(json!({"ok": true, "result": probe_payload(&source, model, &result)})).into_response()
 }
 
-/// `POST /api/free-sources/probe-all`：批量探测（受并发上限与退避保护）。
-pub async fn free_sources_probe_all(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<Value>,
-) -> Response {
-    let id = body.get("source").and_then(Value::as_str).unwrap_or("");
-    let timeout = body
-        .get("timeout")
-        .and_then(Value::as_f64)
-        .unwrap_or(PROBE_TIMEOUT_DEFAULT)
-        .clamp(2.0, PROBE_TIMEOUT_MAX);
-    let Some(source) = fs::source(id) else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            format!("未知免费来源 {id}"),
-            "invalid_request_error",
-            "unknown_free_source",
-        );
-    };
-    let models = match fetch_catalog(&source).await {
-        Ok(items) => items.into_iter().map(|(mid, _)| mid).collect::<Vec<_>>(),
-        Err(message) => {
-            return error_json(
-                StatusCode::BAD_GATEWAY,
-                format!("拉取免费来源目录失败：{message}"),
-                "upstream_error",
-                "free_source_catalog_failed",
-            )
-        }
-    };
-    let selected: Vec<String> = match body.get("models").and_then(Value::as_array) {
+/// 批量探测载荷（free-sources 与插件端点共用）：受退避与并发上限保护。
+async fn probe_all_payload(
+    state: &Arc<AppState>,
+    source: &fs::FreeSource,
+    only: Option<Vec<String>>,
+    timeout: f64,
+) -> Result<Value, Response> {
+    let models = fetch_catalog(source).await.map_err(|message| {
+        error_json(
+            StatusCode::BAD_GATEWAY,
+            format!("拉取免费来源目录失败：{message}"),
+            "upstream_error",
+            "free_source_catalog_failed",
+        )
+    })?;
+    let model_ids: Vec<String> = models.into_iter().map(|(mid, _)| mid).collect();
+    let selected: Vec<String> = match only {
         Some(list) => list
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .filter(|m| models.contains(m))
+            .into_iter()
+            .filter(|m| model_ids.contains(m))
             .collect(),
-        None => models.clone(),
+        None => model_ids,
     };
     if selected.is_empty() {
-        return Json(json!({"ok": true, "results": [], "count": 0})).into_response();
+        return Ok(json!({"ok": true, "results": [], "count": 0}));
     }
 
     // 退避：处于退避期的模型不重复消耗额度，直接标记并跳过。
@@ -582,7 +600,7 @@ pub async fn free_sources_probe_all(
     }
 
     let available = results.iter().filter(|r| r["state"] == "available").count();
-    Json(json!({
+    Ok(json!({
         "ok": true,
         "source": source.id,
         "count": results.len(),
@@ -590,7 +608,39 @@ pub async fn free_sources_probe_all(
         "level": level_of(selected.len(), available),
         "checkedAt": chrono::Utc::now().to_rfc3339(),
     }))
-    .into_response()
+}
+
+/// `POST /api/free-sources/probe-all`：批量探测（受并发上限与退避保护）。
+pub async fn free_sources_probe_all(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let id = body.get("source").and_then(Value::as_str).unwrap_or("");
+    let timeout = body
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .unwrap_or(PROBE_TIMEOUT_DEFAULT)
+        .clamp(2.0, PROBE_TIMEOUT_MAX);
+    let only: Option<Vec<String>> = body
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
+    let Some(source) = fs::source(id) else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            format!("未知免费来源 {id}"),
+            "invalid_request_error",
+            "unknown_free_source",
+        );
+    };
+    match probe_all_payload(&state, &source, only, timeout).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(response) => response,
+    }
 }
 
 /// `POST /api/free-sources/attach`：一键接入（写配置到 bridge.config.json）。
@@ -714,9 +764,112 @@ pub async fn free_sources_attach(
     }
 }
 
+// ───────────────────────── 插件页「模型 · 检测」 ─────────────────────────
+
+/// 插件 → 免费来源解析失败时的统一错误：区分「不存在」与「未声明」。
+///
+/// 「每个插件自身不同」在此收口：kilo/zen 各指向自己的注册表条目，
+/// 没有声明 `freeSource` 的插件（账号池、Provider、导入包）一律没有模型目录。
+fn plugin_source_or_error(state: &Arc<AppState>, id: &str) -> Result<fs::FreeSource, Response> {
+    match crate::plugin::free_source_for(state, id) {
+        Some(source) => Ok(source),
+        None if crate::plugin::manifest_for(state, id).is_some() => Err(error_json(
+            StatusCode::BAD_REQUEST,
+            format!("插件「{id}」未声明免费来源（freeSource）；只有免费来源插件提供模型获取与检测"),
+            "invalid_request_error",
+            "plugin_not_free_source",
+        )),
+        None => Err(error_json(
+            StatusCode::NOT_FOUND,
+            format!("插件「{id}」不存在"),
+            "invalid_request_error",
+            "plugin_not_found",
+        )),
+    }
+}
+
+/// `POST /api/plugins/{id}/models`：插件页目录拉取（零生成）。
+///
+/// kilo 打 OpenRouter 公共目录并按 `:free`/`isFree`/零价筛选；
+/// zen 打指纹头免密层目录并按 `-free`/固定集合筛选——差异都在注册表条目里。
+pub async fn plugin_models(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let source = match plugin_source_or_error(&state, &id) {
+        Ok(source) => source,
+        Err(response) => return response,
+    };
+    match catalog_payload(&source).await {
+        Ok(mut payload) => {
+            payload["plugin"] = json!(id);
+            // 状态字典随目录下发：插件弹窗渲染状态 pill 不必再请求 free-sources。
+            payload["states"] = json!(fs::states());
+            Json(payload).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+/// `POST /api/plugins/{id}/probe`：插件页单模型探测（消耗额度，需显式触发）。
+pub async fn plugin_probe(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let source = match plugin_source_or_error(&state, &id) {
+        Ok(source) => source,
+        Err(response) => return response,
+    };
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let timeout = body
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .unwrap_or(PROBE_TIMEOUT_DEFAULT)
+        .clamp(2.0, PROBE_TIMEOUT_MAX);
+    match probe_one_payload(&state, &source, &model, timeout).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// `POST /api/plugins/{id}/probe-all`：插件页批量探测（与 free-sources 共享退避缓存）。
+pub async fn plugin_probe_all(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let source = match plugin_source_or_error(&state, &id) {
+        Ok(source) => source,
+        Err(response) => return response,
+    };
+    let only: Option<Vec<String>> = body
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
+    let timeout = body
+        .get("timeout")
+        .and_then(Value::as_f64)
+        .unwrap_or(PROBE_TIMEOUT_DEFAULT)
+        .clamp(2.0, PROBE_TIMEOUT_MAX);
+    match probe_all_payload(&state, &source, only, timeout).await {
+        Ok(mut payload) => {
+            payload["plugin"] = json!(id);
+            Json(payload).into_response()
+        }
+        Err(response) => response,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
 
     fn kilo() -> fs::FreeSource {
         fs::source("kilo-free").expect("kilo 来源")
@@ -724,6 +877,87 @@ mod tests {
 
     fn zen() -> fs::FreeSource {
         fs::source("zen-free").expect("zen 来源")
+    }
+
+    async fn body_json(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    /// 插件页端点的错误路径：未知插件 404；非免费插件 400。
+    /// 目录/探测的成功路径要打真实上游，不在单测覆盖（冒烟覆盖）。
+    #[tokio::test]
+    async fn plugin_models_rejects_unknown_and_non_free_plugins() {
+        let dir =
+            std::env::temp_dir().join(format!("mg-fsa-plugin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(crate::db::Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(
+            Config::from_value(json!({})),
+            db,
+            dir.join("c.json"),
+        ));
+
+        let (status, body) =
+            body_json(plugin_models(State(state.clone()), Path("no.such.plugin".into())).await)
+                .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], json!("plugin_not_found"));
+
+        // 导入的 Provider 插件存在，但没有 freeSource → 400 而非 404。
+        let manifest = json!({
+            "schema": "modelgate.plugin/v1",
+            "id": "test.provider",
+            "kind": "provider",
+            "tier": "declarative",
+            "auth": {"mode": "single"},
+            "upstream": {"protocol": "openai", "baseUrl": "https://x"}
+        });
+        crate::plugin::install(State(state.clone()), Json(manifest)).await;
+        let (status, body) =
+            body_json(plugin_models(State(state.clone()), Path("test.provider".into())).await)
+                .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], json!("plugin_not_free_source"));
+
+        // 内置免费插件可以解析（不真正打网络：只验证来源指向）。
+        let kilo_source = crate::plugin::free_source_for(&state, "modelgate.free.kilo");
+        assert_eq!(kilo_source.expect("kilo").id, "kilo-free");
+        let zen_source = crate::plugin::free_source_for(&state, "modelgate.free.opencode");
+        assert_eq!(zen_source.expect("zen").transport, "opencode");
+    }
+
+    /// 未声明 freeSource 的插件在 probe / probe-all 上同样被拒绝。
+    #[tokio::test]
+    async fn plugin_probe_rejects_non_free_plugin() {
+        let dir =
+            std::env::temp_dir().join(format!("mg-fsa-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(crate::db::Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(
+            Config::from_value(json!({})),
+            db,
+            dir.join("c.json"),
+        ));
+        let manifest = json!({
+            "schema": "modelgate.plugin/v1",
+            "id": "test.account",
+            "kind": "account",
+            "tier": "native",
+            "auth": {"mode": "pool"},
+            "upstream": {"protocol": "anthropic", "baseUrl": "https://x"}
+        });
+        crate::plugin::install(State(state.clone()), Json(manifest)).await;
+        for probe in [
+            plugin_probe(State(state.clone()), Path("test.account".into()), Json(json!({"model": "m"}))).await,
+            plugin_probe_all(State(state.clone()), Path("test.account".into()), Json(json!({}))).await,
+        ] {
+            let (status, body) = body_json(probe).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], json!("plugin_not_free_source"));
+        }
     }
 
     /// 同一份错误正文必须稳定归入同一拒因码（面板据此做「同一原因」聚合）。
