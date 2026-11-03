@@ -1,13 +1,12 @@
 //! 凭据池：多 Key / 多账号的统一事实源与请求期选择器。
 //!
 //! 安全口径：
-//! - 数据库只存 `secret_ref`（`store:...` / `legacy:zcode:...`），不存密钥本体；
+//! - 数据库只存 `secret_ref`（`store:...`），不存密钥本体；
 //! - API 响应不返回 secret_ref、密钥、账号、Cookie；
 //! - 删除池/成员默认只停用，不删除密钥；清理密钥需显式参数。
 //!
 //! 状态机：active → cooling（失败达阈值）→ half_open（冷却结束）→ active；
 //! exhausted（配额耗尽，窗口重置后惰性恢复）；disabled（人工停用）。
-//! ZCode 旧账号表保持事实源，池成员只做引用缓存（legacy adapter）。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -213,7 +212,9 @@ fn cache_pools_get(state: &AppState, id: &str) -> Option<Option<Pool>> {
     match cache.pools.get(id) {
         Some((at, pool)) if at.elapsed() < POOL_CACHE_TTL => Some(pool.clone()),
         _ => {
-            cache.pools.retain(|_, (at, _)| at.elapsed() < POOL_CACHE_TTL);
+            cache
+                .pools
+                .retain(|_, (at, _)| at.elapsed() < POOL_CACHE_TTL);
             None
         }
     }
@@ -225,7 +226,9 @@ fn cache_members_get(state: &AppState, pool_id: &str) -> Option<Vec<Member>> {
     match cache.members.get(pool_id) {
         Some((at, members)) if at.elapsed() < POOL_CACHE_TTL => Some(members.clone()),
         _ => {
-            cache.members.retain(|_, (at, _)| at.elapsed() < POOL_CACHE_TTL);
+            cache
+                .members
+                .retain(|_, (at, _)| at.elapsed() < POOL_CACHE_TTL);
             None
         }
     }
@@ -264,7 +267,9 @@ pub fn get_pool(state: &AppState, id: &str) -> Option<Pool> {
         .ok();
     // 池不存在的判断同样值得缓存：expand_attempt_targets 靠它拒绝回落。
     let mut cache = state.pool_cache.lock().unwrap_or_else(|e| e.into_inner());
-    cache.pools.insert(id.to_string(), (Instant::now(), pool.clone()));
+    cache
+        .pools
+        .insert(id.to_string(), (Instant::now(), pool.clone()));
     pool
 }
 
@@ -706,92 +711,6 @@ pub fn create_pool(
     Ok(())
 }
 
-/// ZCode 旧账号表 → legacy 池成员（只建引用，不复制密钥）。
-pub fn sync_legacy_zcode(state: &AppState) {
-    let zcode_upstream = {
-        let cfg = state.cfg();
-        cfg.upstreams
-            .iter()
-            .find(|up| up.transport == "zcode")
-            .map(|up| up.name.clone())
-    };
-    let Some(upstream) = zcode_upstream else {
-        return;
-    };
-    let pool_id = format!("legacy_zcode_{upstream}");
-    let exists: bool = {
-        let conn = state.db.read_conn();
-        conn.query_row(
-            "SELECT COUNT(*) FROM credential_pools WHERE id = ?1",
-            [&pool_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count > 0)
-        .unwrap_or(false)
-    };
-    if !exists {
-        let _ = create_pool(
-            state,
-            &pool_id,
-            &upstream,
-            "priority",
-            60,
-            3,
-            Some("modelgate.account.zcode"),
-        );
-    }
-    let accounts: Vec<(String, String, String, i64, Option<i64>)> = {
-        let conn = state.db.read_conn();
-        let mut out = Vec::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT id, name, status, enabled, cooling_until FROM zcode_accounts ORDER BY created_at",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            }) {
-                out.extend(rows.flatten());
-            }
-        }
-        out
-    };
-    let write = state.db.write_conn();
-    let _ = write.execute(
-        "DELETE FROM credential_members WHERE pool_id = ?1",
-        [&pool_id],
-    );
-    for (id, name, status, enabled, cooling_until) in accounts {
-        let member_status = if enabled == 0 {
-            "disabled"
-        } else if status == "cooling" {
-            "cooling"
-        } else {
-            "active"
-        };
-        let cooldown = cooling_until
-            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.to_rfc3339()));
-        let _ = write.execute(
-            "INSERT INTO credential_members (id, pool_id, label, kind, secret_ref, priority, weight, status, cooldown_until, failure_count, usage_json) VALUES (?1, ?2, ?3, 'account', ?4, 100, 1, ?5, ?6, 0, ?7)",
-            rusqlite::params![
-                format!("zcode_{id}"),
-                pool_id,
-                name,
-                format!("legacy:zcode:{id}"),
-                member_status,
-                cooldown,
-                json!({"dailyTokens": 0, "dailyRequests": 0}).to_string(),
-            ],
-        );
-    }
-    drop(write);
-    invalidate_pool_cache(state);
-}
-
 pub fn record_audit(
     state: &AppState,
     actor: &str,
@@ -843,7 +762,6 @@ fn pool_error(status: StatusCode, message: impl Into<String>, code: &str) -> Res
 
 pub async fn list(State(state): State<Arc<AppState>>) -> Response {
     recover_cooldowns(&state);
-    sync_legacy_zcode(&state);
     let items: Vec<Value> = list_pool_ids(&state)
         .iter()
         .filter_map(|id| get_pool(&state, id))
@@ -915,9 +833,6 @@ pub async fn create(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
 
 pub async fn detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     recover_cooldowns(&state);
-    if id.starts_with("legacy_zcode") {
-        sync_legacy_zcode(&state);
-    }
     let Some(pool) = get_pool(&state, &id) else {
         return pool_error(
             StatusCode::NOT_FOUND,
@@ -1247,7 +1162,10 @@ mod tests {
             let mut store = crate::secret_store::SecretStore::load(&config);
             store.set("upstream:u", "sk-test-1").unwrap();
         }
-        assert_eq!(cache.lookup(&config, "upstream:u"), Some("sk-test-1".into()));
+        assert_eq!(
+            cache.lookup(&config, "upstream:u"),
+            Some("sk-test-1".into())
+        );
         // 文件被改写（面板保存新密钥）→ mtime 变化必须重载，不能永远拿旧值。
         std::thread::sleep(std::time::Duration::from_millis(150));
         {

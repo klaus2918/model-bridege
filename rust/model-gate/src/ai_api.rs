@@ -236,7 +236,7 @@ pub async fn schema() -> Response {
                 "properties": {
                     "templateId": { "type": "string" },
                     "name": { "type": "string", "pattern": "^[^/\\s]+$" },
-                    "protocol": { "enum": ["openai", "anthropic", "commandcode", "opencode", "zcode"] },
+                    "protocol": { "enum": ["openai", "anthropic", "commandcode", "opencode"] },
                     "baseUrl": { "type": "string", "format": "uri" },
                     "privacy": {
                         "type": "object",
@@ -472,7 +472,7 @@ fn build_plan(action: &str, input: &Value, state: &AppState) -> Result<PlanRecor
                 .to_string();
             if !matches!(
                 protocol.as_str(),
-                "openai" | "anthropic" | "commandcode" | "opencode" | "zcode"
+                "openai" | "anthropic" | "commandcode" | "opencode"
             ) {
                 return Err(json_error(
                     StatusCode::BAD_REQUEST,

@@ -36,7 +36,7 @@ fn reasons() -> Option<&'static Map<String, Value>> {
 pub struct FreeSource {
     pub id: String,
     pub label: String,
-    /// 来源类型：`free`（免密）/ `account`（账号池，如 ZCode）。
+    /// 来源类型：`free`（免密）/ `account`（账号池）。
     pub kind: String,
     /// 对应的上游名（写入 `upstreams` 的键）。
     pub upstream: String,
@@ -53,7 +53,7 @@ pub struct FreeSource {
     pub catalog_shape: String,
     /// 免费 id 后缀（zen: `-free`；kilo: `:free`）。
     pub suffixes: Vec<String>,
-    /// 免费 id 固定集合（zen: big-pickle / grok-code；zcode: GLM 模型）。
+    /// 免费 id 固定集合（zen: big-pickle / grok-code）。
     pub fixed_ids: Vec<String>,
     /// 目录条目上的免费标记字段（如 `isFree`）。
     pub flags: Vec<String>,
@@ -642,7 +642,7 @@ pub fn build_attach(
             "endpoint": endpoint,
         }),
     );
-    // 账号型来源（ZCode）的模型是固定清单，不做运行期目录拉取。
+    // 账号型来源的模型是固定清单，不做运行期目录拉取。
     upstream.insert("fetchModels".into(), json!(!is_account));
     // 阻断运行期目录合并：免密/账号来源的模型不进入对外全局清单。
     upstream.insert("autoModels".into(), json!(false));
@@ -663,7 +663,7 @@ pub fn build_attach(
             models_written = true;
         }
         notices.push(
-            "ZCode 是账号型来源：模型清单固定为 GLM 池；请先在 ZCode 面板导入/登录账号，再发起请求。"
+            "账号型来源：模型清单固定为账号池；请先在凭据池中配置可用账号，再发起请求。"
                 .to_string(),
         );
     } else if !models.is_empty() {
@@ -751,7 +751,7 @@ mod tests {
     #[test]
     fn registry_parses_all_sources() {
         let all = all_sources();
-        assert_eq!(all.len(), 3, "应有两个免密来源 + 一个账号型来源");
+        assert_eq!(all.len(), 2, "应有两个免密来源");
         let zen = source("zen-free").expect("zen 来源");
         assert_eq!(zen.transport, "opencode");
         assert_eq!(zen.suffixes, vec!["-free"]);
@@ -761,13 +761,6 @@ mod tests {
         assert_eq!(kilo.suffixes, vec![":free"]);
         assert!(kilo.zero_price);
         assert_eq!(kilo.privacy_level, "danger");
-        let zcode = source("zcode").expect("zcode 来源");
-        assert_eq!(zcode.kind, "account");
-        assert_eq!(zcode.transport, "zcode");
-        assert_eq!(zcode.auth, "managed");
-        assert_eq!(zcode.quota_mode, "account");
-        assert_eq!(zcode.catalog_shape, "fixed");
-        assert_eq!(zcode.fixed_ids, vec!["GLM-5.3-Flash", "GLM-5.3"]);
     }
 
     #[test]
@@ -1071,24 +1064,5 @@ mod tests {
         assert_eq!(out.upstream["protocol"], "openai");
         // Zen 免密层由 transport 接管会话头，不走普通会话头注入。
         assert_eq!(out.upstream["sessionHeader"], json!(false));
-    }
-
-    #[test]
-    fn attach_zcode_writes_fixed_models_without_fetch_or_auth() {
-        let zcode = source("zcode").unwrap();
-        let out = build_attach(&zcode, &[], true);
-        let up = &out.upstream;
-        assert_eq!(up["protocol"], "anthropic");
-        assert_eq!(up["transport"], "zcode");
-        assert_eq!(up["fetchModels"], json!(false));
-        assert_eq!(up["autoModels"], json!(false));
-        assert_eq!(up["compat"]["auth"]["scheme"], "none");
-        // 账号型来源目录固定：catalog.path 为空时不得写 endpoint.models 空串。
-        assert!(up["compat"]["endpoint"].get("models").is_none());
-        // 账号型来源即使顶层 models 为空也写固定模型清单（路由需要）。
-        assert!(out.models_written);
-        assert_eq!(up["models"], json!(["GLM-5.3-Flash", "GLM-5.3"]));
-        assert!(up.get("apiKey").is_none());
-        assert!(!out.notices.is_empty());
     }
 }

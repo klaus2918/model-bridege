@@ -22,7 +22,7 @@ v4 不新建第二份配置，也不替换代理内核。所有接入（官方�
 | 模块 | 职责 |
 |---|---|
 | `access.rs` | 模板目录、AccessObject 聚合、快速添加/自定义添加、更新、写密钥、删除、探测 |
-| `credential_pool.rs` | 池/成员 CRUD、四种选择策略、冷却/半开/耗尽状态机、故障计数、ZCode legacy 映射、审计写入 |
+| `credential_pool.rs` | 池/成员 CRUD、四种选择策略、冷却/半开/耗尽状态机、故障计数、审计写入 |
 | `plugin.rs` | manifest 校验、安装登记、attach/detach 幂等、`auth.mode=pool` 建池 |
 | `ai_api.rs` | AI manifest/schema/templates/inspect/plan/apply/audit/settings、统一脱敏 |
 | `config.rs` | 新可选字段解析、顶层 `privacy` 覆盖、诊断白名单 |
@@ -84,7 +84,6 @@ credential_members(id, pool_id, label, kind, secret_ref,
 `secret_ref` 只存引用：
 
 - `store:<id>`：本机 DPAPI 密钥库条目；
-- `legacy:zcode:<account_id>`：ZCode 旧账号表映射，不复制密文。
 
 ### 5.2 状态机
 
@@ -158,7 +157,7 @@ manifest（`modelgate.plugin/v1`）关键段：
 - 唯一入口：`/ui/`（`v4.html + v4-base.css + v4.css + v4.js + v4-core/config/models/usage/prompts/resources.js`）；
 - `/ui/classic` 仅返回 308 永久跳转到 `/ui/`，旧面板资产已移除；
 - 侧栏 5 个分区、12 个子视图：总览 / 全部接入 / 模型与定价 / 路由组 / 凭据池 /
-  插件 / 免费来源 / ZCode / 用量分析 / 提示词 / 运行日志 / 设置；
+  插件 / 免费来源 / 用量分析 / 提示词 / 运行日志 / 设置；
 - 接入详情使用右侧抽屉，子页签：概览 / 连接 / 凭据 / 模型 / 高级 / 诊断；
 - 「模型」页可维护模型、别名、模型级覆盖与目录行为；「高级」页可维护 `compat`、
   上游超时与会话头；设置页提供保存前校验、备份开关与配置/数据库路径；

@@ -1,6 +1,6 @@
 [package]
 name = "model-gate"
-version = "4.4.0"
+version = "4.5.0"
 edition = "2021"
 description = "Model-Gate 本地模型网关（Rust 实现）"
 license = "MIT"
@@ -31,10 +31,8 @@ async-stream = "0.3"
 arc-swap = "1"
 semver = "1"
 sha2 = "0.10"
-aes-gcm = "0.10"
 base64 = "0.22"
 tray-icon = "0.19"
-headless_chrome = { version = "1.0.22", default-features = false, features = ["offline"] }
 tracing-appender = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

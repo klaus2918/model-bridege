@@ -261,7 +261,6 @@
     templates: "access",
     routes: "settings",
     logs: "settings",
-    zcode: "plugins",
     config: "settings",
   };
 
@@ -633,7 +632,7 @@
       <label class="field span-2"><span>展示名</span><input class="input" id="edit-label" value="${esc(item.label || item.id)}"></label>
       <label class="field"><span>协议</span>
         <select class="input" id="edit-protocol">
-          ${["openai", "anthropic", "commandcode", "opencode", "zcode"]
+          ${["openai", "anthropic", "commandcode", "opencode"]
             .map((protocol) => `<option value="${protocol}"${item.protocol === protocol ? " selected" : ""}>${protocol}</option>`)
             .join("")}
         </select>
@@ -1567,9 +1566,6 @@
     const initials = String(name).slice(0, 2).toUpperCase();
     const kindLabel = { free: "免费来源", "free-source": "免费来源", account: "账号池", provider: "Provider", aggregator: "聚合", tool: "工具" }[plugin.kind] || plugin.kind || "插件";
     const sourceLabel = inLibrary ? "内置包" : plugin.builtin ? "内置包" : plugin.source === "import" ? "导入包" : "本地包";
-    const zcodeBtn = plugin.id === "modelgate.account.zcode" && !inLibrary
-      ? `<button class="btn ghost sm" data-open-zcode="1">账号池 · 领取记录</button>`
-      : "";
     // 免费来源插件（kilo/zen）自带模型获取与检测：目录端点、免费判定与探测
     // 参数由插件 freeSource 指向的注册表条目承载，每个插件各用自己的一套。
     const modelsBtn = plugin.freeSource && !inLibrary
@@ -1596,7 +1592,6 @@
             ${attached.length ? `<button class="btn ghost sm" data-plugin-detach="${esc(plugin.id)}" data-name="${esc(attached[0])}">解绑</button>` : ""}
             ${modelsBtn}
             <button class="btn ghost sm" data-plugin-toggle="${esc(plugin.id)}" data-enabled="${plugin.enabled ? "0" : "1"}">${plugin.enabled ? "停用" : "启用"}</button>
-            ${zcodeBtn}
             <button class="btn danger sm" data-plugin-remove="${esc(plugin.id)}" data-builtin="${plugin.builtin ? "1" : "0"}">移除</button>`}
       </div>
     </article>`;

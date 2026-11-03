@@ -66,42 +66,8 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
-CREATE TABLE IF NOT EXISTS zcode_accounts (
-    id               TEXT PRIMARY KEY,
-    name             TEXT NOT NULL,
-    provider         TEXT NOT NULL DEFAULT 'zai',
-    mode             TEXT NOT NULL,
-    secret_enc       BLOB NOT NULL,
-    secret_fp        TEXT NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'active',
-    enabled          INTEGER NOT NULL DEFAULT 1,
-    quota_json       TEXT,
-    plan_json        TEXT,
-    fingerprint_json TEXT,
-    created_at       INTEGER NOT NULL,
-    last_checked_at  INTEGER,
-    last_used_at     INTEGER,
-    cooling_until    INTEGER,
-    last_error       TEXT,
-    use_count        INTEGER NOT NULL DEFAULT 0,
-    fail_count       INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_zcode_accounts_fp     ON zcode_accounts(secret_fp);
-CREATE INDEX IF NOT EXISTS idx_zcode_accounts_status       ON zcode_accounts(status);
-CREATE TABLE IF NOT EXISTS zcode_claims (
-    id          TEXT PRIMARY KEY,
-    account_id  TEXT NOT NULL,
-    plan_id     TEXT,
-    plan_name   TEXT,
-    code        INTEGER,
-    ok          INTEGER NOT NULL,
-    next_at     INTEGER,
-    message     TEXT,
-    created_at  INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_zcode_claims_account ON zcode_claims(account_id, created_at DESC);
 -- 凭据池：多账号/多 Key 的统一事实源。密钥本体仍在本地加密库，
--- credential_members.secret_ref 只存引用（store:... / legacy:zcode:...）。
+-- credential_members.secret_ref 只存引用（store:...）。
 CREATE TABLE IF NOT EXISTS credential_pools (
     id               TEXT PRIMARY KEY,
     upstream         TEXT NOT NULL,
@@ -327,12 +293,12 @@ impl Db {
         self.readers[idx].lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// ZCode 账号存储专用写连接（同库同事务域，避免再开一条 SQLite 连接）。
+    /// 凭据池写连接（同库同事务域，避免再开一条 SQLite 连接）。
     pub(crate) fn write_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.write.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// ZCode 账号读取连接（只读，轮转）。
+    /// 凭据池读取连接（只读，轮转）。
     pub(crate) fn read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.reader()
     }
@@ -468,7 +434,11 @@ impl Db {
                         r.paused as i64,
                         r.error.clone(),
                         r.cost,
-                        if r.session.is_empty() { None } else { Some(r.session.clone()) },
+                        if r.session.is_empty() {
+                            None
+                        } else {
+                            Some(r.session.clone())
+                        },
                     ])?;
                 }
             }
@@ -988,31 +958,28 @@ impl Db {
                         return updated;
                     }
                 };
-                let mapped = stmt.query_map(
-                    rusqlite::params![last_rowid, BATCH],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            CostRow {
-                                id: row.get("id")?,
-                                ts: row.get("ts")?,
-                                upstream: row
-                                    .get::<_, Option<String>>("upstream")?
-                                    .unwrap_or_default(),
-                                requested_model: row
-                                    .get::<_, Option<String>>("requested_model")?
-                                    .unwrap_or_default(),
-                                upstream_model: row
-                                    .get::<_, Option<String>>("upstream_model")?
-                                    .unwrap_or_default(),
-                                prompt_tokens: row.get("prompt_tokens")?,
-                                completion_tokens: row.get("completion_tokens")?,
-                                cache_read_tokens: row.get("cache_read_tokens")?,
-                                cache_write_tokens: row.get("cache_write_tokens")?,
-                            },
-                        ))
-                    },
-                );
+                let mapped = stmt.query_map(rusqlite::params![last_rowid, BATCH], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        CostRow {
+                            id: row.get("id")?,
+                            ts: row.get("ts")?,
+                            upstream: row
+                                .get::<_, Option<String>>("upstream")?
+                                .unwrap_or_default(),
+                            requested_model: row
+                                .get::<_, Option<String>>("requested_model")?
+                                .unwrap_or_default(),
+                            upstream_model: row
+                                .get::<_, Option<String>>("upstream_model")?
+                                .unwrap_or_default(),
+                            prompt_tokens: row.get("prompt_tokens")?,
+                            completion_tokens: row.get("completion_tokens")?,
+                            cache_read_tokens: row.get("cache_read_tokens")?,
+                            cache_write_tokens: row.get("cache_write_tokens")?,
+                        },
+                    ))
+                });
                 match mapped {
                     Ok(iter) => iter.filter_map(Result::ok).collect(),
                     Err(err) => {
@@ -1033,7 +1000,8 @@ impl Db {
             let result = (|| -> rusqlite::Result<()> {
                 let tx = conn.transaction()?;
                 {
-                    let mut stmt = tx.prepare("UPDATE usage_records SET cost = ?1 WHERE id = ?2")?;
+                    let mut stmt =
+                        tx.prepare("UPDATE usage_records SET cost = ?1 WHERE id = ?2")?;
                     for (cost, id) in &updates {
                         updated += stmt.execute(rusqlite::params![cost, id])?;
                     }
@@ -1545,52 +1513,9 @@ impl Db {
         }
         removed
     }
-
-    /// 保留治理：领取历史只留最近 `keep_days` 天且最多 `max_records` 条。
-    ///
-    /// `created_at` 是毫秒时间戳，天数裁剪可直接比较；条数上限兜底
-    /// 「短期高频领取」的极端情况。同样分批提交，避免长事务。
-    pub fn trim_zcode_claims(&self, keep_days: i64, max_records: i64) -> i64 {
-        let mut removed = 0i64;
-        let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        if keep_days > 0 {
-            let cutoff = now_unix_ms() - keep_days * 86_400_000;
-            loop {
-                let n = conn
-                    .execute(
-                        "DELETE FROM zcode_claims WHERE rowid IN (\
-                         SELECT rowid FROM zcode_claims WHERE created_at < ?1 LIMIT ?2)",
-                        rusqlite::params![cutoff, PROMPT_DELETE_BATCH],
-                    )
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                removed += n;
-                if n < PROMPT_DELETE_BATCH {
-                    break;
-                }
-            }
-        }
-        if max_records > 0 {
-            loop {
-                let n = conn
-                    .execute(
-                        "DELETE FROM zcode_claims WHERE rowid IN (\
-                         SELECT rowid FROM zcode_claims ORDER BY created_at DESC LIMIT ?2 OFFSET ?1)",
-                        rusqlite::params![max_records, PROMPT_DELETE_BATCH],
-                    )
-                    .map(|n| n as i64)
-                    .unwrap_or(0);
-                removed += n;
-                if n < PROMPT_DELETE_BATCH {
-                    break;
-                }
-            }
-        }
-        removed
-    }
 }
 
-/// 当前时间的毫秒时间戳（zcode_claims.created_at 与 store.rs 的 now_ms 同口径）。
+/// 当前时间的毫秒时间戳。
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2454,11 +2379,23 @@ mod tests {
             .map(|n| n > 0)
             .unwrap_or(false)
         };
-        assert!(has_index("idx_usage_up_ts"), "复合索引 (upstream, ts) 必须建立");
-        assert!(has_index("idx_usage_model_ts"), "复合索引 (model, ts) 必须建立");
+        assert!(
+            has_index("idx_usage_up_ts"),
+            "复合索引 (upstream, ts) 必须建立"
+        );
+        assert!(
+            has_index("idx_usage_model_ts"),
+            "复合索引 (model, ts) 必须建立"
+        );
         assert!(has_index("idx_usage_ts"), "时间窗索引保留");
-        assert!(!has_index("idx_usage_up"), "旧单列 upstream 索引必须被复合索引取代");
-        assert!(!has_index("idx_usage_model"), "旧单列 model 索引必须被复合索引取代");
+        assert!(
+            !has_index("idx_usage_up"),
+            "旧单列 upstream 索引必须被复合索引取代"
+        );
+        assert!(
+            !has_index("idx_usage_model"),
+            "旧单列 model 索引必须被复合索引取代"
+        );
     }
 
     #[test]
@@ -2531,7 +2468,10 @@ mod tests {
             for i in 0..12 {
                 conn.execute(
                     "INSERT INTO config_audit (id, at, action) VALUES (?1, ?2, 'test')",
-                    rusqlite::params![format!("audit-{i}"), format!("2026-01-01T00:00:{i:02}+08:00")],
+                    rusqlite::params![
+                        format!("audit-{i}"),
+                        format!("2026-01-01T00:00:{i:02}+08:00")
+                    ],
                 )
                 .unwrap();
             }
@@ -2546,47 +2486,9 @@ mod tests {
             let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
             rows.flatten().collect()
         };
-        assert_eq!(remaining, ["audit-7", "audit-8", "audit-9", "audit-10", "audit-11"]);
-    }
-
-    #[test]
-    fn trim_zcode_claims_cuts_by_age_then_count() {
-        let db = temp_db();
-        let now_ms = now_unix_ms();
-        {
-            let conn = db.write.lock().unwrap();
-            // 40 条 40 天前 + 3 条 1 天内。
-            for i in 0..40 {
-                conn.execute(
-                    "INSERT INTO zcode_claims (id, account_id, ok, created_at) \
-                     VALUES (?1, 'acc', 1, ?2)",
-                    rusqlite::params![format!("claim-old-{i}"), now_ms - 40 * 86_400_000],
-                )
-                .unwrap();
-            }
-            for i in 0..3 {
-                conn.execute(
-                    "INSERT INTO zcode_claims (id, account_id, ok, created_at) \
-                     VALUES (?1, 'acc', 1, ?2)",
-                    rusqlite::params![format!("claim-new-{i}"), now_ms - 86_400_000 + i],
-                )
-                .unwrap();
-            }
-        }
-        // 40 天前的按天数裁掉；1 天内的 3 条保留。
-        assert_eq!(db.trim_zcode_claims(30, 2_000), 40);
-        assert_eq!(count_zcode_claims(&db), 3);
-        // 条数上限兜底：只留最近 1 条。
-        assert_eq!(db.trim_zcode_claims(30, 1), 2);
-        assert_eq!(count_zcode_claims(&db), 1);
-        // 天数/条数均为 0 表示都不裁。
-        assert_eq!(db.trim_zcode_claims(0, 0), 0);
-        assert_eq!(count_zcode_claims(&db), 1);
-    }
-
-    fn count_zcode_claims(db: &Db) -> i64 {
-        let conn = db.read_conn();
-        conn.query_row("SELECT COUNT(*) FROM zcode_claims", [], |r| r.get(0))
-            .unwrap_or(0)
+        assert_eq!(
+            remaining,
+            ["audit-7", "audit-8", "audit-9", "audit-10", "audit-11"]
+        );
     }
 }

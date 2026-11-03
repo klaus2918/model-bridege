@@ -100,8 +100,6 @@ pub struct AppState {
     /// 只影响候选顺序：冷却中的候选排到链尾，仍保留兜底尝试；不改变
     /// `/上游/v1` 的强制路由，也不改变日志里的真实上游归属。
     pub route_health: std::sync::Mutex<HashMap<String, Instant>>,
-    /// ZCode 插件的配置与 OAuth 临时状态；账号事实源在 `db`。
-    pub zcode: Arc<crate::zcode::service::ZcodeService>,
     /// 服务线程的 Tokio 句柄；托盘「刷新模型目录」用它触发异步刷新。
     pub runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     /// 关闭协调器：更新流程用它触发「停服务 → 落盘 → 退出」。
@@ -170,7 +168,6 @@ impl AppState {
         {
             tracing::warn!("用量后台线程启动失败（将同步直写）：{err}");
         }
-        let zcode = Arc::new(crate::zcode::service::ZcodeService::new(&config_path));
         Self {
             cfg: ArcSwap::from_pointee(cfg),
             db,
@@ -188,7 +185,6 @@ impl AppState {
             update,
             free_probe_cache: std::sync::Mutex::new(crate::free_sources::ProbeCache::default()),
             route_health: std::sync::Mutex::new(HashMap::new()),
-            zcode,
             runtime: std::sync::OnceLock::new(),
             shutdown,
         }
@@ -697,47 +693,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/free-sources/attach",
             post(crate::free_sources_api::free_sources_attach),
         )
-        .route("/api/zcode/status", get(crate::zcode::api::status))
-        .route(
-            "/api/zcode/config",
-            get(crate::zcode::api::get_config).put(crate::zcode::api::put_config),
-        )
-        .route("/api/zcode/accounts", get(crate::zcode::api::list_accounts))
-        .route(
-            "/api/zcode/accounts/import/local",
-            post(crate::zcode::api::import_local_info),
-        )
-        .route(
-            "/api/zcode/accounts/import",
-            post(crate::zcode::api::import_local),
-        )
-        .route(
-            "/api/zcode/accounts",
-            post(crate::zcode::api::add).delete(crate::zcode::api::delete),
-        )
-        .route("/api/zcode/accounts/{id}", put(crate::zcode::api::update))
-        .route(
-            "/api/zcode/accounts/{id}/refresh",
-            post(crate::zcode::api::refresh_account),
-        )
-        .route(
-            "/api/zcode/claim/preview",
-            get(crate::zcode::api::claim_preview),
-        )
-        .route("/api/zcode/claim", post(crate::zcode::api::claim_now))
-        .route("/api/zcode/attach", post(crate::zcode::api::attach))
-        .route(
-            "/api/zcode/captcha/test",
-            post(crate::zcode::api::captcha_test),
-        )
-        .route(
-            "/api/zcode/oauth/start",
-            post(crate::zcode::api::oauth_start),
-        )
-        .route(
-            "/api/zcode/oauth/poll/{flow_id}",
-            get(crate::zcode::api::oauth_poll),
-        )
         .route("/api/usage/totals", get(api_usage_totals))
         .route("/api/usage/summary", get(api_usage_summary))
         .route("/api/usage/list", get(api_usage_list))
@@ -1194,8 +1149,7 @@ async fn chat_scoped(
     for (index, target) in plan.targets.iter().enumerate() {
         let has_more = index + 1 < plan.targets.len();
         let upstream = &target.upstream;
-        // 真实发给上游的模型名在 prepare 阶段解析（modelMap）；zcode 分支
-        // 需要提前算出来传给 transport。
+        // 真实发给上游的模型名在 prepare 阶段解析（modelMap）。
         let target_model = upstream
             .model_map
             .get(&target.model)
@@ -1205,68 +1159,6 @@ async fn chat_scoped(
             Some(credential) => format!("{}/{}={status}", upstream.name, credential.label),
             None => format!("{}={status}", upstream.name),
         };
-
-        // ZCode 原生插件：不走 HTTP 上游，直接交给账号池 + 本机 CLI worker。
-        if upstream.transport == "zcode" {
-            let stream = payload
-                .get("stream")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let response = crate::zcode::transport::chat(
-                Arc::clone(&state),
-                upstream,
-                &payload,
-                &requested_model,
-                &target_model,
-                &ctx,
-                started,
-                stream,
-            )
-            .await;
-            let status = response.status();
-            attempts.push(attempt_label(status.as_u16()));
-            if status.is_success() {
-                mark_route_success(&state, upstream, &target_model);
-                log_route_success(&requested_model, group_header.as_deref(), &attempts);
-                return with_route_headers(
-                    response,
-                    upstream,
-                    &target_model,
-                    group_header.as_deref(),
-                    &attempts,
-                );
-            }
-            if has_more && is_retryable_failure(status, "") {
-                mark_route_failure(&state, upstream, &target_model, status, "");
-                tracing::warn!(
-                    requested = %requested_model,
-                    upstream = %upstream.name,
-                    model = %target_model,
-                    status = status.as_u16(),
-                    "路由候选失败，切换下一个"
-                );
-                last_failure = Some(RouteFailure {
-                    upstream: upstream.clone(),
-                    model: target_model,
-                    status,
-                    message: format!("ZCode 上游返回 {}", status.as_u16()),
-                    // ZCode transport 已记录本次尝试；最终成功会用同 id 覆盖，
-                    // 最终失败则保留它更具体的错误。
-                    recorded: true,
-                });
-                continue;
-            }
-            if is_retryable_failure(status, "") {
-                mark_route_failure(&state, upstream, &target_model, status, "");
-            }
-            return with_route_headers(
-                response,
-                upstream,
-                &target_model,
-                group_header.as_deref(),
-                &attempts,
-            );
-        }
 
         let prepared = match prepare_attempt(
             &state,
@@ -1588,7 +1480,6 @@ async fn chat_scoped(
     }
 
     // 所有候选都失败：按最后一个真实尝试记录用量，再返回聚合错误。
-    // ZCode 失败已由 transport 内部记录，避免用泛化错误覆盖它的具体拒因。
     if let Some(failure) = &last_failure {
         if !failure.recorded {
             record(
@@ -1648,7 +1539,7 @@ struct RouteFailure {
     model: String,
     status: StatusCode,
     message: String,
-    /// ZCode transport 已在内部记录过本候选的失败，避免重复覆盖。
+    /// 候选失败是否已在别处记录过用量，避免重复覆盖。
     recorded: bool,
 }
 
@@ -1673,14 +1564,6 @@ fn expand_attempt_targets(
     upstream: &Upstream,
     model: &str,
 ) -> Vec<AttemptTarget> {
-    // ZCode 走账号池 transport，密钥选择由 zcode 模块负责，不在这里展开。
-    if upstream.transport == "zcode" {
-        return vec![AttemptTarget {
-            upstream: upstream.clone(),
-            model: model.to_string(),
-            credential: None,
-        }];
-    }
     let Some(pool_id) = upstream.credential_pool.as_deref() else {
         return vec![AttemptTarget {
             upstream: upstream.clone(),

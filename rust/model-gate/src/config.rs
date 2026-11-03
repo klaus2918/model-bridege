@@ -47,7 +47,7 @@ pub struct Compat {
     pub thinking_passthrough: bool,
     /// 回传时使用的字段/块类型（reasoning_content / thinking）
     pub thinking_field: String,
-    /// zcode 通道 `session/setModel` 的默认推理等级（空 = 内置 max）
+    /// 预留：推理等级默认值（空 = 上游默认）
     pub reasoning_level_default: String,
     /// 允许透传的推理等级白名单（空 = 内置全词表 off/minimal/low/medium/high/xhigh/max）
     pub reasoning_level_allow: Vec<String>,
@@ -1004,6 +1004,9 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
+        // ZCode 插件（transport=zcode）已移除：旧配置里的这类上游直接忽略，
+        // 避免诊断报错并让路由误选不可用的候选。
+        upstreams.retain(|up| up.transport != "zcode");
         // 与 Python 版一致：配置顺序即优先级；没有显式 default 时第一条兜底。
         if !upstreams.iter().any(|u| u.default) {
             if let Some(first) = upstreams.first_mut() {
@@ -1058,9 +1061,11 @@ impl Config {
         let name = model.unwrap_or("");
         let target = self.aliases.get(name).map(String::as_str).unwrap_or(name);
         if !target.is_empty() {
-            if let Some(up) = self.upstreams.iter().find(|u| {
-                u.enabled && u.models.iter().any(|m| m == target)
-            }) {
+            if let Some(up) = self
+                .upstreams
+                .iter()
+                .find(|u| u.enabled && u.models.iter().any(|m| m == target))
+            {
                 return Some(up);
             }
             if let Some(up) = self
@@ -1078,11 +1083,7 @@ impl Config {
     /// 停用的上游始终不可见。
     pub fn unified_visible_upstreams(&self) -> Vec<&Upstream> {
         if self.unified.visible_upstreams.is_empty() {
-            return self
-                .upstreams
-                .iter()
-                .filter(|up| up.enabled)
-                .collect();
+            return self.upstreams.iter().filter(|up| up.enabled).collect();
         }
         let allowed: HashSet<&str> = self
             .unified
@@ -1219,7 +1220,9 @@ impl Config {
         let target = self.aliases.get(name).map(String::as_str).unwrap_or(name);
         if !target.is_empty() {
             if let Some(up) = self.upstreams.iter().find(|up| {
-                allowed.contains(up.name.as_str()) && up.enabled && up.models.iter().any(|m| m == target)
+                allowed.contains(up.name.as_str())
+                    && up.enabled
+                    && up.models.iter().any(|m| m == target)
             }) {
                 return Some(up);
             }
@@ -1408,7 +1411,6 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "accessLog",
     "promptCapture",
     "freeSourcesPanel",
-    "zcodePanel",
     "promptRetentionDays",
     "promptMaxRecords",
     "promptMaxChars",
@@ -1864,7 +1866,7 @@ impl Config {
                     "invalid_groups",
                     "groups",
                     "groups 必须是对象".into(),
-                    "例如 {\"daily\":[\"zcode/GLM-5.3-Flash\",\"go/deepseek-v4\"]}",
+                    "例如 {\"daily\":[\"go/deepseek-v4\",\"zen/grok-code-free\"]}",
                 ),
                 Some(rows) => {
                     for (id, raw_members) in rows {
@@ -1892,7 +1894,7 @@ impl Config {
                                 "invalid_group_members",
                                 &path,
                                 "路由组必须是成员数组".into(),
-                                "例如 [\"zcode/GLM-5.3-Flash\",\"go/deepseek-v4\"]",
+                                "例如 [\"go/deepseek-v4\",\"zen/grok-code-free\"]",
                             );
                             continue;
                         };
@@ -2026,13 +2028,13 @@ impl Config {
                     "可用 openai / anthropic / commandcode",
                 );
             }
-            if !up.transport.is_empty() && up.transport != "opencode" && up.transport != "zcode" {
+            if !up.transport.is_empty() && up.transport != "opencode" {
                 push(
                     "error",
                     "invalid_transport",
                     &format!("{prefix}.transport"),
                     format!("transport「{}」未实现", up.transport),
-                    "当前只支持 opencode / zcode",
+                    "当前只支持 opencode",
                 );
             } else if up.transport == "opencode" && up.protocol != "openai" {
                 push(
@@ -2041,19 +2043,6 @@ impl Config {
                     &format!("{prefix}.transport"),
                     format!(
                         "transport=opencode 只适用于 protocol=openai，当前为 {}",
-                        up.protocol
-                    ),
-                    "",
-                );
-            } else if up.transport == "zcode"
-                && !matches!(up.protocol.as_str(), "openai" | "anthropic")
-            {
-                push(
-                    "error",
-                    "transport_protocol_mismatch",
-                    &format!("{prefix}.transport"),
-                    format!(
-                        "transport=zcode 只适用于 protocol=openai/anthropic，当前为 {}",
                         up.protocol
                     ),
                     "",
@@ -2312,10 +2301,7 @@ impl Config {
                     "例如 /v1/chat/completions",
                 );
             }
-            // transport=zcode 走本机账号池 worker，从不请求模型目录端点；
-            // 一键接入时 catalog.path 就是空串，这里不报 invalid_endpoint。
-            let models_path_used = up.transport != "zcode";
-            if models_path_used && (c.models_path.is_empty() || !c.models_path.starts_with('/')) {
+            if c.models_path.is_empty() || !c.models_path.starts_with('/') {
                 push(
                     "warn",
                     "invalid_endpoint",
@@ -4186,29 +4172,6 @@ mod tests {
     }
 
     #[test]
-    fn zcode_transport_skips_models_endpoint_check() {
-        // 账号型 zcode 上游走本机 worker，从不请求模型目录端点；
-        // 一键接入写入的空 models 路径不应报 invalid_endpoint。
-        let cfg = Config::from_value(json!({
-            "upstreams": {
-                "zcode": {
-                    "protocol": "anthropic",
-                    "transport": "zcode",
-                    "baseUrl": "https://zcode.z.ai/api/anthropic",
-                    "compat": {
-                        "auth": {"scheme": "none"},
-                        "endpoint": {"chat": "/v1/messages", "models": ""}
-                    }
-                }
-            }
-        }));
-        assert!(cfg
-            .diagnostics()
-            .iter()
-            .all(|d| d.code != "invalid_endpoint"));
-    }
-
-    #[test]
     fn disabled_upstream_is_skipped_in_routing_catalog_and_diagnostics() {
         let cfg = Config::from_value(json!({
             "upstreams": {
@@ -4237,19 +4200,13 @@ mod tests {
             cfg.pick_upstream(Some("m-off")).map(|u| u.name.as_str()),
             Some("on")
         );
-        assert_eq!(
-            cfg.default_upstream().map(|u| u.name.as_str()),
-            Some("on")
-        );
+        assert_eq!(cfg.default_upstream().map(|u| u.name.as_str()), Some("on"));
         // 目录与统一入口：停用上游的模型与别名不对外暴露。
         let list = cfg.model_list();
         assert!(list.contains(&"m-on".to_string()));
         assert!(!list.contains(&"m-off".to_string()));
         assert!(cfg.unified_visible_upstreams().iter().all(|u| u.enabled));
-        assert!(cfg
-            .qualified_model_list()
-            .iter()
-            .all(|(_, up)| up != "off"));
+        assert!(cfg.qualified_model_list().iter().all(|(_, up)| up != "off"));
         // 诊断：停用上游的错误（空 baseUrl）不再生成，也不再阻断保存。
         assert!(cfg
             .diagnostics()

@@ -116,7 +116,7 @@ pub async fn free_sources(State(state): State<Arc<AppState>>) -> Response {
 /// Zen 免密层的 `/models` 同样需要客户端指纹与匿名 key（实测：裸请求拿不到可用目录），
 /// 因此走 `transport=opencode` 的来源必须带上同样的头，不能只对 chat 请求带。
 async fn fetch_catalog(source: &fs::FreeSource) -> Result<Vec<(String, Value)>, String> {
-    // 账号型/固定目录来源不访问远端：模型清单来自注册表（如 ZCode GLM 池）。
+    // 账号型/固定目录来源不访问远端：模型清单来自注册表。
     if source.kind == "account" || source.catalog_shape == "fixed" {
         return Ok(source
             .fixed_ids
@@ -525,10 +525,7 @@ async fn probe_all_payload(
     })?;
     let model_ids: Vec<String> = models.into_iter().map(|(mid, _)| mid).collect();
     let selected: Vec<String> = match only {
-        Some(list) => list
-            .into_iter()
-            .filter(|m| model_ids.contains(m))
-            .collect(),
+        Some(list) => list.into_iter().filter(|m| model_ids.contains(m)).collect(),
         None => model_ids,
     };
     if selected.is_empty() {
@@ -621,14 +618,11 @@ pub async fn free_sources_probe_all(
         .and_then(Value::as_f64)
         .unwrap_or(PROBE_TIMEOUT_DEFAULT)
         .clamp(2.0, PROBE_TIMEOUT_MAX);
-    let only: Option<Vec<String>> = body
-        .get("models")
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        });
+    let only: Option<Vec<String>> = body.get("models").and_then(Value::as_array).map(|list| {
+        list.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    });
     let Some(source) = fs::source(id) else {
         return error_json(
             StatusCode::NOT_FOUND,
@@ -844,14 +838,11 @@ pub async fn plugin_probe_all(
         Ok(source) => source,
         Err(response) => return response,
     };
-    let only: Option<Vec<String>> = body
-        .get("models")
-        .and_then(Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        });
+    let only: Option<Vec<String>> = body.get("models").and_then(Value::as_array).map(|list| {
+        list.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    });
     let timeout = body
         .get("timeout")
         .and_then(Value::as_f64)
@@ -890,8 +881,7 @@ mod tests {
     /// 目录/探测的成功路径要打真实上游，不在单测覆盖（冒烟覆盖）。
     #[tokio::test]
     async fn plugin_models_rejects_unknown_and_non_free_plugins() {
-        let dir =
-            std::env::temp_dir().join(format!("mg-fsa-plugin-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("mg-fsa-plugin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(crate::db::Db::open(&dir.join("t.db")).unwrap());
         let state = Arc::new(AppState::new(
@@ -932,8 +922,7 @@ mod tests {
     /// 未声明 freeSource 的插件在 probe / probe-all 上同样被拒绝。
     #[tokio::test]
     async fn plugin_probe_rejects_non_free_plugin() {
-        let dir =
-            std::env::temp_dir().join(format!("mg-fsa-probe-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("mg-fsa-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(crate::db::Db::open(&dir.join("t.db")).unwrap());
         let state = Arc::new(AppState::new(
@@ -951,8 +940,18 @@ mod tests {
         });
         crate::plugin::install(State(state.clone()), Json(manifest)).await;
         for probe in [
-            plugin_probe(State(state.clone()), Path("test.account".into()), Json(json!({"model": "m"}))).await,
-            plugin_probe_all(State(state.clone()), Path("test.account".into()), Json(json!({}))).await,
+            plugin_probe(
+                State(state.clone()),
+                Path("test.account".into()),
+                Json(json!({"model": "m"})),
+            )
+            .await,
+            plugin_probe_all(
+                State(state.clone()),
+                Path("test.account".into()),
+                Json(json!({})),
+            )
+            .await,
         ] {
             let (status, body) = body_json(probe).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);

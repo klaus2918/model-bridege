@@ -374,67 +374,6 @@
       <div class="card-head" style="padding:14px 2px 6px"><h2>内置库</h2><span class="hint">已移除的内置插件在这里一键重装</span></div>
       <div id="plugin-library" class="pkg-grid"></div>
     </div>
-
-    <div class="card" id="zcode-panel" hidden style="margin-top:16px">
-      <div class="card-head">
-        <h2>ZCode 账号池</h2>
-        <span class="hint">modelgate.account.zcode 的账号、领取与接入</span>
-        <span class="spacer"></span>
-        <button class="btn ghost sm" id="zcode-help">配置说明</button>
-        <button class="btn ghost sm" id="zcode-refresh">刷新</button>
-        <button class="btn ghost sm" id="zcode-panel-close">收起</button>
-      </div>
-      <div style="padding:0 16px 16px">
-        <div class="stat-row" id="zcode-status"></div>
-        <div class="grid two">
-          <div class="card">
-            <div class="card-head"><h2>基础设置</h2><span class="hint" id="zcode-save-hint">启用只影响聊天请求</span></div>
-            <form id="zcode-config-form" autocomplete="off" class="form-grid">
-              <label class="check span-2"><input type="checkbox" id="zcode-enabled"> 启用 ZCode 插件</label>
-              <label class="field span-2"><span>ZCode CLI 路径</span><input class="input" id="zcode-cli-path" placeholder="留空自动探测"></label>
-              <label class="check"><input type="checkbox" id="zcode-auto-claim"> 每日定时领取</label>
-              <label class="field"><span>领取时间</span><input class="input" id="zcode-claim-time" type="time"></label>
-              <label class="field"><span>失败换号上限</span><input class="input" id="zcode-concurrency" type="number" min="1" max="4"></label>
-              <label class="field"><span>连接方式</span><select class="input" id="zcode-backend"><option value="direct">直连（推荐，低延迟）</option><option value="appserver">本机 CLI（兼容）</option></select></label>
-              <label class="field"><span>Node 路径</span><input class="input" id="zcode-node-path"></label>
-              <label class="field"><span>ZCode 数据目录</span><input class="input" id="zcode-data-dir"></label>
-              <label class="field"><span>浏览器路径</span><input class="input" id="zcode-browser-path"></label>
-              <label class="field"><span>验证码场景 ID</span><input class="input" id="zcode-captcha-scene"></label>
-              <div class="span-2 card-actions wrap">
-                <button class="btn primary sm" type="button" id="zcode-save">保存设置</button>
-                <button class="btn ghost sm" type="button" id="zcode-captcha-test">验证码自检</button>
-                <span class="hint" id="zcode-captcha-hint"></span>
-              </div>
-            </form>
-          </div>
-          <div class="card">
-            <div class="card-head"><h2>账号操作</h2><span class="hint" id="zcode-pool-hint">—</span></div>
-            <div class="card-actions wrap">
-              <button class="btn primary sm" id="zcode-import-local">从本机导入</button>
-              <button class="btn ghost sm" id="zcode-add-manual">批量添加</button>
-              <button class="btn ghost sm" id="zcode-oauth-start">OAuth 登录</button>
-              <button class="btn ghost sm" id="zcode-claim-preview">预览可领</button>
-              <button class="btn ghost sm" id="zcode-claim-now">立即领取</button>
-              <button class="btn ghost sm" id="zcode-attach">接入 GLM 上游</button>
-            </div>
-            <div class="inline-note" id="zcode-action-hint">密钥只保存密文，页面只显示掩码。</div>
-          </div>
-        </div>
-        <div class="card flush" style="margin-top:16px">
-          <div class="card-head"><h2>账号</h2><span class="hint">调用 / 失败 / 最近错误</span></div>
-          <div class="table-wrap"><table class="table" id="zcode-account-table">
-            <thead><tr><th>名称</th><th>模式</th><th>状态</th><th>套餐 / 额度</th><th class="num">调用 / 失败</th><th>最近错误</th><th class="right">操作</th></tr></thead>
-            <tbody></tbody>
-          </table></div>
-        </div>
-        <div class="card flush" style="margin-top:16px">
-          <div class="card-head"><h2>领取记录</h2><span class="hint">只记录业务码与结果，不记录凭据</span></div>
-          <div class="table-wrap"><table class="table" id="zcode-claim-table">
-            <thead><tr><th>时间</th><th>账号</th><th>套餐</th><th>结果</th><th>下次检查</th></tr></thead><tbody></tbody>
-          </table></div>
-        </div>
-      </div>
-    </div>
   </section>
 
   <!-- ═══════════ 设置（子导航） ═══════════ -->
@@ -484,7 +423,6 @@
                   <label class="check"><input type="checkbox" id="set-access-log"> 访问日志</label>
                   <label class="check"><input type="checkbox" id="set-thinking"> thinking 回传</label>
                   <label class="check"><input type="checkbox" id="set-free-panel"> 显示免费来源</label>
-                  <label class="check"><input type="checkbox" id="set-zcode-panel"> 显示 ZCode</label>
                 </div>
               </div>
             </div>

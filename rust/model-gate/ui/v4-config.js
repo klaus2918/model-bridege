@@ -171,7 +171,6 @@
     setChecked("#set-access-log", cfg.accessLog !== false);
     setChecked("#set-thinking", cfg.thinkingPassthrough !== false);
     setChecked("#set-free-panel", cfg.freeSourcesPanel !== false);
-    setChecked("#set-zcode-panel", cfg.zcodePanel === true);
     setChecked("#set-prompt-capture", Boolean(cfg.promptCapture));
     setValue("#set-prompt-retention", cfg.promptRetentionDays == null ? 7 : cfg.promptRetentionDays);
     setValue("#set-prompt-max-records", cfg.promptMaxRecords || 0);
@@ -285,7 +284,6 @@
       accessLog: $("#set-access-log").checked,
       thinkingPassthrough: $("#set-thinking").checked,
       freeSourcesPanel: $("#set-free-panel").checked,
-      zcodePanel: $("#set-zcode-panel").checked,
       promptCapture: $("#set-prompt-capture").checked,
       promptRetentionDays: Number($("#set-prompt-retention").value) || 0,
       promptMaxRecords: Number($("#set-prompt-max-records").value) || 0,
@@ -444,7 +442,7 @@
   ];
 
   const HELP_UPSTREAM_FIELDS = [
-    ["protocol", "string", "openai", "wire 协议：openai / anthropic / commandcode / opencode / zcode"],
+    ["protocol", "string", "openai", "wire 协议：openai / anthropic / commandcode / opencode"],
     ["baseUrl", "string", "—", "上游请求地址，一般带 /v1 后缀"],
     ["apiKeyStore", "string", "—", "本机加密库引用；密钥由 Windows DPAPI 保存，配置只留引用"],
     ["apiKeyEnv", "string", "—", "旧字段：密钥环境变量名；v4 默认使用加密库"],

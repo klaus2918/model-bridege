@@ -86,7 +86,7 @@ impl SecretStore {
         let blob = base64::engine::general_purpose::STANDARD
             .decode(sealed)
             .ok()?;
-        let plain = crate::zcode::secret::open(&blob).ok()?;
+        let plain = crate::seal::open(&blob).ok()?;
         String::from_utf8(plain).ok()
     }
 
@@ -105,7 +105,7 @@ impl SecretStore {
             return Err("密钥库条目 id 不能为空".into());
         }
         crate::key_file::validate_key(key).map_err(|err| err.to_string())?;
-        let sealed = crate::zcode::secret::seal(key.as_bytes())?;
+        let sealed = crate::seal::seal(key.as_bytes())?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(sealed);
         self.entries.insert(id.to_string(), encoded);
         self.save()

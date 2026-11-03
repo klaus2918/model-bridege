@@ -46,38 +46,6 @@ fn builtin_manifests() -> Vec<Value> {
     vec![
         json!({
             "schema": "modelgate.plugin/v1",
-            "id": "modelgate.account.zcode",
-            "name": "ZCode 账号池",
-            "description": "ZCode / GLM 计划账号池；账号与领取记录仍由 ZCode 面板管理。",
-            "version": "3.0.0",
-            "kind": "account",
-            "tier": "native",
-            "auth": {
-                "mode": "pool",
-                "schemes": ["bearer"],
-                "pool": {
-                    "strategy": "priority",
-                    "memberKind": "account",
-                    "minMembers": 1,
-                    "cooldownSeconds": 60,
-                    "failureThreshold": 3,
-                }
-            },
-            "access": {
-                "requiredFields": [],
-                "advancedFields": ["models", "compat"],
-                "privacy": { "support": "none", "zdrDefault": false }
-            },
-            "upstream": {
-                "protocol": "anthropic",
-                "transport": "zcode",
-                "baseUrl": "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
-                "models": [],
-                "compat": { "profile": "anthropic" }
-            }
-        }),
-        json!({
-            "schema": "modelgate.plugin/v1",
             "id": "modelgate.free.kilo",
             "name": "Kilo 免费池",
             "description": "Kilo AI 公共网关的 OpenRouter 兼容端点；免密钥，按 IP 限流。",
@@ -221,7 +189,7 @@ fn validate_manifest(manifest: &Value) -> Result<(), String> {
         .unwrap_or("openai");
     if !matches!(
         protocol,
-        "openai" | "anthropic" | "commandcode" | "opencode" | "zcode"
+        "openai" | "anthropic" | "commandcode" | "opencode"
     ) {
         return Err(format!("不支持的协议「{protocol}」"));
     }
@@ -369,7 +337,10 @@ fn plugin_summary(state: &AppState, manifest: &Value, enabled: bool, installed: 
 /// 条目（kilo→kilo-free、zen→zen-free），目录端点、免费判定与探测参数都由
 /// 注册表承载，这里只做指针解析。仅 `kind=free` 且已声明的插件有该能力；
 /// 已移除的插件一律视为没有。
-pub fn free_source_for(state: &AppState, plugin_id: &str) -> Option<crate::free_sources::FreeSource> {
+pub fn free_source_for(
+    state: &AppState,
+    plugin_id: &str,
+) -> Option<crate::free_sources::FreeSource> {
     if is_removed(&state.db, plugin_id) {
         return None;
     }
@@ -780,7 +751,10 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Response {
             None => items.push(plugin_summary(&state, manifest, true, false)),
         }
     }
-    for row in stored.iter().filter(|row| !row.removed && !is_builtin(&row.id)) {
+    for row in stored
+        .iter()
+        .filter(|row| !row.removed && !is_builtin(&row.id))
+    {
         items.push(plugin_summary(&state, &row.manifest, row.enabled, true));
     }
     Json(json!({
@@ -844,7 +818,9 @@ fn register_manifest(
         ],
     );
     drop(conn);
-    result.map(|_| ()).map_err(|err| format!("插件登记失败: {err}"))
+    result
+        .map(|_| ())
+        .map_err(|err| format!("插件登记失败: {err}"))
 }
 
 pub async fn install(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
@@ -1198,8 +1174,6 @@ mod tests {
         let zen = free_source_for(&state, "modelgate.free.opencode").expect("zen 应有免费来源");
         assert_eq!(zen.id, "zen-free");
         assert_eq!(zen.transport, "opencode", "zen 走指纹头免密层");
-        // 账号池插件没有免费模型目录：zcode 保留专属账号面板。
-        assert!(free_source_for(&state, "modelgate.account.zcode").is_none());
         // 摘要透传 freeSource，供插件卡片判断是否渲染「模型 · 检测」。
         let summary = plugin_summary(
             &state,
@@ -1208,13 +1182,6 @@ mod tests {
             true,
         );
         assert_eq!(summary["freeSource"], json!("kilo-free"));
-        let summary = plugin_summary(
-            &state,
-            &json!({"id": "modelgate.account.zcode", "kind": "account"}),
-            true,
-            true,
-        );
-        assert_eq!(summary["freeSource"], json!(""));
     }
 
     /// 已移除的插件不再提供模型获取与检测。
@@ -1290,7 +1257,10 @@ mod tests {
         conn.execute("DELETE FROM plugins WHERE id = ?1", ["test.imported"])
             .unwrap();
         drop(conn);
-        assert!(stored_row(&db, "test.imported").is_none(), "导入插件卸载即删行");
+        assert!(
+            stored_row(&db, "test.imported").is_none(),
+            "导入插件卸载即删行"
+        );
     }
 
     #[test]
@@ -1334,19 +1304,5 @@ mod tests {
             err.contains("不得声明密钥") || err.contains("密钥字段"),
             "unexpected: {err}"
         );
-    }
-
-    #[test]
-    fn attach_entry_uses_pool_without_key() {
-        let manifest = builtin_manifests()
-            .into_iter()
-            .find(|m| m["id"] == "modelgate.account.zcode")
-            .unwrap();
-        let entry = build_attach_entry(&manifest, "zcode");
-        assert_eq!(entry["kind"], "plugin");
-        assert_eq!(entry["pluginId"], "modelgate.account.zcode");
-        assert!(!entry.contains_key("apiKeyStore"));
-        assert!(!entry.contains_key("apiKeyEnv"));
-        assert_eq!(entry["privacy"]["zdr"], false);
     }
 }

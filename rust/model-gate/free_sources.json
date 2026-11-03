@@ -2,11 +2,31 @@
   "version": 1,
   "_doc": "免费来源注册表：免密（无需账号/Key）上游的定义与拒因字典。Rust 内核内嵌（include_str!）。判定只做筛选，最终可用性由探测决定。",
   "states": {
-    "available": { "label": "可用", "order": 0, "tone": "ok" },
-    "transient": { "label": "暂时不可用", "order": 1, "tone": "warn" },
-    "suspect": { "label": "疑似可用", "order": 2, "tone": "warn" },
-    "region": { "label": "地区受限", "order": 3, "tone": "info" },
-    "unavailable": { "label": "明确不可用", "order": 4, "tone": "bad" }
+    "available": {
+      "label": "可用",
+      "order": 0,
+      "tone": "ok"
+    },
+    "transient": {
+      "label": "暂时不可用",
+      "order": 1,
+      "tone": "warn"
+    },
+    "suspect": {
+      "label": "疑似可用",
+      "order": 2,
+      "tone": "warn"
+    },
+    "region": {
+      "label": "地区受限",
+      "order": 3,
+      "tone": "info"
+    },
+    "unavailable": {
+      "label": "明确不可用",
+      "order": 4,
+      "tone": "bad"
+    }
   },
   "sources": {
     "zen-free": {
@@ -18,10 +38,18 @@
       "chatPath": "/v1/chat/completions",
       "auth": "none",
       "freeMatch": {
-        "suffixes": ["-free"],
-        "ids": ["big-pickle", "grok-code"]
+        "suffixes": [
+          "-free"
+        ],
+        "ids": [
+          "big-pickle",
+          "grok-code"
+        ]
       },
-      "catalog": { "path": "/v1/models", "shape": "openai" },
+      "catalog": {
+        "path": "/v1/models",
+        "shape": "openai"
+      },
       "probe": {
         "mode": "chat",
         "minMaxTokens": 512,
@@ -42,11 +70,18 @@
       "chatPath": "/v1/chat/completions",
       "auth": "none",
       "freeMatch": {
-        "suffixes": [":free"],
-        "flags": ["isFree"],
+        "suffixes": [
+          ":free"
+        ],
+        "flags": [
+          "isFree"
+        ],
         "zeroPrice": true
       },
-      "catalog": { "path": "/v1/models", "shape": "openai" },
+      "catalog": {
+        "path": "/v1/models",
+        "shape": "openai"
+      },
       "probe": {
         "mode": "chat",
         "minMaxTokens": 512,
@@ -57,34 +92,6 @@
         "note": "Kilo 免密池：20 个免费模型中 19 个 mayTrainOnYourPrompts=true；NVIDIA 免费端点官方明示会记录会话用于改进产品。勿发送机密内容。"
       },
       "docsUrl": "https://kilo.ai/docs/gateway/models-and-providers"
-    },
-    "zcode": {
-      "kind": "account",
-      "label": "ZCode Start Plan（GLM 账号池）",
-      "upstream": "zcode",
-      "protocol": "anthropic",
-      "transport": "zcode",
-      "baseUrl": "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
-      "chatPath": "/v1/messages",
-      "auth": "managed",
-      "freeMatch": {
-        "ids": ["GLM-5.3-Flash", "GLM-5.3"]
-      },
-      "catalog": { "path": "", "shape": "fixed" },
-      "probe": {
-        "mode": "chat",
-        "minMaxTokens": 8,
-        "prompt": "ping"
-      },
-      "quota": {
-        "mode": "account",
-        "note": "Start Plan 额度由 ZCode 插件自动领取"
-      },
-      "privacy": {
-        "level": "warn",
-        "note": "账号型免费额度：请求经本机 ZCode CLI worker 转发，不发送到第三方；请遵守 Z.AI 使用条款。"
-      },
-      "docsUrl": "https://github.com/dengyie/zcode2api"
     }
   },
   "rejectReasons": {

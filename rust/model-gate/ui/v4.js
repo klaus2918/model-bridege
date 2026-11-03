@@ -80,16 +80,6 @@
     if (pane === "maintain" && v4.observe === "diag") loadDiagnostics().catch(() => {});
   }
 
-  // ───────────────────────── ZCode 账号池面板 ─────────────────────────
-
-  function openZcodePanel() {
-    const panel = $("#zcode-panel");
-    if (!panel) return;
-    panel.hidden = false;
-    panel.scrollIntoView({ behavior: "smooth", block: "start" });
-    MG.runView("zcode");
-  }
-
   function setObserveTab(tab) {
     v4.observe = tab === "diag" ? "diag" : "logs";
     $$("#observe-tabs [data-observe-tab]").forEach((button) => {
@@ -606,11 +596,6 @@
     });
 
     document.addEventListener("click", (event) => {
-      if (event.target.closest("[data-open-zcode]")) openZcodePanel();
-      if (event.target.closest("#zcode-panel-close")) {
-        const panel = $("#zcode-panel");
-        if (panel) panel.hidden = true;
-      }
       const diag = event.target.closest("[data-diag-view]");
       if (diag) {
         MG.navigate(diag.dataset.diagView);

@@ -285,9 +285,6 @@ fn infer_kind(up: &Upstream, entry: Option<&Map<String, Value>>, template_id: &s
             return "plugin".into();
         }
     }
-    if up.transport == "zcode" {
-        return "account".into();
-    }
     let known = crate::provider_profiles::is_known_profile(template_id);
     if known {
         "official".into()
@@ -495,7 +492,7 @@ fn validate_name(name: &str) -> Result<(), Response> {
 fn validate_protocol(protocol: &str) -> Result<(), Response> {
     if matches!(
         protocol,
-        "openai" | "anthropic" | "commandcode" | "opencode" | "zcode"
+        "openai" | "anthropic" | "commandcode" | "opencode"
     ) {
         Ok(())
     } else {

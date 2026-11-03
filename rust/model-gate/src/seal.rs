@@ -1,8 +1,8 @@
-//! ZCode 账号密钥的静态加密。
+//! 凭据的静态加密（DPAPI）。
 //!
 //! Windows 使用 DPAPI（`CryptProtectData` / `CryptUnprotectData`），密文只能由
 //! 同一用户在同一台机器上解开；非 Windows 暂时拒绝（Model-Gate 当前是 Windows
-//! 桌面产品，避免把 JWT 以明文写进 SQLite）。
+//! 桌面产品，避免把密钥以明文写进 SQLite）。
 //!
 //! 存储格式：`dpapi:v1:` + DPAPI blob。前缀用于未来迁移/识别。
 
@@ -98,12 +98,12 @@ pub fn open(sealed: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(not(windows))]
 pub fn seal(_plain: &[u8]) -> Result<Vec<u8>, String> {
-    Err("ZCode 凭据加密当前仅支持 Windows DPAPI".to_string())
+    Err("凭据加密当前仅支持 Windows DPAPI".to_string())
 }
 
 #[cfg(not(windows))]
 pub fn open(_sealed: &[u8]) -> Result<Vec<u8>, String> {
-    Err("ZCode 凭据解密当前仅支持 Windows DPAPI".to_string())
+    Err("凭据解密当前仅支持 Windows DPAPI".to_string())
 }
 
 #[cfg(test)]
@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let plain = b"zcode-jwt-token-for-test";
+        let plain = b"credential-for-test";
         let sealed = seal(plain).expect("seal");
         assert!(sealed.starts_with(PREFIX));
         assert_ne!(&sealed[PREFIX.len()..], plain);
