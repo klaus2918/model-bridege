@@ -186,6 +186,14 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
     let url = format!("http://{}:{}/ui/", cfg.host, actual_port);
     let endpoint = format!("http://{}:{}/v1", cfg.host, actual_port);
     let state = Arc::new(AppState::new(cfg, db, config_path));
+    // 保留治理后台线程：用量（retentionDays>0 时）/ 配置审计 / 领取历史的周期裁剪。
+    let retention_state = state.clone();
+    if let Err(err) = std::thread::Builder::new()
+        .name("retention".into())
+        .spawn(move || retention_loop(retention_state))
+    {
+        tracing::warn!("保留治理线程启动失败（数据将不再自动裁剪）：{err}");
+    }
     let app = proxy::router(state.clone());
     // 托盘指标快照：后台每 10 秒查库，主线程只读快照，避免阻塞消息循环。
     let today_snapshot = Arc::new(std::sync::Mutex::new(state.db.today_stats()));
@@ -202,6 +210,7 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
         // 纯代理模式：没有托盘，关闭请求只能来自 HTTP 服务自身的优雅退出
         // （Ctrl+C 或更新流程）。服务停下来后落盘数据库再退出。
         let _ = server.join();
+        wait_usage_flush(&state);
         state.db.checkpoint();
         return Ok(());
     }
@@ -244,9 +253,52 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
         Err(err) => {
             tracing::warn!("桌面壳不可用（{err}），降级为纯代理模式：{url}");
             let _ = server.join();
+            wait_usage_flush(&state);
+            state.db.checkpoint();
         }
     }
     Ok(())
+}
+
+/// 退出前等待用量后台批次落库：聚批窗口 50ms，正常几十毫秒清空；
+/// 兜底限时 2 秒，退出流程不被慢盘拖住。
+fn wait_usage_flush(state: &Arc<AppState>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while state.usage_pending.load(std::sync::atomic::Ordering::Relaxed) > 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// 保留治理后台线程：按周期裁剪无界增长的诊断/历史表。
+///
+/// - `usage_records`：`retentionDays > 0` 才启用（默认 0 = 不自动删用户数据，
+///   与现状一致；面板手动清理入口保留）；
+/// - `config_audit` / `zcode_claims`：诊断与领取历史，默认保留上限兜底。
+///
+/// 首轮延迟 60 秒执行（避免拖慢启动），之后每 6 小时一轮。
+fn retention_loop(state: Arc<AppState>) {
+    const TICK_SECS: u64 = 6 * 3600;
+    const FIRST_RUN_DELAY_SECS: u64 = 60;
+    std::thread::sleep(std::time::Duration::from_secs(FIRST_RUN_DELAY_SECS));
+    loop {
+        let retention_days = state.cfg().retention_days;
+        if retention_days > 0 {
+            let removed = state.db.delete_older_than(retention_days as i64);
+            if removed > 0 {
+                tracing::info!("保留策略：已清理 {removed} 条超过 {retention_days} 天的用量记录");
+            }
+        }
+        let audits = state.db.trim_config_audit(5000);
+        let claims = state.db.trim_zcode_claims(30, 2000);
+        if audits > 0 || claims > 0 {
+            tracing::debug!("保留策略：裁剪配置审计 {audits} 条、领取历史 {claims} 条");
+        }
+        // 大批量删除后刷新查询计划统计。
+        state.db.optimize();
+        std::thread::sleep(std::time::Duration::from_secs(TICK_SECS));
+    }
 }
 
 /// 优雅退出：停 HTTP 服务 → 数据库落盘 → 结束进程。
@@ -265,6 +317,7 @@ fn graceful_exit(state: &Arc<AppState>, shutdown: &Arc<crate::lifecycle::Shutdow
     if !shutdown.server_stopped() {
         tracing::warn!("HTTP 服务未在 10 秒内停止，仍继续退出流程");
     }
+    wait_usage_flush(state);
     state.db.checkpoint();
     // 通知安装看护脚本：资源已释放，可以开始安装。
     shutdown.signal_exit();

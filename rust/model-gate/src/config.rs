@@ -900,6 +900,8 @@ pub struct Config {
     pub prompt_max_records: u64,
     /// 单条提示词最大字符数；超过按消息边界截断。
     pub prompt_max_chars: u64,
+    /// 用量记录保留天数；0 = 不自动清理（默认，行为与旧版一致，面板手动清理保留）。
+    pub retention_days: u64,
     pub aliases: HashMap<String, String>,
     pub upstreams: Vec<Upstream>,
     /// 统一接入口的可见上游与命名分组。
@@ -979,6 +981,10 @@ impl Config {
             .get("promptMaxChars")
             .and_then(Value::as_u64)
             .unwrap_or(100_000);
+        let retention_days = obj
+            .get("retentionDays")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let aliases = obj
             .get("aliases")
             .and_then(Value::as_object)
@@ -1025,6 +1031,7 @@ impl Config {
             prompt_retention_days,
             prompt_max_records,
             prompt_max_chars,
+            retention_days,
             aliases,
             upstreams,
             unified,

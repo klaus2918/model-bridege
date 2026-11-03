@@ -90,6 +90,15 @@ impl SecretStore {
         String::from_utf8(plain).ok()
     }
 
+    /// 解密全部条目，供进程内缓存一次性构建（条目数量级是个位数）。
+    /// 解不开的条目按“未读到”跳过，与 `get` 的口径一致。
+    pub fn decrypted_all(&self) -> BTreeMap<String, String> {
+        self.entries
+            .keys()
+            .filter_map(|id| self.get(id).map(|key| (id.clone(), key)))
+            .collect()
+    }
+
     /// 加密并保存一把密钥；成功返回后立即可被 `get` 读到。
     pub fn set(&mut self, id: &str, key: &str) -> Result<(), String> {
         if id.trim().is_empty() {

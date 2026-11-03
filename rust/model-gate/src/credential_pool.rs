@@ -9,9 +9,11 @@
 //! exhausted（配额耗尽，窗口重置后惰性恢复）；disabled（人工停用）。
 //! ZCode 旧账号表保持事实源，池成员只做引用缓存（legacy adapter）。
 
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, State},
@@ -127,6 +129,47 @@ impl PoolSummary {
     }
 }
 
+/// 池/成员快照缓存：TTL 内选择凭据零 SQL。
+///
+/// 为什么能缓存：`credential_members` 的全部写路径都在本文件内（已核对无
+/// 旁路写），结构性写入后显式失效；TTL 只是跨进程改动的兜底。冷却判定
+/// 不依赖快照新鲜度——`cooldown_active` 用真实时间对快照里的
+/// `cooldown_until` 求值；`last_used_at`/`failure_count` 等影响选择排序
+/// 的字段在写入后**原位更新**缓存（`cache_touch`），轮转公平性不受影响。
+#[derive(Default)]
+pub struct PoolCache {
+    pools: HashMap<String, (Instant, Option<Pool>)>,
+    members: HashMap<String, (Instant, Vec<Member>)>,
+}
+
+const POOL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 密钥库解密缓存：按文件 mtime 失效。
+///
+/// 为什么：池选择要对每个成员解一次密钥（读盘 + JSON 解析 + DPAPI 解密），
+/// 5 成员池每次尝试 6 次磁盘读。mtime 不变时直接复用解密结果；面板写密钥
+/// 走 `set → save` 原子替换文件，mtime 变化自动触发重载，无需显式钩子。
+#[derive(Default)]
+pub struct SecretsCache {
+    path: Option<PathBuf>,
+    mtime: Option<SystemTime>,
+    keys: BTreeMap<String, String>,
+}
+
+impl SecretsCache {
+    fn lookup(&mut self, config_path: &std::path::Path, id: &str) -> Option<String> {
+        let path = crate::secret_store::path_for_config(config_path);
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if self.path.as_deref() != Some(path.as_path()) || self.mtime != mtime {
+            let store = crate::secret_store::SecretStore::load(config_path);
+            self.keys = store.decrypted_all();
+            self.path = Some(path);
+            self.mtime = mtime;
+        }
+        self.keys.get(id).cloned()
+    }
+}
+
 fn pool_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pool> {
     Ok(Pool {
         id: row.get(0)?,
@@ -164,14 +207,65 @@ fn member_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Member> {
 const MEMBER_COLS: &str =
     "id, pool_id, label, kind, secret_ref, priority, weight, status, cooldown_until, failure_count, quota_json, last_used_at, usage_json";
 
+/// 读缓存条目；过期条目顺手清掉。命中与否都不打库。
+fn cache_pools_get(state: &AppState, id: &str) -> Option<Option<Pool>> {
+    let mut cache = state.pool_cache.lock().unwrap_or_else(|e| e.into_inner());
+    match cache.pools.get(id) {
+        Some((at, pool)) if at.elapsed() < POOL_CACHE_TTL => Some(pool.clone()),
+        _ => {
+            cache.pools.retain(|_, (at, _)| at.elapsed() < POOL_CACHE_TTL);
+            None
+        }
+    }
+}
+
+/// 读成员快照；过期条目顺手清掉。
+fn cache_members_get(state: &AppState, pool_id: &str) -> Option<Vec<Member>> {
+    let mut cache = state.pool_cache.lock().unwrap_or_else(|e| e.into_inner());
+    match cache.members.get(pool_id) {
+        Some((at, members)) if at.elapsed() < POOL_CACHE_TTL => Some(members.clone()),
+        _ => {
+            cache.members.retain(|_, (at, _)| at.elapsed() < POOL_CACHE_TTL);
+            None
+        }
+    }
+}
+
+/// 原位更新缓存里的成员字段：选择排序/冷却判定立即可见，不触发整池重建。
+fn cache_touch(state: &AppState, member_id: &str, apply: impl Fn(&mut Member)) {
+    let mut cache = state.pool_cache.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, members) in cache.members.values_mut() {
+        for member in members.iter_mut() {
+            if member.id == member_id {
+                apply(member);
+            }
+        }
+    }
+}
+
+/// 结构性写入（增删成员/池、批量同步）后调用：下一请求重建快照。
+pub fn invalidate_pool_cache(state: &AppState) {
+    let mut cache = state.pool_cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.pools.clear();
+    cache.members.clear();
+}
+
 pub fn get_pool(state: &AppState, id: &str) -> Option<Pool> {
+    if let Some(hit) = cache_pools_get(state, id) {
+        return hit;
+    }
     let conn = state.db.read_conn();
-    conn.query_row(
-        &format!("SELECT {POOL_COLS} FROM credential_pools WHERE id = ?1"),
-        [id],
-        pool_from_row,
-    )
-    .ok()
+    let pool = conn
+        .query_row(
+            &format!("SELECT {POOL_COLS} FROM credential_pools WHERE id = ?1"),
+            [id],
+            pool_from_row,
+        )
+        .ok();
+    // 池不存在的判断同样值得缓存：expand_attempt_targets 靠它拒绝回落。
+    let mut cache = state.pool_cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.pools.insert(id.to_string(), (Instant::now(), pool.clone()));
+    pool
 }
 
 pub fn list_pool_ids(state: &AppState) -> Vec<String> {
@@ -196,6 +290,20 @@ pub fn pool_for_upstream(state: &AppState, upstream: &str) -> Option<Pool> {
 }
 
 pub fn members(state: &AppState, pool_id: &str) -> Vec<Member> {
+    if let Some(hit) = cache_members_get(state, pool_id) {
+        return hit;
+    }
+    // 快照构建（≤1 次/秒）：惰性推进状态机只在这里跑，而不是每次选择凭据。
+    recover_cooldowns(state);
+    let rows = load_members(state, pool_id);
+    let mut cache = state.pool_cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .members
+        .insert(pool_id.to_string(), (Instant::now(), rows.clone()));
+    rows
+}
+
+fn load_members(state: &AppState, pool_id: &str) -> Vec<Member> {
     let conn = state.db.read_conn();
     let mut out = Vec::new();
     if let Ok(mut stmt) = conn.prepare(&format!(
@@ -349,10 +457,12 @@ pub fn member_json(member: &Member) -> Value {
 }
 
 fn resolve_secret(state: &AppState, secret_ref: &str) -> Option<String> {
-    if let Some(id) = secret_ref.strip_prefix("store:") {
-        return crate::secret_store::SecretStore::load(&state.config_path).get(id);
-    }
-    None
+    let id = secret_ref.strip_prefix("store:")?;
+    state
+        .secrets_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .lookup(&state.config_path, id)
 }
 
 /// 选择可用成员；失败原因用字符串返回（供 503 诊断）。
@@ -397,8 +507,9 @@ pub fn select_credential(
         for id in unusable {
             let _ = write.execute(
                 "UPDATE credential_members SET status = 'needs_secret' WHERE id = ?1",
-                [id],
+                [id.as_str()],
             );
+            cache_touch(state, &id, |member| member.status = "needs_secret".into());
         }
     }
     if rows.is_empty() {
@@ -446,11 +557,18 @@ pub fn select_credential(
     let Some(key) = resolve_secret(state, &chosen.secret_ref) else {
         return Err("pool_unavailable: 选中成员读取密钥失败".into());
     };
+    let used_at = now_text();
     let write = state.db.write_conn();
     let _ = write.execute(
         "UPDATE credential_members SET last_used_at = ?2 WHERE id = ?1",
-        rusqlite::params![chosen.id, now_text()],
+        rusqlite::params![chosen.id, used_at],
     );
+    drop(write);
+    // 轮转/最久未用排序依赖 last_used_at：原位更新缓存，同一秒内的后续
+    // 请求不会重复选中同一成员。
+    cache_touch(state, &chosen.id, |member| {
+        member.last_used_at = Some(used_at.clone());
+    });
     Ok(PoolCredential {
         pool_id: pool.id.clone(),
         member_id: chosen.id,
@@ -460,11 +578,20 @@ pub fn select_credential(
 }
 
 pub fn mark_success(state: &AppState, member_id: &str) {
+    let now = now_text();
     let write = state.db.write_conn();
     let _ = write.execute(
         "UPDATE credential_members SET status = 'active', failure_count = 0, cooldown_until = NULL, last_used_at = ?2 WHERE id = ?1",
-        rusqlite::params![member_id, now_text()],
+        rusqlite::params![member_id, now],
     );
+    drop(write);
+    // 影响选择排序/冷却判定的字段原位更新缓存，下一次选择立即可见。
+    cache_touch(state, member_id, |member| {
+        member.status = "active".into();
+        member.failure_count = 0;
+        member.cooldown_until = None;
+        member.last_used_at = Some(now.clone());
+    });
 }
 
 pub fn mark_failure(state: &AppState, member_id: &str, hard: bool) {
@@ -479,28 +606,37 @@ pub fn mark_failure(state: &AppState, member_id: &str, hard: bool) {
     };
     let (cooldown, threshold) = pool.unwrap_or((60, 3));
     let write = state.db.write_conn();
-    let current: i64 = write
+    // 单语句自增并取回：原来是 SELECT + UPDATE 两次锁往返，RETURNING 把读
+    // 合并进写语句（rusqlite 的 execute 不接受返回行，这里用 query_row）。
+    let failures: Option<i64> = write
         .query_row(
-            "SELECT failure_count FROM credential_members WHERE id = ?1",
+            "UPDATE credential_members SET failure_count = failure_count + 1 WHERE id = ?1 RETURNING failure_count",
             [member_id],
             |row| row.get(0),
         )
-        .unwrap_or(0);
-    let failures = current + 1;
+        .ok();
+    let Some(failures) = failures else {
+        // 成员已不存在（并发删除），无事可做。
+        return;
+    };
     let cooling = hard || failures >= threshold.max(1);
+    let mut cooling_until: Option<String> = None;
     if cooling {
         let until = chrono::Local::now()
             + chrono::Duration::seconds(if hard { 300 } else { cooldown.max(1) });
+        cooling_until = Some(until.to_rfc3339());
         let _ = write.execute(
-            "UPDATE credential_members SET failure_count = ?2, status = 'cooling', cooldown_until = ?3 WHERE id = ?1",
-            rusqlite::params![member_id, failures, until.to_rfc3339()],
-        );
-    } else {
-        let _ = write.execute(
-            "UPDATE credential_members SET failure_count = ?2 WHERE id = ?1",
-            rusqlite::params![member_id, failures],
+            "UPDATE credential_members SET status = 'cooling', cooldown_until = ?2 WHERE id = ?1",
+            rusqlite::params![member_id, cooling_until],
         );
     }
+    drop(write);
+    let status = if cooling { "cooling" } else { "active" };
+    cache_touch(state, member_id, |member| {
+        member.failure_count = failures;
+        member.status = status.into();
+        member.cooldown_until = cooling_until.clone();
+    });
 }
 
 /// 新增成员：密钥只写本机加密库，DB 只存引用。
@@ -544,6 +680,8 @@ pub fn add_member(
         ],
     )
     .map_err(|err| format!("成员写入失败: {err}"))?;
+    drop(conn);
+    invalidate_pool_cache(state);
     Ok(member_id)
 }
 
@@ -563,6 +701,8 @@ pub fn create_pool(
         rusqlite::params![id, upstream, plugin_id, strategy, cooldown, threshold, now],
     )
     .map_err(|err| format!("池创建失败: {err}"))?;
+    drop(conn);
+    invalidate_pool_cache(state);
     Ok(())
 }
 
@@ -648,6 +788,8 @@ pub fn sync_legacy_zcode(state: &AppState) {
             ],
         );
     }
+    drop(write);
+    invalidate_pool_cache(state);
 }
 
 pub fn record_audit(
@@ -855,6 +997,7 @@ pub async fn update(
         );
     }
     drop(conn);
+    invalidate_pool_cache(&state);
     let pool = get_pool(&state, &id);
     Json(json!({ "ok": true, "pool": pool.as_ref().map(|pool| pool_json(&state, pool)) }))
         .into_response()
@@ -873,6 +1016,8 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
         "UPDATE credential_pools SET status = 'disabled', updated_at = ?2 WHERE id = ?1",
         rusqlite::params![id, now_text()],
     );
+    drop(conn);
+    invalidate_pool_cache(&state);
     Json(json!({ "ok": true, "disabled": id })).into_response()
 }
 
@@ -951,7 +1096,11 @@ pub async fn update_member(
     let conn = state.db.write_conn();
     match conn.execute(&sql, rusqlite::params_from_iter(params)) {
         Ok(0) => pool_error(StatusCode::NOT_FOUND, "成员不存在", "member_not_found"),
-        Ok(_) => Json(json!({ "ok": true, "memberId": member_id })).into_response(),
+        Ok(_) => {
+            drop(conn);
+            invalidate_pool_cache(&state);
+            Json(json!({ "ok": true, "memberId": member_id })).into_response()
+        }
         Err(err) => pool_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("更新失败: {err}"),
@@ -969,6 +1118,8 @@ pub async fn delete_member(
         "UPDATE credential_members SET status = 'disabled' WHERE id = ?1 AND pool_id = ?2",
         rusqlite::params![member_id, id],
     );
+    drop(conn);
+    invalidate_pool_cache(&state);
     Json(json!({ "ok": true, "disabled": member_id })).into_response()
 }
 
@@ -1074,5 +1225,40 @@ mod tests {
             usage_json: None,
         };
         assert_eq!(quota_numbers(&member), (0, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secrets_cache_reloads_on_mtime_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "mg-pool-secrets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("bridge.config.json");
+        let mut cache = SecretsCache::default();
+        // 空库 → 未命中。
+        assert_eq!(cache.lookup(&config, "upstream:u"), None);
+        {
+            let mut store = crate::secret_store::SecretStore::load(&config);
+            store.set("upstream:u", "sk-test-1").unwrap();
+        }
+        assert_eq!(cache.lookup(&config, "upstream:u"), Some("sk-test-1".into()));
+        // 文件被改写（面板保存新密钥）→ mtime 变化必须重载，不能永远拿旧值。
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        {
+            let mut store = crate::secret_store::SecretStore::load(&config);
+            store.set("upstream:u", "sk-test-2").unwrap();
+        }
+        assert_eq!(
+            cache.lookup(&config, "upstream:u"),
+            Some("sk-test-2".into()),
+            "mtime 变化必须重载解密缓存"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

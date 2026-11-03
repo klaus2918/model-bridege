@@ -36,8 +36,10 @@ CREATE TABLE IF NOT EXISTS usage_records (
     session           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_usage_ts     ON usage_records(ts DESC);
-CREATE INDEX IF NOT EXISTS idx_usage_model  ON usage_records(requested_model);
-CREATE INDEX IF NOT EXISTS idx_usage_up     ON usage_records(upstream);
+-- 复合索引对齐真实查询形状：面板高频过滤是「时间窗 + 上游/模型」组合，
+-- 单列索引只能选其一再回表过滤；复合索引让组合过滤在索引内完成。
+CREATE INDEX IF NOT EXISTS idx_usage_model_ts ON usage_records(requested_model, ts);
+CREATE INDEX IF NOT EXISTS idx_usage_up_ts    ON usage_records(upstream, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_day    ON usage_records(created_at);
 CREATE TABLE IF NOT EXISTS prompt_records (
     id              TEXT PRIMARY KEY,
@@ -306,13 +308,16 @@ impl Db {
         let readers = (0..READER_POOL_SIZE)
             .map(|_| connect(path).map(Mutex::new))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self {
+        let db = Self {
             path: path.to_path_buf(),
             write: Mutex::new(write),
             readers,
             prompt_stats: Arc::new(PromptStats::default()),
             agg_cache: Arc::new(AggregateCache::default()),
-        })
+        };
+        // 查询计划治理：启动时按需刷新统计，避免大库上查询计划长期劣化。
+        db.optimize();
+        Ok(db)
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -399,53 +404,81 @@ impl Db {
     }
 
     pub fn record_usage(&self, r: &UsageRecord) -> String {
-        let id = if r.id.is_empty() {
-            uuid::Uuid::new_v4().simple().to_string()
+        let mut record = r.clone();
+        if record.id.is_empty() {
+            record.id = uuid::Uuid::new_v4().simple().to_string();
+        }
+        let id = record.id.clone();
+        if self.record_usage_batch(std::slice::from_ref(&record)) == 1 {
+            id
         } else {
-            r.id.clone()
-        };
+            String::new()
+        }
+    }
+
+    /// 批量写入用量记录：一次事务、一次写锁，供后台 worker 聚合写入。
+    ///
+    /// 为什么批量：代理路径每个请求都会产生一条用量，逐条写入会让热路径
+    /// 每次都争抢全局写连接；聚合成一批后，并发请求共享一次事务提交。
+    /// `INSERT OR REPLACE` 保持与单条写入相同的幂等语义（请求 ID 关联）。
+    pub fn record_usage_batch(&self, records: &[UsageRecord]) -> usize {
+        if records.is_empty() {
+            return 0;
+        }
         let now = Local::now();
+        let created_at = now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string();
+        let ts = now.timestamp();
+        let mut conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let result = (|| -> rusqlite::Result<()> {
-            let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute(
-                "INSERT OR REPLACE INTO usage_records (
-                    id, ts, created_at, upstream, protocol, requested_model,
-                    upstream_model, prompt_tokens, completion_tokens,
-                    cache_read_tokens, cache_write_tokens, total_tokens,
-                    duration_ms, ttft_ms, status, stream, truncated, paused, error,
-                    cost, session
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
-                rusqlite::params![
-                    id,
-                    now.timestamp(),
-                    now.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
-                    r.upstream.as_str(),
-                    r.protocol.as_str(),
-                    r.requested_model.as_str(),
-                    r.upstream_model.as_str(),
-                    r.prompt_tokens,
-                    r.completion_tokens,
-                    r.cache_read_tokens,
-                    r.cache_write_tokens,
-                    r.prompt_tokens + r.completion_tokens,
-                    r.duration_ms,
-                    r.ttft_ms,
-                    r.status,
-                    r.stream as i64,
-                    r.truncated as i64,
-                    r.paused as i64,
-                    r.error.clone(),
-                    r.cost,
-                    if r.session.is_empty() { None } else { Some(r.session.clone()) },
-                ],
-            )?;
-            Ok(())
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR REPLACE INTO usage_records (
+                        id, ts, created_at, upstream, protocol, requested_model,
+                        upstream_model, prompt_tokens, completion_tokens,
+                        cache_read_tokens, cache_write_tokens, total_tokens,
+                        duration_ms, ttft_ms, status, stream, truncated, paused, error,
+                        cost, session
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                )?;
+                for r in records {
+                    let id = if r.id.is_empty() {
+                        uuid::Uuid::new_v4().simple().to_string()
+                    } else {
+                        r.id.clone()
+                    };
+                    stmt.execute(rusqlite::params![
+                        id,
+                        ts,
+                        created_at,
+                        r.upstream.as_str(),
+                        r.protocol.as_str(),
+                        r.requested_model.as_str(),
+                        r.upstream_model.as_str(),
+                        r.prompt_tokens,
+                        r.completion_tokens,
+                        r.cache_read_tokens,
+                        r.cache_write_tokens,
+                        r.prompt_tokens + r.completion_tokens,
+                        r.duration_ms,
+                        r.ttft_ms,
+                        r.status,
+                        r.stream as i64,
+                        r.truncated as i64,
+                        r.paused as i64,
+                        r.error.clone(),
+                        r.cost,
+                        if r.session.is_empty() { None } else { Some(r.session.clone()) },
+                    ])?;
+                }
+            }
+            tx.commit()
         })();
         match result {
-            Ok(()) => id,
+            Ok(()) => records.len(),
             Err(err) => {
-                tracing::warn!("用量落库失败: {err}");
-                String::new()
+                tracing::warn!("用量批量落库失败: {err}");
+                0
             }
         }
     }
@@ -932,68 +965,88 @@ impl Db {
         .unwrap_or(0)
     }
 
-    /// 用回调重算全部历史记录的费用并单事务批量 UPDATE。
+    /// 用回调重算全部历史记录的费用：按批流式「读 → 算 → 写」。
     ///
-    /// 保存单价表后的「重算历史费用」入口：读取阶段失败返回 0；
-    /// 写入阶段失败记日志（费用字段为辅助信息，绝不因此丢记录）。
+    /// 保存单价表后的「重算历史费用」入口。为什么分批：百万行级表一次性
+    /// 读进内存再单事务全量 UPDATE，会长时间占住写连接并驻留一份全表
+    /// 数据；改成 rowid 翻页，每批独立提交，代理写入在批间基本无感。
+    /// 中途失败时已完成批次保留（费用是辅助字段，重跑即可补齐），绝不丢记录。
     pub fn recompute_costs(&self, compute: impl Fn(&CostRow) -> f64) -> usize {
-        let rows: Vec<CostRow> = {
-            let conn = self.reader();
-            let sql = "SELECT id, ts, upstream, requested_model, upstream_model, \
-                       prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens \
-                       FROM usage_records";
-            let mut stmt = match conn.prepare(sql) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!("重算费用读取失败: {err}");
-                    return 0;
+        const BATCH: i64 = PROMPT_DELETE_BATCH;
+        let mut last_rowid: i64 = 0;
+        let mut updated = 0usize;
+        loop {
+            let rows: Vec<(i64, CostRow)> = {
+                let conn = self.reader();
+                let sql = "SELECT rowid, id, ts, upstream, requested_model, upstream_model, \
+                           prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens \
+                           FROM usage_records WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
+                let mut stmt = match conn.prepare(sql) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tracing::warn!("重算费用读取失败: {err}");
+                        return updated;
+                    }
+                };
+                let mapped = stmt.query_map(
+                    rusqlite::params![last_rowid, BATCH],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            CostRow {
+                                id: row.get("id")?,
+                                ts: row.get("ts")?,
+                                upstream: row
+                                    .get::<_, Option<String>>("upstream")?
+                                    .unwrap_or_default(),
+                                requested_model: row
+                                    .get::<_, Option<String>>("requested_model")?
+                                    .unwrap_or_default(),
+                                upstream_model: row
+                                    .get::<_, Option<String>>("upstream_model")?
+                                    .unwrap_or_default(),
+                                prompt_tokens: row.get("prompt_tokens")?,
+                                completion_tokens: row.get("completion_tokens")?,
+                                cache_read_tokens: row.get("cache_read_tokens")?,
+                                cache_write_tokens: row.get("cache_write_tokens")?,
+                            },
+                        ))
+                    },
+                );
+                match mapped {
+                    Ok(iter) => iter.filter_map(Result::ok).collect(),
+                    Err(err) => {
+                        tracing::warn!("重算费用遍历失败: {err}");
+                        return updated;
+                    }
                 }
             };
-            let mapped = stmt.query_map([], |row| {
-                Ok(CostRow {
-                    id: row.get("id")?,
-                    ts: row.get("ts")?,
-                    upstream: row
-                        .get::<_, Option<String>>("upstream")?
-                        .unwrap_or_default(),
-                    requested_model: row
-                        .get::<_, Option<String>>("requested_model")?
-                        .unwrap_or_default(),
-                    upstream_model: row
-                        .get::<_, Option<String>>("upstream_model")?
-                        .unwrap_or_default(),
-                    prompt_tokens: row.get("prompt_tokens")?,
-                    completion_tokens: row.get("completion_tokens")?,
-                    cache_read_tokens: row.get("cache_read_tokens")?,
-                    cache_write_tokens: row.get("cache_write_tokens")?,
-                })
-            });
-            match mapped {
-                Ok(iter) => iter.filter_map(Result::ok).collect(),
-                Err(err) => {
-                    tracing::warn!("重算费用遍历失败: {err}");
-                    return 0;
-                }
+            if rows.is_empty() {
+                break;
             }
-        };
-        let updates: Vec<(f64, &str)> = rows
-            .iter()
-            .map(|row| (compute(row), row.id.as_str()))
-            .collect();
-        let mut conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let mut updated = 0usize;
-        let result = (|| -> rusqlite::Result<()> {
-            let tx = conn.transaction()?;
-            {
-                let mut stmt = tx.prepare("UPDATE usage_records SET cost = ?1 WHERE id = ?2")?;
-                for (cost, id) in &updates {
-                    updated += stmt.execute(rusqlite::params![cost, id])?;
+            last_rowid = rows.last().map(|(rowid, _)| *rowid).unwrap_or(last_rowid);
+            let updates: Vec<(f64, &str)> = rows
+                .iter()
+                .map(|(_, row)| (compute(row), row.id.as_str()))
+                .collect();
+            let mut conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
+            let result = (|| -> rusqlite::Result<()> {
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt = tx.prepare("UPDATE usage_records SET cost = ?1 WHERE id = ?2")?;
+                    for (cost, id) in &updates {
+                        updated += stmt.execute(rusqlite::params![cost, id])?;
+                    }
                 }
+                tx.commit()
+            })();
+            if let Err(err) = result {
+                tracing::warn!("重算费用写入失败: {err}");
             }
-            tx.commit()
-        })();
-        if let Err(err) = result {
-            tracing::warn!("重算费用写入失败: {err}");
+            drop(conn);
+            if rows.len() < BATCH as usize {
+                break;
+            }
         }
         updated
     }
@@ -1394,13 +1447,24 @@ impl Db {
     pub fn clear_usage(&self, f: &Filters) -> i64 {
         let (where_sql, args) = where_clause(f, f.only.as_deref());
         let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let removed = conn
-            .execute(
-                &format!("DELETE FROM usage_records{where_sql}"),
-                params_from_iter(args.iter()),
-            )
-            .map(|n| n as i64)
-            .unwrap_or(0);
+        // 与 clear_prompts 同样的分批策略：一次清掉百万行会长时间占住写锁、
+        // 撑大 WAL；每批独立提交，写锁在批次之间释放，代理写入基本无感。
+        let mut removed = 0i64;
+        loop {
+            let n = conn
+                .execute(
+                    &format!(
+                        "DELETE FROM usage_records WHERE rowid IN (\
+                         SELECT rowid FROM usage_records{where_sql} LIMIT {PROMPT_DELETE_BATCH})"
+                    ),
+                    params_from_iter(args.iter()),
+                )
+                .unwrap_or(0) as i64;
+            removed += n;
+            if n < PROMPT_DELETE_BATCH {
+                break;
+            }
+        }
         drop(conn);
         if removed > 0 {
             self.invalidate_agg_cache();
@@ -1444,6 +1508,94 @@ impl Db {
             .map(|m| m.len() as i64)
             .unwrap_or(0)
     }
+
+    /// 查询计划治理：`PRAGMA optimize` 按需 ANALYZE，让查询计划器拿到新鲜统计。
+    ///
+    /// 启动时与保留清理大批量删除后调用。失败只记日志：优化失败不该阻断流程。
+    pub fn optimize(&self) {
+        let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(err) = conn.execute_batch("PRAGMA optimize;") {
+            tracing::warn!("数据库统计优化失败：{err}");
+        }
+    }
+
+    /// 保留治理：配置审计只留最近 `max_records` 条（按 rowid 保序，插入即递增）。
+    ///
+    /// 为什么不用天数：`at` 是 RFC3339 本地时间文本，夏令时切换时字典序与
+    /// 时间序会短暂错位；rowid 单调且与插入顺序一致，语义就是「最近 N 条」。
+    pub fn trim_config_audit(&self, max_records: i64) -> i64 {
+        if max_records <= 0 {
+            return 0;
+        }
+        let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut removed = 0i64;
+        loop {
+            let n = conn
+                .execute(
+                    "DELETE FROM config_audit WHERE rowid IN (\
+                     SELECT rowid FROM config_audit ORDER BY rowid DESC LIMIT ?2 OFFSET ?1)",
+                    rusqlite::params![max_records, PROMPT_DELETE_BATCH],
+                )
+                .map(|n| n as i64)
+                .unwrap_or(0);
+            removed += n;
+            if n < PROMPT_DELETE_BATCH {
+                break;
+            }
+        }
+        removed
+    }
+
+    /// 保留治理：领取历史只留最近 `keep_days` 天且最多 `max_records` 条。
+    ///
+    /// `created_at` 是毫秒时间戳，天数裁剪可直接比较；条数上限兜底
+    /// 「短期高频领取」的极端情况。同样分批提交，避免长事务。
+    pub fn trim_zcode_claims(&self, keep_days: i64, max_records: i64) -> i64 {
+        let mut removed = 0i64;
+        let conn = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        if keep_days > 0 {
+            let cutoff = now_unix_ms() - keep_days * 86_400_000;
+            loop {
+                let n = conn
+                    .execute(
+                        "DELETE FROM zcode_claims WHERE rowid IN (\
+                         SELECT rowid FROM zcode_claims WHERE created_at < ?1 LIMIT ?2)",
+                        rusqlite::params![cutoff, PROMPT_DELETE_BATCH],
+                    )
+                    .map(|n| n as i64)
+                    .unwrap_or(0);
+                removed += n;
+                if n < PROMPT_DELETE_BATCH {
+                    break;
+                }
+            }
+        }
+        if max_records > 0 {
+            loop {
+                let n = conn
+                    .execute(
+                        "DELETE FROM zcode_claims WHERE rowid IN (\
+                         SELECT rowid FROM zcode_claims ORDER BY created_at DESC LIMIT ?2 OFFSET ?1)",
+                        rusqlite::params![max_records, PROMPT_DELETE_BATCH],
+                    )
+                    .map(|n| n as i64)
+                    .unwrap_or(0);
+                removed += n;
+                if n < PROMPT_DELETE_BATCH {
+                    break;
+                }
+            }
+        }
+        removed
+    }
+}
+
+/// 当前时间的毫秒时间戳（zcode_claims.created_at 与 store.rs 的 now_ms 同口径）。
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1541,6 +1693,11 @@ fn migrate(conn: &Connection) {
         "CREATE INDEX IF NOT EXISTS idx_prompt_session_ts ON prompt_records(session, ts)",
         [],
     );
+    // 旧版本的单列 upstream/model 索引已被 SCHEMA 里的复合索引取代。
+    // SCHEMA 先建复合索引、这里再删旧索引：中断后重启可重试，两步都幂等；
+    // 不删的话旧索引会在每次启动时被 SCHEMA 重建，大库上白付一次全索引构建。
+    let _ = conn.execute("DROP INDEX IF EXISTS idx_usage_up", []);
+    let _ = conn.execute("DROP INDEX IF EXISTS idx_usage_model", []);
 }
 
 /// LIKE 模式转义：用户输入里的 `%` / `_` / `\` 按字面量匹配。
@@ -2230,5 +2387,206 @@ mod tests {
             1,
             "明细的 (无会话) 过滤必须命中 NULL"
         );
+    }
+
+    #[test]
+    fn record_usage_batch_keeps_ids_and_is_idempotent() {
+        let db = temp_db();
+        let record = |id: &str| UsageRecord {
+            id: id.into(),
+            upstream: "u".into(),
+            requested_model: "m".into(),
+            upstream_model: "m".into(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            status: 200,
+            ..Default::default()
+        };
+        let written = db.record_usage_batch(&[record("req-a"), record("req-b")]);
+        assert_eq!(written, 2, "批量写入条数必须等于输入条数");
+        // 空批次直接返回。
+        assert_eq!(db.record_usage_batch(&[]), 0);
+        // 后台重试重放同 ID（INSERT OR REPLACE）不产生重复行。
+        db.record_usage_batch(std::slice::from_ref(&record("req-a")));
+        assert_eq!(db.count_usage(&Filters::default()), 2);
+        // 空 ID 由库层补 UUID，且能落库。
+        let id = db.record_usage(&UsageRecord {
+            upstream: "u".into(),
+            requested_model: "m".into(),
+            upstream_model: "m".into(),
+            status: 200,
+            ..Default::default()
+        });
+        assert!(!id.is_empty());
+        assert_eq!(db.count_usage(&Filters::default()), 3);
+    }
+
+    #[test]
+    fn clear_usage_batches_deletes_beyond_one_transaction() {
+        let db = temp_db();
+        // PROMPT_DELETE_BATCH = 5000：造 5100 行强制清理走两批以上删除。
+        let batch: Vec<UsageRecord> = (0..5_100)
+            .map(|i| UsageRecord {
+                id: format!("req-{i}"),
+                upstream: "u".into(),
+                requested_model: "m".into(),
+                upstream_model: "m".into(),
+                status: 200,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(db.record_usage_batch(&batch), 5_100);
+        let removed = db.clear_usage(&Filters::default());
+        assert_eq!(removed, 5_100, "分批删除的总行数必须等于全表行数");
+        assert_eq!(db.count_usage(&Filters::default()), 0);
+    }
+
+    #[test]
+    fn composite_indexes_replace_legacy_single_column_ones() {
+        let db = temp_db();
+        let conn = db.write.lock().unwrap();
+        let has_index = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+        };
+        assert!(has_index("idx_usage_up_ts"), "复合索引 (upstream, ts) 必须建立");
+        assert!(has_index("idx_usage_model_ts"), "复合索引 (model, ts) 必须建立");
+        assert!(has_index("idx_usage_ts"), "时间窗索引保留");
+        assert!(!has_index("idx_usage_up"), "旧单列 upstream 索引必须被复合索引取代");
+        assert!(!has_index("idx_usage_model"), "旧单列 model 索引必须被复合索引取代");
+    }
+
+    #[test]
+    fn legacy_single_column_indexes_are_dropped_on_reopen() {
+        let dir = std::env::temp_dir().join(format!("mg-db-legacy-idx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("modelgate.db");
+        {
+            let _db = Db::open(&path).unwrap();
+        }
+        // 模拟旧版本库文件：手工补回旧单列索引后再打开。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_usage_up ON usage_records(upstream)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let conn = db.write.lock().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_usage_up'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "重开后旧单列索引必须被清理，避免每次启动重建");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_returning_is_supported_by_bundled_sqlite() {
+        let db = temp_db();
+        // mark_failure 依赖 UPDATE ... RETURNING（SQLite ≥3.35）；守住能力面，
+        // 版本回退时这里先炸而不是热路径静默拿不到失败计数。
+        let conn = db.write.lock().unwrap();
+        conn.execute(
+            "INSERT INTO credential_members (id, pool_id, label, kind, secret_ref) \
+             VALUES ('m1', 'p1', '成员', 'api_key', 'store:x')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "UPDATE credential_members SET failure_count = failure_count + 1 \
+                 WHERE id = 'm1' RETURNING failure_count",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let n: i64 = conn
+            .query_row(
+                "UPDATE credential_members SET failure_count = failure_count + 1 \
+                 WHERE id = 'm1' RETURNING failure_count",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "自增必须累加而不是覆盖");
+    }
+
+    #[test]
+    fn trim_config_audit_keeps_newest_rows() {
+        let db = temp_db();
+        {
+            let conn = db.write.lock().unwrap();
+            for i in 0..12 {
+                conn.execute(
+                    "INSERT INTO config_audit (id, at, action) VALUES (?1, ?2, 'test')",
+                    rusqlite::params![format!("audit-{i}"), format!("2026-01-01T00:00:{i:02}+08:00")],
+                )
+                .unwrap();
+            }
+        }
+        let removed = db.trim_config_audit(5);
+        assert_eq!(removed, 7, "只保留最近 5 条");
+        let conn = db.write.lock().unwrap();
+        let remaining: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM config_audit ORDER BY rowid")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.flatten().collect()
+        };
+        assert_eq!(remaining, ["audit-7", "audit-8", "audit-9", "audit-10", "audit-11"]);
+    }
+
+    #[test]
+    fn trim_zcode_claims_cuts_by_age_then_count() {
+        let db = temp_db();
+        let now_ms = now_unix_ms();
+        {
+            let conn = db.write.lock().unwrap();
+            // 40 条 40 天前 + 3 条 1 天内。
+            for i in 0..40 {
+                conn.execute(
+                    "INSERT INTO zcode_claims (id, account_id, ok, created_at) \
+                     VALUES (?1, 'acc', 1, ?2)",
+                    rusqlite::params![format!("claim-old-{i}"), now_ms - 40 * 86_400_000],
+                )
+                .unwrap();
+            }
+            for i in 0..3 {
+                conn.execute(
+                    "INSERT INTO zcode_claims (id, account_id, ok, created_at) \
+                     VALUES (?1, 'acc', 1, ?2)",
+                    rusqlite::params![format!("claim-new-{i}"), now_ms - 86_400_000 + i],
+                )
+                .unwrap();
+            }
+        }
+        // 40 天前的按天数裁掉；1 天内的 3 条保留。
+        assert_eq!(db.trim_zcode_claims(30, 2_000), 40);
+        assert_eq!(count_zcode_claims(&db), 3);
+        // 条数上限兜底：只留最近 1 条。
+        assert_eq!(db.trim_zcode_claims(30, 1), 2);
+        assert_eq!(count_zcode_claims(&db), 1);
+        // 天数/条数均为 0 表示都不裁。
+        assert_eq!(db.trim_zcode_claims(0, 0), 0);
+        assert_eq!(count_zcode_claims(&db), 1);
+    }
+
+    fn count_zcode_claims(db: &Db) -> i64 {
+        let conn = db.read_conn();
+        conn.query_row("SELECT COUNT(*) FROM zcode_claims", [], |r| r.get(0))
+            .unwrap_or(0)
     }
 }

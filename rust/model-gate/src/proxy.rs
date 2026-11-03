@@ -61,6 +61,12 @@ const PROMPT_BATCH_WAIT_MS: u64 = 50;
 /// 保留清理按写入条数/时间触发，避免每批都执行 DELETE。
 const PROMPT_CLEANUP_EVERY: u64 = 64;
 const PROMPT_CLEANUP_INTERVAL_SECS: i64 = 300;
+/// 用量后台队列容量。队列满时调用方同步直写兜底，绝不丢记录。
+const USAGE_QUEUE_CAPACITY: usize = 4096;
+/// 单批最多聚合的记录数。
+const USAGE_BATCH_MAX: usize = 64;
+/// 单批等待窗口：把并发请求的用量聚成一次事务提交。
+const USAGE_BATCH_WAIT_MS: u64 = 50;
 
 pub struct AppState {
     pub cfg: ArcSwap<Config>,
@@ -69,6 +75,14 @@ pub struct AppState {
     pub prompt_tx: std::sync::mpsc::SyncSender<PromptJob>,
     /// 因后台队列已满而丢弃的提示词记录数（用于诊断，不影响代理）。
     pub prompt_dropped: AtomicU64,
+    /// 用量后台队列发送端；请求路径只做 try_send，队列满/断开时同步直写兜底。
+    pub usage_tx: std::sync::mpsc::SyncSender<UsageRecord>,
+    /// 已投递但尚未写库的用量记录数；退出前等待归零，升级替换进程不丢最后一批。
+    pub usage_pending: Arc<AtomicU64>,
+    /// 凭据池快照缓存（TTL + 写失效）：选择凭据的热路径不再每次打库。
+    pub pool_cache: std::sync::Mutex<crate::credential_pool::PoolCache>,
+    /// 密钥库解密缓存（按文件 mtime 失效）：池路径不再每成员读盘 + DPAPI 解密。
+    pub secrets_cache: std::sync::Mutex<crate::credential_pool::SecretsCache>,
     pub client: reqwest::Client,
     pub started: Instant,
     pub config_path: std::path::PathBuf,
@@ -144,12 +158,28 @@ impl AppState {
         {
             tracing::warn!("提示词后台线程启动失败（记录将不可用）：{err}");
         }
+        // 用量专用后台 worker：请求路径只投递，批量落库在这里完成；
+        // 队列满/线程不可用时调用方同步直写兜底，绝不丢记录。
+        let (usage_tx, usage_rx) = sync_channel(USAGE_QUEUE_CAPACITY);
+        let usage_db = db.clone();
+        let usage_pending = Arc::new(AtomicU64::new(0));
+        let usage_pending_worker = usage_pending.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("usage-writer".into())
+            .spawn(move || usage_writer_loop(usage_db, usage_rx, usage_pending_worker))
+        {
+            tracing::warn!("用量后台线程启动失败（将同步直写）：{err}");
+        }
         let zcode = Arc::new(crate::zcode::service::ZcodeService::new(&config_path));
         Self {
             cfg: ArcSwap::from_pointee(cfg),
             db,
             prompt_tx,
             prompt_dropped: AtomicU64::new(0),
+            usage_tx,
+            usage_pending,
+            pool_cache: std::sync::Mutex::new(crate::credential_pool::PoolCache::default()),
+            secrets_cache: std::sync::Mutex::new(crate::credential_pool::SecretsCache::default()),
             client,
             started: Instant::now(),
             config_path,
@@ -2569,8 +2599,18 @@ pub(crate) fn record_ex(
         cost,
         session: ctx.session.clone(),
     };
-    state.db.record_usage(&rec);
+    // 访问日志先写（只借用），再投递后台队列：请求路径只投递，一次事务
+    // 聚合多个并发请求。队列满/线程不可用时同步直写兜底——用量是计费与
+    // 统计的事实源，绝不丢弃。
     log_access(state, &rec, ttft_ms, truncated, paused);
+    state.usage_pending.fetch_add(1, Ordering::Relaxed);
+    match state.usage_tx.try_send(rec) {
+        Ok(()) => {}
+        Err(TrySendError::Full(rec)) | Err(TrySendError::Disconnected(rec)) => {
+            state.usage_pending.fetch_sub(1, Ordering::Relaxed);
+            state.db.record_usage(&rec);
+        }
+    }
 }
 
 /// 请求调用日志：受 `accessLog` 开关控制，格式对齐 Python 版（模型 -> 上游:目标 状态 耗时 tokens）；
@@ -2739,6 +2779,34 @@ fn prompt_writer_loop(db: Arc<Db>, rx: Receiver<PromptJob>) {
             written_since_cleanup = 0;
             last_cleanup = now;
         }
+    }
+}
+
+/// 用量专用后台线程：把并发请求的用量聚成小批，一次事务写入。
+///
+/// 与 `prompt_writer_loop` 同一套聚批策略；`pending` 计数供退出流程判断
+/// 「还有多少条已投递未落库」，保证升级替换进程前把最后一批写完。
+fn usage_writer_loop(db: Arc<Db>, rx: Receiver<UsageRecord>, pending: Arc<AtomicU64>) {
+    loop {
+        let first = match rx.recv() {
+            Ok(record) => record,
+            Err(_) => break,
+        };
+        let mut batch = vec![first];
+        let deadline = Instant::now() + Duration::from_millis(USAGE_BATCH_WAIT_MS);
+        while batch.len() < USAGE_BATCH_MAX {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(record) => batch.push(record),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        db.record_usage_batch(&batch);
+        pending.fetch_sub(batch.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -4337,6 +4405,16 @@ mod tests {
         (state, db, dir)
     }
 
+    /// 用量落库已改为后台批量写入：断言库内行数前先等队列清空（兜底 2s）。
+    fn wait_usage_flush(state: &AppState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while state.usage_pending.load(Ordering::Relaxed) > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn header_of(response: &Response, name: &str) -> String {
         response
             .headers()
@@ -4372,13 +4450,14 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = runtime.block_on(chat_inner(state, None, HeaderMap::new(), body));
+        let resp = runtime.block_on(chat_inner(state.clone(), None, HeaderMap::new(), body));
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(header_of(&resp, "x-bridge-upstream"), "b");
         assert_eq!(header_of(&resp, "x-bridge-upstream-model"), "same");
         assert_eq!(header_of(&resp, "x-bridge-group"), "daily");
         assert_eq!(header_of(&resp, "x-bridge-route-attempts"), "2");
 
+        wait_usage_flush(&state);
         let rows = db.list_usage(&Filters::default(), 10, 0, "ts", "desc");
         assert_eq!(rows.len(), 1, "一次客户端请求只落一条最终用量");
         assert_eq!(rows[0]["upstream"], "b", "日志必须记录真实成功上游");
@@ -4412,10 +4491,11 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = runtime.block_on(chat_inner(state, None, HeaderMap::new(), body));
+        let resp = runtime.block_on(chat_inner(state.clone(), None, HeaderMap::new(), body));
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(header_of(&resp, "x-bridge-upstream"), "b");
         assert_eq!(header_of(&resp, "x-bridge-route-attempts"), "2");
+        wait_usage_flush(&state);
         let rows = db.list_usage(&Filters::default(), 10, 0, "ts", "desc");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["upstream"], "b");
@@ -4493,6 +4573,7 @@ mod tests {
             session: Some("sess-mix".to_string()),
             ..Default::default()
         };
+        wait_usage_flush(&state);
         let mut rows: Vec<(String, String, String)> = db
             .list_usage(&filters, 10, 0, "ts", "asc")
             .into_iter()
@@ -4571,7 +4652,7 @@ mod tests {
             })
             .to_string(),
         );
-        let resp = runtime.block_on(chat_inner(state, None, HeaderMap::new(), body));
+        let resp = runtime.block_on(chat_inner(state.clone(), None, HeaderMap::new(), body));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&dir);
     }
