@@ -1,6 +1,6 @@
 [package]
 name = "model-gate"
-version = "4.5.0"
+version = "4.6.0"
 edition = "2021"
 description = "Model-Gate 本地模型网关（Rust 实现）"
 license = "MIT"
@@ -57,8 +57,11 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [profile.release]
-opt-level = "s"
-lto = false
+# opt-level=3 而非 "s"：网关的每请求成本主要是 JSON 解析与 SSE 流处理，
+# 体积导向的 "s" 会明显放大这部分 CPU；安装包略大几 MB 可接受。
+opt-level = 3
+# thin LTO：跨 crate 内联带来的运行时收益，编译时间增量可控。
+lto = "thin"
 codegen-units = 16
 panic = "abort"
 strip = true

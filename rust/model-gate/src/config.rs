@@ -877,6 +877,123 @@ pub struct RouteGroup {
 /// 直接 413，因此这里给一个够用且仍能兜住异常放大的值。
 pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
+/// 运行期模块开关：默认全开（与历史行为一致），可逐项关闭或 `--minimal` 一键全关。
+///
+/// 只做运行期门控、不做编译期 features：关闭的模块不挂路由、不启动线程、不产生
+/// IO，但代码仍在同一二进制里（体积不变，换来零维护矩阵）。核心转发不在清单里——
+/// 它是产品的最小事实，永远开启。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Modules {
+    /// 用量统计落库与费用估算（usage_records + usage-writer 线程 + /api/usage/*）。
+    pub stats: bool,
+    /// 文件日志层（data/modelgate.log + 轮转）；关闭后仅 stdout warn。
+    pub logging: bool,
+    /// 插件登记与免费来源（/api/plugins/*、/api/free-sources/*）。
+    pub plugins: bool,
+    /// 凭据池（/api/pools/* 与转发路径的池成员选择）。
+    pub pool: bool,
+    /// Web 面板与全部管理 API（/ui/*、/api/info、/api/config* 等）。
+    pub panel: bool,
+    /// 接入编排（/api/access/*）。
+    pub access: bool,
+    /// AI 可读配置 API（/api/ai/*、/llms.txt）。
+    pub ai_config: bool,
+    /// 应用内自更新（/api/update/* 与启动后自动检查）。
+    pub update: bool,
+}
+
+impl Default for Modules {
+    fn default() -> Self {
+        Self {
+            stats: true,
+            logging: true,
+            plugins: true,
+            pool: true,
+            panel: true,
+            access: true,
+            ai_config: true,
+            update: true,
+        }
+    }
+}
+
+impl Modules {
+    /// 精简形态：只保留核心转发，全部可选模块关闭。
+    pub fn all_off() -> Self {
+        Self {
+            stats: false,
+            logging: false,
+            plugins: false,
+            pool: false,
+            panel: false,
+            access: false,
+            ai_config: false,
+            update: false,
+        }
+    }
+
+    /// 从 `modules` 顶层键解析；缺省键视为 true（保持旧行为）。
+    fn from_value(value: Option<&Value>) -> Self {
+        let Some(obj) = value.and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let flag = |key: &str| obj.get(key).and_then(Value::as_bool).unwrap_or(true);
+        Self {
+            stats: flag("stats"),
+            logging: flag("logging"),
+            plugins: flag("plugins"),
+            pool: flag("pool"),
+            panel: flag("panel"),
+            access: flag("access"),
+            ai_config: flag("aiConfig"),
+            update: flag("update"),
+        }
+    }
+
+    /// 数据库是否需要真实打开：任一依赖持久化表的模块开启即需要。
+    ///
+    /// 全关时启动用内存库替代（不产生 modelgate.db，也无 writer/retention 活动）。
+    pub fn db_needed(&self) -> bool {
+        self.stats || self.plugins || self.pool || self.panel || self.ai_config || self.update
+    }
+}
+
+/// 运行时资源控制：与功能无关的线程/连接池开关。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    /// Tokio worker 线程数。代理是 IO 密集负载，少量 worker 即可支撑大量并发
+    /// SSE 流；默认 2，避免在低核机器上开满核数线程平白增加调度与内存开销。
+    pub worker_threads: usize,
+}
+
+/// worker 数上限：防呆，避免误配置出成百上千线程。
+const WORKER_THREADS_MAX: usize = 64;
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: DEFAULT_WORKER_THREADS,
+        }
+    }
+}
+
+/// 默认 worker 数：2。依据见 [`RuntimeConfig::worker_threads`]。
+pub const DEFAULT_WORKER_THREADS: usize = 2;
+
+impl RuntimeConfig {
+    fn from_value(value: Option<&Value>) -> Self {
+        let Some(obj) = value.and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let worker_threads = obj
+            .get("workerThreads")
+            .and_then(Value::as_u64)
+            .map(|n| (n as usize).clamp(1, WORKER_THREADS_MAX))
+            .unwrap_or(DEFAULT_WORKER_THREADS);
+        Self { worker_threads }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub raw: Value,
@@ -910,6 +1027,10 @@ pub struct Config {
     pub groups: Vec<RouteGroup>,
     /// 单价表（解析后的 `pricing` 配置）：非法条目被跳过并记入 issues。
     pub pricing: crate::pricing::PricingTable,
+    /// 运行期模块开关（`modules` 顶层键）：核心转发之外的可选子系统。
+    pub modules: Modules,
+    /// 运行时资源控制（`runtime` 顶层键）。
+    pub runtime: RuntimeConfig,
 }
 
 impl Config {
@@ -1018,6 +1139,8 @@ impl Config {
         let groups = normalize_route_groups(obj.get("groups"));
         let pricing =
             crate::pricing::PricingTable::from_value(obj.get("pricing").unwrap_or(&Value::Null));
+        let modules = Modules::from_value(obj.get("modules"));
+        let runtime = RuntimeConfig::from_value(obj.get("runtime"));
 
         Self {
             raw,
@@ -1040,6 +1163,8 @@ impl Config {
             unified,
             groups,
             pricing,
+            modules,
+            runtime,
         }
     }
 
@@ -1401,6 +1526,8 @@ fn valid_unified_group_id(id: &str) -> bool {
 const TOP_LEVEL_KEYS: &[&str] = &[
     "version",
     "aiConfig",
+    "modules",
+    "runtime",
     "port",
     "host",
     "defaultModel",
@@ -5216,5 +5343,92 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|d| d.code == "reserved_group_prefix" && d.path == "upstreams.group"));
+    }
+}
+
+/// 运行期模块开关的解析与派生规则。
+#[cfg(test)]
+mod modules_tests {
+    use super::*;
+
+    #[test]
+    fn modules_default_all_on_and_overrides_parse() {
+        // 无 modules 键 → 全开（与历史行为一致）。
+        let cfg = Config::from_value(json!({}));
+        assert!(cfg.modules.stats);
+        assert!(cfg.modules.panel);
+        assert!(cfg.modules.update);
+
+        // 逐项关闭；未声明的键保持默认开启；未知键被忽略。
+        let cfg = Config::from_value(json!({
+            "modules": {"stats": false, "panel": false, "aiConfig": false, "unknownKey": "x"}
+        }));
+        assert!(!cfg.modules.stats);
+        assert!(!cfg.modules.panel);
+        assert!(!cfg.modules.ai_config);
+        assert!(cfg.modules.logging, "未声明的模块保持默认开启");
+        assert!(cfg.modules.plugins);
+
+        // 缺省布尔值（null）视为开启：宁可保守恢复旧行为。
+        let cfg = Config::from_value(json!({"modules": {"logging": null}}));
+        assert!(cfg.modules.logging);
+    }
+
+    #[test]
+    fn runtime_worker_threads_parse_and_clamp() {
+        let cfg = Config::from_value(json!({}));
+        assert_eq!(cfg.runtime.worker_threads, DEFAULT_WORKER_THREADS);
+        let cfg = Config::from_value(json!({"runtime": {"workerThreads": 4}}));
+        assert_eq!(cfg.runtime.worker_threads, 4);
+        // 越界防呆：0 收敛到 1，999 收敛到上限。
+        let cfg = Config::from_value(json!({"runtime": {"workerThreads": 0}}));
+        assert_eq!(cfg.runtime.worker_threads, 1);
+        let cfg = Config::from_value(json!({"runtime": {"workerThreads": 999}}));
+        assert_eq!(cfg.runtime.worker_threads, WORKER_THREADS_MAX);
+    }
+
+    #[test]
+    fn modules_db_needed_follows_dependency_rule() {
+        let mut m = Modules::all_off();
+        assert!(!m.db_needed(), "全部模块关闭时不需要真实库");
+        m.stats = true;
+        assert!(m.db_needed(), "stats 依赖 usage_records");
+        m.stats = false;
+        m.plugins = true;
+        assert!(m.db_needed(), "plugins 依赖 plugins 表");
+        m.plugins = false;
+        m.pool = true;
+        assert!(m.db_needed(), "pool 依赖凭据池表");
+        m.pool = false;
+        m.panel = true;
+        assert!(m.db_needed(), "panel 读用量与审计表");
+        m.panel = false;
+        m.ai_config = true;
+        assert!(m.db_needed(), "aiConfig 写 config_audit");
+        m.ai_config = false;
+        m.update = true;
+        assert!(m.db_needed(), "update 用 settings 存自动更新开关");
+        m.update = false;
+        // logging / access 不依赖持久化表。
+        m.logging = true;
+        m.access = true;
+        assert!(!m.db_needed(), "logging 与 access 只需要文件与配置");
+    }
+
+    #[test]
+    fn modules_all_off_matches_minimal_semantics() {
+        let m = Modules::all_off();
+        for flag in [
+            m.stats,
+            m.logging,
+            m.plugins,
+            m.pool,
+            m.panel,
+            m.access,
+            m.ai_config,
+            m.update,
+        ] {
+            assert!(!flag, "精简形态下所有可选模块必须全关");
+        }
     }
 }

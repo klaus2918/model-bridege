@@ -251,9 +251,13 @@ struct PromptStats {
 
 /// 面板聚合查询（totals/summary/model/upstream/session 用量）的短 TTL 缓存。
 /// 这些查询在百万行级用量表上是一次全范围扫描；筛选切换、总览重载、
-/// 自动刷新在 TTL 内直接命中缓存。属监控口径，10 秒陈旧可接受；
+/// 自动刷新在 TTL 内直接命中缓存。属监控口径，60 秒陈旧可接受；
 /// 清理/删除操作会显式失效。
-const AGG_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// 为什么是 60 秒：面板用量页每 30 秒自动刷新（v4-usage.js），
+/// 10 秒 TTL 意味着每次刷新几乎都是一次全量扫描；60 秒让隔次刷新
+/// 直接命中缓存，把周期性扫描的频率降为原来的 1/6。
+const AGG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Default)]
 struct AggregateCache {
@@ -284,6 +288,37 @@ impl Db {
         // 查询计划治理：启动时按需刷新统计，避免大库上查询计划长期劣化。
         db.optimize();
         Ok(db)
+    }
+
+    /// 精简形态的替代库：纯内存、零磁盘 IO、零 WAL。
+    ///
+    /// 当 `modules` 派生出「没有任何模块需要持久化」时（`--minimal` 或配置全关），
+    /// 用它顶替 `Db::open`：`Arc<Db>` 类型与其余调用点完全不变，但不会创建
+    /// `modelgate.db` 文件，也没有 writer/retention 类后台活动去碰它。
+    /// 表结构照常建在内存里，保证误用的查询路径得到空结果而不是报错。
+    pub fn open_in_memory() -> anyhow::Result<Self> {
+        let write = Connection::open_in_memory()?;
+        write.execute_batch(SCHEMA)?;
+        migrate(&write);
+        // 内存库每条连接都是独立数据库：只读连接池也必须各自建表，
+        // 误用的查询才会得到空结果而不是「no such table」。
+        let readers = (0..READER_POOL_SIZE)
+            .map(|_| {
+                Connection::open_in_memory()
+                    .and_then(|conn| {
+                        conn.execute_batch(SCHEMA)?;
+                        Ok(conn)
+                    })
+                    .map(Mutex::new)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self {
+            path: PathBuf::from(":memory:"),
+            write: Mutex::new(write),
+            readers,
+            prompt_stats: Arc::new(PromptStats::default()),
+            agg_cache: Arc::new(AggregateCache::default()),
+        })
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1964,6 +1999,84 @@ mod tests {
         let stats = db.today_stats();
         assert_eq!(stats["requests"].as_i64(), Some(0));
         assert!(stats["cache_hit_rate"].is_null());
+    }
+
+    /// 聚合查询基准（人工触发，避免拖慢常规测试）：
+    /// `cargo test bench_aggregates_on_large_table -- --ignored --nocapture`
+    ///
+    /// 往临时库灌 50 万行 usage_records，打印 totals / summary 的
+    /// 「首次扫描」与「缓存命中」耗时——AGG_TTL 与面板刷新策略的量化依据。
+    #[test]
+    #[ignore]
+    fn bench_aggregates_on_large_table() {
+        let db = temp_db();
+        const ROWS: i64 = 500_000;
+        let seed_started = std::time::Instant::now();
+        {
+            let conn = db.write_conn();
+            conn.execute_batch("BEGIN").unwrap();
+            for i in 0..ROWS {
+                conn.execute(
+                    "INSERT INTO usage_records (id, ts, created_at, upstream, protocol,
+                        requested_model, upstream_model, prompt_tokens, completion_tokens,
+                        cache_read_tokens, cache_write_tokens, total_tokens, duration_ms,
+                        ttft_ms, status, stream, truncated, paused, error, cost, session)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                    rusqlite::params![
+                        format!("bench-{i}"),
+                        1_700_000_000 + i % 1_000_000,
+                        "2023-11-14T22:13:20.000+08:00",
+                        if i % 3 == 0 { "cch" } else { "go" },
+                        "openai",
+                        if i % 2 == 0 { "m-a" } else { "m-b" },
+                        "m-a",
+                        1000 + i % 500,
+                        200,
+                        800,
+                        100,
+                        1200 + i % 500,
+                        400 + i % 5000,
+                        120,
+                        200,
+                        1,
+                        0,
+                        0,
+                        Option::<String>::None,
+                        0.02,
+                        Option::<String>::None,
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let f = Filters::default();
+        let t0 = std::time::Instant::now();
+        let totals = db.totals(&f);
+        let totals_cold = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let totals_warm_value = db.totals(&f);
+        let totals_warm = t1.elapsed();
+        assert_eq!(totals["requests"], ROWS);
+        assert_eq!(totals_warm_value["requests"], ROWS);
+
+        let t2 = std::time::Instant::now();
+        let summary = db.summary(&f, "model").expect("summary 查询应成功");
+        let summary_cold = t2.elapsed();
+        let t3 = std::time::Instant::now();
+        let _ = db.summary(&f, "model");
+        let summary_warm = t3.elapsed();
+        assert!(!summary.is_empty());
+
+        println!("灌库 {ROWS} 行耗时 {:?}", seed_started.elapsed());
+        println!(
+            "totals  冷扫描 {:?} / 缓存命中 {:?}",
+            totals_cold, totals_warm
+        );
+        println!(
+            "summary(model) 冷扫描 {:?} / 缓存命中 {:?}",
+            summary_cold, summary_warm
+        );
     }
 
     #[test]

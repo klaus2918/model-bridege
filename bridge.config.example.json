@@ -18,6 +18,19 @@
   "maxBodyBytes": 67108864,
   "accessLog": true,
   "modelsCacheSeconds": 300,
+  "modules": {
+    "stats": true,
+    "logging": true,
+    "plugins": true,
+    "pool": true,
+    "panel": true,
+    "access": true,
+    "aiConfig": true,
+    "update": true
+  },
+  "runtime": {
+    "workerThreads": 2
+  },
   "aliases": {},
   "thinking": {
     "passthrough": true,

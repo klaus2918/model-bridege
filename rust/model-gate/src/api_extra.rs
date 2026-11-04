@@ -91,7 +91,14 @@ pub async fn usage_clear(State(state): State<Arc<AppState>>, Json(body): Json<Va
             _ => filters.since_ts = Some(now() - 86400),
         }
     }
-    let removed = run_blocking(move || state.db.clear_usage(&filters)).await;
+    let removed = run_blocking(move || {
+        let removed = state.db.clear_usage(&filters);
+        // 清理可能删掉今日记录（all/today/24h… 都覆盖当天）：清完立刻用库
+        // 重算托盘今日计数，否则托盘会停留在清空前的数字直到重启。
+        state.reseed_today();
+        removed
+    })
+    .await;
     Json(json!({"ok": true, "removed": removed})).into_response()
 }
 

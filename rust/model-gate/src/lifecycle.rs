@@ -379,6 +379,135 @@ fn spawn_cmd_fallback(plan: &InstallPlan) -> Result<(), String> {
         .map_err(|err| format!("启动 cmd 安装链失败：{err}"))
 }
 
+/// 一次「退出并由看护脚本拉起自己（换参数）」的计划：托盘模式切换用。
+///
+/// 与 [`InstallPlan`] 的差别：没有安装器，纯「等本进程退出 → 带新参数
+/// 重新启动同一个 exe」。参数由调用方按目标模式组装好（见
+/// [`build_relaunch_args`]），这里只负责等待与拉起。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelaunchPlan {
+    /// 要重新启动的 exe（= 当前进程的 exe）。
+    pub exe: PathBuf,
+    /// 目标参数行：已按 Windows 规则引号化（见 [`join_relaunch_args`]）。
+    pub arg_line: String,
+    /// 本进程 pid：看护脚本等它退出。
+    pub parent_pid: u32,
+    /// 「本进程即将退出」信号文件：与安装流程共用同一套 marker。
+    pub exit_marker: PathBuf,
+    /// 脚本状态日志（relaunch=ok / relaunch=failed）。
+    pub log_file: PathBuf,
+}
+
+/// 组装「切换模式重启」的目标参数：保留用户原有参数，剥掉旧的
+/// `--minimal`（两种写法都认），再按目标模式决定是否补上。
+pub fn build_relaunch_args(original: &[String], minimal: bool) -> Vec<String> {
+    let mut out: Vec<String> = original
+        .iter()
+        .filter(|arg| !arg.starts_with("--minimal"))
+        .cloned()
+        .collect();
+    if minimal {
+        out.push("--minimal".to_string());
+    }
+    out
+}
+
+/// 把参数数组拼成可交给 `Start-Process -ArgumentList` 的单行字符串：
+/// 含空格/制表符的参数用双引号包住（路径带空格是常态）。
+pub fn join_relaunch_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.contains([' ', '\t']) {
+                format!("\"{arg}\"")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 生成重启看护脚本（纯函数，便于单测）。正文一律 ASCII，理由同
+/// [`build_watch_script`]：PowerShell 5.1 对无 BOM 脚本按 ANSI 解码。
+pub fn build_relaunch_script(plan: &RelaunchPlan) -> String {
+    let proc_name = plan
+        .exe
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Model-Gate");
+    format!(
+        r#"$ErrorActionPreference = 'SilentlyContinue'
+$newExe = '{exe}'
+$argLine = '{arg_line}'
+$marker = '{marker}'
+$log = '{log}'
+"relaunch-started $(Get-Date -Format o)" | Out-File -FilePath $log -Encoding UTF8 -Append
+# 1) wait until the old process exits (marker first, pid as fallback)
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline) {{
+    if (Test-Path $marker) {{ break }}
+    if (-not (Get-Process -Id {pid} -ErrorAction SilentlyContinue)) {{ break }}
+    Start-Sleep -Milliseconds 200
+}}
+# the old exe handle is released a moment after exit; let it go
+Start-Sleep -Milliseconds 800
+# 2) relaunch the same exe with the new mode args
+if ($argLine -ne '') {{
+    Start-Process -FilePath $newExe -ArgumentList $argLine
+}} else {{
+    Start-Process -FilePath $newExe
+}}
+# 3) confirm the app is really running (exit code alone is not enough)
+Start-Sleep -Seconds 2
+if (Get-Process -Name '{proc_name}' -ErrorAction SilentlyContinue) {{
+    "relaunch=ok" | Out-File -FilePath $log -Encoding UTF8 -Append
+}} else {{
+    "relaunch=failed" | Out-File -FilePath $log -Encoding UTF8 -Append
+}}
+Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+"#,
+        exe = ps_escape(&plan.exe.display().to_string()),
+        arg_line = ps_escape(&plan.arg_line),
+        marker = ps_escape(&plan.exit_marker.display().to_string()),
+        log = ps_escape(&plan.log_file.display().to_string()),
+        pid = plan.parent_pid,
+        proc_name = ps_escape(proc_name),
+    )
+}
+
+/// 重启看护脚本的落盘位置：临时目录下的 `Model-Gate/relaunch-<pid>.ps1`。
+pub fn relaunch_script_path(parent_pid: u32) -> PathBuf {
+    std::env::temp_dir()
+        .join("Model-Gate")
+        .join(format!("relaunch-{parent_pid}.ps1"))
+}
+
+/// 重启看护脚本的状态日志：`Model-Gate/relaunch-<pid>.log`。
+pub fn relaunch_log_path(parent_pid: u32) -> PathBuf {
+    std::env::temp_dir()
+        .join("Model-Gate")
+        .join(format!("relaunch-{parent_pid}.log"))
+}
+
+/// 写并启动重启看护脚本（复用安装流程的 BOM 写盘与无窗口 PowerShell）。
+///
+/// 与安装流程不同：PowerShell 不可用时**不做** cmd 降级——降级链容易把
+/// 自定义参数（--config/--db）丢掉，重启出一个配置错位的实例比不重启更糟；
+/// 此时返回错误，托盘记日志，应用继续以当前模式运行。
+pub fn spawn_relaunch_script(plan: &RelaunchPlan) -> Result<PathBuf, String> {
+    let script_path = relaunch_script_path(plan.parent_pid);
+    if let Some(parent) = script_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("创建重启脚本目录失败 {}：{err}", parent.display()))?;
+    }
+    let script = build_relaunch_script(plan);
+    write_script_with_bom(&script_path, &script)
+        .map_err(|err| format!("写重启脚本失败 {}：{err}", script_path.display()))?;
+    spawn_powershell(&script_path)?;
+    Ok(script_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +678,121 @@ mod tests {
             path.to_string_lossy().contains("install-1234.ps1"),
             "{path:?}"
         );
+    }
+
+    fn sample_relaunch_plan() -> RelaunchPlan {
+        RelaunchPlan {
+            exe: PathBuf::from(r"D:\mysoft\Model-Gate\Model-Gate.exe"),
+            arg_line: "--config \"D:\\my dir\\bridge.config.json\" --minimal".to_string(),
+            parent_pid: 4242,
+            exit_marker: PathBuf::from(r"C:\temp\Model-Gate\exit-4242.flag"),
+            log_file: PathBuf::from(r"C:\temp\Model-Gate\relaunch-4242.log"),
+        }
+    }
+
+    #[test]
+    fn relaunch_args_strip_old_minimal_and_apply_target_mode() {
+        let original: Vec<String> = ["--port", "18990", "--minimal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 目标精简：剥旧 --minimal 后补回一个，不重复。
+        assert_eq!(
+            build_relaunch_args(&original, true),
+            vec!["--port", "18990", "--minimal"]
+        );
+        // 目标完整：--minimal 被剥掉。
+        assert_eq!(
+            build_relaunch_args(&original, false),
+            vec!["--port", "18990"]
+        );
+        // clap 的 = 写法同样剥掉。
+        let with_eq: Vec<String> = ["--minimal=true", "--no-gui"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(build_relaunch_args(&with_eq, false), vec!["--no-gui"]);
+    }
+
+    #[test]
+    fn relaunch_args_quote_args_with_spaces() {
+        let args: Vec<String> = ["--config", "D:\\my dir\\c.json", "--no-gui"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            join_relaunch_args(&args),
+            "--config \"D:\\my dir\\c.json\" --no-gui"
+        );
+    }
+
+    #[test]
+    fn relaunch_script_waits_exit_then_relaunches_with_args() {
+        let script = build_relaunch_script(&sample_relaunch_plan());
+        // 等待（marker 优先、pid 兜底）→ 拉起 → 确认，顺序不可颠倒。
+        let wait = script.find("Test-Path $marker").expect("缺少等待步骤");
+        let pid_wait = script.find("Get-Process -Id 4242").expect("缺少 pid 兜底");
+        let relaunch = script
+            .find("Start-Process -FilePath $newExe")
+            .expect("缺少拉起步骤");
+        let confirm = script
+            .find("Get-Process -Name 'Model-Gate'")
+            .expect("缺少确认步骤");
+        assert!(wait < relaunch, "{script}");
+        assert!(pid_wait < relaunch, "{script}");
+        assert!(relaunch < confirm, "{script}");
+        // 带参数拉起走 ArgumentList。
+        assert!(script.contains("-ArgumentList $argLine"), "{script}");
+        assert!(script.contains("relaunch=ok"), "{script}");
+        assert!(script.contains("relaunch=failed"), "{script}");
+    }
+
+    #[test]
+    fn relaunch_script_is_ascii_only_and_escapes_quotes() {
+        let mut plan = sample_relaunch_plan();
+        plan.exe = PathBuf::from(r"D:\my 'soft\Model-Gate.exe");
+        let script = build_relaunch_script(&plan);
+        assert!(script.is_ascii(), "重启脚本必须只含 ASCII 字符");
+        assert!(script.contains("my ''soft"), "{script}");
+        assert!(!script.contains("''''"), "{script}");
+    }
+
+    #[test]
+    fn relaunch_script_path_is_per_process() {
+        let path = relaunch_script_path(5678);
+        assert!(
+            path.to_string_lossy().contains("relaunch-5678.ps1"),
+            "{path:?}"
+        );
+    }
+
+    /// 端到端重启冒烟辅助（人工触发）：按**运行时指定的 pid/参数**把重启脚本
+    /// 写到 `%TEMP%\Model-Gate\smoke-relaunch.ps1`，供外部冒烟驱动真实进程。
+    ///
+    /// 用法：
+    /// `RELAUNCH_SMOKE_PID=<pid> RELAUNCH_SMOKE_EXE=<exe路径> \
+    ///  RELAUNCH_SMOKE_ARGS=<参数行> cargo test dump_relaunch_script_for_smoke \
+    ///  -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_relaunch_script_for_smoke() {
+        let pid: u32 = std::env::var("RELAUNCH_SMOKE_PID")
+            .expect("需要 RELAUNCH_SMOKE_PID")
+            .parse()
+            .expect("RELAUNCH_SMOKE_PID 必须是数字");
+        let plan = RelaunchPlan {
+            exe: std::env::var("RELAUNCH_SMOKE_EXE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("Model-Gate.exe")),
+            arg_line: std::env::var("RELAUNCH_SMOKE_ARGS").unwrap_or_default(),
+            parent_pid: pid,
+            exit_marker: exit_marker_path(pid),
+            log_file: relaunch_log_path(pid),
+        };
+        let dir = std::env::temp_dir().join("Model-Gate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("smoke-relaunch.ps1");
+        write_script_with_bom(&path, &build_relaunch_script(&plan)).unwrap();
+        println!("重启脚本已生成：{}", path.display());
     }
 }

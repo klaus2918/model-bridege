@@ -19,6 +19,19 @@
   "promptMaxRecords": 5000,
   "promptMaxChars": 100000,
   "modelsCacheSeconds": 300,
+  "modules": {
+    "stats": true,
+    "logging": true,
+    "plugins": true,
+    "pool": true,
+    "panel": true,
+    "access": true,
+    "aiConfig": true,
+    "update": true
+  },
+  "runtime": {
+    "workerThreads": 2
+  },
   "aliases": {},
   "thinking": {
     "passthrough": true,

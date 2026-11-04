@@ -143,7 +143,9 @@ fn backup_endpoints_are_registered() {
 /// 手工编辑配置文件后就没法让它立即生效（必须重启进程）。
 #[test]
 fn reload_from_file_reads_disk_not_runtime() {
-    let source = fs::read_to_string(crate_root().join("src/proxy.rs")).expect("read src/proxy.rs");
+    // api_config_reload 已从 proxy.rs 拆到 panel_api.rs（面板处理器专属文件）。
+    let source =
+        fs::read_to_string(crate_root().join("src/panel_api.rs")).expect("read src/panel_api.rs");
     let start = source
         .find("async fn api_config_reload")
         .expect("找不到 api_config_reload");

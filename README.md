@@ -228,8 +228,11 @@ model-bridge 把这些差异都收敛到一个进程里，Agent 只需指向一�
 |---|---|---|---|
 | 桌面（默认） | `Model-Gate.exe` | 面板 + 托盘；关窗不退出 | 本机日常 |
 | 无界面（headless） | `Model-Gate.exe --no-gui --port 8911` | 纯代理，无窗口无托盘，Ctrl+C 停 | 服务器 / CI / 远程开发 |
+| 精简（4.6.0+） | `Model-Gate.exe --minimal`（可叠加 `--no-gui`） | 只做转发：统计/文件日志/插件/池/面板/接入/AI 配置/更新全关，不创建数据库文件 | 低配机器 / 最低占用 |
 
 **关系**：同一份 exe、同一套配置解析、同一个库结构，差别只在「有没有窗口」；`--no-gui` 不会跳过任何代理能力。
+
+**精简形态与逐项开关（4.6.0+）**：`--minimal` 把核心转发之外的可选子系统一键全关，不产生 `modelgate.db`。需要保留部分能力时用配置文件顶层 `modules` 键逐项控制（缺省全开，`--minimal` 优先级更高）；`runtime.workerThreads`（默认 2）可收敛 Tokio worker 数。模块清单、派生规则与本轮性能修复见 `docs/architecture/modules.md`。
 
 **不能共用同一个数据目录**：单实例锁以 `modelgate.db` 所在目录为粒度，第二个实例会被判为重复启动并退出。要并存（灰度切换 / 并行验证）必须同时满足「端口不同 + `--db` 指向不同目录」，配置也建议用副本：
 
@@ -628,6 +631,8 @@ curl http://127.0.0.1:8900/v1/models
 | `thinking.cacheSize` | 思考内容缓存条数上限，默认 `500` |
 | `tools.downgradeForcedChoice` | 上游 thinking 模式下把强制的 `tool_choice` 降级为 `auto`（默认 `true`） |
 | `models` | 顶层模型白名单，配了则 `/v1/models` 只返回这几个（见第七节） |
+| `modules` | 运行期模块开关（4.6.0+）：`stats`/`logging`/`plugins`/`pool`/`panel`/`access`/`aiConfig`/`update` 八个布尔键，缺省全开；关闭的模块不挂路由、不起线程、不落 IO（见 `docs/architecture/modules.md`） |
+| `runtime.workerThreads` | Tokio worker 线程数（4.6.0+），默认 `2`、上限 `64`；代理是 IO 密集负载，低核机器无需开满核数 |
 
 ### 每个上游的字段
 

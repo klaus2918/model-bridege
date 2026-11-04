@@ -60,6 +60,14 @@ pub struct ShellOptions {
     pub data_dir: String,
     /// 是否在托盘就绪后自动打开面板（首次运行或 --open）。
     pub open_on_start: bool,
+    /// panel 模块是否开启：关闭时不注册「打开面板/检查更新」菜单项，
+    /// 双击托盘也不再打开面板地址（/ui/ 未挂载，打开只会得到 404）。
+    pub panel_enabled: bool,
+    /// 当前是否处于精简形态（modules 全关）：决定重启菜单的文案与目标模式。
+    pub minimal: bool,
+    /// 「切换模式重启」传给新进程的参数行（已按 Windows 规则引号化，
+    /// 见 `lifecycle::join_relaunch_args`）：原参数剥掉 `--minimal` 后按目标模式补回。
+    pub relaunch_args: String,
 }
 
 /// 启动托盘壳并阻塞在主线程消息循环；`refresh_models` 由「刷新模型目录」菜单触发，
@@ -81,15 +89,29 @@ pub fn run(
     let open = MenuItem::new("打开面板", true, None);
     let check_update = MenuItem::new("检查更新", true, None);
     let refresh = MenuItem::new("刷新模型目录", true, None);
+    let switch_mode = MenuItem::new(
+        if options.minimal {
+            "以完整模式重启"
+        } else {
+            "以精简模式重启"
+        },
+        true,
+        None,
+    );
     let copy = MenuItem::new("复制接入地址", true, None);
     let open_dir = MenuItem::new("打开数据目录", true, None);
     let today = MenuItem::new("今日请求 —", false, None);
     let hit = MenuItem::new("缓存命中率 —", false, None);
     let address = MenuItem::new(format!("服务地址 {}", options.endpoint), false, None);
     let quit = MenuItem::new("退出", true, None);
-    let _ = menu.append(&open);
-    let _ = menu.append(&check_update);
+    // panel 关闭时「打开面板/检查更新」都指向未挂载的 /ui/，直接不注册。
+    if options.panel_enabled {
+        let _ = menu.append(&open);
+        let _ = menu.append(&check_update);
+    }
     let _ = menu.append(&refresh);
+    // 模块开关是启动冻结的，运行中切换的落点是「带新参数重启」而不是热切换。
+    let _ = menu.append(&switch_mode);
     let _ = menu.append(&copy);
     let _ = menu.append(&open_dir);
     let _ = menu.append(&PredefinedMenuItem::separator());
@@ -167,6 +189,8 @@ pub fn run(
                 }
             } else if event.id == refresh.id() {
                 refresh_models();
+            } else if event.id == switch_mode.id() {
+                restart_in_mode(&options, &shutdown);
             } else if event.id == copy.id() {
                 if !copy_to_clipboard(&options.endpoint) {
                     tracing::warn!("复制接入地址失败：剪贴板不可用");
@@ -180,7 +204,10 @@ pub fn run(
             }
         }
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(event, TrayIconEvent::DoubleClick { .. }) && !open_url(&options.url) {
+            if matches!(event, TrayIconEvent::DoubleClick { .. })
+                && options.panel_enabled
+                && !open_url(&options.url)
+            {
                 tracing::warn!("打开面板失败：{}", options.url);
             }
         }
@@ -203,6 +230,46 @@ pub fn run(
 #[cfg(windows)]
 fn is_stats_timer_message(message: u32, wparam: usize, timer_id: usize) -> bool {
     timer_id != 0 && message == WM_TIMER && wparam == timer_id
+}
+
+/// 托盘「切换模式重启」：先写好看护脚本（等本进程退出后带新参数拉起自己），
+/// 再登记退出信号并请求优雅关闭——落库、停服务都走既有的 graceful 路径，
+/// 脚本看到退出信号后立刻拉起新进程，端口不会被占。
+///
+/// 看护脚本启动失败只记日志：应用继续以当前模式运行，比重启出一个
+/// 参数错位的实例安全。
+#[cfg(windows)]
+fn restart_in_mode(options: &ShellOptions, shutdown: &Arc<crate::lifecycle::Shutdown>) {
+    let pid = std::process::id();
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!("切换模式重启失败（拿不到当前 exe 路径）：{err}");
+            return;
+        }
+    };
+    let plan = crate::lifecycle::RelaunchPlan {
+        exe,
+        arg_line: options.relaunch_args.clone(),
+        parent_pid: pid,
+        exit_marker: crate::lifecycle::exit_marker_path(pid),
+        log_file: crate::lifecycle::relaunch_log_path(pid),
+    };
+    let target = if options.minimal { "完整" } else { "精简" };
+    match crate::lifecycle::spawn_relaunch_script(&plan) {
+        Ok(script_path) => {
+            tracing::info!(
+                "以{target}模式重启：看护脚本 {} 已就绪，优雅退出后自动拉起",
+                script_path.display()
+            );
+            // graceful_exit 末尾会写 exit marker，脚本据此立刻拉起新进程。
+            shutdown.set_exit_marker(plan.exit_marker);
+            shutdown.request();
+        }
+        Err(err) => {
+            tracing::warn!("以{target}模式重启失败（应用继续以当前模式运行）：{err}");
+        }
+    }
 }
 
 /// 找到本线程里 `tray-icon` 创建的托盘窗口，并子类化它的窗口过程。

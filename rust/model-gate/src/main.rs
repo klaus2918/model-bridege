@@ -17,6 +17,7 @@ mod gui;
 mod key_file;
 mod lifecycle;
 mod opencode_transport;
+mod panel_api;
 mod plugin;
 mod pricing;
 mod prompt;
@@ -25,6 +26,7 @@ mod proxy;
 mod seal;
 mod secret_store;
 mod thinking;
+mod today;
 mod ui_assets;
 mod update;
 mod update_paths;
@@ -59,6 +61,10 @@ struct Args {
     /// 纯代理模式：不创建托盘、不打开浏览器
     #[arg(long = "no-gui", default_value_t = false)]
     no_gui: bool,
+    /// 精简形态：只保留核心转发。统计/日志/插件/池/面板/接入/AI 配置/更新
+    /// 全部关闭，不创建数据库文件。需要逐项微调时用配置文件的 `modules` 键。
+    #[arg(long = "minimal", default_value_t = false)]
+    minimal: bool,
     /// 配置文件不存在时不自动生成默认配置
     #[arg(long = "no-generate-config", default_value_t = false)]
     no_generate_config: bool,
@@ -110,7 +116,10 @@ fn main() {
     }
 
     install_panic_hook(data_dir.clone());
-    init_logging(&db_path);
+    // 文件日志层是否安装取决于 modules.logging：完整解析前先轻量窥探一个键，
+    // 保证配置损坏时 stdout 层仍能看到报错。--minimal 一并关闭。
+    let file_logging = !args.minimal && peek_module_flag(&config_path, "logging");
+    init_logging(&db_path, file_logging);
     let no_gui = args.no_gui;
     if let Err(err) = run(args, config_path, db_path) {
         let path = write_fatal_log(&data_dir, &err);
@@ -143,6 +152,10 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
     }
 
     let mut cfg = Config::load(&config_path)?;
+    // --minimal：一键精简形态，优先级高于配置文件里的 modules 键。
+    if args.minimal {
+        cfg.modules = config::Modules::all_off();
+    }
     if let Some(port) = args.port {
         cfg.port = port;
     }
@@ -163,15 +176,29 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
 
     let (listener, actual_port) = bind_with_fallback(&cfg.host, cfg.port)?;
     cfg.port = actual_port;
-    let db = Arc::new(Db::open(&db_path)?);
-    let first_run = db.get_setting("lastPort").is_none();
+    // 库按需打开：没有任何模块需要持久化（--minimal 或 modules 全关）时，
+    // 用内存库顶替——`Arc<Db>` 类型与调用点零改动，但不产生 modelgate.db，
+    // 也没有 WAL、writer、retention 类磁盘活动。
+    let db = if cfg.modules.db_needed() {
+        Arc::new(Db::open(&db_path)?)
+    } else {
+        Arc::new(Db::open_in_memory()?)
+    };
+    let first_run = cfg.modules.db_needed() && db.get_setting("lastPort").is_none();
     db.set_setting("lastPort", &actual_port.to_string());
+    // 端口同时落到 data/state.json：精简模式没有可读的库文件，
+    // 二次启动的 activate_existing 仍能找到运行中实例的端口。
+    write_last_port_state(&db_path, actual_port);
     tracing::info!(
         "Model-Gate (rust) v{} 已启动 http://{}:{}/v1  db={}",
         env!("CARGO_PKG_VERSION"),
         cfg.host,
         actual_port,
-        db_path.display()
+        if cfg.modules.db_needed() {
+            db_path.display().to_string()
+        } else {
+            "memory（精简形态）".to_string()
+        }
     );
     for up in &cfg.upstreams {
         tracing::info!(
@@ -185,26 +212,22 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
 
     let url = format!("http://{}:{}/ui/", cfg.host, actual_port);
     let endpoint = format!("http://{}:{}/v1", cfg.host, actual_port);
+    let modules = cfg.modules.clone();
     let state = Arc::new(AppState::new(cfg, db, config_path));
-    // 保留治理后台线程：用量（retentionDays>0 时）/ 配置审计 / 领取历史的周期裁剪。
-    let retention_state = state.clone();
-    if let Err(err) = std::thread::Builder::new()
-        .name("retention".into())
-        .spawn(move || retention_loop(retention_state))
-    {
-        tracing::warn!("保留治理线程启动失败（数据将不再自动裁剪）：{err}");
+    // 保留治理后台线程：用量（retentionDays>0 时）/ 配置审计的周期裁剪。
+    // 只在真实库上运行——内存库（精简形态）没有可治理的持久化数据。
+    if modules.db_needed() {
+        let retention_state = state.clone();
+        if let Err(err) = std::thread::Builder::new()
+            .name("retention".into())
+            .spawn(move || retention_loop(retention_state))
+        {
+            tracing::warn!("保留治理线程启动失败（数据将不再自动裁剪）：{err}");
+        }
     }
     let app = proxy::router(state.clone());
-    // 托盘指标快照：后台每 10 秒查库，主线程只读快照，避免阻塞消息循环。
-    let today_snapshot = Arc::new(std::sync::Mutex::new(state.db.today_stats()));
     let shutdown = state.shutdown.clone();
-    let server = spawn_server(
-        listener,
-        app,
-        state.clone(),
-        today_snapshot.clone(),
-        shutdown.clone(),
-    );
+    let server = spawn_server(listener, app, state.clone(), shutdown.clone());
 
     if args.no_gui {
         // 纯代理模式：没有托盘，关闭请求只能来自 HTTP 服务自身的优雅退出
@@ -218,12 +241,23 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| ".".to_string());
-    let open_on_start = !args.no_browser && (args.open || first_run);
+    // 面板模块关闭时不自动开浏览器：/ui/ 没挂载，打开只会看到 404。
+    let open_on_start = !args.no_browser && (args.open || first_run) && modules.panel;
+    // 托盘「切换模式重启」：目标参数 = 原参数剥掉 --minimal 后按目标模式补回
+    // （当前精简 → 目标完整；当前非精简 → 目标精简）。原样保留 --config/--db/--port。
+    let is_minimal = modules == config::Modules::all_off();
+    let original_args: Vec<String> = std::env::args().skip(1).collect();
+    let relaunch_args = crate::lifecycle::join_relaunch_args(
+        &crate::lifecycle::build_relaunch_args(&original_args, !is_minimal),
+    );
     let options = gui::ShellOptions {
         url: url.clone(),
         endpoint,
         data_dir,
         open_on_start,
+        panel_enabled: modules.panel,
+        minimal: is_minimal,
+        relaunch_args,
     };
     let tray_state = state.clone();
     let refresh_models = Box::new(move || {
@@ -237,13 +271,9 @@ fn run(args: Args, config_path: PathBuf, db_path: PathBuf) -> anyhow::Result<()>
             tracing::info!("模型目录已刷新（{} 个模型）", cache.ids.len());
         });
     });
-    let stats_slot = today_snapshot.clone();
-    let today_stats = Box::new(move || {
-        stats_slot
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or(serde_json::Value::Null)
-    });
+    // 托盘今日指标直读内存计数器（与旧 today_stats 同形 JSON）：零 SQL、零后台轮询。
+    let stats_slot = state.today.clone();
+    let today_stats = Box::new(move || stats_slot.snapshot());
     match gui::run(options, refresh_models, today_stats, shutdown.clone()) {
         Ok(()) => {
             // 托盘退出 / 更新流程要求关闭：统一走优雅关闭
@@ -297,8 +327,10 @@ fn retention_loop(state: Arc<AppState>) {
         if audits > 0 {
             tracing::debug!("保留策略：裁剪配置审计 {audits} 条");
         }
-        // 大批量删除后刷新查询计划统计。
+        // 大批量删除后刷新查询计划统计，并把 WAL 收缩回去：
+        // DELETE 只在 WAL 里标记页，长期不 checkpoint 会让 -wal 文件一直膨胀。
         state.db.optimize();
+        state.db.checkpoint();
         std::thread::sleep(std::time::Duration::from_secs(TICK_SECS));
     }
 }
@@ -347,12 +379,16 @@ fn spawn_server(
     listener: std::net::TcpListener,
     app: axum::Router,
     state: Arc<AppState>,
-    today_snapshot: Arc<std::sync::Mutex<serde_json::Value>>,
     shutdown: Arc<crate::lifecycle::Shutdown>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        // worker 数可配（runtime.workerThreads，默认 2）：代理是 IO 密集负载，
+        // 两个 worker 足够支撑大量并发 SSE 流；开满核数只增加线程切换与
+        // 内存开销，对吞吐没有帮助（4 核机器上默认曾直接开 4 个）。
+        let worker_threads = state.cfg().runtime.worker_threads;
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .worker_threads(worker_threads)
             .build()
         {
             Ok(rt) => rt,
@@ -363,27 +399,13 @@ fn spawn_server(
         };
         // 托盘菜单需要跨线程触发异步刷新：把运行时句柄登记到共享状态。
         let _ = state.runtime.set(runtime.handle().clone());
-        // 今日指标：后台任务查库写快照，托盘定时器只读快照。
-        let stats_db = state.db.clone();
-        let stats_slot = today_snapshot.clone();
-        runtime.spawn(async move {
-            loop {
-                let db = stats_db.clone();
-                let value = tokio::task::spawn_blocking(move || db.today_stats())
-                    .await
-                    .unwrap_or(serde_json::Value::Null);
-                if !value.is_null() {
-                    if let Ok(mut slot) = stats_slot.lock() {
-                        *slot = value;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            }
-        });
-        let update = state.update.clone();
-        runtime.spawn(async move {
-            crate::update::auto_check(update).await;
-        });
+        // 今日指标已改由内存计数器承担（state.today），不再有周期性查库任务。
+        if state.modules.update {
+            let update = state.update.clone();
+            runtime.spawn(async move {
+                crate::update::auto_check(update).await;
+            });
+        }
         // 优雅退出：Ctrl+C 或关闭请求（更新流程 / 外部 WM_CLOSE）。
         // 服务停下来 = 监听套接字释放 = 端口可被新版本立刻绑定。
         let mut server_signal = shutdown.server_signal();
@@ -409,7 +431,22 @@ fn spawn_server(
     })
 }
 
-fn init_logging(db_path: &std::path::Path) {
+fn init_logging(db_path: &std::path::Path, file_logging: bool) {
+    // 时间戳统一用**本地时区**（中国 = UTC+8）并显式带偏移。
+    // tracing-subscriber 默认用 SystemTime，输出 `...Z` 的 UTC 时间，
+    // 机器上看到的日志会整体早 8 小时（曾因此误判请求时间）。
+    let timer =
+        tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f %:z".to_string());
+    let filter = EnvFilter::try_from_default_env();
+    if !file_logging {
+        // logging 模块关闭：不建目录、不轮转、不装文件层，stdout 只留 warn
+        // 以上（致命错误仍可见）。tracing 宏照常编译，空转开销为零。
+        let _ = tracing_subscriber::registry()
+            .with(filter.unwrap_or_else(|_| "warn,hyper=warn".into()))
+            .with(tracing_subscriber::fmt::layer().with_timer(timer))
+            .try_init();
+        return;
+    }
     let dir = db_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -418,14 +455,8 @@ fn init_logging(db_path: &std::path::Path) {
     rotate_log_if_needed(&dir);
     let appender = tracing_appender::rolling::never(&dir, "modelgate.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,hyper=warn".into());
-    // 时间戳统一用**本地时区**（中国 = UTC+8）并显式带偏移。
-    // tracing-subscriber 默认用 SystemTime，输出 `...Z` 的 UTC 时间，
-    // 机器上看到的日志会整体早 8 小时（曾因此误判请求时间）。
-    let timer =
-        tracing_subscriber::fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f %:z".to_string());
     let _ = tracing_subscriber::registry()
-        .with(filter)
+        .with(filter.unwrap_or_else(|_| "info,hyper=warn".into()))
         .with(tracing_subscriber::fmt::layer().with_timer(timer.clone()))
         .with(
             tracing_subscriber::fmt::layer()
@@ -436,6 +467,53 @@ fn init_logging(db_path: &std::path::Path) {
         .try_init();
     // guard 必须活到进程结束，否则后台日志线程会被提前回收。
     std::mem::forget(guard);
+}
+
+/// 完整解析配置前轻量窥探 `modules.<key>`：只读原始 JSON 的一个布尔键。
+///
+/// 缺省 / 文件不存在 / JSON 损坏一律按开启处理（true）——日志与面板是
+/// 历史默认行为，配置读不出来时宁可保守。
+fn peek_module_flag(config_path: &std::path::Path, key: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return true;
+    };
+    let Ok(raw) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
+        return true;
+    };
+    raw.get("modules")
+        .and_then(|m| m.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// 运行端口的状态文件：`<db 同目录>/data/state.json`（跟随库路径约定）。
+///
+/// 精简模式没有 `settings.lastPort` 可读（内存库），二次启动的
+/// activate_existing 靠它找到运行中实例的端口；默认模式同样写入，
+/// 作为库读取失败时的兜底。
+fn last_port_state_path(db_path: &std::path::Path) -> PathBuf {
+    db_path
+        .parent()
+        .map(|p| p.join("state.json"))
+        .unwrap_or_else(|| PathBuf::from("state.json"))
+}
+
+fn write_last_port_state(db_path: &std::path::Path, port: u16) {
+    let path = last_port_state_path(db_path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let text = serde_json::json!({ "lastPort": port }).to_string();
+    let _ = std::fs::write(&path, text + "\n");
+}
+
+fn read_last_port_file(db_path: &std::path::Path) -> Option<u16> {
+    let text = std::fs::read_to_string(last_port_state_path(db_path)).ok()?;
+    let raw: serde_json::Value = serde_json::from_str(&text).ok()?;
+    raw.get("lastPort")
+        .and_then(serde_json::Value::as_u64)
+        .map(|p| p as u16)
 }
 
 /// 单文件日志上限：超过即轮转，避免请求调用日志长期运行后无限增长。
@@ -498,6 +576,13 @@ fn activate_existing(db_path: &std::path::Path, args: &Args) {
     if args.no_browser {
         return;
     }
+    // 面板模块关闭（--minimal 或 modules.panel=false）时没有面板可打开，
+    // 只提示运行中实例的存在，不开一个 404 标签页。
+    let config_path = args.config.clone().unwrap_or_else(default_config_path);
+    if args.minimal || !peek_module_flag(&config_path, "panel") {
+        tracing::warn!("Model-Gate 已在运行（精简形态，面板未启用）");
+        return;
+    }
     match read_last_port(db_path) {
         Some(port) => {
             let url = format!("http://127.0.0.1:{port}/ui/");
@@ -532,8 +617,17 @@ fn read_last_port_once(db_path: &std::path::Path) -> Result<u16, ()> {
     read_last_port_opt(db_path).map_err(|_| ())?.ok_or(())
 }
 
-/// 只读查询 `settings.lastPort`：库不存在/无该键 → `Ok(None)`，读取失败 → `Err(原因)`。
+/// 只读查询运行端口：先查库（历史行为），再回退 `data/state.json`（精简模式落点）。
 fn read_last_port_opt(db_path: &std::path::Path) -> Result<Option<u16>, String> {
+    let from_db = read_last_port_db(db_path)?;
+    if from_db.is_some() {
+        return Ok(from_db);
+    }
+    Ok(read_last_port_file(db_path))
+}
+
+/// 只读查询 `settings.lastPort`：库不存在/无该键 → `Ok(None)`，读取失败 → `Err(原因)`。
+fn read_last_port_db(db_path: &std::path::Path) -> Result<Option<u16>, String> {
     use rusqlite::{Connection, OpenFlags};
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|err| err.to_string())?;

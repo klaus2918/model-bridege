@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Request, State};
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -71,14 +71,24 @@ const USAGE_BATCH_WAIT_MS: u64 = 50;
 pub struct AppState {
     pub cfg: ArcSwap<Config>,
     pub db: Arc<Db>,
+    /// 运行期模块开关：路由挂载、后台线程、请求路径记录都以它为准。
+    ///
+    /// **启动冻结**：`replace_config`（面板保存 / `/api/config/reload`）只换
+    /// `cfg`，不改这里——路由表与后台线程是启动时装配的，模块增减必须
+    /// 重启才生效，避免「路由没挂载但开始记录」的混合态。
+    pub modules: crate::config::Modules,
     /// 提示词后台队列发送端；请求路径只做 try_send，不做等待。
-    pub prompt_tx: std::sync::mpsc::SyncSender<PromptJob>,
+    /// stats 模块关闭时为 None：writer 线程不启动，提示词一律不记录。
+    pub prompt_tx: Option<std::sync::mpsc::SyncSender<PromptJob>>,
     /// 因后台队列已满而丢弃的提示词记录数（用于诊断，不影响代理）。
     pub prompt_dropped: AtomicU64,
     /// 用量后台队列发送端；请求路径只做 try_send，队列满/断开时同步直写兜底。
-    pub usage_tx: std::sync::mpsc::SyncSender<UsageRecord>,
+    /// stats 模块关闭时为 None：writer 线程不启动，用量一律不记录。
+    pub usage_tx: Option<std::sync::mpsc::SyncSender<UsageRecord>>,
     /// 已投递但尚未写库的用量记录数；退出前等待归零，升级替换进程不丢最后一批。
     pub usage_pending: Arc<AtomicU64>,
+    /// 今日指标内存计数器：托盘与轻量展示读这里，不再周期性查库。
+    pub today: Arc<crate::today::TodayCounters>,
     /// 凭据池快照缓存（TTL + 写失效）：选择凭据的热路径不再每次打库。
     pub pool_cache: std::sync::Mutex<crate::credential_pool::PoolCache>,
     /// 密钥库解密缓存（按文件 mtime 失效）：池路径不再每成员读盘 + DPAPI 解密。
@@ -116,6 +126,10 @@ impl AppState {
             .timeout(std::time::Duration::from_secs_f64(cfg.timeout_seconds))
             .connect_timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
+            // 连接池显式收敛：reqwest 默认每主机空闲连接数不设上限，
+            // 高并发突发后会留下一堆半关闭 socket；网关上游就那几个，8 个足够。
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
             .build()
             .expect("http client");
         let thinking_enabled = cfg
@@ -144,37 +158,71 @@ impl AppState {
             install_dir,
             shutdown.clone(),
         ));
-        // 启动即执行一次提示词保留策略：即使本次未开启记录，也清理上次遗留的超期数据。
-        db.delete_prompts_older_than(cfg.prompt_retention_days as i64);
-        db.trim_prompts(cfg.prompt_max_records as i64);
-        // 提示词专用后台 worker：请求路径只投递，解析/脱敏/批量写库都在这里完成。
-        let (prompt_tx, prompt_rx) = sync_channel(PROMPT_QUEUE_CAPACITY);
-        let prompt_db = db.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("prompt-writer".into())
-            .spawn(move || prompt_writer_loop(prompt_db, prompt_rx))
-        {
-            tracing::warn!("提示词后台线程启动失败（记录将不可用）：{err}");
+        let modules = cfg.modules.clone();
+        // 今日指标计数器：托盘读内存快照，不再每 10 秒查库聚合。
+        let today = Arc::new(crate::today::TodayCounters::default());
+        // 跨重启不丢当日累计：stats 开启时用库里「今日」聚合预热一次。
+        // 旧实现靠每 10 秒查库才能做到这一点；现在只在启动查一次，
+        // 之后由请求路径增量维护。精简形态（stats 关）没有记录，无需预热。
+        if modules.stats {
+            let stats = db.today_stats();
+            today.seed(
+                stats.get("requests").and_then(Value::as_i64).unwrap_or(0),
+                stats.get("ok").and_then(Value::as_i64).unwrap_or(0),
+                stats
+                    .get("prompt_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                stats
+                    .get("cache_read_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            );
         }
-        // 用量专用后台 worker：请求路径只投递，批量落库在这里完成；
+        // 提示词子系统仅 stats 模块开启时活动：启动清理 + 后台 worker。
+        // stats 关闭即提示词记录整体停摆（历史数据留在旧库文件里不动）。
+        let prompt_tx = if modules.stats {
+            // 启动即执行一次提示词保留策略：即使本次未开启记录，也清理上次遗留的超期数据。
+            db.delete_prompts_older_than(cfg.prompt_retention_days as i64);
+            db.trim_prompts(cfg.prompt_max_records as i64);
+            let (prompt_tx, prompt_rx) = sync_channel(PROMPT_QUEUE_CAPACITY);
+            let prompt_db = db.clone();
+            if let Err(err) = std::thread::Builder::new()
+                .name("prompt-writer".into())
+                .spawn(move || prompt_writer_loop(prompt_db, prompt_rx))
+            {
+                tracing::warn!("提示词后台线程启动失败（记录将不可用）：{err}");
+            }
+            Some(prompt_tx)
+        } else {
+            None
+        };
+        // 用量子系统仅 stats 模块开启时活动：请求路径只投递，批量落库在这里完成；
         // 队列满/线程不可用时调用方同步直写兜底，绝不丢记录。
-        let (usage_tx, usage_rx) = sync_channel(USAGE_QUEUE_CAPACITY);
-        let usage_db = db.clone();
-        let usage_pending = Arc::new(AtomicU64::new(0));
-        let usage_pending_worker = usage_pending.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("usage-writer".into())
-            .spawn(move || usage_writer_loop(usage_db, usage_rx, usage_pending_worker))
-        {
-            tracing::warn!("用量后台线程启动失败（将同步直写）：{err}");
-        }
+        let (usage_tx, usage_pending) = if modules.stats {
+            let (usage_tx, usage_rx) = sync_channel(USAGE_QUEUE_CAPACITY);
+            let usage_db = db.clone();
+            let usage_pending = Arc::new(AtomicU64::new(0));
+            let usage_pending_worker = usage_pending.clone();
+            if let Err(err) = std::thread::Builder::new()
+                .name("usage-writer".into())
+                .spawn(move || usage_writer_loop(usage_db, usage_rx, usage_pending_worker))
+            {
+                tracing::warn!("用量后台线程启动失败（将同步直写）：{err}");
+            }
+            (Some(usage_tx), usage_pending)
+        } else {
+            (None, Arc::new(AtomicU64::new(0)))
+        };
         Self {
             cfg: ArcSwap::from_pointee(cfg),
             db,
+            modules,
             prompt_tx,
             prompt_dropped: AtomicU64::new(0),
             usage_tx,
             usage_pending,
+            today,
             pool_cache: std::sync::Mutex::new(crate::credential_pool::PoolCache::default()),
             secrets_cache: std::sync::Mutex::new(crate::credential_pool::SecretsCache::default()),
             client,
@@ -450,6 +498,26 @@ impl AppState {
         cfg.raw["host"] = json!(cfg.host);
         self.cfg.store(Arc::new(cfg));
     }
+
+    /// 用库里的「今日」聚合重新预热托盘计数器（阻塞查询：调用方须已离开
+    /// async 上下文，如 `run_blocking` 闭包或启动路径）。
+    ///
+    /// 用途：清理用量后托盘数字与库对齐——`all` 清空归零，区间清理按剩余量累计。
+    pub fn reseed_today(&self) {
+        let stats = self.db.today_stats();
+        self.today.seed(
+            stats.get("requests").and_then(Value::as_i64).unwrap_or(0),
+            stats.get("ok").and_then(Value::as_i64).unwrap_or(0),
+            stats
+                .get("prompt_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            stats
+                .get("cache_read_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+        );
+    }
 }
 
 /// 统一接入口的作用域：默认全部可见上游，或指定分组。
@@ -483,7 +551,40 @@ impl UnifiedScope {
 const BUFFERED_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
-    use axum::routing::{delete, get, post, put};
+    let modules = state.modules.clone();
+    // 核心转发恒挂载：网关的最小事实，任何模块组合下都必须可用。
+    let mut app = core_routes();
+    // 可选子系统按 `modules` 开关挂载：关闭的模块不注册路由，
+    // 面板/管理 API 一律 404，对应的后台线程与 IO 也一并缺席。
+    if modules.panel {
+        app = app.merge(panel_routes());
+    }
+    if modules.stats {
+        app = app.merge(usage_routes());
+    }
+    if modules.plugins {
+        app = app.merge(plugin_routes());
+    }
+    if modules.pool {
+        app = app.merge(pool_routes());
+    }
+    if modules.access {
+        app = app.merge(access_routes());
+    }
+    if modules.ai_config {
+        app = app.merge(ai_routes());
+    }
+    if modules.update {
+        app = app.merge(update_routes());
+    }
+    // 管理接口（面板）走 `Json` 提取器，抬到与 chat 同量级的入站上限。
+    app.layer(DefaultBodyLimit::max(BUFFERED_BODY_LIMIT_BYTES))
+        .with_state(state)
+}
+
+/// 核心转发路由：`/health`、模型目录与 chat 转发（含 unified/强制上游变体）。
+fn core_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
     axum::Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -500,84 +601,119 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             post(chat_unified_group),
         )
         .route("/{upstream}/v1/chat/completions", post(chat_forced))
-        .route("/ui/", get(ui_index))
-        .route("/ui/classic", get(ui_classic))
-        .route("/ui/{*path}", get(ui_asset))
-        .route("/api/info", get(api_info))
-        .route("/api/update/status", get(crate::update::api_update_status))
-        .route("/api/update/check", get(crate::update::api_update_check))
+        .fallback(not_found)
+}
+
+/// Web 面板与配置管理 API（`panel` 模块）。
+fn panel_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/ui/", get(crate::panel_api::ui_index))
+        .route("/ui/classic", get(crate::panel_api::ui_classic))
+        .route("/ui/{*path}", get(crate::panel_api::ui_asset))
+        .route("/api/info", get(crate::panel_api::api_info))
+        .route("/api/proxy/status", get(crate::panel_api::api_proxy_status))
+        .route("/api/upstreams", get(crate::panel_api::api_upstreams))
         .route(
-            "/api/update/download",
-            post(crate::update::api_update_download),
+            "/api/config",
+            get(crate::panel_api::api_config).post(crate::panel_api::api_config_save),
         )
         .route(
-            "/api/update/download-install",
-            post(crate::update::api_update_download_install),
+            "/api/config/validate",
+            post(crate::panel_api::api_config_validate),
         )
         .route(
-            "/api/update/install",
-            post(crate::update::api_update_install),
+            "/api/config/preview",
+            post(crate::panel_api::api_config_preview),
         )
         .route(
-            "/api/update/settings",
-            post(crate::update::api_update_settings),
+            "/api/config/reload",
+            axum::routing::post(crate::panel_api::api_config_reload),
         )
-        .route(
-            "/api/update/open-location",
-            post(crate::update::api_update_open_location),
-        )
-        .route(
-            "/api/update/download-dir",
-            post(crate::update::api_update_download_dir),
-        )
-        .route("/api/proxy/status", get(api_proxy_status))
-        .route("/api/upstreams", get(api_upstreams))
-        .route("/api/config", get(api_config).post(api_config_save))
-        .route("/api/config/validate", post(api_config_validate))
-        .route("/api/config/preview", post(api_config_preview))
-        .route("/api/config/reload", axum::routing::post(api_config_reload))
         .route("/api/config/backups", get(crate::api_extra::backups_list))
         .route(
             "/api/config/backups/restore",
             post(crate::api_extra::backups_restore),
         )
-        // 接入编排：模板、读模型、快速添加、受控更新与密钥写入。
         .route(
-            "/api/access",
-            get(crate::access::list).post(crate::access::quick_add),
+            "/api/pricing",
+            get(crate::panel_api::api_pricing).post(crate::api_extra::pricing_save),
         )
-        .route("/api/access/templates", get(crate::access::list_templates))
-        .route("/api/access/quick", post(crate::access::quick_add))
-        .route("/api/access/custom", post(crate::access::custom_add))
+        .route("/api/models/catalog", get(crate::api_extra::models_catalog))
+        .route("/api/logs", get(crate::api_extra::logs_get))
+        .route("/api/logs/clear", post(crate::api_extra::logs_clear))
         .route(
-            "/api/access/{id}",
-            get(crate::access::detail)
-                .patch(crate::access::update)
-                .delete(crate::access::delete),
-        )
-        .route("/api/access/{id}/secret", post(crate::access::write_secret))
-        .route("/api/access/{id}/probe", post(crate::access::probe))
-        // 凭据池：池与成员的脱敏 CRUD、探测。
-        .route(
-            "/api/pools",
-            get(crate::credential_pool::list).post(crate::credential_pool::create),
+            "/api/upstreams/health",
+            get(crate::api_extra::upstreams_health),
         )
         .route(
-            "/api/pools/{id}",
-            get(crate::credential_pool::detail)
-                .patch(crate::credential_pool::update)
-                .delete(crate::credential_pool::delete),
+            "/api/upstreams/probe",
+            post(crate::api_extra::upstream_probe),
         )
         .route(
-            "/api/pools/{id}/members",
-            post(crate::credential_pool::add_member_handler),
+            "/api/upstreams/{name}/models",
+            get(crate::api_extra::upstream_models),
         )
         .route(
-            "/api/pools/{id}/members/{mid}",
-            axum::routing::patch(crate::credential_pool::update_member)
-                .delete(crate::credential_pool::delete_member),
+            "/api/upstreams/models",
+            post(crate::api_extra::upstream_models_post),
         )
-        .route("/api/pools/{id}/probe", post(crate::credential_pool::probe))
+        .route(
+            "/api/upstreams/secret",
+            post(crate::api_extra::upstream_secret),
+        )
+}
+
+/// 用量统计与提示词记录 API（`stats` 模块）。
+fn usage_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/api/usage/clear", post(crate::api_extra::usage_clear))
+        .route(
+            "/api/usage/retention/apply",
+            post(crate::api_extra::retention_apply),
+        )
+        .route("/api/usage/export", get(crate::api_extra::usage_export))
+        .route("/api/usage/sessions", get(crate::api_extra::usage_sessions))
+        .route("/api/usage/totals", get(crate::panel_api::api_usage_totals))
+        .route(
+            "/api/usage/summary",
+            get(crate::panel_api::api_usage_summary),
+        )
+        .route("/api/usage/list", get(crate::panel_api::api_usage_list))
+        .route("/api/usage/models", get(crate::panel_api::api_usage_models))
+        .route(
+            "/api/usage/upstreams",
+            get(crate::panel_api::api_usage_upstreams),
+        )
+        .route("/api/prompts", get(crate::api_extra::prompts_list))
+        .route("/api/prompts/stats", get(crate::api_extra::prompts_stats))
+        .route("/api/prompts/export", get(crate::api_extra::prompts_export))
+        .route(
+            "/api/prompts/evolution",
+            get(crate::api_extra::prompts_evolution),
+        )
+        .route("/api/prompts/diff", get(crate::api_extra::prompts_diff))
+        .route(
+            "/api/prompts/diff/download",
+            get(crate::api_extra::prompts_diff_download),
+        )
+        .route("/api/prompts/clear", post(crate::api_extra::prompts_clear))
+        .route(
+            "/api/prompts/vacuum",
+            post(crate::api_extra::prompts_vacuum),
+        )
+        .route(
+            "/api/prompts/{id}/download",
+            get(crate::api_extra::prompt_download),
+        )
+        .route("/api/prompts/{id}", get(crate::api_extra::prompt_detail))
+}
+
+/// 插件与免费来源 API（`plugins` 模块）。
+fn plugin_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
         // 插件：登记、导入、启停、移除/重装、幂等接入/解绑。
         .route("/api/plugins", get(crate::plugin::list))
         .route("/api/plugins/install", post(crate::plugin::install))
@@ -604,75 +740,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/plugins/{id}/probe-all",
             post(crate::free_sources_api::plugin_probe_all),
         )
-        // AI 可读配置：只读 + 草案 + 人工确认应用。
-        .route("/llms.txt", get(crate::ai_api::llms_txt))
-        .route("/api/ai/manifest", get(crate::ai_api::manifest))
-        .route("/api/ai/schema", get(crate::ai_api::schema))
-        .route("/api/ai/templates", get(crate::ai_api::templates))
-        .route("/api/ai/inspect", get(crate::ai_api::inspect))
-        .route("/api/ai/plan", post(crate::ai_api::plan))
-        .route("/api/ai/apply", post(crate::ai_api::apply))
-        .route("/api/ai/audit", get(crate::ai_api::audit))
-        .route(
-            "/api/ai/settings",
-            get(crate::ai_api::get_settings).put(crate::ai_api::put_settings),
-        )
-        .route(
-            "/api/pricing",
-            get(api_pricing).post(crate::api_extra::pricing_save),
-        )
-        .route("/api/models/catalog", get(crate::api_extra::models_catalog))
-        .route("/api/usage/clear", post(crate::api_extra::usage_clear))
-        .route(
-            "/api/usage/retention/apply",
-            post(crate::api_extra::retention_apply),
-        )
-        .route("/api/usage/export", get(crate::api_extra::usage_export))
-        .route("/api/usage/sessions", get(crate::api_extra::usage_sessions))
-        .route("/api/prompts", get(crate::api_extra::prompts_list))
-        .route("/api/prompts/stats", get(crate::api_extra::prompts_stats))
-        .route("/api/prompts/export", get(crate::api_extra::prompts_export))
-        .route(
-            "/api/prompts/evolution",
-            get(crate::api_extra::prompts_evolution),
-        )
-        .route("/api/prompts/diff", get(crate::api_extra::prompts_diff))
-        .route(
-            "/api/prompts/diff/download",
-            get(crate::api_extra::prompts_diff_download),
-        )
-        .route("/api/prompts/clear", post(crate::api_extra::prompts_clear))
-        .route(
-            "/api/prompts/vacuum",
-            post(crate::api_extra::prompts_vacuum),
-        )
-        .route(
-            "/api/prompts/{id}/download",
-            get(crate::api_extra::prompt_download),
-        )
-        .route("/api/prompts/{id}", get(crate::api_extra::prompt_detail))
-        .route("/api/logs", get(crate::api_extra::logs_get))
-        .route("/api/logs/clear", post(crate::api_extra::logs_clear))
-        .route(
-            "/api/upstreams/health",
-            get(crate::api_extra::upstreams_health),
-        )
-        .route(
-            "/api/upstreams/probe",
-            post(crate::api_extra::upstream_probe),
-        )
-        .route(
-            "/api/upstreams/{name}/models",
-            get(crate::api_extra::upstream_models),
-        )
-        .route(
-            "/api/upstreams/models",
-            post(crate::api_extra::upstream_models_post),
-        )
-        .route(
-            "/api/upstreams/secret",
-            post(crate::api_extra::upstream_secret),
-        )
         .route(
             "/api/free-sources",
             get(crate::free_sources_api::free_sources),
@@ -693,15 +760,104 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/free-sources/attach",
             post(crate::free_sources_api::free_sources_attach),
         )
-        .route("/api/usage/totals", get(api_usage_totals))
-        .route("/api/usage/summary", get(api_usage_summary))
-        .route("/api/usage/list", get(api_usage_list))
-        .route("/api/usage/models", get(api_usage_models))
-        .route("/api/usage/upstreams", get(api_usage_upstreams))
-        // 管理接口（面板）走 `Json` 提取器，抬到与 chat 同量级的入站上限。
-        .layer(DefaultBodyLimit::max(BUFFERED_BODY_LIMIT_BYTES))
-        .fallback(not_found)
-        .with_state(state)
+}
+
+/// 凭据池 API（`pool` 模块）。
+fn pool_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        // 凭据池：池与成员的脱敏 CRUD、探测。
+        .route(
+            "/api/pools",
+            get(crate::credential_pool::list).post(crate::credential_pool::create),
+        )
+        .route(
+            "/api/pools/{id}",
+            get(crate::credential_pool::detail)
+                .patch(crate::credential_pool::update)
+                .delete(crate::credential_pool::delete),
+        )
+        .route(
+            "/api/pools/{id}/members",
+            post(crate::credential_pool::add_member_handler),
+        )
+        .route(
+            "/api/pools/{id}/members/{mid}",
+            axum::routing::patch(crate::credential_pool::update_member)
+                .delete(crate::credential_pool::delete_member),
+        )
+        .route("/api/pools/{id}/probe", post(crate::credential_pool::probe))
+}
+
+/// 接入编排 API（`access` 模块）：模板、读模型、快速添加、受控更新与密钥写入。
+fn access_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route(
+            "/api/access",
+            get(crate::access::list).post(crate::access::quick_add),
+        )
+        .route("/api/access/templates", get(crate::access::list_templates))
+        .route("/api/access/quick", post(crate::access::quick_add))
+        .route("/api/access/custom", post(crate::access::custom_add))
+        .route(
+            "/api/access/{id}",
+            get(crate::access::detail)
+                .patch(crate::access::update)
+                .delete(crate::access::delete),
+        )
+        .route("/api/access/{id}/secret", post(crate::access::write_secret))
+        .route("/api/access/{id}/probe", post(crate::access::probe))
+}
+
+/// AI 可读配置 API（`aiConfig` 模块）：只读 + 草案 + 人工确认应用。
+fn ai_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/llms.txt", get(crate::ai_api::llms_txt))
+        .route("/api/ai/manifest", get(crate::ai_api::manifest))
+        .route("/api/ai/schema", get(crate::ai_api::schema))
+        .route("/api/ai/templates", get(crate::ai_api::templates))
+        .route("/api/ai/inspect", get(crate::ai_api::inspect))
+        .route("/api/ai/plan", post(crate::ai_api::plan))
+        .route("/api/ai/apply", post(crate::ai_api::apply))
+        .route("/api/ai/audit", get(crate::ai_api::audit))
+        .route(
+            "/api/ai/settings",
+            get(crate::ai_api::get_settings).put(crate::ai_api::put_settings),
+        )
+}
+
+/// 自更新 API（`update` 模块）。
+fn update_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/api/update/status", get(crate::update::api_update_status))
+        .route("/api/update/check", get(crate::update::api_update_check))
+        .route(
+            "/api/update/download",
+            post(crate::update::api_update_download),
+        )
+        .route(
+            "/api/update/download-install",
+            post(crate::update::api_update_download_install),
+        )
+        .route(
+            "/api/update/install",
+            post(crate::update::api_update_install),
+        )
+        .route(
+            "/api/update/settings",
+            post(crate::update::api_update_settings),
+        )
+        .route(
+            "/api/update/open-location",
+            post(crate::update::api_update_open_location),
+        )
+        .route(
+            "/api/update/download-dir",
+            post(crate::update::api_update_download_dir),
+        )
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1071,7 +1227,12 @@ async fn chat_scoped(
         id: uuid::Uuid::new_v4().simple().to_string(),
         session: resolve_session(&headers, &payload),
     };
-    capture_prompt(&state, body.clone(), &ctx, &requested_model);
+    // 门控留在克隆之前：capture_prompt 内部虽然还会再查一次开关，但
+    // body.clone() 在这里是实打实的整份拷贝（多模态请求可达数十 MiB），
+    // 提示词记录关闭时白克隆一次是纯浪费。stats 模块关闭时同样不记录。
+    if state.modules.stats && state.cfg().prompt_capture {
+        capture_prompt(&state, body.clone(), &ctx, &requested_model);
+    }
     if requested_model.is_empty() {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -1564,6 +1725,16 @@ fn expand_attempt_targets(
     upstream: &Upstream,
     model: &str,
 ) -> Vec<AttemptTarget> {
+    // pool 模块关闭：忽略上游的池绑定，一律按单 Key 直连。
+    // 池子系统整体缺席（路由/线程都不挂载）时读池表只会得到空结果，
+    // 这里提前短路并给出明确语义，而不是让请求撞上不可用的池。
+    if !state.modules.pool {
+        return vec![AttemptTarget {
+            upstream: upstream.clone(),
+            model: model.to_string(),
+            credential: None,
+        }];
+    }
     let Some(pool_id) = upstream.credential_pool.as_deref() else {
         return vec![AttemptTarget {
             upstream: upstream.clone(),
@@ -2118,6 +2289,19 @@ fn prepare_attempt(
     })
 }
 
+/// SSE 事件边界 `\n\n` 的字节级查找（与旧实现 `String::find("\n\n")` 同口径）。
+fn find_event_boundary(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|w| w == b"\n\n")
+}
+
+/// 事件块是否值得做 JSON 解析：真实 usage 键在 JSON 里必然以 `"usage"` 字节
+/// 序列出现。中间事件占一条流的绝大多数且都不含它，预判命中才解析——
+/// 否则一次长流会产生数千次只为抓末尾 usage 的整事件 JSON parse。
+/// 字符串内容里偶尔出现同名词只是多一次解析，不影响正确性。
+fn block_may_contain_usage(block: &[u8]) -> bool {
+    block.windows(7).any(|w| w == b"\"usage\"")
+}
+
 async fn stream_response(
     state: Arc<AppState>,
     upstream: Upstream,
@@ -2131,16 +2315,23 @@ async fn stream_response(
     let header_model = target_model.clone();
     let mut byte_stream = response.bytes_stream();
     let stream = async_stream::stream! {
-        let mut buffer = String::new();
+        // 保留原始字节：转发字节不变，usage 抓取只对通过预判的块做 UTF-8 转换。
+        // 旧实现每个 chunk 都 from_utf8_lossy，跨 chunk 的多字节字符会被
+        // replacement char 打断（影响 usage 抓取窗口），且平白多一次拷贝。
+        let mut buffer: Vec<u8> = Vec::new();
         let mut usage: Option<Value> = None;
         let mut ttft_ms = 0i64;
         while let Some(chunk) = byte_stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    buffer.extend_from_slice(&bytes);
                     // 逐块扫描 SSE，抓取末尾的 usage（不改变转发字节）。
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let block: String = buffer.drain(..pos + 2).collect();
+                    while let Some(pos) = find_event_boundary(&buffer) {
+                        let block: Vec<u8> = buffer.drain(..pos + 2).collect();
+                        if !block_may_contain_usage(&block) {
+                            continue;
+                        }
+                        let block = String::from_utf8_lossy(&block);
                         for line in block.lines() {
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if data.trim() == "[DONE]" { continue; }
@@ -2446,6 +2637,12 @@ pub(crate) fn record_ex(
     truncated: bool,
     paused: bool,
 ) {
+    let stats_on = state.modules.stats;
+    let logging_on = state.modules.logging;
+    if !stats_on && !logging_on {
+        // 统计与日志全关：请求收尾只差记录，转发本身不受影响。
+        return;
+    }
     let usage = usage.cloned().unwrap_or(Value::Null);
     let prompt_tokens = usage
         .get("prompt_tokens")
@@ -2465,16 +2662,21 @@ pub(crate) fn record_ex(
         .and_then(Value::as_i64)
         .unwrap_or(0);
     // 费用按单价表即时估算（人民币落库）；峰谷判定用当前时间。
-    let cost = state.cfg().pricing.cost_for(
-        &up.name,
-        requested,
-        target,
-        chrono::Utc::now().timestamp(),
-        prompt_tokens,
-        completion_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-    );
+    // stats 关闭时跳过单价查询——访问日志不需要费用。
+    let cost = if stats_on {
+        state.cfg().pricing.cost_for(
+            &up.name,
+            requested,
+            target,
+            chrono::Utc::now().timestamp(),
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        )
+    } else {
+        0.0
+    };
     let rec = UsageRecord {
         id: ctx.id.clone(),
         upstream: up.name.clone(),
@@ -2498,11 +2700,27 @@ pub(crate) fn record_ex(
     // 访问日志先写（只借用），再投递后台队列：请求路径只投递，一次事务
     // 聚合多个并发请求。队列满/线程不可用时同步直写兜底——用量是计费与
     // 统计的事实源，绝不丢弃。
-    log_access(state, &rec, ttft_ms, truncated, paused);
+    if logging_on {
+        log_access(state, &rec, ttft_ms, truncated, paused);
+    }
+    if !stats_on {
+        return;
+    }
+    // 今日指标走内存计数：托盘零 SQL。
+    state
+        .today
+        .record(rec.status, rec.prompt_tokens, rec.cache_read_tokens);
     state.usage_pending.fetch_add(1, Ordering::Relaxed);
-    match state.usage_tx.try_send(rec) {
-        Ok(()) => {}
-        Err(TrySendError::Full(rec)) | Err(TrySendError::Disconnected(rec)) => {
+    match state.usage_tx.as_ref() {
+        Some(tx) => match tx.try_send(rec) {
+            Ok(()) => {}
+            Err(TrySendError::Full(rec)) | Err(TrySendError::Disconnected(rec)) => {
+                state.usage_pending.fetch_sub(1, Ordering::Relaxed);
+                state.db.record_usage(&rec);
+            }
+        },
+        // stats 开启但 writer 不可用（仅线程 spawn 失败时可能）：同步直写兜底。
+        None => {
             state.usage_pending.fetch_sub(1, Ordering::Relaxed);
             state.db.record_usage(&rec);
         }
@@ -2621,7 +2839,11 @@ fn capture_prompt(
     };
     drop(cfg);
 
-    match state.prompt_tx.try_send(job) {
+    // stats 模块关闭时 writer 未启动；调用点已做门控，这里兜底直接丢弃。
+    let Some(prompt_tx) = state.prompt_tx.as_ref() else {
+        return;
+    };
+    match prompt_tx.try_send(job) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             let dropped = state.prompt_dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2787,441 +3009,6 @@ pub(crate) fn error_json(
         .into_response()
 }
 
-fn ui_page_html(source: &str) -> String {
-    let version = env!("CARGO_PKG_VERSION");
-    let mut html = source.to_string();
-    // 资源带版本号，避免升级后浏览器复用旧 JS/CSS。
-    for file in [
-        "v4-base.css",
-        "v4.css",
-        "v4-core.js",
-        "v4-config.js",
-        "v4-models.js",
-        "v4-usage.js",
-        "v4-prompts.js",
-        "v4-resources.js",
-        "v4.js",
-    ] {
-        html = html.replace(
-            &format!("href=\"{file}\""),
-            &format!("href=\"{file}?v={version}\""),
-        );
-        html = html.replace(
-            &format!("src=\"{file}\""),
-            &format!("src=\"{file}?v={version}\""),
-        );
-    }
-    html
-}
-
-async fn ui_index() -> Response {
-    // v4 控制台是唯一入口。
-    let Some(source) = crate::ui_assets::load("v4.html") else {
-        return error_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "面板资源缺失：请检查 ui/ 目录或用 --ui-dir 指定",
-            "server_error",
-            "ui_assets_missing",
-        );
-    };
-    let html = ui_page_html(source.as_ref());
-    (
-        [
-            ("content-type", "text/html; charset=utf-8"),
-            ("cache-control", "no-store"),
-        ],
-        html,
-    )
-        .into_response()
-}
-
-async fn ui_classic() -> impl IntoResponse {
-    // 旧面板已由 v4 完整替代；保留路径做永久跳转，避免旧书签 404。
-    axum::response::Redirect::permanent("/ui/")
-}
-
-async fn ui_asset(Path(path): Path<String>) -> Response {
-    // 只允许单层文件名（见 crate::ui_assets::sanitize），天然挡住路径穿越。
-    // release 只认内嵌清单；debug/`--ui-dir` 直接读磁盘，改前端不必重编译。
-    let Some(body) = crate::ui_assets::load(&path) else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "页面不存在",
-            "invalid_request_error",
-            "not_found",
-        );
-    };
-    (
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                crate::ui_assets::content_type(&path),
-            ),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "no-store, no-cache, must-revalidate, max-age=0",
-            ),
-        ],
-        body.into_owned(),
-    )
-        .into_response()
-}
-
-async fn api_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({
-        "app": "Model-Gate",
-        "version": env!("CARGO_PKG_VERSION"),
-        "port": state.cfg().port,
-        "host": state.cfg().host,
-        "upstream_count": state.cfg().upstreams.len(),
-        "db_path": state.db.path.display().to_string(),
-        "config_path": state.config_path.display().to_string(),
-        "thinking": state.thinking.stats(),
-        "server_time": chrono::Utc::now().timestamp(),
-        "prompt_capture": state.cfg().prompt_capture,
-        "runtime": "rust",
-    }))
-}
-
-async fn api_proxy_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = state.cfg();
-    let default_upstream = cfg
-        .upstreams
-        .iter()
-        .find(|u| u.default)
-        .or_else(|| cfg.upstreams.first())
-        .map(|u| u.name.clone())
-        .unwrap_or_default();
-    Json(json!({
-        "running": true,
-        "version": env!("CARGO_PKG_VERSION"),
-        "host": state.cfg().host,
-        "port": state.cfg().port,
-        "endpoint": format!("http://{}:{}/v1", state.cfg().host, state.cfg().port),
-        "access_log": state.cfg().access_log,
-        "thinking": {"enabled": true, "size": 0, "max_size": 500},
-        "upstream_count": state.cfg().upstreams.len(),
-        "model_count": state.cfg().model_list().len(),
-        "default_upstream": default_upstream,
-        "db_path": state.db.path.display().to_string(),
-        "config_path": state.config_path.display().to_string(),
-        "uptime_seconds": state.started.elapsed().as_secs(),
-        "runtime": "rust",
-    }))
-}
-
-async fn api_config_save(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<Value>,
-) -> Response {
-    let incoming = match payload.get("config") {
-        Some(v @ Value::Object(_)) => v.clone(),
-        _ => {
-            return error_json(
-                StatusCode::BAD_REQUEST,
-                "缺少 config 对象",
-                "invalid_request_error",
-                "invalid_config",
-            );
-        }
-    };
-    if !incoming.is_object() {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            "配置必须是 JSON 对象",
-            "invalid_request_error",
-            "invalid_config",
-        );
-    }
-    // 备份策略：面板的 backup 开关（缺省开启）。首次无备份时强制备份一次。
-    let policy = crate::config_store::BackupPolicy::from_flag(
-        payload.get("backup").and_then(Value::as_bool),
-    );
-    // 面板不回传明文密钥：写盘时剔除 apiKey，内存里沿用当前解析出的密钥。
-    let current = state.cfg();
-    let current_raw = current.raw.clone();
-    let keys: Vec<(String, String, String)> = current
-        .upstreams
-        .iter()
-        .map(|u| (u.name.clone(), u.api_key.clone(), u.key_source.clone()))
-        .collect();
-    drop(current);
-
-    // 合并语义：顶层按键合并 + upstreams 按名增删改。
-    // 传入的集合即最终集合 —— 面板删掉的上游从结果中消失，不再被顶回。
-    let merged = crate::config_store::merge_incoming(&current_raw, &incoming);
-    // 面板只认识常用字段：未渲染的兼容字段（cliVersion、compat、modelCatalog…）
-    // 由 merge_incoming 逐字段保留，避免一次保存静默丢配置。
-    // 明文密钥永不落盘。
-    let mut to_write = merged.clone();
-    crate::config_store::strip_secrets(&mut to_write);
-
-    // 先诊断、后落盘：error 级问题不写入配置文件。
-    // 带上本地密钥库解析，避免把已加密保存的密钥误报为缺失。
-    let store = crate::secret_store::SecretStore::load(&state.config_path);
-    let candidate = Config::from_value_with_store(merged.clone(), &store);
-    let diagnostics = candidate.diagnostics();
-    let errors: Vec<&crate::config::Diagnostic> =
-        diagnostics.iter().filter(|d| d.level == "error").collect();
-    if !errors.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": {
-                    "message": format!("配置有 {} 处错误，未保存：{}", errors.len(), errors[0].message),
-                    "type": "invalid_request_error",
-                    "code": "invalid_config",
-                },
-                "diagnostics": diagnostics.iter().map(|d| d.to_json()).collect::<Vec<_>>(),
-                "effective": candidate.effective_upstreams(),
-            })),
-        )
-            .into_response();
-    }
-
-    // 备份（在写入前）：存的是旧内容，替换失败也不丢原始配置。
-    let backup = match crate::config_store::backup_config(&state.config_path, policy) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            return error_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("配置备份失败: {err}"),
-                "server_error",
-                "config_backup_failed",
-            );
-        }
-    };
-    // 原子写：临时文件 → 回读校验 → 替换。
-    if let Err(err) = crate::config_store::save_atomic(&state.config_path, &to_write) {
-        return error_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("配置写入失败: {err}"),
-            "server_error",
-            "config_write_failed",
-        );
-    }
-
-    let mut new_cfg = candidate;
-    for up in new_cfg.upstreams.iter_mut() {
-        if up.api_key.is_empty() {
-            if let Some((_, key, source)) = keys.iter().find(|(name, _, _)| *name == up.name) {
-                up.api_key = key.clone();
-                up.key_source = source.clone();
-            }
-        }
-    }
-    let count = new_cfg.upstreams.len();
-    let issues: Vec<Value> = new_cfg.diagnostics().iter().map(|d| d.to_json()).collect();
-    let effective = new_cfg.effective_upstreams();
-    state.replace_config(new_cfg);
-    state.clear_models_cache().await;
-    Json(json!({
-        "ok": true,
-        "upstreams": count,
-        "note": "已保存并热重载",
-        "config_path": state.config_path.display().to_string(),
-        "backup": backup_json(&backup),
-        "diagnostics": issues,
-        "effective": effective,
-    }))
-    .into_response()
-}
-
-/// 备份结果的回显结构（面板提示语直接用）。
-fn backup_json(outcome: &crate::config_store::BackupOutcome) -> Value {
-    json!({
-        "created": outcome.created,
-        "forcedFirst": outcome.forced_first,
-        "path": outcome.path.as_ref().map(|p| p.display().to_string()),
-    })
-}
-
-async fn api_config_reload(State(state): State<Arc<AppState>>) -> Response {
-    match Config::load(&state.config_path) {
-        Ok(cfg) => {
-            let count = cfg.upstreams.len();
-            state.replace_config(cfg);
-            state.clear_models_cache().await;
-            Json(json!({"ok": true, "upstreams": count})).into_response()
-        }
-        Err(err) => error_json(
-            StatusCode::BAD_REQUEST,
-            format!("重新载入失败: {err}"),
-            "invalid_request_error",
-            "config_load_failed",
-        ),
-    }
-}
-
-async fn api_pricing(State(state): State<Arc<AppState>>) -> Response {
-    let cfg = state.cfg();
-    let pricing = cfg.raw.get("pricing").cloned().unwrap_or_else(|| json!({}));
-    let retention = cfg
-        .raw
-        .get("retentionDays")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    Json(json!({
-        "pricing": pricing,
-        // 落库本位币固定人民币；美元单价按 fx.USD 换算成人民币入账。
-        "currency": "CNY",
-        "configured": cfg.pricing.configured(),
-        "fx": { "USD": cfg.pricing.fx_usd },
-        "entries": cfg.pricing.entries.len(),
-        "diagnostics": cfg.pricing.issues,
-        "retention_days": retention,
-    }))
-    .into_response()
-}
-
-async fn api_upstreams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = state.cfg();
-    let rows: Vec<Value> = cfg
-        .upstreams
-        .iter()
-        .map(|u| {
-            json!({
-                "name": u.name,
-                "protocol": u.protocol,
-                "transport": u.transport,
-                "profile": u.compat.profile,
-                "baseUrl": u.base_url,
-                "chatPath": u.compat.chat_path,
-                "authScheme": u.compat.auth_scheme,
-                "sessionHeader": u.compat.session_header,
-                "thinkingPassthrough": u.compat.thinking_passthrough,
-                "maxOutputTokens": u.compat.max_output_tokens,
-                "default": u.default,
-                "models": u.models,
-                "modelsAll": u.models,
-                "keySource": u.display_key_source(),
-                "keyConfigured": u.any_key_configured(),
-                "apiKeyEnv": u.api_key_env,
-                "apiKeyFile": u.api_key_file,
-                "apiKeyAgent": u.api_key_agent,
-                "apiKeyStore": u.api_key_store,
-                // 逐模型密钥：只回显变量名/来源与可用性，绝不回显密钥本体。
-                "modelKeys": u.model_keys.iter().map(|mk| json!({
-                    "model": mk.pattern,
-                    "env": mk.env_name,
-                    "store": mk.store_id,
-                    "source": mk.source,
-                    "configured": mk.missing.is_none(),
-                    "missing": mk.missing,
-                })).collect::<Vec<_>>(),
-                "plan": Value::Null,
-                "planError": Value::Null,
-            })
-        })
-        .collect();
-    Json(json!({"upstreams": rows}))
-}
-
-async fn api_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = state.cfg();
-    let mut payload = cfg.raw.clone();
-    if let Some(ups) = payload.get_mut("upstreams").and_then(Value::as_object_mut) {
-        for up in cfg.upstreams.iter() {
-            if let Some(target) = ups.get_mut(&up.name).and_then(Value::as_object_mut) {
-                target.remove("apiKey");
-                target.remove("apiKeyEnc");
-                // 逐模型条目里的历史明文 apiKey 也不得回显给面板。
-                if let Some(keys) = target.get_mut("modelKeys").and_then(Value::as_object_mut) {
-                    for (_, spec) in keys.iter_mut() {
-                        if let Some(spec) = spec.as_object_mut() {
-                            spec.remove("apiKey");
-                            spec.remove("apiKeyEnc");
-                        }
-                    }
-                }
-                target.insert("_keyConfigured".into(), json!(up.any_key_configured()));
-                target.insert("_keySource".into(), json!(up.display_key_source()));
-            }
-        }
-    }
-    let diagnostics: Vec<Value> = cfg.diagnostics().iter().map(|d| d.to_json()).collect();
-    Json(json!({
-        "config": payload,
-        "config_path": state.config_path.display().to_string(),
-        "diagnostics": diagnostics,
-        "effective": cfg.effective_upstreams(),
-        "profiles": crate::provider_profiles::profiles_meta(),
-        "thinking": state.thinking.stats(),
-    }))
-}
-
-/// 只校验、不落盘：面板保存前可先拿结构化诊断。
-async fn api_config_validate(Json(payload): Json<Value>) -> Response {
-    let incoming = payload.get("config").cloned().unwrap_or(payload);
-    if !incoming.is_object() {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            "配置必须是 JSON 对象",
-            "invalid_request_error",
-            "invalid_config",
-        );
-    }
-    let cfg = Config::from_value(incoming);
-    let issues: Vec<Value> = cfg.diagnostics().iter().map(|d| d.to_json()).collect();
-    let errors = issues
-        .iter()
-        .filter(|d| d.get("level").and_then(Value::as_str) == Some("error"))
-        .count();
-    Json(json!({
-        "ok": errors == 0,
-        "errors": errors,
-        "warnings": issues.len() - errors,
-        "diagnostics": issues,
-        "effective": cfg.effective_upstreams(),
-        "profiles": crate::provider_profiles::profiles_meta(),
-    }))
-    .into_response()
-}
-
-/// 只读预览：给新增/编辑表单用，返回这对 protocol/baseUrl/profile 的生效值。
-/// 不写配置、不发外网请求，也不读取密钥。
-async fn api_config_preview(Json(payload): Json<Value>) -> Response {
-    let protocol = payload
-        .get("protocol")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("openai");
-    let base_url = payload
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-    let profile = payload
-        .get("compat")
-        .and_then(Value::as_object)
-        .and_then(|c| c.get("profile"))
-        .and_then(Value::as_str)
-        .or_else(|| payload.get("profile").and_then(Value::as_str))
-        .map(str::trim)
-        .unwrap_or("");
-
-    let mut upstream = serde_json::Map::new();
-    upstream.insert("protocol".into(), json!(protocol));
-    upstream.insert("baseUrl".into(), json!(base_url));
-    if !profile.is_empty() {
-        upstream.insert("compat".into(), json!({"profile": profile}));
-    }
-    let cfg = Config::from_value(json!({"upstreams": {"preview": upstream}}));
-    let effective = cfg
-        .effective_upstreams()
-        .get(0)
-        .cloned()
-        .unwrap_or(Value::Null);
-    let diagnostics: Vec<Value> = cfg.diagnostics().iter().map(|d| d.to_json()).collect();
-    Json(json!({
-        "effective": effective,
-        "diagnostics": diagnostics,
-    }))
-    .into_response()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3230,7 +3017,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_preview_resolves_deepseek_profile() {
-        let resp = api_config_preview(Json(json!({
+        let resp = crate::panel_api::api_config_preview(Json(json!({
             "protocol": "openai",
             "baseUrl": "https://api.deepseek.com/v1",
             "compat": {"profile": "deepseek"}
@@ -3443,6 +3230,295 @@ mod tests {
             }
         });
         (format!("http://{addr}"), rx)
+    }
+
+    /// 精简形态（modules 全关）：核心转发可用，面板/统计/扩展接口整体 404。
+    #[tokio::test]
+    async fn minimal_modules_keep_core_and_drop_panel() {
+        use tower::ServiceExt;
+
+        let url = spawn_fixed_chat_server("minimal-ok", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "modules": {
+                "stats": false, "logging": false, "plugins": false, "pool": false,
+                "panel": false, "access": false, "aiConfig": false, "update": false
+            },
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": url, "apiKey": "k"}}
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-minimal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+
+        // 管理面整体缺席：每个模块组抽一个代表路由。
+        for path in [
+            "/api/info",
+            "/ui/",
+            "/api/usage/totals",
+            "/api/plugins",
+            "/api/pools",
+            "/api/access",
+            "/api/ai/manifest",
+            "/api/update/status",
+        ] {
+            let response = router(state.clone())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path} 应不挂载");
+        }
+
+        // 健康检查仍可用。
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 核心转发完整可用：请求打到假上游并返回其内容。
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("读取转发响应");
+        let payload: Value = serde_json::from_slice(&bytes).expect("响应必须是 JSON");
+        assert_eq!(payload["choices"][0]["message"]["content"], "minimal-ok");
+
+        // stats 关闭：不落用量记录，今日计数器保持零。
+        assert_eq!(
+            state
+                .db
+                .list_usage(&Filters::default(), 10, 0, "ts", "desc")
+                .len(),
+            0
+        );
+        assert_eq!(state.today.snapshot()["requests"], 0);
+    }
+
+    /// 默认（全模块开启）：面板路由挂载，一次 chat 后用量落库且今日计数器 +1。
+    #[tokio::test]
+    async fn default_modules_record_usage_and_today_counters() {
+        use tower::ServiceExt;
+
+        let url = spawn_fixed_chat_server("counted", 1);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": url, "apiKey": "k"}}
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-counted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 用量走后台聚批（50ms 窗口），给一次落库机会。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            state
+                .db
+                .list_usage(&Filters::default(), 10, 0, "ts", "desc")
+                .len(),
+            1,
+            "默认形态必须落一条用量记录"
+        );
+        let today = state.today.snapshot();
+        assert_eq!(today["requests"], 1, "今日计数器即时累加");
+        assert_eq!(today["ok"], 1);
+        assert_eq!(today["prompt_tokens"], 1);
+
+        // 默认形态下面板路由在位。
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// SSE 流假上游：chunked 逐块推送；首事件的多字节字符拆在两个 chunk 之间，
+    /// filler 事件不含 usage，末尾事件带 usage，最后 [DONE] 收尾。
+    fn spawn_sse_stream_server(filler_events: usize) -> String {
+        use std::io::{Read, Write};
+        fn chunk(sock: &mut std::net::TcpStream, data: &[u8]) -> std::io::Result<()> {
+            use std::io::Write;
+            write!(sock, "{:x}\r\n", data.len())?;
+            sock.write_all(data)?;
+            sock.write_all(b"\r\n")
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            );
+            // 多字节字符跨 chunk：旧实现逐 chunk from_utf8_lossy 会在这里插
+            // replacement char（不影响转发字节，但会破坏 usage 抓取窗口的解析）。
+            // 「中」= E4 B8 AD：前两个字节在上一块，第三字节在下一块开头。
+            let _ = chunk(&mut sock, b"data: {\"id\":\"split\",\"delta\":\"\xe4\xb8");
+            let _ = chunk(&mut sock, b"\xad\xe5\xad\x97\"}\n\n");
+            for i in 0..filler_events {
+                let event = format!("data: {{\"id\":\"e{i}\",\"delta\":\"中文增量内容{i}\"}}\n\n");
+                let _ = chunk(&mut sock, event.as_bytes());
+            }
+            let _ = chunk(
+                &mut sock,
+                b"data: {\"id\":\"final\",\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
+            );
+            let _ = chunk(&mut sock, b"data: [DONE]\n\n");
+            let _ = sock.write_all(b"0\r\n\r\n");
+        });
+        format!("http://{addr}")
+    }
+
+    /// 透传 SSE 热路径：中间事件不含 usage（预判跳过解析）也不丢末尾 usage，
+    /// 跨 chunk 的多字节字符不再破坏事件边界；转发字节逐块原样。
+    #[tokio::test]
+    async fn stream_response_captures_usage_from_chunked_transparent_stream() {
+        use tower::ServiceExt;
+
+        let url = spawn_sse_stream_server(200);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": url, "apiKey": "k"}}
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-sse-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("读取 SSE 流");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("中字\""), "跨 chunk 多字节字符应完整透传");
+        assert!(body.contains("中文增量内容0"), "中间事件应原样透传");
+        assert!(body.contains("\"usage\""), "末尾 usage 事件应透传");
+        assert!(body.contains("[DONE]"), "流应以 [DONE] 结尾");
+
+        // usage 抓取仍有效：等聚批窗口后落库。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let rows = state
+            .db
+            .list_usage(&Filters::default(), 10, 0, "ts", "desc");
+        assert_eq!(rows.len(), 1, "流结束后应记录一条用量");
+        assert_eq!(
+            rows[0].get("prompt_tokens").and_then(Value::as_i64),
+            Some(7),
+            "末尾事件的 usage 必须被抓到"
+        );
+        assert_eq!(state.today.snapshot()["prompt_tokens"], 7);
+    }
+
+    /// SSE 透传吞吐基准（人工触发，避免拖慢常规测试）：
+    /// `cargo test bench_sse_stream_throughput -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn bench_sse_stream_throughput() {
+        use tower::ServiceExt;
+
+        let url = spawn_sse_stream_server(5000);
+        let cfg = crate::config::Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": url, "apiKey": "k"}}
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-sse-bench-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+
+        let started = Instant::now();
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "m",
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        println!(
+            "SSE 5000 事件（{} KiB）透传耗时 {:?}",
+            bytes.len() / 1024,
+            started.elapsed()
+        );
+        assert!(!bytes.is_empty());
     }
 
     /// 假上游：返回带固定标记的 OpenAI 响应，用于断言请求实际落到了哪条上游。
@@ -4713,165 +4789,6 @@ fn insert_header(headers: &mut reqwest::header::HeaderMap, name: &str, value: &s
     ) {
         headers.insert(name, value);
     }
-}
-
-fn query_map(uri: &Uri) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    if let Some(query) = uri.query() {
-        for pair in query.split('&') {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = percent_encoding::percent_decode_str(k)
-                .decode_utf8_lossy()
-                .to_string();
-            let plus = v.replace('+', " ");
-            let value = percent_encoding::percent_decode_str(&plus)
-                .decode_utf8_lossy()
-                .to_string();
-            out.insert(key, value);
-        }
-    }
-    out
-}
-
-fn scoped_filters(uri: &Uri) -> Filters {
-    filters_from_query(uri.query().unwrap_or(""), chrono::Utc::now().timestamp())
-}
-
-async fn api_usage_totals(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
-    let f = scoped_filters(&uri);
-    // compare=1：与「上一等长区间」对比，前端据此展示 KPI 环比箭头。
-    // 口径与 Python 版一致（range=all 无可比区间时跳过）。
-    let prev_window = if query_map(&uri).get("compare").is_some() {
-        previous_window(uri.query().unwrap_or(""), chrono::Utc::now().timestamp())
-    } else {
-        None
-    };
-    // totals 在大区间上是全范围窗口扫描，放阻塞线程池，别占住 tokio worker。
-    let payload = crate::api_extra::run_blocking(move || {
-        let mut payload = json!({"totals": state.db.totals(&f)});
-        if let Some((prev_since, prev_until)) = prev_window {
-            let mut prev = f.clone();
-            prev.since_ts = Some(prev_since);
-            prev.until_ts = Some(prev_until);
-            payload["previous"] = state.db.totals(&prev);
-        }
-        payload
-    })
-    .await;
-    Json(payload).into_response()
-}
-
-async fn api_usage_summary(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
-    let params = query_map(&uri);
-    let group = params
-        .get("group_by")
-        .cloned()
-        .unwrap_or_else(|| "day".into());
-    let f = scoped_filters(&uri);
-    let group_for_query = group.clone();
-    let result =
-        crate::api_extra::run_blocking(move || state.db.summary(&f, &group_for_query)).await;
-    match result {
-        Ok(rows) => Json(json!({"group_by": group, "rows": rows})).into_response(),
-        Err(message) => (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response(),
-    }
-}
-
-async fn api_usage_list(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
-    let params = query_map(&uri);
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(100)
-        .clamp(1, 500);
-    let offset = params
-        .get("offset")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
-        .max(0);
-    let sort = params.get("sort").cloned().unwrap_or_else(|| "ts".into());
-    let order = params
-        .get("order")
-        .cloned()
-        .unwrap_or_else(|| "desc".into());
-    let mut f = scoped_filters(&uri);
-    f.only = params.get("only").filter(|v| !v.is_empty()).cloned();
-    let only = f.only.clone();
-    let (list_sort, list_order) = (sort.clone(), order.clone());
-    let (rows, total) = crate::api_extra::run_blocking(move || {
-        (
-            state
-                .db
-                .list_usage(&f, limit, offset, &list_sort, &list_order),
-            state.db.count_usage(&f),
-        )
-    })
-    .await;
-    Json(json!({
-        "rows": rows,
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "sort": sort,
-        "order": order,
-        "only": only.unwrap_or_default(),
-    }))
-    .into_response()
-}
-
-async fn api_usage_models(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
-    let params = query_map(&uri);
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(100)
-        .clamp(1, 500);
-    let f = scoped_filters(&uri);
-    let inner_state = Arc::clone(&state);
-    let rows = crate::api_extra::run_blocking(move || inner_state.db.model_usage(&f, limit)).await;
-    let pricing = state.cfg().pricing.clone();
-    // 附带该模型的单价信息：额度制条目让面板显示「额度制」而不是 ¥0
-    let rows: Vec<Value> = rows
-        .into_iter()
-        .map(|mut row| {
-            let model = row
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            if let Some(quote) = pricing.quote("", &model) {
-                row["pricing"] = quote;
-            }
-            row
-        })
-        .collect();
-    Json(json!({
-        "rows": rows,
-        "range": params.get("range").cloned().unwrap_or_else(|| "24h".into()),
-        "filters": {},
-        "currency": "CNY",
-        "pricing_configured": pricing.configured(),
-        "fx": { "USD": pricing.fx_usd },
-    }))
-    .into_response()
-}
-
-async fn api_usage_upstreams(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
-    let params = query_map(&uri);
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(200)
-        .clamp(1, 500);
-    let f = scoped_filters(&uri);
-    let rows = crate::api_extra::run_blocking(move || state.db.upstream_usage(&f, limit)).await;
-    Json(json!({
-        "rows": rows,
-        "models": [],
-        "range": params.get("range").cloned().unwrap_or_else(|| "24h".into()),
-        "filters": {},
-    }))
-    .into_response()
 }
 
 async fn not_found() -> Response {
