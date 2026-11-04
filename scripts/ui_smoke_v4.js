@@ -408,23 +408,29 @@ async function main() {
     await click('.drawer-tab[data-dtab="connection"]');
     await click('.drawer-tab[data-dtab="models"]');
     await click('.drawer-tab[data-dtab="advanced"]');
-    // 查询清单（成功路径，走 zen 上游：transport=opencode，本机可达）：
-    // 断言勾选网格渲染且已声明模型（big-pickle）默认勾上。
-    await evaluate(`document.querySelector('[data-open="zen"]').click()`);
-    await waitFor(() => evaluate(`!document.querySelector("#drawer").hidden`), 4000, "zen 抽屉");
-    await click('.drawer-tab[data-dtab="models"]');
-    await click("#fetch-upstream-models");
-    await waitFor(() => evaluate(`document.querySelectorAll("#fetched-model-grid input").length > 0`), 15000, "查询清单勾选网格");
-    const fetched = await evaluate(`({
-      count: document.querySelectorAll("#fetched-model-grid input").length,
-      bigPickleChecked: document.querySelector('#fetched-model-grid input[data-fetched-model="big-pickle"]')?.checked,
-      meta: (document.querySelector("#fetch-models-meta")?.textContent || "").trim(),
-    })`);
-    if (!fetched.bigPickleChecked) throw new Error(`已声明模型未默认勾选：${JSON.stringify(fetched)}`);
-    await screenshot("v4-04b-drawer-fetch-models");
+    // 查询清单成功路径（zen 上游，transport=opencode）：断言勾选网格渲染且
+    // 已声明模型（big-pickle）默认勾上。冒烟配置可能只有演示上游（CI），
+    // 没有 zen 卡片时跳过这段——该成功路径由带 zen 的本地冒烟覆盖。
+    const hasZen = await evaluate(`!!document.querySelector('[data-open="zen"]')`);
+    let fetchDetail = "无 zen 上游，跳过查询清单";
+    if (hasZen) {
+      await evaluate(`document.querySelector('[data-open="zen"]').click()`);
+      await waitFor(() => evaluate(`!document.querySelector("#drawer").hidden`), 4000, "zen 抽屉");
+      await click('.drawer-tab[data-dtab="models"]');
+      await click("#fetch-upstream-models");
+      await waitFor(() => evaluate(`document.querySelectorAll("#fetched-model-grid input").length > 0`), 15000, "查询清单勾选网格");
+      const fetched = await evaluate(`({
+        count: document.querySelectorAll("#fetched-model-grid input").length,
+        bigPickleChecked: document.querySelector('#fetched-model-grid input[data-fetched-model="big-pickle"]')?.checked,
+        meta: (document.querySelector("#fetch-models-meta")?.textContent || "").trim(),
+      })`);
+      if (!fetched.bigPickleChecked) throw new Error(`已声明模型未默认勾选：${JSON.stringify(fetched)}`);
+      await screenshot("v4-04b-drawer-fetch-models");
+      fetchDetail = `查询清单 ${fetched.count} 个 · big-pickle 默认勾选`;
+    }
     await evaluate(`document.querySelector("#drawer-close").click()`);
     await waitFor(() => evaluate(`document.querySelector("#drawer").hidden`), 3000, "关闭抽屉");
-    return `${data.cards} 张接入卡 / 页签 ${tabs.join("·")} / 查询清单 ${fetched.count} 个 · big-pickle 默认勾选`;
+    return `${data.cards} 张接入卡 / 页签 ${tabs.join("·")} / ${fetchDetail}`;
   });
 
   await check("用量筛选刷新后保留（localStorage）", async () => {
@@ -451,27 +457,26 @@ async function main() {
     return `刷新后 range=${value}`;
   });
 
-  await check("插件页：包管理与 ZCode 账号池面板", async () => {
+  await check("插件页：包管理列表与内置库", async () => {
     await navigate("plugins");
-    await waitFor(() => evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length >= 3`), 6000, "插件卡片");
+    // 内置免费插件就 kilo/zen 两条；CI 冷启动首帧可能慢，放宽到 10s。
+    await waitFor(() => evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length >= 2`), 10000, "插件卡片");
     const data = await evaluate(`({
       plugins: document.querySelectorAll("#plugin-list .plugin-card").length,
       libraryHidden: document.getElementById("plugin-library-wrap")?.hidden,
       library: document.querySelectorAll("#plugin-library .plugin-card").length,
+      zcodeEntry: !!document.querySelector("[data-open-zcode]") || !!document.querySelector("#zcode-panel"),
     })`);
-    await evaluate(`document.querySelector("[data-open-zcode]").click()`);
-    await waitFor(() => evaluate(`!document.querySelector("#zcode-panel").hidden`), 4000, "ZCode 面板");
-    await waitFor(() => evaluate(`document.querySelectorAll("#zcode-status .stat").length >= 4`), 6000, "ZCode 状态");
-    const zcode = await evaluate(`document.querySelectorAll("#zcode-status .stat").length`);
+    // 回归守卫：ZCode 账号池已在 4.5.0 整体移除，入口与专属面板不得复活。
+    if (data.zcodeEntry) throw new Error("ZCode 账号池入口/面板不应存在");
     await screenshot("v4-06-plugins");
-    await evaluate(`document.querySelector("#zcode-panel-close").click()`);
-    return `插件 ${data.plugins} / 内置库 ${data.libraryHidden ? "隐藏" : data.library} / ZCode ${zcode}`;
+    return `插件 ${data.plugins} / 内置库 ${data.libraryHidden ? "隐藏" : data.library}`;
   });
 
   await check("插件页：免费插件「模型 · 检测」入口与弹窗", async () => {
     await navigate("plugins");
-    await waitFor(() => evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length >= 3`), 6000, "插件卡片");
-    // kilo/zen 卡片必须带「模型 · 检测」；zcode 账号池插件沿用专属面板，不提供免费模型目录。
+    await waitFor(() => evaluate(`document.querySelectorAll("#plugin-list .plugin-card").length >= 2`), 10000, "插件卡片");
+    // kilo/zen 卡片必须带「模型 · 检测」；ZCode 账号池已移除，不应再有免费模型目录入口。
     const buttons = await evaluate(`({
       kilo: !!document.querySelector('[data-plugin-models="modelgate.free.kilo"]'),
       zen: !!document.querySelector('[data-plugin-models="modelgate.free.opencode"]'),
