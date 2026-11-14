@@ -64,9 +64,13 @@ v4 不新建第二份配置，也不替换代理内核。所有接入（官方�
 
 - 官方快速添加：模板已提供协议/地址/鉴权/隐私默认值，用户只补 Key。
 - 自定义添加：最少 5 项（标识、厂商、地址、协议、Key）。
-- 写密钥时删除 `apiKeyEnv/file/agent`，避免 env 优先级压过密钥库。
+- 写密钥按**互斥四选一**（`keyTarget`/`target`：store / env / file，缺省 store）写入所选来源，
+  并只保留所选来源的引用（`apply_credential_ref`）：写入 store 时移除 env/file 引用（env 优先级
+  高于 store，保留会让新密钥不生效）；写入 env 时引用 `apiKeyEnv` 并移除 store/file——
+  env/file 来源不再被「保存 key」静默覆盖。
 - 配置写失败会删除刚写入的密钥（新增场景），不留半状态。
-- 删除接入默认保留密钥；密钥清理需显式操作。
+- 删除接入默认保留密钥；路由组 / 统一分组里对该上游的引用会被自动清理
+  （响应 `cleanedRefs` 列出），避免 `group_member_unresolved` 阻断保存。
 
 ## 5. 凭据池
 

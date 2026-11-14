@@ -15,12 +15,29 @@
 > 推荐用 `apiKeyEnv` 引用环境变量，或直接点面板「加密保存到本机」：
 > 密钥经 Windows DPAPI 加密后写入配置文件同目录的 `*.secrets.json`，`bridge.config.json` 只保留
 > `apiKeyStore` 引用（`upstream:名称` / `model:上游:模型`），密文绑定当前 Windows 用户与机器，
-> 接口不回显密钥。也可以**写入用户环境变量**（`HKCU\Environment`，读取时进程环境优先）
+> 接口不回显密钥。也可以**写入用户环境变量**（Windows `HKCU\Environment`；Linux 写入
+> `~/.bashrc` 托管块并同步已存在的 `~/.zshrc`，读取时进程环境优先）
 > 或**写入你手动指定的文件**（JSON / `.env`，只写你填的那个路径，配置文件里仅存路径引用）。
-> **不再内置**任何厂商客户端凭据路径。`apiKeyFile` / `apiKeyAgentPath` 仅在你自己显式填写路径时读取。
+> 三个写入目标（加密库 / 环境变量 / 凭据文件）在接入详情与添加向导里都可选，来源**互斥**：
+> 保存后只保留所选来源的引用。**不再内置**任何厂商客户端凭据路径。`apiKeyFile` / `apiKeyAgentPath` 仅在你自己显式填写路径时读取。
 > 分享配置用 `bridge.config.example.json`（零明文）。`bridge.config.json`、`*.secrets.json` 已在 `.gitignore` 中，不会进版本库。
 > 注：v4.5.0 起 **ZCode 账号池插件已移除**（上游风控拦截非官方客户端，详见 docs/architecture/free-sources.md 历史）；
 > 旧配置里的 `upstreams.zcode` 会在加载时被忽略，数据库遗留表不再读写。
+
+## GPUI 原生面板（`panel-gpui`）
+
+`rust/panel-gpui` 是新的**原生桌面面板**（GPUI，Linux/Windows 可构建），
+与网关进程分离：面板只调用 `127.0.0.1:8900` 的 `/api`（配置 / 接入 / 密钥四选一 /
+路由分组 / 用量 / 日志），密钥永不经过面板、接口不回显。运行：
+
+```bash
+cargo run -p panel-gpui            # 需先运行网关（托盘/无头均可）
+MODEL_GATE_URL=http://127.0.0.1:8900 cargo run -p panel-gpui   # 自定义地址
+```
+
+五页：工作台（状态 / KPI / 上游健康 / 启动网关）、接入管理（模板向导 +
+详情抽屉 + 凭据四选一）、路由与分组（可见矩阵 / 路由组 `上游/模型` 成员编辑）、
+用量、日志。浏览器版 v4 控制台继续保留（见下节），两者共用同一 `/api`。
 
 ## v4 控制台（默认面板）
 
