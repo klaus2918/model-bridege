@@ -325,6 +325,12 @@
   }
 
   function navigate(view) {
+    // 路由草稿未保存时离开要确认：两个编辑器各自持有快照，
+    // 静默离开再保存另一份会把草稿覆盖掉。
+    if (state.view === "routes" && view !== "routes" && routesDraftDirty()) {
+      if (!confirm("路由配置有未保存的修改，离开将丢弃。确定离开？")) return;
+      setRoutesDraftDirty(false);
+    }
     state.view = view;
     const url = new URL(location.href);
     if (view === "usage") url.searchParams.delete("view");
@@ -654,9 +660,16 @@
 
   function drawerCredential(item) {
     const pool = item.pool;
+    const raw = rawAccessConfig(item);
     const poolOptions = state.pools
       .map((entry) => `<option value="${esc(entry.id)}"${item.auth.poolId === entry.id ? " selected" : ""}>${esc(entry.id)} · ${esc(entry.upstream)}</option>`)
       .join("");
+    // 写入目标四选一（本机加密库 / 环境变量 / 凭据文件；暂不配置=不点保存）：
+    // 缺省目标跟随当前来源，避免给 env 来源的接入默认覆盖成加密库。
+    const source = String(item.auth.source || "");
+    const defaultTarget = /env/.test(source) ? "env" : /file|agent/.test(source) ? "file" : "store";
+    const envName = typeof raw.apiKeyEnv === "string" ? raw.apiKeyEnv : "";
+    const filePath = typeof raw.apiKeyFile === "string" ? raw.apiKeyFile : "";
     return `<dl class="kv">
       <dt>模式</dt><dd>${esc(item.auth.mode)}</dd>
       <dt>来源</dt><dd>${esc(item.auth.source || "—")}</dd>
@@ -669,8 +682,21 @@
       <label class="field span-2"><span>API Key（只写，不回显）</span>
         <input class="input secret-input" id="secret-input" type="password" autocomplete="new-password" placeholder="粘贴密钥后保存">
       </label>
+      <label class="field span-2"><span>写入目标（互斥：保存后只保留所选来源）</span>
+        <select class="input" id="secret-target">
+          <option value="store"${defaultTarget === "store" ? " selected" : ""}>本机加密库（推荐）</option>
+          <option value="env"${defaultTarget === "env" ? " selected" : ""}>用户环境变量</option>
+          <option value="file"${defaultTarget === "file" ? " selected" : ""}>凭据文件</option>
+        </select>
+      </label>
+      <label class="field span-2" id="secret-env-row" hidden><span>环境变量名</span>
+        <input class="input" id="secret-env-name" placeholder="例如 OPENROUTER_API_KEY" value="${esc(envName)}">
+      </label>
+      <label class="field span-2" id="secret-file-row" hidden><span>凭据文件路径（绝对路径，.json / .env）</span>
+        <input class="input" id="secret-file-path" placeholder="/home/you/.secrets/key.json" value="${esc(filePath)}">
+      </label>
     </div>
-    <div class="modal-actions"><button class="btn primary sm" id="save-secret">保存到本机加密库</button></div>
+    <div class="modal-actions"><button class="btn primary sm" id="save-secret">保存密钥</button></div>
     <div class="section-title">绑定凭据池</div>
     <div class="form-grid">
       <label class="field span-2"><span>凭据池</span>
@@ -904,6 +930,18 @@
         }
       });
     }
+    const secretTarget = $("#secret-target");
+    if (secretTarget) {
+      const toggleSecretRows = () => {
+        const target = secretTarget.value;
+        const envRow = $("#secret-env-row");
+        const fileRow = $("#secret-file-row");
+        if (envRow) envRow.hidden = target !== "env";
+        if (fileRow) fileRow.hidden = target !== "file";
+      };
+      secretTarget.addEventListener("change", toggleSecretRows);
+      toggleSecretRows();
+    }
     const saveSecret = $("#save-secret");
     if (saveSecret) {
       saveSecret.addEventListener("click", async () => {
@@ -912,14 +950,31 @@
           toast("请先粘贴密钥", "error");
           return;
         }
+        const target = $("#secret-target") ? $("#secret-target").value : "store";
+        if (target === "env" && !$("#secret-env-name").value.trim()) {
+          toast("请填写环境变量名", "error");
+          return;
+        }
+        if (target === "file" && !$("#secret-file-path").value.trim()) {
+          toast("请填写凭据文件路径", "error");
+          return;
+        }
         saveSecret.disabled = true;
         try {
+          const payload = { apiKey: value, target };
+          if (target === "env") payload.envName = $("#secret-env-name").value.trim();
+          if (target === "file") payload.filePath = $("#secret-file-path").value.trim();
           await api(`/api/access/${encodeURIComponent(item.id)}/secret`, {
             method: "POST",
-            body: JSON.stringify({ apiKey: value }),
+            body: JSON.stringify(payload),
           });
           $("#secret-input").value = "";
-          toast("密钥已写入本机加密库", "ok");
+          const doneMessage = {
+            store: "密钥已写入本机加密库",
+            env: "密钥已写入用户环境变量（新终端自动继承）",
+            file: "密钥已写入凭据文件",
+          }[target] || "密钥已保存";
+          toast(doneMessage, "ok");
           await refreshAccess();
           renderDrawer();
           renderAccess();
@@ -1080,6 +1135,15 @@
     return [];
   }
 
+  // 路由草稿脏标记（模块级）：navigate 守卫与保存后复位都依赖它。
+  let routesDraft = false;
+  function setRoutesDraftDirty(dirty) {
+    routesDraft = dirty;
+  }
+  function routesDraftDirty() {
+    return routesDraft;
+  }
+
   function routeModelCount(name) {
     const item = state.access.find((row) => row.id === name);
     return Number(item?.models?.declared || 0);
@@ -1098,11 +1162,36 @@
   }
 
   async function saveRouteDraft(patch, message) {
-    const config = cleanRouteConfig({ ...(state.config || {}) });
-    if (patch.unified) config.unified = { ...(config.unified || {}), ...patch.unified };
-    if (patch.groups) config.groups = patch.groups;
+    // 保存流程：先拉最新配置 → 合并本次改动 → 服务端校验 → 通过才落盘。
+    // 不用页面停留期间的 state.config 快照整包覆盖：期间经由其它入口
+    // （接入页、另一个标签页、手改文件）发生的修改不能被悄悄回滚。
     try {
+      const fresh = await api("/api/config");
+      const base = fresh && fresh.config && typeof fresh.config === "object" ? fresh.config : {};
+      const config = cleanRouteConfig({ ...base });
+      if (patch.unified) config.unified = { ...(config.unified || {}), ...patch.unified };
+      if (patch.groups) config.groups = patch.groups;
+      const validate = await api("/api/config/validate", {
+        method: "POST",
+        body: JSON.stringify({ config }),
+      });
+      const errors = (validate && Array.isArray(validate.diagnostics) ? validate.diagnostics : [])
+        .filter((issue) => issue.level === "error");
+      if (errors.length) {
+        openModal(
+          "路由配置校验未通过",
+          `发现 ${errors.length} 个错误，未保存；按提示修正后再保存。`,
+          `<div class="list compact">${errors
+            .map(
+              (issue) => `<div class="row"><span class="pill danger">error</span><div class="grow"><div class="name">${esc(issue.path || issue.code || "")}</div><div class="meta">${esc(issue.message || "")}</div><div class="meta">${esc(issue.hint || "")}</div></div></div>`
+            )
+            .join("")}</div><div class="modal-actions"><button class="btn primary" id="route-validate-close">返回修改</button></div>`
+        );
+        $("#route-validate-close").addEventListener("click", closeModal);
+        return;
+      }
       await api("/api/config", { method: "POST", body: JSON.stringify({ config, backup: true }) });
+      setRoutesDraftDirty(false);
       await refreshConfig();
       renderRoutes();
       toast(message || "路由配置已保存", "ok");
@@ -1139,6 +1228,7 @@
 
     const markDirty = () => {
       dirty = true;
+      setRoutesDraftDirty(true);
       const pill = $("#route-dirty");
       if (pill) pill.hidden = false;
       const save = $("#route-save");
@@ -1174,39 +1264,7 @@
     const groupHost = $("#route-group-cards");
     if (groupHost) {
       groupHost.innerHTML = routeGroups.length
-        ? routeGroups
-            .map(
-              (group) => `<article class="route-group-card" data-group="${esc(group.id)}">
-                <div class="route-group-head">
-                  <div><div class="route-group-name">group/${esc(group.id)}</div><div class="hint">${group.members.length} 个成员 · 按顺序尝试</div></div>
-                  <span class="pill">${esc(group.id)}</span>
-                </div>
-                <ol class="route-members" data-group-members="${esc(group.id)}">
-                  ${group.members.length
-                    ? group.members
-                        .map(
-                          (member, index) => `<li draggable="true" data-member="${esc(member)}" data-index="${index}">
-                            <span class="drag">⋮⋮</span>
-                            <span class="grow"><b>${esc(member)}</b><small>${index + 1} · ${routeModelCount(member)} 个模型</small></span>
-                            <button class="icon-btn" data-member-up="${esc(member)}" title="上移" ${index === 0 ? "disabled" : ""}>↑</button>
-                            <button class="icon-btn" data-member-down="${esc(member)}" title="下移" ${index === group.members.length - 1 ? "disabled" : ""}>↓</button>
-                            <button class="icon-btn danger" data-member-remove="${esc(member)}" title="移除">×</button>
-                          </li>`
-                        )
-                        .join("")
-                    : `<li class="empty-line">还没有成员。从下方选择上游加入。</li>`}
-                </ol>
-                <div class="route-group-foot">
-                  <select class="input select" data-group-add-select="${esc(group.id)}">
-                    <option value="">添加上游…</option>
-                    ${names.filter((name) => !group.members.includes(name)).map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("")}
-                  </select>
-                  <button class="btn ghost sm" data-group-add="${esc(group.id)}">加入成员</button>
-                  <button class="btn danger sm" data-group-delete="${esc(group.id)}">删除组</button>
-                </div>
-              </article>`
-            )
-            .join("")
+        ? routeGroups.map((group) => routeGroupCardHtml(group)).join("")
         : `<div class="empty-line">还没有路由组。到「设置 → 路由组」新增，或从下方新建。</div>`;
       groupHost.insertAdjacentHTML(
         "beforeend",
@@ -1309,15 +1367,34 @@
     });
 
     $$("#route-group-cards [data-group-add]").forEach((button) => {
-      button.addEventListener("click", () => {
+      const addMember = () => {
         const groupId = button.dataset.groupAdd;
         const select = document.querySelector(`[data-group-add-select="${groupId}"]`);
-        const name = select?.value;
-        if (!name) return;
+        const freeInput = document.querySelector(`[data-group-add-input="${groupId}"]`);
+        // 下拉里选了 上游/模型 就用下拉；否则用自由输入（模型名 / 别名）。
+        const name = (select?.value || freeInput?.value || "").trim();
+        if (!name) {
+          toast("先选择 上游/模型，或输入模型名 / 别名", "error");
+          return;
+        }
         mutate(groupId, (members) => {
           if (!members.includes(name)) members.push(name);
+          else toast(`成员「${name}」已在组里`, "error");
         });
-      });
+        if (select) select.value = "";
+        if (freeInput) freeInput.value = "";
+      };
+      button.addEventListener("click", addMember);
+      const groupId = button.dataset.groupAdd;
+      const freeInput = document.querySelector(`[data-group-add-input="${groupId}"]`);
+      if (freeInput) {
+        freeInput.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            addMember();
+          }
+        });
+      }
     });
 
     $$("#route-group-cards [data-group-delete]").forEach((button) => {
@@ -1354,39 +1431,81 @@
     if (!host) return;
     // 重新渲染成员列表与选择器，但保留已输入的新组名。
     const draftName = $("#route-group-new")?.value || "";
-    const names = upstreamNameList();
     host.innerHTML = routeGroups.length
-      ? routeGroups
-          .map(
-            (group) => `<article class="route-group-card" data-group="${esc(group.id)}">
-              <div class="route-group-head"><div><div class="route-group-name">group/${esc(group.id)}</div><div class="hint">${group.members.length} 个成员 · 按顺序尝试</div></div><span class="pill">${esc(group.id)}</span></div>
-              <ol class="route-members" data-group-members="${esc(group.id)}">
-                ${group.members.length
-                  ? group.members
-                      .map(
-                        (member, index) => `<li draggable="true" data-member="${esc(member)}" data-index="${index}">
-                          <span class="drag">⋮⋮</span>
-                          <span class="grow"><b>${esc(member)}</b><small>${index + 1} · ${routeModelCount(member)} 个模型</small></span>
-                          <button class="icon-btn" data-member-up="${esc(member)}" ${index === 0 ? "disabled" : ""}>↑</button>
-                          <button class="icon-btn" data-member-down="${esc(member)}" ${index === group.members.length - 1 ? "disabled" : ""}>↓</button>
-                          <button class="icon-btn danger" data-member-remove="${esc(member)}">×</button>
-                        </li>`
-                      )
-                      .join("")
-                  : `<li class="empty-line">还没有成员。从下方选择上游加入。</li>`}
-              </ol>
-              <div class="route-group-foot">
-                <select class="input select" data-group-add-select="${esc(group.id)}"><option value="">添加上游…</option>${names.filter((name) => !group.members.includes(name)).map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("")}</select>
-                <button class="btn ghost sm" data-group-add="${esc(group.id)}">加入成员</button>
-                <button class="btn danger sm" data-group-delete="${esc(group.id)}">删除组</button>
-              </div>
-            </article>`
-          )
-          .join("")
+      ? routeGroups.map((group) => routeGroupCardHtml(group)).join("")
       : `<div class="empty-line">还没有路由组。到「设置 → 路由组」新增，或从下方新建。</div>`;
     host.insertAdjacentHTML("beforeend", `<div class="route-group-add"><input class="input" id="route-group-new" placeholder="新组标识，例如 fast" value="${esc(draftName)}"><button class="btn ghost sm" id="route-group-create">+ 新建路由组</button></div>`);
     bindRouteGroupActions(routeGroups, markDirty);
     markDirty();
+  }
+
+  // 路由组成员的合法写法（后端设计）：`上游/模型`、已声明模型名、别名。
+  // 裸上游名不是合法成员 —— 这里只给 `上游/模型` 候选，自由输入留给模型名/别名。
+  function upstreamModelOptions() {
+    const ups = (state.config && state.config.upstreams) || {};
+    return Object.entries(ups)
+      .filter(([, row]) => row && typeof row === "object")
+      .map(([name, row]) => {
+        const models = Array.isArray(row.models) ? row.models.filter(Boolean).map(String) : [];
+        const mapped = row.modelMap && typeof row.modelMap === "object" ? Object.keys(row.modelMap) : [];
+        const seen = new Set();
+        const items = [];
+        for (const item of [...models, ...mapped]) {
+          const key = item.trim();
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          items.push(`${name}/${key}`);
+        }
+        return { name, items };
+      })
+      .filter((up) => up.items.length);
+  }
+
+  function routeGroupCardHtml(group) {
+    const memberRow = (member, index) => {
+      const slash = member.indexOf("/");
+      const upstream = slash > 0 ? member.slice(0, slash) : "";
+      const hint = upstream
+        ? upstreamNameList().includes(upstream)
+          ? `上游 ${esc(upstream)} · ${esc(member.slice(slash + 1))}`
+          : `<span class="danger">上游未声明</span>`
+        : `模型名 / 别名 · 未锁定上游`;
+      return `<li draggable="true" data-member="${esc(member)}" data-index="${index}">
+        <span class="drag">⋮⋮</span>
+        <span class="grow"><b>${esc(member)}</b><small>${index + 1} · ${hint}</small></span>
+        <button class="icon-btn" data-member-up="${esc(member)}" title="上移" ${index === 0 ? "disabled" : ""}>↑</button>
+        <button class="icon-btn" data-member-down="${esc(member)}" title="下移" ${index === group.members.length - 1 ? "disabled" : ""}>↓</button>
+        <button class="icon-btn danger" data-member-remove="${esc(member)}" title="移除">×</button>
+      </li>`;
+    };
+    const options = upstreamModelOptions()
+      .map((up) => {
+        const available = up.items.filter((item) => !group.members.includes(item));
+        return available.length
+          ? `<optgroup label="${esc(up.name)}">${available.map((item) => `<option value="${esc(item)}">${esc(item)}</option>`).join("")}</optgroup>`
+          : "";
+      })
+      .join("");
+    return `<article class="route-group-card" data-group="${esc(group.id)}">
+      <div class="route-group-head">
+        <div><div class="route-group-name">group/${esc(group.id)}</div><div class="hint">${group.members.length} 个成员 · 按顺序尝试</div></div>
+        <span class="pill">${esc(group.id)}</span>
+      </div>
+      <ol class="route-members" data-group-members="${esc(group.id)}">
+        ${group.members.length
+          ? group.members.map((member, index) => memberRow(member, index)).join("")
+          : `<li class="empty-line">还没有成员。选择 上游/模型，或输入模型名 / 别名。</li>`}
+      </ol>
+      <div class="route-group-foot">
+        <select class="input select" data-group-add-select="${esc(group.id)}">
+          <option value="">添加 上游/模型…</option>
+          ${options}
+        </select>
+        <button class="btn ghost sm" data-group-add="${esc(group.id)}">加入成员</button>
+        <input class="input" data-group-add-input="${esc(group.id)}" placeholder="或输入 模型名 / 别名，回车加入">
+        <button class="btn danger sm" data-group-delete="${esc(group.id)}">删除组</button>
+      </div>
+    </article>`;
   }
 
   function renderRoutePreview(query) {
@@ -1837,6 +1956,61 @@
     renderAddModal();
   }
 
+  // 密钥写入目标四选一（与设计文档一致）：本机加密库（推荐）/ 环境变量 /
+  // 凭据文件 / 暂不配置（不点保存即暂不配置）。互斥：保存后只保留所选来源。
+  function suggestedEnvName(name) {
+    const suffix = String(name || "").toUpperCase().replace(/[^A-Z0-9]/g, "_");
+    return suffix ? `${suffix}_API_KEY` : "";
+  }
+
+  function secretTargetFields(prefix, suggestedName) {
+    return `
+      <label class="field span-2"><span>密钥写入目标（互斥：只保留所选来源）</span>
+        <select class="input" id="${prefix}-key-target">
+          <option value="store" selected>本机加密库（推荐）</option>
+          <option value="env">用户环境变量</option>
+          <option value="file">凭据文件</option>
+        </select>
+      </label>
+      <label class="field span-2" id="${prefix}-env-row" hidden><span>环境变量名</span>
+        <input class="input" id="${prefix}-env-name" value="${esc(suggestedEnvName(suggestedName))}" placeholder="例如 OPENROUTER_API_KEY">
+      </label>
+      <label class="field span-2" id="${prefix}-file-row" hidden><span>凭据文件路径（绝对路径，.json / .env）</span>
+        <input class="input" id="${prefix}-file-path" placeholder="/home/you/.secrets/key.json">
+      </label>`;
+  }
+
+  function bindSecretTargetFields(prefix) {
+    const select = $(`#${prefix}-key-target`);
+    if (!select) return;
+    const toggle = () => {
+      const envRow = $(`#${prefix}-env-row`);
+      const fileRow = $(`#${prefix}-file-row`);
+      if (envRow) envRow.hidden = select.value !== "env";
+      if (fileRow) fileRow.hidden = select.value !== "file";
+    };
+    select.addEventListener("change", toggle);
+    toggle();
+  }
+
+  function collectKeyTarget(prefix) {
+    const select = $(`#${prefix}-key-target`);
+    if (!select) return { keyTarget: "store" };
+    const target = select.value;
+    if (target === "env" && !$(`#${prefix}-env-name`).value.trim()) {
+      toast("请填写环境变量名", "error");
+      return null;
+    }
+    if (target === "file" && !$(`#${prefix}-file-path`).value.trim()) {
+      toast("请填写凭据文件路径", "error");
+      return null;
+    }
+    const payload = { keyTarget: target };
+    if (target === "env") payload.envName = $(`#${prefix}-env-name`).value.trim();
+    if (target === "file") payload.filePath = $(`#${prefix}-file-path`).value.trim();
+    return payload;
+  }
+
   function closeModal() {
     $("#modal").hidden = true;
     $("#scrim").hidden = true;
@@ -1919,8 +2093,9 @@
         <label class="field"><span>上游标识</span><input class="input" id="quick-name" value="${esc(template.id)}"></label>
         <label class="field"><span>模板</span><input class="input" value="${esc(template.id)}" disabled></label>
         <label class="field span-2"><span>API Key ${template.requiredFields.includes("apiKey") ? "（必填）" : "（可留空）"}</span>
-          <input class="input secret-input" id="quick-key" type="password" autocomplete="new-password" placeholder="粘贴后只写入本机加密库">
+          <input class="input secret-input" id="quick-key" type="password" autocomplete="new-password" placeholder="粘贴后按所选目标写入（不回显）">
         </label>
+        ${secretTargetFields("quick", template.id)}
         <label class="check span-2"><input type="checkbox" id="quick-zdr" ${template.privacy.zdrDefault ? "checked" : ""}>
           请求零数据保留（ZDR） · 该厂商：${esc(SUPPORT_LABEL[support] || support)}</label>
         <div class="inline-note span-2">${
@@ -1953,6 +2128,7 @@
           </select>
         </label>
         <label class="field"><span>API Key（必填）</span><input class="input secret-input" id="custom-key" type="password" autocomplete="new-password"></label>
+        ${secretTargetFields("custom", "")}
         <label class="check span-2"><input type="checkbox" id="custom-zdr" checked> 请求零数据保留（ZDR）</label>
         <div class="inline-note span-2">保存前会校验地址与重名；模型目录拉取失败不阻断保存，之后可重试。</div>
       </div>
@@ -2000,6 +2176,21 @@
     if (submit) submit.addEventListener("click", submitQuickAdd);
     const customSubmit = $("#custom-submit");
     if (customSubmit) customSubmit.addEventListener("click", submitCustomAdd);
+    bindSecretTargetFields("quick");
+    bindSecretTargetFields("custom");
+    // 自定义接入：随上游标识联想环境变量名（用户改过就不再覆盖）。
+    const customName = $("#custom-name");
+    const customEnvName = $("#custom-env-name");
+    if (customName && customEnvName) {
+      customName.addEventListener("input", () => {
+        if (!customEnvName.dataset.touched) {
+          customEnvName.value = suggestedEnvName(customName.value);
+        }
+      });
+      customEnvName.addEventListener("input", () => {
+        customEnvName.dataset.touched = "1";
+      });
+    }
     $$("[data-add-mode]").forEach((button) => {
       button.addEventListener("click", () => {
         state.addMode = button.dataset.addMode;
@@ -2025,6 +2216,8 @@
       toast("请填写 API Key", "error");
       return;
     }
+    const keyTarget = collectKeyTarget("quick");
+    if (!keyTarget) return;
     const button = $("#quick-submit");
     button.disabled = true;
     try {
@@ -2034,6 +2227,7 @@
           templateId: template.id,
           name,
           apiKey,
+          ...keyTarget,
           privacy: { zdr: $("#quick-zdr").checked },
         }),
       });
@@ -2061,6 +2255,8 @@
       toast("请填写标识、请求地址与 API Key", "error");
       return;
     }
+    const keyTarget = collectKeyTarget("custom");
+    if (!keyTarget) return;
     const button = $("#custom-submit");
     button.disabled = true;
     try {
@@ -2072,6 +2268,7 @@
           baseUrl,
           protocol: $("#custom-protocol").value,
           apiKey,
+          ...keyTarget,
           privacy: { zdr: $("#custom-zdr").checked },
         }),
       });
@@ -2454,13 +2651,14 @@
     $("#drawer-delete").addEventListener("click", async () => {
       if (!state.drawerId) return;
       const name = state.drawerId;
-      if (!confirm(`删除接入「${name}」？默认保留密钥；输入名称无法撤销。`)) return;
+      if (!confirm(`删除接入「${name}」？默认保留密钥；路由组 / 统一分组里对它的引用会一并清理。`)) return;
       try {
-        await api(`/api/access/${encodeURIComponent(name)}`, { method: "DELETE" });
+        const data = await api(`/api/access/${encodeURIComponent(name)}`, { method: "DELETE" });
         closeDrawer();
         await refreshAccess();
         renderAccess();
-        toast("接入已删除", "ok");
+        const refs = Array.isArray(data?.cleanedRefs) ? data.cleanedRefs : [];
+        toast(refs.length ? `接入已删除；同时清理了 ${refs.length} 处分组引用：${refs.join("、")}` : "接入已删除", "ok");
       } catch (error) {
         toast(error.message, "error");
       }

@@ -7,8 +7,6 @@
   let unifiedGroups = [];
   let routeGroups = [];
   let bound = false;
-  let snapshot = "";
-  let overwrite = false;
 
   const asArray = (value) => (Array.isArray(value) ? value : []);
   const lines = (value) => (Array.isArray(value) ? value.join("\n") : String(value || ""));
@@ -57,14 +55,6 @@
       );
     }
     return value;
-  }
-
-  function fingerprint(value) {
-    try {
-      return JSON.stringify(cleanConfig(value || {}));
-    } catch {
-      return "";
-    }
   }
 
   function upstreamNames() {
@@ -155,10 +145,6 @@
 
   function render() {
     const cfg = config();
-    snapshot = fingerprint(cfg);
-    overwrite = false;
-    const revision = $("#settings-revision");
-    if (revision) revision.hidden = true;
     setValue("#set-host", cfg.host || "127.0.0.1");
     setValue("#set-port", cfg.port || 8900);
     setValue("#set-default-model", cfg.defaultModel || "");
@@ -263,13 +249,27 @@
   }
 
   async function save() {
-    const cfg = cleanConfig(config());
     readGroups();
     const port = Number($("#set-port").value);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       toast("端口必须是 1–65535 的整数", "error");
       return;
     }
+    // 基线取**刚拉取的最新配置**而不是页面快照：接入页 / 路由视图 / 手改文件
+    // 在快照之后落盘的修改不能被这里悄悄回滚（分组的双编辑器曾互相覆盖）。
+    let fresh;
+    try {
+      const live = await api("/api/config");
+      fresh = live && live.config && typeof live.config === "object" ? live.config : null;
+    } catch (error) {
+      toast(error.message, "error");
+      return;
+    }
+    if (!fresh) {
+      toast("无法读取最新配置，未保存", "error");
+      return;
+    }
+    const cfg = cleanConfig(fresh);
     const next = cleanConfig({
       ...cfg,
       host: $("#set-host").value.trim() || "127.0.0.1",
@@ -301,26 +301,9 @@
       if (!(await validateCurrent(next, false))) {
         return;
       }
-      if (!overwrite) {
-        const live = await api("/api/config");
-        const liveCfg = live.config && typeof live.config === "object" ? live.config : live;
-        if (snapshot && fingerprint(liveCfg) !== snapshot) {
-          const notice = $("#settings-revision");
-          if (notice) {
-            notice.hidden = false;
-            notice.scrollIntoView({ block: "nearest", behavior: "smooth" });
-          }
-          toast("配置已在其他窗口或磁盘上被修改，请先重载或确认覆盖", "error");
-          return;
-        }
-      }
       const backup = $("#settings-backup") ? $("#settings-backup").checked : true;
       await api("/api/config", { method: "POST", body: JSON.stringify({ config: next, backup }) });
       state.config = next;
-      overwrite = false;
-      snapshot = fingerprint(next);
-      const revision = $("#settings-revision");
-      if (revision) revision.hidden = true;
       await api("/api/ai/settings", {
         method: "PUT",
         body: JSON.stringify({
@@ -905,10 +888,6 @@
     bound = true;
     $("#settings-reload").addEventListener("click", reloadConfig);
     $("#settings-restore").addEventListener("click", restoreBackup);
-    $("#settings-overwrite")?.addEventListener("click", () => {
-      overwrite = true;
-      save().catch((error) => toast(error.message, "error"));
-    });
     $("#settings-json").addEventListener("click", showRawConfig);
     $("#settings-diagnostics").addEventListener("click", exportDiagnostics);
     $("#settings-update").addEventListener("click", update);
