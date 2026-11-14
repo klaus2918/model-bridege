@@ -98,18 +98,20 @@ pub fn open(sealed: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(not(windows))]
 pub fn seal(_plain: &[u8]) -> Result<Vec<u8>, String> {
-    Err("凭据加密当前仅支持 Windows DPAPI".to_string())
+    Err("本机加密库当前仅支持 Windows DPAPI；Linux 请使用「写入用户环境变量」或「写入凭据文件」来源".to_string())
 }
 
 #[cfg(not(windows))]
 pub fn open(_sealed: &[u8]) -> Result<Vec<u8>, String> {
-    Err("凭据解密当前仅支持 Windows DPAPI".to_string())
+    Err("本机加密库当前仅支持 Windows DPAPI；Linux 请使用「写入用户环境变量」或「写入凭据文件」来源".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn seal_open_roundtrip() {
         let plain = b"credential-for-test";

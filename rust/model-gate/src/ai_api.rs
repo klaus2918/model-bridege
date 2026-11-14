@@ -509,6 +509,7 @@ fn build_plan(action: &str, input: &Value, state: &AppState) -> Result<PlanRecor
                 &name,
                 &protocol,
                 &base_url,
+                // AI 草案不含密钥：密钥由人工按四选一写入，这里不带凭据引用。
                 None,
                 input,
                 if action == "create_custom_upstream" {

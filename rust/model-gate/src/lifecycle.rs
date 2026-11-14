@@ -608,6 +608,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn watch_script_reports_relaunch_result_and_cleans_marker() {
         // 安装失败时应用已经退出，用户看不到任何界面；日志是唯一线索。
@@ -726,6 +728,8 @@ mod tests {
         );
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn relaunch_script_waits_exit_then_relaunches_with_args() {
         let script = build_relaunch_script(&sample_relaunch_plan());

@@ -2187,7 +2187,11 @@ fn write_secret_to_user_env(
         "envName": env_name,
         "scope": "user",
         "keySource": "user-env",
-        "note": "已写入 Windows 用户环境变量（HKCU\\Environment）；新进程自动继承",
+        "note": if cfg!(windows) {
+            "已写入 Windows 用户环境变量（HKCU\\Environment）；新进程自动继承".to_string()
+        } else {
+            "已写入用户 shell 配置（~/.bashrc 托管块，~/.zshrc 若存在则同步）；新开终端自动继承".to_string()
+        },
     }))
     .into_response()
 }

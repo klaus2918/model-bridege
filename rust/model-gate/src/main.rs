@@ -844,6 +844,8 @@ mod tests {
         std::env::temp_dir().join(format!("modelgate-test-{tag}-{}", std::process::id()))
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn default_db_path_follows_config_directory() {
         // 升级衔接：库必须与配置同目录，不随 CWD 漂移。

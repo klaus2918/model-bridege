@@ -4,7 +4,9 @@
 //! 本进程只保留托盘、剪贴板、Shell 打开等轻量交互。
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(windows)]
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+#[cfg(windows)]
 use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 #[cfg(windows)]

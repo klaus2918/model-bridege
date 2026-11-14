@@ -1400,6 +1400,11 @@ impl Config {
             }
         }
         for group in &self.groups {
+            // 与请求期行为一致：所有成员都解析不了（或全落在停用上游上）的组
+            // 请求必然 503，不该出现在 /v1/models 里误导客户端。
+            if self.group_targets(group).is_empty() {
+                continue;
+            }
             let id = format!("group/{}", group.id);
             if !out.contains(&id) {
                 out.push(id);
@@ -2076,8 +2081,11 @@ impl Config {
                                     "写成 上游/模型、已声明的模型名或已有别名",
                                 ),
                                 Some((upstream, model)) => {
+                                    // model_map 的键是裸模型名：`上游/别名` 成员解析出的
+                                    // model 已经是裸名，按解析结果检查，不要拿完整成员串
+                                    // 去查（会让合法的 `上游/别名` 成员误报警告）。
                                     let declared = upstream.models.iter().any(|m| m == &model)
-                                        || upstream.model_map.contains_key(member)
+                                        || upstream.model_map.contains_key(&model)
                                         || self.aliases.contains_key(member);
                                     if !declared {
                                         push(
@@ -3037,8 +3045,36 @@ fn normalize_unified(value: Option<&Value>) -> Unified {
 ///
 /// 成员保持原始写法与顺序，请求期再解析；非法/空项在这里先剔除，
 /// 详细诊断由 [`Config::diagnostics`] 按原始 JSON 给出。
+///
+/// 兼容读取旧数组形式 `[{id|name, members}]`：运行时按转换结果工作，
+/// 诊断仍按对象形式报错，保存时落盘为对象（面板保存路径会自动转换）。
 fn normalize_route_groups(value: Option<&Value>) -> Vec<RouteGroup> {
-    let Some(obj) = value.and_then(Value::as_object) else {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    if let Some(rows) = value.as_array() {
+        return rows
+            .iter()
+            .filter_map(|row| {
+                let obj = row.as_object()?;
+                let id = obj
+                    .get("id")
+                    .or_else(|| obj.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if id.is_empty() {
+                    return None;
+                }
+                Some(RouteGroup {
+                    id,
+                    members: route_group_members(obj.get("members")),
+                })
+            })
+            .collect();
+    }
+    let Some(obj) = value.as_object() else {
         return Vec::new();
     };
     obj.iter()
@@ -3047,23 +3083,27 @@ fn normalize_route_groups(value: Option<&Value>) -> Vec<RouteGroup> {
             if id.is_empty() {
                 return None;
             }
-            let members = raw
-                .as_array()
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|member| !member.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
             Some(RouteGroup {
                 id: id.to_string(),
-                members,
+                members: route_group_members(Some(raw)),
             })
         })
         .collect()
+}
+
+/// 路由组成员数组解析：保留字符串成员，trim、去空。
+fn route_group_members(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|member| !member.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 字符串数组：trim、去空、去重保序。
@@ -5343,6 +5383,75 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|d| d.code == "reserved_group_prefix" && d.path == "upstreams.group"));
+    }
+
+    /// `上游/modelMap别名` 是合法成员：解析出的 model 是裸名，按裸名查
+    /// model_map；旧实现拿完整成员串去查，会产生误报警告。
+    #[test]
+    fn route_group_member_with_model_map_alias_is_not_flagged() {
+        let cfg = Config::from_value(json!({
+            "groups": {"daily": ["a/my-alias"]},
+            "upstreams": {
+                "a": {
+                    "protocol": "openai",
+                    "baseUrl": "http://a",
+                    "models": ["real"],
+                    "modelMap": {"my-alias": "real"}
+                }
+            }
+        }));
+        let diags = cfg.diagnostics();
+        let spurious: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == "group_member_model_not_declared")
+            .collect();
+        assert!(spurious.is_empty(), "不应误报: {spurious:?}");
+        // 请求期也能按 (a, my-alias) 解析（转发前再经 model_map 映射成 real）。
+        let targets = cfg.group_targets(&cfg.groups[0]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0.name, "a");
+        assert_eq!(targets[0].1, "my-alias");
+    }
+
+    /// 全员不可解析 / 全落在停用上游上的组不出现在 /v1/models：
+    /// 请求它必然 503，不该误导客户端。
+    #[test]
+    fn model_list_skips_groups_without_resolvable_members() {
+        let cfg = Config::from_value(json!({
+            "groups": {
+                "dead": ["ghost/none"],
+                "disabled": ["off/m"],
+                "live": ["a/m"]
+            },
+            "upstreams": {
+                "a": {"protocol": "openai", "baseUrl": "http://a", "models": ["m"]},
+                "off": {"protocol": "openai", "baseUrl": "http://off", "models": ["m"], "enabled": false}
+            }
+        }));
+        let list = cfg.model_list();
+        assert!(list.contains(&"group/live".to_string()));
+        assert!(!list.contains(&"group/dead".to_string()));
+        assert!(!list.contains(&"group/disabled".to_string()));
+    }
+
+    /// 旧数组形式 `[{id, members}]` 兼容读取：运行期按对象语义工作，
+    /// 诊断仍要求对象形式，保存路径落盘为对象。
+    #[test]
+    fn route_groups_accept_legacy_array_form_for_runtime() {
+        let cfg = Config::from_value(json!({
+            "upstreams": {"a": {"protocol": "openai", "baseUrl": "http://a", "models": ["m"]}},
+            "groups": [{"id": "daily", "members": ["a/m"]}, {"name": "alt", "members": ["a/m"]}]
+        }));
+        let ids: Vec<_> = cfg.groups.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(ids, vec!["daily", "alt"]);
+        let targets = cfg.group_targets(&cfg.groups[0]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0.name, "a");
+        // 诊断仍按对象形式报错，推动迁移到规范写法。
+        assert!(cfg
+            .diagnostics()
+            .iter()
+            .any(|d| d.level == "error" && d.code == "invalid_groups"));
     }
 }
 

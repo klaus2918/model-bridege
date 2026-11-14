@@ -182,3 +182,62 @@ fn walk_for_literal_keys(value: &serde_json::Value, path: &str, hits: &mut Vec<S
         _ => {}
     }
 }
+
+/// v4 面板必须重新提供三种写入目标（设计文档 §9.2 的四选一）：
+/// 保存 key 不能再把 env/file 来源静默覆盖成加密库。
+#[test]
+fn v4_panel_offers_env_and_file_write_targets() {
+    let text = v4_panel_js();
+    assert!(
+        text.contains("用户环境变量"),
+        "v4 凭据页必须提供「写入用户环境变量」目标"
+    );
+    assert!(
+        text.contains("凭据文件"),
+        "v4 凭据页必须提供「写入凭据文件」目标"
+    );
+}
+
+/// 接入级密钥接口必须支持 target 通道（store / env / file），
+/// 且写入走互斥引用注入，不再无条件删除 apiKeyEnv。
+#[test]
+fn access_secret_endpoint_supports_env_and_file_targets() {
+    let mut combined = String::new();
+    for path in rust_sources() {
+        combined.push_str(&fs::read_to_string(&path).unwrap_or_default());
+        combined.push('\n');
+    }
+    for marker in [
+        "parse_key_target",
+        "persist_credential",
+        "apply_credential_ref",
+        "KeyTarget::Env",
+        "KeyTarget::File",
+        "write_user_var",
+    ] {
+        assert!(
+            combined.contains(marker),
+            "接入级密钥通道缺少 {marker}：env/file 目标实现被移除了？"
+        );
+    }
+    // 互斥注入是唯一入口：access.rs 不允许再出现「先插 store 再逐个 remove」的
+    // 直写模式（那是 env 来源被覆盖的根因）。
+    let access = fs::read_to_string(crate_root().join("src/access.rs")).expect("access.rs 存在");
+    let write_secret = access
+        .split("pub async fn write_secret")
+        .nth(1)
+        .and_then(|rest| rest.split("pub async fn delete").next())
+        .unwrap_or("");
+    assert!(
+        write_secret.contains("parse_key_target"),
+        "write_secret 必须经 parse_key_target 解析写入目标"
+    );
+    assert!(
+        write_secret.contains("persist_credential") && write_secret.contains("apply_credential_ref"),
+        "write_secret 必须走统一凭据写入与互斥引用注入"
+    );
+    assert!(
+        !write_secret.contains("entry.remove(\"apiKeyEnv\")"),
+        "write_secret 不得直接删除 apiKeyEnv（互斥注入由 apply_credential_ref 负责）"
+    );
+}
