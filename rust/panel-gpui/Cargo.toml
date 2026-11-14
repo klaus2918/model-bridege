@@ -1,0 +1,18 @@
+[package]
+name = "panel-gpui"
+version = "0.1.0"
+edition = "2021"
+description = "Model-Gate 原生桌面面板（GPUI）"
+
+[[bin]]
+name = "panel-gpui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# GPUI Kit：应用侧唯一依赖。::* 即 GPUI 全量 API，
+# component::* 为 gpui-component 组件库，application()/open_window() 为入口。
+gpui-kit = "0.9.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = { version = "2", default-features = false, features = ["json", "rustls"] }
