@@ -7,7 +7,8 @@
 | 路径 | 职责 | 是否入库 |
 |---|---|---|
 | `rust/model-gate/` | 唯一产品源码：代理内核、协议适配、配置、SQLite、更新、托盘壳 | 是 |
-| `rust/model-gate/ui/` | 内嵌 v4 控制台资源（`v4.html` / `v4-base.css` / `v4.css` / `v4.js` / `v4-core/config/models/usage/prompts/resources.js`）——**面板资源只有这一份** | 是 |
+| `rust/model-gate/ui/` | 内嵌 v4 控制台资源（`v4.html` / `v4-base.css` / `v4.css` / `v4.js` / `v4-core/config/models/usage/prompts/resources.js`）——浏览器面板资源只有这一份 | 是 |
+| `rust/panel-gpui/` | GPUI 原生桌面面板（独立进程，REST 调网关 `/api`；五页：工作台 / 接入管理 / 路由与分组 / 用量 / 日志）——**不内嵌、不复制网关内核** | 是 |
 | `rust/model-gate/tests/` | 集成测试：契约守卫（`user_env_contracts.rs` / `key_file_contracts.rs`）与夹具（含 `legacy_config.json` 兼容样本） | 是 |
 | `rust/model-gate/provider_profiles.json` | Provider 预设注册表（编译期内嵌） | 是 |
 | `rust/model-gate/Cargo.toml` | 版本唯一源与依赖 | 是 |
@@ -24,8 +25,9 @@
 
 > **Python 旧实现已彻底移除**：`modelgate/`、根 `tests/`、`entry.py`、`ModelGate.spec`、
 > `build.bat`、`legacy/node-bridge/` 与 `scripts/` 下的 Python/Shell/MJS 脚本均已删除
-> （历史保留在 git 历史中）。仓库只剩 Rust 一条产品线，面板资源只有
-> `rust/model-gate/ui/` 一份。**不要**再引入第二份前端副本或 Python 回退实现。
+> （历史保留在 git 历史中）。仓库只剩 Rust 产品线；浏览器面板资源只有
+> `rust/model-gate/ui/` 一份，原生面板只有 `rust/panel-gpui/` 一个 crate。
+> **不要**再引入第二份前端副本或 Python 回退实现。
 
 ## 二、新增文件的归属规则
 

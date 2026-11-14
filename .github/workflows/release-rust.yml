@@ -1,7 +1,9 @@
 name: Rust Desktop Release
 
-# Model-Gate Rust 桌面版发布流水线：
-#   - 推送 v* tag（如 v2.19.0）触发构建并发布 GitHub Release；
+# Model-Gate Rust 桌面版发布流水线（多端）：
+#   - 推送 v* tag（如 v4.7.0）触发构建并发布 GitHub Release；
+#   - Windows：Inno Setup 安装包 + 便携 exe（build job）；
+#   - Linux：model-gate + panel-gpui 的 tar.gz（build-linux job，在 build 之后追加到同一 Release）；
 #   - 手动 workflow_dispatch 默认只构建产物（可勾选 publish 一并发布）。
 # 版本唯一源：rust/model-gate/Cargo.toml；tag 触发时校验 tag == v<version>。
 on:
@@ -209,8 +211,14 @@ jobs:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.meta.outputs.version) }}
           name: Model-Gate v${{ steps.meta.outputs.version }} (Rust)
           body: |
-            Model-Gate v4.0：控制台 v4 成为唯一面板，请求体上限与 ZCode 通道加固。
+            Model-Gate v4.7：密钥来源互斥四选一（加密库 / 环境变量 / 凭据文件）、
+            路由组对齐设计意图、GPUI 原生面板（panel-gpui）与 Linux 产物。
             Rust 桌面版：托盘常驻 + 系统浏览器面板（无内嵌 WebView2）。
+
+            - **密钥四选一（互斥）**：接入详情与添加向导可选「本机加密库（推荐）/ 写入用户环境变量 / 写入凭据文件」，保存后只保留所选来源——保存 key 不再把 env 模式静默覆盖成加密库（Linux 环境变量写入 ~/.bashrc 托管块）。
+            - **路由组对齐设计意图**：成员写法统一为 上游/模型（UI 选择器同步），modelMap 别名不再误报警告，`/v1/models` 不再列出全员不可解析的空组，删除接入自动清理分组引用。
+            - **GPUI 原生面板 panel-gpui**：独立进程调用网关 /api，五页（工作台 / 接入管理 / 路由与分组 / 用量 / 日志）；密钥永不经过面板。
+            - **Linux 支持**：网关可无托盘运行，随 Release 提供 `Model-Gate-v*-linux-x86_64.tar.gz`（含 model-gate 与 panel-gpui）。
 
             - **控制台 v4（唯一入口）**：`/ui/` 即 v4 控制台，v3 面板资源从仓库与运行时移除；6 个一级入口 + 配置中心，总览/用量/提示词/接入管理 1 次点击可达，任意对象 1 次点击打开统一抽屉。
             - **深浅双主题**：正文对比度 16.4 / 14.5，浅色 `#F4F1E8` 与深色 `#0A0E0D` 各一套令牌；1440 / 1024 / 390 三档布局。
@@ -228,3 +236,99 @@ jobs:
             dist/Model-Gate-v${{ steps.meta.outputs.version }}-rust-setup.exe
             dist/Model-Gate-rust.exe
             dist/SHA256SUMS
+
+  build-linux:
+    name: 构建 Linux 产物（网关 + GPUI 面板）
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust/model-gate
+            rust/panel-gpui
+
+      - name: 安装构建依赖（GPUI 面板需要）
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+
+      - name: 读取版本并校验 tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '^version' rust/model-gate/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${ver}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match v${ver}" >&2
+            exit 1
+          fi
+          echo "version: ${ver}"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: 后端测试（Linux 语义：env/file 来源可用）
+        shell: bash
+        working-directory: rust/model-gate
+        run: |
+          set -euo pipefail
+          out=$(cargo test 2>&1) || { echo "$out" | tail -30; exit 1; }
+          echo "$out" | grep -E "test result" | tail -3
+
+      - name: 构建网关与 GPUI 面板
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path rust/model-gate/Cargo.toml
+          cargo build --release --manifest-path rust/panel-gpui/Cargo.toml
+          mkdir -p dist
+          cp rust/model-gate/target/release/model-gate dist/model-gate
+          cp rust/panel-gpui/target/release/panel-gpui dist/panel-gpui
+
+      - name: 打包 Linux tar.gz
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.meta.outputs.version }}"
+          mkdir -p "pkg/Model-Gate-v${ver}-linux-x86_64"
+          cp dist/model-gate dist/panel-gpui "pkg/Model-Gate-v${ver}-linux-x86_64/"
+          cat > "pkg/Model-Gate-v${ver}-linux-x86_64/README.txt" <<'EOF'
+          Model-Gate Linux (x86_64)
+
+          1) 启动网关（默认 127.0.0.1:8900，托盘不可用时自动退化为纯代理模式）：
+             ./model-gate
+          2) 启动 GPUI 原生面板（需图形会话；连接 http://127.0.0.1:8900）：
+             ./panel-gpui
+          3) 密钥来源推荐「写入用户环境变量」（写入 ~/.bashrc 托管块）
+             或「写入凭据文件」；本机加密库仅支持 Windows DPAPI。
+          EOF
+          tar -czf "dist/Model-Gate-v${ver}-linux-x86_64.tar.gz" -C pkg "Model-Gate-v${ver}-linux-x86_64"
+          hash=$(sha256sum "dist/Model-Gate-v${ver}-linux-x86_64.tar.gz" | awk '{print $1}')
+          echo "${hash}  Model-Gate-v${ver}-linux-x86_64.tar.gz" > dist/SHA256SUMS-linux
+          cat dist/SHA256SUMS-linux
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle
+          path: |
+            dist/Model-Gate-v${{ steps.meta.outputs.version }}-linux-x86_64.tar.gz
+            dist/SHA256SUMS-linux
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 发布 Linux 产物到 Release
+        if: ${{ github.ref_type == 'tag' || inputs.publish }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.meta.outputs.version) }}
+          files: |
+            dist/Model-Gate-v${{ steps.meta.outputs.version }}-linux-x86_64.tar.gz
+            dist/SHA256SUMS-linux
