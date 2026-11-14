@@ -574,6 +574,378 @@ fn remove_key(state: &AppState, name: &str) {
     let _ = store.remove(&id);
 }
 
+/// 密钥写入目标：与设计文档「密钥来源互斥四选一」对应。
+///
+/// - `Store`：DPAPI 加密库（推荐，Windows）；配置只留 `apiKeyStore` 引用。
+/// - `Env`：写入用户级环境变量并让配置引用 `apiKeyEnv`。
+/// - `File`：写入用户指定的凭据文件并让配置引用 `apiKeyFile`/`apiKeyAgentPath`。
+///
+/// 互斥语义（设计意图）：写入任何一种来源时移除其它来源引用，
+/// 避免 env 优先级压过 store 导致新写入的密钥不生效。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum KeyTarget {
+    Store,
+    Env { env_name: Option<String> },
+    File {
+        file_path: Option<String>,
+        file_format: Option<String>,
+        field: Option<String>,
+    },
+}
+
+/// 从请求体解析写入目标（`keyTarget` / `target`，缺省 store）。
+pub(crate) fn parse_key_target(body: &Value) -> Result<KeyTarget, Response> {
+    let raw = body
+        .get("keyTarget")
+        .or_else(|| body.get("target"))
+        .and_then(Value::as_str)
+        .unwrap_or("store")
+        .trim()
+        .to_ascii_lowercase();
+    let field = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match raw.as_str() {
+        "" | "store" => Ok(KeyTarget::Store),
+        "env" => Ok(KeyTarget::Env {
+            env_name: field("envName"),
+        }),
+        "file" => Ok(KeyTarget::File {
+            file_path: field("filePath"),
+            file_format: field("fileFormat"),
+            field: field("field"),
+        }),
+        other => Err(access_error(
+            StatusCode::BAD_REQUEST,
+            format!("未知密钥写入目标「{other}」：只支持 store / env / file"),
+            "invalid_key_target",
+        )),
+    }
+}
+
+/// `persist_credential` 的结果：密钥已真正落盘后，配置条目应持有的引用。
+#[derive(Clone, Debug)]
+pub(crate) enum CredentialRef {
+    Store { id: String },
+    Env { env_name: String },
+    File { path: String, json_root: bool, field: String },
+}
+
+impl CredentialRef {
+    /// 响应里的人类可读说明（不含密钥值）。
+    pub(crate) fn describe(&self) -> Value {
+        match self {
+            CredentialRef::Store { id } => json!({ "target": "store", "ref": id }),
+            CredentialRef::Env { env_name } => json!({
+                "target": "env",
+                "envName": env_name,
+                "note": env_target_note(),
+            }),
+            CredentialRef::File { path, json_root, field } => json!({
+                "target": "file",
+                "filePath": path,
+                "field": field,
+                "jsonRoot": json_root,
+            }),
+        }
+    }
+}
+
+fn env_target_note() -> String {
+    if cfg!(windows) {
+        "已写入 Windows 用户环境变量（HKCU\\Environment）；新进程自动继承".to_string()
+    } else {
+        "已写入用户 shell 配置（~/.bashrc 托管块，~/.zshrc 若存在则同步）；新开终端自动继承".to_string()
+    }
+}
+
+/// 把密钥真正写到目标位置（加密库 / 用户环境变量 / 凭据文件），
+/// 返回配置条目应写入的引用。失败时目标存储零残留（env 变量写失败即返回错误）。
+pub(crate) fn persist_credential(
+    state: &AppState,
+    name: &str,
+    key: &str,
+    target: &KeyTarget,
+) -> Result<CredentialRef, Response> {
+    match target {
+        KeyTarget::Store => {
+            let id = write_key(state, name, key)?;
+            Ok(CredentialRef::Store { id })
+        }
+        KeyTarget::Env { env_name } => {
+            let env_name = env_name.clone().unwrap_or_default();
+            if env_name.is_empty() {
+                return Err(access_error(
+                    StatusCode::BAD_REQUEST,
+                    "缺少密钥环境变量名：请填写 envName",
+                    "missing_env_name",
+                ));
+            }
+            if !crate::key_file::is_valid_env_name(&env_name) {
+                return Err(access_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("环境变量名不合法：{env_name}"),
+                    "invalid_env_name",
+                ));
+            }
+            crate::user_env::write_user_var(&env_name, key).map_err(|err| {
+                access_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("写入用户变量 {env_name} 失败：{err}"),
+                    "write_user_var_failed",
+                )
+            })?;
+            // Windows 环境块是启动快照：靠会话缓存让本进程立刻读到新值。
+            crate::user_env::remember_session_var(&env_name, key);
+            crate::user_env::notify_environment_changed();
+            Ok(CredentialRef::Env { env_name })
+        }
+        KeyTarget::File {
+            file_path,
+            file_format,
+            field,
+        } => {
+            let path_raw = file_path.clone().unwrap_or_default();
+            if path_raw.is_empty() {
+                return Err(access_error(
+                    StatusCode::BAD_REQUEST,
+                    "缺少凭据文件路径：请填写 filePath",
+                    "missing_file_path",
+                ));
+            }
+            let format_raw = file_format.clone().unwrap_or_else(|| "json".to_string());
+            let format = match crate::key_file::KeyFileFormat::parse(&format_raw) {
+                Some(f) => f,
+                None => {
+                    return Err(access_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("未知凭据文件格式 {format_raw}：只支持 json / env"),
+                        "invalid_file_format",
+                    ))
+                }
+            };
+            // `.env` 必须有变量名；JSON 缺省写根字段 `apiKey`。
+            let field_name = field.clone().unwrap_or_default();
+            let path = crate::config::expand_home(&path_raw);
+            if !path.is_absolute() {
+                return Err(access_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("凭据文件路径必须是绝对路径：{path_raw}"),
+                    "invalid_file_path",
+                ));
+            }
+            // 禁止把密钥写进 Model-Gate 自己的配置文件。
+            let protected = vec![state.config_path.clone()];
+            let written =
+                match crate::key_file::write_key_file(&path, format, &field_name, key, &protected) {
+                    Ok(w) => w,
+                    Err(err) => {
+                        return Err(access_error(
+                            match err {
+                                crate::key_file::KeyFileError::Invalid(_) => {
+                                    StatusCode::BAD_REQUEST
+                                }
+                                crate::key_file::KeyFileError::Io(_) => {
+                                    StatusCode::INTERNAL_SERVER_ERROR
+                                }
+                            },
+                            err.to_string(),
+                            "write_key_file_failed",
+                        ))
+                    }
+                };
+            // 回读校验：用与运行时相同的读取语义确认密钥真的落到了文件里。
+            if !crate::key_file::verify_key_file(&written.path, &written.field) {
+                return Err(access_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "写入 {} 后回读校验失败，请检查文件格式与字段名",
+                        written.path.display()
+                    ),
+                    "verify_key_file_failed",
+                ));
+            }
+            let json_root = matches!(format, crate::key_file::KeyFileFormat::Json)
+                && written.field == "apiKey";
+            Ok(CredentialRef::File {
+                path: written.path.display().to_string(),
+                json_root,
+                field: written.field,
+            })
+        }
+    }
+}
+
+/// 按互斥语义把凭据引用写入上游条目：只保留选中来源，移除其它来源引用。
+pub(crate) fn apply_credential_ref(entry: &mut Map<String, Value>, credential: &CredentialRef) {
+    match credential {
+        CredentialRef::Store { id } => {
+            entry.insert("apiKeyStore".into(), json!(id));
+            for key in SOURCE_KEYS_ENV_FILE_AGENT {
+                entry.remove(key);
+            }
+        }
+        CredentialRef::Env { env_name } => {
+            entry.insert("apiKeyEnv".into(), json!(env_name));
+            for key in SOURCE_KEYS_STORE_FILE_AGENT {
+                entry.remove(key);
+            }
+        }
+        CredentialRef::File {
+            path,
+            json_root,
+            field,
+        } => {
+            entry.remove("apiKeyStore");
+            entry.remove("apiKeyEnv");
+            entry.remove("apiKeyAgent");
+            if *json_root {
+                // 根字段 apiKey 走 apiKeyFile；其余字段走 agent 自定义路径。
+                entry.insert("apiKeyFile".into(), json!(path));
+                entry.remove("apiKeyAgentPath");
+                entry.remove("apiKeyAgentProvider");
+            } else {
+                entry.insert("apiKeyAgentPath".into(), json!(path));
+                entry.insert("apiKeyAgentProvider".into(), json!(field));
+                entry.remove("apiKeyFile");
+            }
+        }
+    }
+}
+
+/// store 目标要移除的其它来源引用。
+const SOURCE_KEYS_ENV_FILE_AGENT: [&str; 5] = [
+    "apiKeyEnv",
+    "apiKeyFile",
+    "apiKeyAgent",
+    "apiKeyAgentPath",
+    "apiKeyAgentProvider",
+];
+
+/// env 目标要移除的其它来源引用。
+const SOURCE_KEYS_STORE_FILE_AGENT: [&str; 5] = [
+    "apiKeyStore",
+    "apiKeyFile",
+    "apiKeyAgent",
+    "apiKeyAgentPath",
+    "apiKeyAgentProvider",
+];
+
+/// 配置写失败时撤销已落盘的密钥。store 撤加密库条目；
+/// env / file 的本体写在用户环境（shell rc / 用户文件）里，
+/// 配置没写引用就不会被网关读取，保留本体，不替用户清理。
+fn rollback_credential(state: &AppState, name: &str, credential: Option<&CredentialRef>) {
+    if matches!(credential, Some(CredentialRef::Store { .. })) {
+        remove_key(state, name);
+    }
+}
+
+/// env / file 目标缺省沿用上游已有的引用：
+/// envName 缺省取当前 `apiKeyEnv`；filePath 缺省取当前 `apiKeyFile` / `apiKeyAgentPath`
+/// （按扩展名猜测格式）；field 缺省取当前 `apiKeyAgentProvider`。
+fn with_default_target_refs(state: &AppState, name: &str, target: KeyTarget) -> KeyTarget {
+    let entry = state
+        .cfg()
+        .raw
+        .get("upstreams")
+        .and_then(|u| u.get(name))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let raw_field = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match target {
+        KeyTarget::Env { env_name: None } => KeyTarget::Env {
+            env_name: raw_field("apiKeyEnv"),
+        },
+        KeyTarget::File {
+            file_path: None,
+            file_format,
+            field,
+        } => {
+            let path = raw_field("apiKeyFile").or_else(|| raw_field("apiKeyAgentPath"));
+            let file_format = file_format.or_else(|| {
+                path.as_ref().map(|p| {
+                    if p.ends_with(".env") {
+                        "env".to_string()
+                    } else {
+                        "json".to_string()
+                    }
+                })
+            });
+            KeyTarget::File {
+                file_path: path,
+                file_format,
+                field: field.or_else(|| raw_field("apiKeyAgentProvider")),
+            }
+        }
+        other => other,
+    }
+}
+
+/// 删除接入时清理路由组 / 统一分组对该上游的引用：
+/// 不清理会让 commit_raw 的诊断（group_member_unresolved 等）阻断保存。
+/// 返回被清理的引用位置（供响应与 UI 提示）。
+pub(crate) fn strip_upstream_refs(next: &mut Value, name: &str) -> Vec<String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    // 路由组成员：`name/模型` 前缀成员（斜杠边界避免 go/golang 误伤）。
+    if let Some(groups) = next.get_mut("groups").and_then(Value::as_object_mut) {
+        for (gid, members) in groups.iter_mut() {
+            if let Some(arr) = members.as_array_mut() {
+                let before = arr.len();
+                arr.retain(|m| {
+                    !m.as_str()
+                        .map(|s| s.strip_prefix(name).unwrap_or("").starts_with('/'))
+                        .unwrap_or(false)
+                });
+                if arr.len() != before {
+                    cleaned.push(format!("groups.{gid}"));
+                }
+            }
+        }
+    }
+    // 统一分组：命名分组成员上游 + 可见上游白名单。
+    if let Some(unified) = next.get_mut("unified").and_then(Value::as_object_mut) {
+        if let Some(rows) = unified.get_mut("groups").and_then(Value::as_array_mut) {
+            for row in rows.iter_mut() {
+                let Some(obj) = row.as_object_mut() else {
+                    continue;
+                };
+                if let Some(ups) = obj.get_mut("upstreams").and_then(Value::as_array_mut) {
+                    let before = ups.len();
+                    ups.retain(|u| u.as_str() != Some(name));
+                    if ups.len() != before {
+                        let id = obj
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("(无 id)")
+                            .to_string();
+                        cleaned.push(format!("unified.groups.{id}"));
+                    }
+                }
+            }
+        }
+        if let Some(vis) = unified.get_mut("visibleUpstreams").and_then(Value::as_array_mut) {
+            let before = vis.len();
+            vis.retain(|u| u.as_str() != Some(name));
+            if vis.len() != before {
+                cleaned.push("unified.visibleUpstreams".to_string());
+            }
+        }
+    }
+    cleaned
+}
+
 fn privacy_overrides(input: Option<&Value>) -> (Option<bool>, Option<String>) {
     let Some(privacy) = input.and_then(Value::as_object) else {
         return (None, None);
@@ -633,7 +1005,7 @@ pub(crate) fn build_upstream_entry(
     name: &str,
     protocol: &str,
     base_url: &str,
-    api_key: Option<&str>,
+    credential: Option<&CredentialRef>,
     input: &Value,
     kind: &str,
     vendor: Option<&str>,
@@ -685,18 +1057,10 @@ pub(crate) fn build_upstream_entry(
     }
     apply_privacy(&mut entry, template, input.get("privacy"));
     ensure_profile(&mut entry, template);
-    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
-        entry.insert(
-            "apiKeyStore".into(),
-            json!(crate::secret_store::upstream_id(name)),
-        );
-        // 避免 env 优先级压过密钥库（resolve_api_key 的顺序是 env → file → agent → store）。
-        entry.remove("apiKeyEnv");
-        entry.remove("apiKeyFile");
-        entry.remove("apiKeyAgent");
-        entry.remove("apiKeyAgentPath");
-        entry.remove("apiKeyAgentProvider");
-        let _ = key;
+    // 密钥引用按调用方选择的写入目标注入（互斥：只留选中来源）。
+    // 密钥本体由调用方先经 persist_credential 落盘，这里只写引用。
+    if let Some(credential) = credential {
+        apply_credential_ref(&mut entry, credential);
     }
     entry
 }
@@ -810,29 +1174,39 @@ pub async fn quick_add(State(state): State<Arc<AppState>>, Json(body): Json<Valu
             "missing_field",
         );
     }
+    // 写入目标四选一（默认加密库）：解析在前，参数错误不产生任何副作用。
+    let target = match parse_key_target(&body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    // 先写密钥：失败时不改配置；配置写失败时回滚刚写入的密钥。
+    let credential = match api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(key) => match persist_credential(&state, &name, key, &target) {
+            Ok(c) => Some(c),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
     let entry = build_upstream_entry(
-        &template, &name, &protocol, &base_url, api_key, &body, "official", None,
+        &template,
+        &name,
+        &protocol,
+        &base_url,
+        credential.as_ref(),
+        &body,
+        "official",
+        None,
     );
     let next = next_config_with(&state, &name, Value::Object(entry));
-    // 先写密钥：失败时不改配置；配置写失败时回滚刚写入的密钥。
-    let wrote_key = if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        if let Err(resp) = write_key(&state, &name, key) {
-            return resp;
-        }
-        true
-    } else {
-        false
-    };
     if let Err(resp) = commit_raw(&state, &next) {
-        if wrote_key {
-            remove_key(&state, &name);
-        }
+        rollback_credential(&state, &name, credential.as_ref());
         return resp;
     }
     state.clear_models_cache().await;
     Json(json!({
         "ok": true,
         "access": finalize_access(&state, &name),
+        "credential": credential.as_ref().map(|c| c.describe()),
         "diagnostics": state.cfg().diagnostics().iter()
             .filter(|d| d.path.starts_with(&format!("upstreams.{name}")))
             .map(|d| d.to_json()).collect::<Vec<_>>(),
@@ -893,21 +1267,38 @@ pub async fn custom_add(State(state): State<Arc<AppState>>, Json(body): Json<Val
     }
     let template = custom_template();
     let vendor = body.get("vendor").and_then(Value::as_str);
+    // 写入目标四选一（默认加密库）：解析在前，参数错误不产生任何副作用。
+    let target = match parse_key_target(&body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let credential = match api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(key) => match persist_credential(&state, &name, key, &target) {
+            Ok(c) => Some(c),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
     let entry = build_upstream_entry(
-        &template, &name, &protocol, &base_url, api_key, &body, "custom", vendor,
+        &template,
+        &name,
+        &protocol,
+        &base_url,
+        credential.as_ref(),
+        &body,
+        "custom",
+        vendor,
     );
     let next = next_config_with(&state, &name, Value::Object(entry));
-    if let Err(resp) = write_key(&state, &name, api_key.unwrap_or("")) {
-        return resp;
-    }
     if let Err(resp) = commit_raw(&state, &next) {
-        remove_key(&state, &name);
+        rollback_credential(&state, &name, credential.as_ref());
         return resp;
     }
     state.clear_models_cache().await;
     Json(json!({
         "ok": true,
         "access": finalize_access(&state, &name),
+        "credential": credential.as_ref().map(|c| c.describe()),
     }))
     .into_response()
 }
@@ -1012,6 +1403,14 @@ pub async fn update(
 }
 
 /// POST /api/access/{id}/secret：人工写入或替换密钥（仅本机回环）。
+///
+/// `target` 四选一（缺省 store）：
+/// - `store`：DPAPI 加密库（推荐，Windows）。互斥移除 env/file 引用 —— 设计如此，
+///   env 优先级高于 store，保留会让新密钥不生效；响应里列出被移除的引用。
+/// - `env`：写入用户级环境变量（Windows HKCU / Linux shell rc 托管块），
+///   配置引用 `apiKeyEnv`。envName 缺省沿用当前值。
+/// - `file`：写入用户指定凭据文件，配置引用 `apiKeyFile`/`apiKeyAgentPath`。
+///   filePath 缺省沿用当前值。
 pub async fn write_secret(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1028,6 +1427,11 @@ pub async fn write_secret(
             "access_not_found",
         );
     }
+    let target = match parse_key_target(&body) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let target = with_default_target_refs(&state, &name, target);
     let mut entry = state
         .cfg()
         .raw
@@ -1036,27 +1440,43 @@ pub async fn write_secret(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    entry.insert(
-        "apiKeyStore".into(),
-        json!(crate::secret_store::upstream_id(&name)),
-    );
-    entry.remove("apiKeyEnv");
-    entry.remove("apiKeyFile");
-    entry.remove("apiKeyAgent");
-    entry.remove("apiKeyAgentPath");
-    entry.remove("apiKeyAgentProvider");
-    if let Err(resp) = write_key(&state, &name, api_key) {
-        return resp;
-    }
+    // 记录覆盖前的原有来源引用（互斥语义会移除它们；响应里如实列出）。
+    let replaced: Vec<String> = [
+        "apiKeyEnv",
+        "apiKeyFile",
+        "apiKeyAgent",
+        "apiKeyAgentPath",
+        "apiKeyAgentProvider",
+        "apiKeyStore",
+    ]
+    .iter()
+    .filter(|key| entry.get(**key).is_some())
+    .map(|key| key.to_string())
+    .collect();
+    let credential = match persist_credential(&state, &name, api_key.trim(), &target) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    apply_credential_ref(&mut entry, &credential);
     let next = next_config_with(&state, &name, Value::Object(entry));
     if let Err(resp) = commit_raw(&state, &next) {
-        remove_key(&state, &name);
+        rollback_credential(&state, &name, Some(&credential));
         return resp;
     }
-    Json(json!({ "ok": true, "access": finalize_access(&state, &name) })).into_response()
+    state.clear_models_cache().await;
+    Json(json!({
+        "ok": true,
+        "credential": credential.describe(),
+        "replaced": replaced,
+        "access": finalize_access(&state, &name),
+    }))
+    .into_response()
 }
 
 /// DELETE /api/access/{id}：删除接入；默认保留密钥。
+///
+/// 路由组 / 统一分组里对该上游的引用会被一并清理（响应 `cleanedRefs` 列出），
+/// 否则 `group_member_unresolved` 诊断会阻断保存，用户还得先手动改分组。
 pub async fn delete(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     if state.cfg().upstream(&name).is_none() {
         return access_error(
@@ -1069,11 +1489,12 @@ pub async fn delete(State(state): State<Arc<AppState>>, Path(name): Path<String>
     if let Some(upstreams) = next.get_mut("upstreams").and_then(Value::as_object_mut) {
         upstreams.remove(&name);
     }
+    let cleaned_refs = strip_upstream_refs(&mut next, &name);
     if let Err(resp) = commit_raw(&state, &next) {
         return resp;
     }
     state.clear_models_cache().await;
-    Json(json!({ "ok": true, "removed": name })).into_response()
+    Json(json!({ "ok": true, "removed": name, "cleanedRefs": cleaned_refs })).into_response()
 }
 
 /// GET /api/access：列表 + 模板目录摘要。
@@ -1247,5 +1668,123 @@ mod tests {
             assert!(!text.contains("apiKeyStore"));
             assert!(!text.contains("secret"));
         }
+    }
+
+    /// 写入目标解析：缺省 store；keyTarget / target 两个参数名都接受。
+    #[test]
+    fn parse_key_target_defaults_to_store_and_validates() {
+        assert_eq!(parse_key_target(&json!({})).unwrap(), KeyTarget::Store);
+        assert_eq!(parse_key_target(&json!({"target": "store"})).unwrap(), KeyTarget::Store);
+        assert_eq!(
+            parse_key_target(&json!({"target": "env", "envName": " K " })).unwrap(),
+            KeyTarget::Env { env_name: Some("K".into()) }
+        );
+        assert!(matches!(
+            parse_key_target(&json!({"keyTarget": "file", "filePath": "/tmp/k.json"})).unwrap(),
+            KeyTarget::File { .. }
+        ));
+        assert!(parse_key_target(&json!({"target": "bogus"})).is_err());
+    }
+
+    /// 互斥语义：写入任一来源都要移除其它来源引用，避免 env 优先级
+    /// 压过新写入的密钥（这是「保存 key 后环境变量失效」的根因）。
+    #[test]
+    fn apply_credential_ref_keeps_only_selected_source() {
+        let mut entry = Map::new();
+        entry.insert("apiKeyEnv".into(), json!("OLD_VAR"));
+        entry.insert("apiKeyStore".into(), json!("upstream:x"));
+        // env 目标：写 apiKeyEnv，清掉 store / file / agent 引用。
+        apply_credential_ref(
+            &mut entry,
+            &CredentialRef::Env { env_name: "NEW_VAR".into() },
+        );
+        assert_eq!(entry.get("apiKeyEnv"), Some(&json!("NEW_VAR")));
+        assert!(entry.get("apiKeyStore").is_none());
+        // store 目标：写 apiKeyStore，清掉 env / file / agent 引用。
+        apply_credential_ref(
+            &mut entry,
+            &CredentialRef::Store { id: "upstream:y".into() },
+        );
+        assert_eq!(entry.get("apiKeyStore"), Some(&json!("upstream:y")));
+        assert!(entry.get("apiKeyEnv").is_none());
+        // file（JSON 根字段）：apiKeyFile；file（非根 / env 格式）：agent 路径。
+        apply_credential_ref(
+            &mut entry,
+            &CredentialRef::File {
+                path: "/tmp/k.json".into(),
+                json_root: true,
+                field: "apiKey".into(),
+            },
+        );
+        assert_eq!(entry.get("apiKeyFile"), Some(&json!("/tmp/k.json")));
+        assert!(entry.get("apiKeyStore").is_none());
+        apply_credential_ref(
+            &mut entry,
+            &CredentialRef::File {
+                path: "/tmp/k.env".into(),
+                json_root: false,
+                field: "K_ENV".into(),
+            },
+        );
+        assert_eq!(entry.get("apiKeyAgentPath"), Some(&json!("/tmp/k.env")));
+        assert_eq!(entry.get("apiKeyAgentProvider"), Some(&json!("K_ENV")));
+        assert!(entry.get("apiKeyFile").is_none());
+    }
+
+    /// 删除接入时清理组引用：`name/模型` 成员、命名分组成员上游、可见白名单。
+    /// 斜杠边界保证 go 与 go2 不互相误伤。
+    #[test]
+    fn strip_upstream_refs_cleans_groups_and_unified() {
+        let mut next = json!({
+            "groups": {
+                "daily": ["go/deepseek", "x/deepseek"],
+                "night": ["x/gpt", "y/gpt"],
+                "prefix": ["go2/m", "go/m"]
+            },
+            "unified": {
+                "visibleUpstreams": ["x", "y"],
+                "groups": [
+                    {"id": "a", "label": "A", "upstreams": ["x", "y"]},
+                    {"id": "b", "label": "B", "upstreams": ["y"]}
+                ]
+            }
+        });
+        let cleaned = strip_upstream_refs(&mut next, "x");
+        assert_eq!(next["groups"]["daily"], json!(["go/deepseek"]));
+        assert_eq!(next["groups"]["night"], json!(["y/gpt"]));
+        assert_eq!(next["unified"]["visibleUpstreams"], json!(["y"]));
+        assert_eq!(next["unified"]["groups"][0]["upstreams"], json!(["y"]));
+        assert_eq!(next["unified"]["groups"][1]["upstreams"], json!(["y"]));
+        assert!(cleaned.iter().any(|s| s == "groups.daily"));
+        assert!(cleaned.iter().any(|s| s == "groups.night"));
+        assert!(cleaned.iter().any(|s| s.contains("unified.groups.a")));
+        assert!(cleaned.iter().any(|s| s == "unified.visibleUpstreams"));
+        // go2/m 不受 go 清理影响（斜杠边界）。
+        let cleaned2 = strip_upstream_refs(&mut next, "go");
+        assert_eq!(next["groups"]["prefix"], json!(["go2/m"]));
+        assert!(cleaned2.iter().any(|s| s == "groups.prefix"));
+    }
+
+    /// 端到端：删除被路由组引用的接入不再被诊断阻断，引用被自动清理。
+    #[tokio::test]
+    async fn delete_cleans_route_group_refs_instead_of_failing() {
+        let cfg = crate::config::Config::from_value(json!({
+            "upstreams": {
+                "x": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "MG_X_KEY", "models": ["m"]},
+                "y": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1", "apiKeyEnv": "MG_Y_KEY", "models": ["m"]}
+            },
+            "groups": {"daily": ["x/m", "y/m"]},
+            "unified": {"visibleUpstreams": ["x", "y"]}
+        }));
+        let dir = std::env::temp_dir().join(format!("mg-access-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(crate::db::Db::open(&dir.join("t.db")).unwrap());
+        let state = Arc::new(AppState::new(cfg, db, dir.join("c.json")));
+        let resp = delete(State(state.clone()), Path("x".into())).await;
+        assert!(resp.status().is_success(), "删除应成功");
+        let raw = state.cfg().raw.clone();
+        assert_eq!(raw["groups"]["daily"], json!(["y/m"]));
+        assert_eq!(raw["unified"]["visibleUpstreams"], json!(["y"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

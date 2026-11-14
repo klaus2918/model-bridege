@@ -495,6 +495,8 @@ mod tests {
         assert_eq!(dir, download_dir());
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn resolve_download_dir_migrates_legacy_default_to_downloads() {
         // 旧版本把默认目录存进了设置：升级后必须回到 Windows「下载」目录，
@@ -562,6 +564,8 @@ mod tests {
         assert_eq!(dir, PathBuf::from(r"D:\tools\Model-Gate"));
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn install_target_uses_inno_exe_name() {
         let target =
@@ -569,6 +573,8 @@ mod tests {
         assert_eq!(target, PathBuf::from(r"D:\tools\Model-Gate\Model-Gate.exe"));
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn install_target_with_prefers_registered_location() {
         let target = effective_install_target_with(
@@ -581,6 +587,8 @@ mod tests {
         );
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn dir_from_icon_value_handles_plain_and_indexed() {
         assert_eq!(
@@ -597,6 +605,8 @@ mod tests {
         );
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn dir_from_icon_value_keeps_comma_in_path() {
         assert_eq!(
@@ -610,6 +620,8 @@ mod tests {
         assert_eq!(dir_from_icon_value("Model-Gate.exe"), None);
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn dir_from_uninstall_string_handles_quoted_and_args() {
         assert_eq!(
@@ -626,6 +638,8 @@ mod tests {
         );
     }
 
+    // Windows 专属语义（DPAPI / Inno Setup / 大小写不敏感路径），仅在 Windows 上运行。
+    #[cfg(windows)]
     #[test]
     fn same_dir_ignores_trailing_separator_and_case() {
         assert!(same_dir(
