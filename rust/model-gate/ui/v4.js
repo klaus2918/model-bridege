@@ -50,8 +50,9 @@
     models: "access-pane-models",
     free: "access-pane-free",
     templates: "access-pane-templates",
+    auth: "access-pane-auth",
   };
-  const PANE_VIEW = { pools: "credentials", models: "models", free: "free", templates: "templates" };
+  const PANE_VIEW = { pools: "credentials", models: "models", free: "free", templates: "templates", auth: "auth" };
 
   function setAccessTab(tab) {
     if (!ACCESS_PANES[tab]) tab = "list";

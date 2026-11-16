@@ -5,6 +5,7 @@ mod access;
 mod ai_api;
 mod anthropic;
 mod api_extra;
+mod auth;
 mod commandcode;
 mod commandcode_catalog;
 mod config;
@@ -417,7 +418,8 @@ fn spawn_server(
                     return;
                 }
             };
-            let _ = axum::serve(listener, app)
+            // into_make_service_with_connect_info：给认证中间件提供来源 IP。
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async move {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {}

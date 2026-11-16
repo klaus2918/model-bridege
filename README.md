@@ -650,6 +650,7 @@ curl http://127.0.0.1:8900/v1/models
 | `models` | 顶层模型白名单，配了则 `/v1/models` 只返回这几个（见第七节） |
 | `modules` | 运行期模块开关（4.6.0+）：`stats`/`logging`/`plugins`/`pool`/`panel`/`access`/`aiConfig`/`update` 八个布尔键，缺省全开；关闭的模块不挂路由、不起线程、不落 IO（见 `docs/architecture/modules.md`） |
 | `runtime.workerThreads` | Tokio worker 线程数（4.6.0+），默认 `2`、上限 `64`；代理是 IO 密集负载，低核机器无需开满核数 |
+| `auth` | 接入认证（4.8.0+）：`enabled` 总开关（默认 `true`）、`ipAllowlist` IP 白名单（默认仅本机 `127.0.0.1`/`::1`）、`keys` 认证码摘要列表（面板生成，上限 32 条）。见第八节「接入认证」 |
 
 ### 每个上游的字段
 
@@ -967,6 +968,21 @@ cch 已显式关掉两者：
 | `/api/prompts/diff/download` | GET | 差异 unified diff 文本下载 |
 | `/api/usage/sessions` | GET | 会话汇总（请求、token、错误、P50/P95、模型、首末活跃） |
 | `/api/usage/export?group=session` | GET | 会话汇总 CSV 导出 |
+| `/api/auth` | GET/PUT | 接入认证读取与保存（开关 + IP 白名单；认证码列表只回摘要） |
+| `/api/auth/keys` | POST | 生成认证码；响应里的 `key` 是明文唯一一次返回 |
+| `/api/auth/keys/{id}` | DELETE | 吊销认证码，即刻失效 |
+
+### 接入认证（IP 白名单与认证码）
+
+网关默认开启接入认证：**仅允许本机来源（127.0.0.1 / ::1）直接访问**；其他来源必须命中 IP 白名单或携带有效认证码，否则一律 401。判定对所有路由统一生效（chat 转发、面板、管理 API），拒绝发生在最外层中间件，不进入任何业务逻辑。
+
+- **两个放行通道**：① 来源 IP 在 `auth.ipAllowlist`（只接受精确 IP，不支持网段写法，IP 取自 TCP 连接而非 `X-Forwarded-For`——后者可伪造）；② 请求头携带有效认证码（`Authorization: Bearer mgk_…` 或 `x-api-key`）。两通道任一命中即放行，本机默认命中第一通道，所以**本机客户端零配置可用**。
+- **认证码**：形如 `mgk_<43 位 base64url>`，在面板「接入 → 认证」生成。明文**只在生成弹窗显示一次**，配置文件只存 SHA-256 摘要（任何接口都不会再返回明文）。上限 32 条，吊销即刻失效。适合让局域网/远程设备在不动白名单的情况下访问。
+- **关闭验证**：`auth.enabled = false`（面板开关一键保存）后所有来源直接放行，与未引入认证前的行为一致。
+- **热生效**：开关、白名单、认证码的增删走配置保存链路（备份 → 原子写 → 热重载），无需重启；生成认证码后立即就能用。
+- **本机服务不受影响**：托盘、v4 面板、GPUI 面板都从本机访问，默认白名单直接放行。
+- **远程访问怎么选**：固定设备加白名单（`ipAllowlist` 里写对方 IP）；动态地址或共享给多人用认证码；两者都不要时清空白名单——此时连本机也需要认证码。面板把白名单清空后如果又吊销了全部认证码，唯一恢复途径是直接编辑 `bridge.config.json`（`auth.enabled` 改回或补白名单），属预期防呆。
+- **对应接口**：`GET/PUT /api/auth`、`POST /api/auth/keys`、`DELETE /api/auth/keys/{id}`（见上表）。
 
 ### 提示词记录与会话统计
 

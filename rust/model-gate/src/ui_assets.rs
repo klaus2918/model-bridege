@@ -28,6 +28,7 @@ const EMBEDDED: &[(&str, &str)] = &[
     ("v4-usage.js", include_str!("../ui/v4-usage.js")),
     ("v4-prompts.js", include_str!("../ui/v4-prompts.js")),
     ("v4-resources.js", include_str!("../ui/v4-resources.js")),
+    ("v4-auth.js", include_str!("../ui/v4-auth.js")),
 ];
 
 /// 面板依赖的全部资源名（不含 index）。供启动自检/文档使用。
@@ -41,6 +42,7 @@ pub const ASSET_NAMES: &[&str] = &[
     "v4-usage.js",
     "v4-prompts.js",
     "v4-resources.js",
+    "v4-auth.js",
 ];
 
 /// 面板目录：优先环境变量（`--ui-dir` 会写进它），其次编译期 crate 目录，

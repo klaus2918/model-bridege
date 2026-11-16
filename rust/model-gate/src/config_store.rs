@@ -241,8 +241,20 @@ pub fn backup_config(path: &Path, policy: BackupPolicy) -> anyhow::Result<Backup
     // 轮转：把 .bak.N 依次后移，.bak 变成 .bak.1。
     rotate_backups(path)?;
 
-    fs::copy(path, &target)
-        .with_context(|| format!("备份配置失败: {} -> {}", path.display(), target.display()))?;
+    // fs::copy 在部分虚拟/网络文件系统（virtiofs、某些 FUSE/NFS）上会因
+    // copy_file_range 不被支持而直接报错；此时退回读+写，备份动作不因
+    // 存储介质而失败。
+    if let Err(copy_err) = fs::copy(path, &target) {
+        let bytes = fs::read(path)
+            .with_context(|| format!("备份配置失败（回退读取）: {}", path.display()))?;
+        fs::write(&target, bytes).with_context(|| {
+            format!(
+                "备份配置失败: {} -> {}（fs::copy: {copy_err}）",
+                path.display(),
+                target.display()
+            )
+        })?;
+    }
     Ok(BackupOutcome {
         created: true,
         path: Some(target),

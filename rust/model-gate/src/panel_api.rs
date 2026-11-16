@@ -36,6 +36,7 @@ fn ui_page_html(source: &str) -> String {
         "v4-usage.js",
         "v4-prompts.js",
         "v4-resources.js",
+        "v4-auth.js",
         "v4.js",
     ] {
         html = html.replace(
