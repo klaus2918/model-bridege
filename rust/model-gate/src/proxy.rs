@@ -558,6 +558,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     // 面板/管理 API 一律 404，对应的后台线程与 IO 也一并缺席。
     if modules.panel {
         app = app.merge(panel_routes());
+        app = app.merge(auth_routes());
     }
     if modules.stats {
         app = app.merge(usage_routes());
@@ -579,7 +580,28 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
     }
     // 管理接口（面板）走 `Json` 提取器，抬到与 chat 同量级的入站上限。
     app.layer(DefaultBodyLimit::max(BUFFERED_BODY_LIMIT_BYTES))
+        // 接入认证挂最外层：被拒请求不进任何业务提取器，也不读请求体。
+        // 判定依据见 crate::auth：IP 白名单或认证码，关闭即全放行。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::auth_middleware,
+        ))
         .with_state(state)
+}
+
+/// 接入认证管理 API（`panel` 模块）：读取、开关/白名单、认证码生成与吊销。
+fn auth_routes() -> axum::Router<Arc<AppState>> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route(
+            "/api/auth",
+            get(crate::auth::get_auth).put(crate::auth::put_auth),
+        )
+        .route("/api/auth/keys", post(crate::auth::create_key))
+        .route(
+            "/api/auth/keys/{id}",
+            axum::routing::delete(crate::auth::delete_key),
+        )
 }
 
 /// 核心转发路由：`/health`、模型目录与 chat 转发（含 unified/强制上游变体）。
@@ -4626,6 +4648,258 @@ mod tests {
         );
         let resp = runtime.block_on(chat_inner(state.clone(), None, HeaderMap::new(), body));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 接入认证：路由层集成（中间件挂最外层，白名单/认证码/关闭三态） ──
+
+    fn get_with_ip(path: &str, ip: Option<std::net::SocketAddr>) -> Request {
+        let mut builder = Request::builder().uri(path);
+        if let Some(addr) = ip {
+            builder = builder.extension(axum::extract::ConnectInfo(addr));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn ip(addr: &str) -> std::net::SocketAddr {
+        addr.parse().expect("合法 socket 地址")
+    }
+
+    async fn status_of(state: Arc<AppState>, req: Request) -> StatusCode {
+        use tower::ServiceExt;
+        router(state)
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn auth_default_blocks_remote_and_allows_loopback() {
+        let cfg = Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1"}}
+        }));
+        let (state, _db, dir) = pool_test_state(cfg);
+        // 默认白名单仅本机：远程来源一律 401（health 也不例外）。
+        assert_eq!(
+            status_of(state.clone(), get_with_ip("/health", Some(ip("192.168.1.20:53000")))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status_of(state.clone(), get_with_ip("/health", Some(ip("10.0.0.2:53000")))).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // 本机与未携带 ConnectInfo（测试直调语义 = 本机）放行。
+        assert_eq!(
+            status_of(state.clone(), get_with_ip("/health", Some(ip("127.0.0.1:53000")))).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(state.clone(), get_with_ip("/health", None)).await,
+            StatusCode::OK
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_allows_remote() {
+        let cfg = Config::from_value(json!({
+            "accessLog": false,
+            "auth": {"enabled": false},
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1"}}
+        }));
+        let (state, _db, dir) = pool_test_state(cfg);
+        assert_eq!(
+            status_of(state.clone(), get_with_ip("/health", Some(ip("8.8.8.8:53000")))).await,
+            StatusCode::OK,
+            "关闭验证后远程来源放行"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_key_grants_remote_access() {
+        let (plain, record) = crate::auth::generate_key("远程机器");
+        let cfg = Config::from_value(json!({
+            "accessLog": false,
+            "auth": {"keys": [{
+                "id": record.id, "name": record.name, "prefix": record.prefix,
+                "sha256": record.sha256, "createdAt": record.created_at
+            }]},
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1"}}
+        }));
+        let (state, _db, dir) = pool_test_state(cfg);
+        let remote = ip("192.168.1.30:53000");
+
+        let auth_req = Request::builder()
+            .uri("/health")
+            .header(header::AUTHORIZATION, format!("Bearer {plain}"))
+            .extension(axum::extract::ConnectInfo(remote))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(state.clone(), auth_req).await,
+            StatusCode::OK,
+            "有效认证码放行远程来源"
+        );
+
+        let api_key_req = Request::builder()
+            .uri("/health")
+            .header("x-api-key", plain.as_str())
+            .extension(axum::extract::ConnectInfo(remote))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(state.clone(), api_key_req).await,
+            StatusCode::OK,
+            "x-api-key 头同样有效"
+        );
+
+        let wrong_req = Request::builder()
+            .uri("/health")
+            .header(header::AUTHORIZATION, "Bearer mgk_wrong")
+            .extension(axum::extract::ConnectInfo(remote))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(state.clone(), wrong_req).await,
+            StatusCode::UNAUTHORIZED,
+            "错误认证码拒绝"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_management_endpoints_roundtrip() {
+        use tower::ServiceExt;
+        let cfg = Config::from_value(json!({
+            "accessLog": false,
+            "upstreams": {"u": {"protocol": "openai", "baseUrl": "http://127.0.0.1:1"}}
+        }));
+        let (state, _db, dir) = pool_test_state(cfg);
+
+        // 读取：默认开启 + 仅本机白名单。
+        let resp = router(state.clone())
+            .oneshot(get_with_ip("/api/auth", None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["auth"]["enabled"], json!(true));
+        assert_eq!(body["auth"]["ipAllowlist"], json!(["127.0.0.1", "::1"]));
+
+        // 防呆：还没有认证码就清空白名单 = 全部来源（含本机面板）被拒，应拒绝保存。
+        let lockout = Request::builder()
+            .method("PUT")
+            .uri("/api/auth")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"ipAllowlist": []}).to_string()))
+            .unwrap();
+        let resp = router(state.clone()).oneshot(lockout).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "清空白名单且无认证码应被拒绝（auth_lockout_guard）"
+        );
+
+        // 保存：关闭验证 + 自定义白名单（含非法条目应 400）。
+        let put = Request::builder()
+            .method("PUT")
+            .uri("/api/auth")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({
+                "enabled": false,
+                "ipAllowlist": ["127.0.0.1", "192.168.1.20"]
+            }).to_string()))
+            .unwrap();
+        let resp = router(state.clone()).oneshot(put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!state.cfg().auth.enabled);
+        assert_eq!(state.cfg().auth.ip_allowlist, vec!["127.0.0.1", "192.168.1.20"]);
+
+        let bad_put = Request::builder()
+            .method("PUT")
+            .uri("/api/auth")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"ipAllowlist": ["192.168.0.0/24"]}).to_string()))
+            .unwrap();
+        let resp = router(state.clone()).oneshot(bad_put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "网段写法应被拒绝");
+
+        // 重新开启验证：后续断言依赖「远程来源必须凭认证码」的默认语义。
+        let reenable = Request::builder()
+            .method("PUT")
+            .uri("/api/auth")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"enabled": true}).to_string()))
+            .unwrap();
+        let resp = router(state.clone()).oneshot(reenable).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.cfg().auth.enabled);
+        assert_eq!(
+            status_of(state.clone(), get_with_ip("/health", Some(ip("8.8.8.8:53000")))).await,
+            StatusCode::UNAUTHORIZED,
+            "重新开启后远程来源恢复拦截"
+        );
+
+        // 生成：明文仅返回一次；配置里只出现摘要。
+        let post = Request::builder()
+            .method("POST")
+            .uri("/api/auth/keys")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"name": "笔记本"}).to_string()))
+            .unwrap();
+        let resp = router(state.clone()).oneshot(post).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let plain = body["key"].as_str().expect("生成响应含明文认证码").to_string();
+        assert!(plain.starts_with("mgk_"));
+        assert_eq!(state.cfg().auth.keys.len(), 1);
+        assert_eq!(state.cfg().auth.keys[0].name, "笔记本");
+        let written = std::fs::read_to_string(dir.join("c.json")).unwrap();
+        assert!(
+            written.contains(&state.cfg().auth.keys[0].sha256),
+            "落盘内容含摘要"
+        );
+        assert!(
+            !written.contains(plain.as_str()),
+            "明文认证码绝不能落盘"
+        );
+
+        // 新认证码即刻可用（热生效，无需重启）。
+        let remote = ip("192.168.1.30:53000");
+        let auth_req = Request::builder()
+            .uri("/health")
+            .header(header::AUTHORIZATION, format!("Bearer {plain}"))
+            .extension(axum::extract::ConnectInfo(remote))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(status_of(state.clone(), auth_req).await, StatusCode::OK);
+
+        // 吊销：明文即刻失效。
+        let id = state.cfg().auth.keys[0].id.clone();
+        let del = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/auth/keys/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(state.clone()).oneshot(del).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.cfg().auth.keys.is_empty(), "吊销后记录清空");
+        let revoked_req = Request::builder()
+            .uri("/health")
+            .header(header::AUTHORIZATION, format!("Bearer {plain}"))
+            .extension(axum::extract::ConnectInfo(remote))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            status_of(state.clone(), revoked_req).await,
+            StatusCode::UNAUTHORIZED,
+            "吊销后同一明文失效"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

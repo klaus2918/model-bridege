@@ -458,12 +458,17 @@ mod managed_block {
                 }
             }
         }
-        let tmp = path.with_extension("mg-tmp");
+        // 临时名唯一化：两个进程/线程并发写同一个 rc 文件时，共用固定名会让
+        // 先 rename 的一方把临时文件挪走，后 rename 的一方直接失败。
+        let tmp = path.with_extension(format!("mg-tmp-{}", uuid::Uuid::new_v4().simple()));
         std::fs::write(&tmp, updated.as_bytes())
             .map_err(|err| format!("写入 {} 失败：{err}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .map_err(|err| format!("替换 {} 失败：{err}", path.display()))?;
-        Ok(())
+        let replaced = std::fs::rename(&tmp, path)
+            .map_err(|err| format!("替换 {} 失败：{err}", path.display()));
+        if replaced.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        replaced
     }
 }
 
@@ -490,36 +495,85 @@ mod tests {
     /// 测试专用变量名：避免与用户真实变量冲突。
     const TEST_VAR: &str = "MODEL_GATE_TEST_USER_ENV_VAR";
 
-    fn cleanup(name: &str) {
-        let _ = delete_user_var(name);
+    /// 临时 HOME：单测走可注入路径，绝不动用户真实的 ~/.bashrc
+    /// （并行测试共享同一真实文件时读写会互相覆盖）。
+    fn temp_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mg-user-env-home-{}-{}-{}",
+            tag,
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("创建临时 HOME");
+        dir
+    }
+
+    // 非 Windows 用可注入 home 的实现（隔离真实 rc 文件）；
+    // Windows 写 HKCU\Environment（按值原子写，无共享文件竞争），沿用公开入口。
+    #[cfg(not(windows))]
+    fn write_in(home: &std::path::Path, name: &str, value: &str) -> Result<(), String> {
+        imp::write_user_var_in(home, name, value)
+    }
+    #[cfg(windows)]
+    fn write_in(_home: &std::path::Path, name: &str, value: &str) -> Result<(), String> {
+        write_user_var(name, value)
+    }
+
+    #[cfg(not(windows))]
+    fn read_in(home: &std::path::Path, name: &str) -> Option<String> {
+        imp::read_user_var_in(home, name)
+    }
+    #[cfg(windows)]
+    fn read_in(_home: &std::path::Path, name: &str) -> Option<String> {
+        read_user_var(name)
+    }
+
+    fn cleanup_in(home: &std::path::Path, name: &str) {
+        #[cfg(not(windows))]
+        {
+            let _ = imp::delete_user_var_in(home, name);
+        }
+        #[cfg(windows)]
+        {
+            let _ = home;
+            let _ = delete_user_var(name);
+        }
     }
 
     #[test]
     fn write_then_read_user_var_round_trips() {
-        cleanup(TEST_VAR);
+        let home = temp_home("roundtrip");
+        cleanup_in(&home, TEST_VAR);
         let value = "sk-test-value-1234567890";
-        write_user_var(TEST_VAR, value).expect("写入用户变量应成功");
-        let read_back = read_user_var(TEST_VAR);
-        cleanup(TEST_VAR);
+        write_in(&home, TEST_VAR, value).expect("写入用户变量应成功");
+        let read_back = read_in(&home, TEST_VAR);
+        cleanup_in(&home, TEST_VAR);
         assert_eq!(read_back.as_deref(), Some(value));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn write_overwrites_existing_value() {
         // 与 round_trips 用不同变量名：cargo test 默认并行，共用变量会互相覆盖。
         const OVERWRITE_VAR: &str = "MODEL_GATE_TEST_USER_ENV_VAR_OVERWRITE";
-        cleanup(OVERWRITE_VAR);
-        write_user_var(OVERWRITE_VAR, "first").expect("首次写入应成功");
-        write_user_var(OVERWRITE_VAR, "second").expect("覆盖写入应成功");
-        let read_back = read_user_var(OVERWRITE_VAR);
-        cleanup(OVERWRITE_VAR);
+        let home = temp_home("overwrite");
+        cleanup_in(&home, OVERWRITE_VAR);
+        write_in(&home, OVERWRITE_VAR, "first").expect("首次写入应成功");
+        write_in(&home, OVERWRITE_VAR, "second").expect("覆盖写入应成功");
+        let read_back = read_in(&home, OVERWRITE_VAR);
+        cleanup_in(&home, OVERWRITE_VAR);
         assert_eq!(read_back.as_deref(), Some("second"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn missing_var_reads_as_none() {
-        cleanup(TEST_VAR);
-        assert!(read_user_var("MODEL_GATE_TEST_VAR_SHOULD_NOT_EXIST").is_none());
+        let home = temp_home("missing");
+        cleanup_in(&home, TEST_VAR);
+        assert!(
+            read_in(&home, "MODEL_GATE_TEST_VAR_SHOULD_NOT_EXIST").is_none()
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

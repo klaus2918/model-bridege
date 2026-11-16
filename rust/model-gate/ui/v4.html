@@ -189,6 +189,7 @@
       <button class="seg-tab" data-access-tab="models">模型与定价</button>
       <button class="seg-tab" data-access-tab="free">免费来源</button>
       <button class="seg-tab" data-access-tab="templates">模板</button>
+      <button class="seg-tab" data-access-tab="auth">认证</button>
     </div>
 
     <div id="access-pane-list">
@@ -351,6 +352,53 @@
       <div class="card" style="margin-top:16px">
         <div class="card-head"><h2>模板登记</h2><span class="pill" id="template-count">0</span></div>
         <div id="template-list" class="list compact"></div>
+      </div>
+    </div>
+
+    <div id="access-pane-auth" hidden>
+      <div class="page-head">
+        <div><h1>接入认证</h1><p class="sub">控制谁能访问本网关：IP 白名单与认证码（<code>mgk_</code> 前缀）。默认开启，仅允许本机来源。</p></div>
+        <div class="head-actions">
+          <button class="btn ghost sm" id="auth-refresh">刷新</button>
+          <button class="btn primary sm" id="auth-key-generate">+ 生成认证码</button>
+        </div>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <div class="card-head"><h2>验证开关</h2><span class="pill" id="auth-state-pill">—</span></div>
+          <div class="card-actions">
+            <label class="check"><input type="checkbox" id="auth-enabled"> 启用接入认证</label>
+          </div>
+          <div class="card-actions wrap">
+            <button class="btn primary sm" id="auth-save">保存开关</button>
+          </div>
+          <div class="inline-note">关闭后所有来源直接放行（与未引入认证前一致）；开启后白名单或认证码二选一放行。</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>IP 白名单</h2><span class="hint">精确 IP，命中即放行</span></div>
+          <div id="auth-allowlist" class="tagline"></div>
+          <div class="route-preview" style="margin-top:12px">
+            <input class="input grow" id="auth-ip-input" placeholder="例如 192.168.1.20 或 ::1">
+            <button class="btn ghost sm" id="auth-ip-add">加入白名单</button>
+          </div>
+          <div class="card-actions wrap">
+            <button class="btn ghost sm" id="auth-allowlist-default">恢复默认（仅本机）</button>
+            <button class="btn primary sm" id="auth-allowlist-save">保存白名单</button>
+          </div>
+          <div class="inline-note">白名单清空 = 拒绝一切直连来源，只认认证码；只支持精确 IP，不支持网段。</div>
+        </div>
+      </div>
+      <div class="card flush" style="margin-top:16px">
+        <div class="card-head"><h2>认证码</h2><span class="pill" id="auth-key-count">0 条</span><span class="hint">明文只在生成时显示一次，落盘只存摘要</span></div>
+        <div class="table-wrap"><table class="table" id="auth-key-table">
+          <thead><tr><th>名称</th><th>标识</th><th>创建时间</th><th class="right">操作</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+        <div class="empty" id="auth-key-empty" hidden>
+          <div class="empty-mark">⚿</div>
+          <h3>还没有认证码</h3>
+          <p>需要从其他设备访问网关时生成一个；本机来源默认放行，不需要认证码。</p>
+        </div>
       </div>
     </div>
   </section>
@@ -621,6 +669,7 @@
 <script src="v4-usage.js"></script>
 <script src="v4-prompts.js"></script>
 <script src="v4-resources.js"></script>
+<script src="v4-auth.js"></script>
 <script src="v4.js"></script>
 </body>
 </html>

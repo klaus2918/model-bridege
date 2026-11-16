@@ -4,6 +4,7 @@
   "_models": "各上游的 models 是该上游可用模型的声明（也是按名路由的依据）。可以在面板上点「查询清单」按上游拉取并勾选写入，不用手打：面板按 OpenAI 兼容约定拉 GET {baseUrl}/v1/models（路径可用 compat.endpoint.models 改）。",
   "_modelKeys": "同一个上游下不同模型可用不同密钥：在 upstreams.<名>.modelKeys 里写 {模型id: 环境变量名}，或对象写法 {\"apiKeyEnv\":\"...\"} / {\"apiKeyFile\":\"...\"}。键必须是 modelMap 解析后的真实模型名；支持单个 * 通配；未命中的模型回落到上游级 apiKeyEnv。明文 apiKey 会被忽略。",
   "_freeSources": "免费来源：zen 与 kilo 两条免密通道，无需账号与 API Key（zen 用匿名 Bearer public + 客户端指纹，kilo 完全不发送鉴权头）。面板「免费来源」页可一键接入与实测可用性。注意：免费模型只登记在各自上游的 models 里，不会自动进入顶层 models（顶层 models 非空时全局清单只按白名单展示）——需要对外暴露时在模型卡上点「加入全局清单」。",
+  "_auth": "接入认证（4.8.0+）：控制谁能访问本网关。enabled=true 时，来源 IP 命中 ipAllowlist 或携带有效认证码（Authorization: Bearer mgk_… / x-api-key 头）才放行，其余 401。ipAllowlist 只接受精确 IP（默认仅本机回环），keys 存的是 SHA-256 摘要——认证码在面板「接入 → 认证」生成，明文只显示一次，请勿手写。enabled=false 关闭全部验证。面板与本机客户端默认放行，无需额外配置。",
   "port": 8900,
   "host": "127.0.0.1",
   "defaultModel": "deepseek-flash",
@@ -30,6 +31,11 @@
   },
   "runtime": {
     "workerThreads": 2
+  },
+  "auth": {
+    "enabled": true,
+    "ipAllowlist": ["127.0.0.1", "::1"],
+    "keys": []
   },
   "aliases": {},
   "thinking": {

@@ -312,7 +312,7 @@
 
   // 接入页次级页签的懒加载：切到哪个 pane 就刷新哪个模块的数据。
   function runAccessPane() {
-    const map = { pools: "credentials", models: "models", free: "free", templates: "templates" };
+    const map = { pools: "credentials", models: "models", free: "free", templates: "templates", auth: "auth" };
     const name = map[state.accessTab || "list"];
     if (!name) return;
     const loader = externalViews.get(name) || viewLoaders[name];

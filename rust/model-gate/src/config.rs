@@ -994,6 +994,198 @@ impl RuntimeConfig {
     }
 }
 
+/// 认证码记录（存储形态）。配置文件只存 SHA-256 摘要，明文只在生成时返回一次，
+/// 之后任何接口都不再吐出——与上游 apiKey「明文不落盘」的约定同一立场。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthKeyRecord {
+    /// 稳定标识：吊销 / 引用用，与明文无关。
+    pub id: String,
+    /// 展示名（面板里给人看的备注）。
+    pub name: String,
+    /// 明文前缀（如 `mgk_1a2b3c4d`）：列表里用于认出是哪条，短前缀不构成泄露。
+    pub prefix: String,
+    /// 明文认证码的 SHA-256 hex 摘要（64 位小写 hex）。
+    pub sha256: String,
+    /// 创建时间（RFC3339）。
+    pub created_at: String,
+}
+
+/// 接入认证配置（`auth` 顶层键）：客户端访问网关本身的准入控制。
+///
+/// 语义（见 crate::auth 中间件）：关闭即全放行；开启后「来源 IP 命中白名单
+/// 或 携带有效认证码」二选一放行，否则 401。默认 `enabled=true` 且白名单仅
+/// 本机回环——本机客户端零配置可用，远程来源必须显式加白或发认证码。
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    /// 总开关：false = 关闭全部验证（所有来源放行，与未引入认证前的行为一致）。
+    pub enabled: bool,
+    /// IP 白名单：精确 IP（IPv4/IPv6），命中即放行。默认仅本机回环。
+    pub ip_allowlist: Vec<String>,
+    /// 认证码记录；上限 [`AUTH_KEYS_MAX`]。
+    pub keys: Vec<AuthKeyRecord>,
+    /// 解析期发现的问题：error 不阻断启动但面板提示，warn 提示修正。
+    pub issues: Vec<Diagnostic>,
+}
+
+/// 默认白名单：仅本机回环（IPv4 + IPv6）。
+pub const AUTH_DEFAULT_ALLOWLIST: &[&str] = &["127.0.0.1", "::1"];
+/// 认证码条数上限：防配置膨胀，也防生成后无人管理的幽灵凭据堆积。
+pub const AUTH_KEYS_MAX: usize = 32;
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ip_allowlist: AUTH_DEFAULT_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            keys: Vec::new(),
+            issues: Vec::new(),
+        }
+    }
+}
+
+/// sha256 摘要是否为合法形态：64 位小写 hex。
+fn valid_auth_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+        && value.bytes().all(|b| !b.is_ascii_uppercase())
+}
+
+impl AuthConfig {
+    /// 从 `auth` 顶层键解析。非法条目跳过并记入 issues，不阻断启动。
+    fn from_value(value: Option<&Value>) -> Self {
+        let Some(obj) = value.and_then(Value::as_object) else {
+            if value.is_some() {
+                // auth 存在但不是对象：整体回落默认值，并给出可读诊断。
+                let mut cfg = Self::default();
+                cfg.issues.push(Diagnostic {
+                    level: "error".into(),
+                    code: "auth_invalid".into(),
+                    path: "auth".into(),
+                    message: "auth 必须是 JSON 对象，已按默认配置（开启 + 仅本机白名单）运行".into(),
+                    hint: "移除 auth 键或改成对象，形如 {\"enabled\":true,\"ipAllowlist\":[\"127.0.0.1\"],\"keys\":[]}".into(),
+                });
+                return cfg;
+            }
+            return Self::default();
+        };
+        let mut cfg = Self::default();
+        if let Some(flag) = obj.get("enabled") {
+            match flag.as_bool() {
+                Some(v) => cfg.enabled = v,
+                None => cfg.issues.push(Diagnostic {
+                    level: "warn".into(),
+                    code: "auth_enabled_invalid".into(),
+                    path: "auth.enabled".into(),
+                    message: "auth.enabled 必须是布尔值，已按 true 处理".into(),
+                    hint: "true = 启用验证；false = 关闭验证".into(),
+                }),
+            }
+        }
+        // 白名单：允许缺省（用默认本机回环）；条目逐个解析为 IP，非法跳过。
+        if let Some(list) = obj.get("ipAllowlist") {
+            match list.as_array() {
+                Some(items) => {
+                    let mut allow: Vec<String> = Vec::new();
+                    for (idx, item) in items.iter().enumerate() {
+                        let Some(text) = item.as_str() else {
+                            cfg.issues.push(invalid_ip_diagnostic(idx, "条目必须是字符串"));
+                            continue;
+                        };
+                        match text.trim().parse::<std::net::IpAddr>() {
+                            Ok(ip) => {
+                                let normalized = ip.to_string();
+                                if !allow.contains(&normalized) {
+                                    allow.push(normalized);
+                                }
+                            }
+                            Err(_) => cfg
+                                .issues
+                                .push(invalid_ip_diagnostic(idx, &format!("不是合法 IP：{text}"))),
+                        }
+                    }
+                    cfg.ip_allowlist = allow;
+                }
+                None => cfg.issues.push(Diagnostic {
+                    level: "warn".into(),
+                    code: "auth_allowlist_invalid".into(),
+                    path: "auth.ipAllowlist".into(),
+                    message: "auth.ipAllowlist 必须是 IP 字符串数组，已按默认白名单（仅本机）处理".into(),
+                    hint: "例如 [\"127.0.0.1\", \"::1\"]；置空数组表示拒绝一切直连来源，只认认证码".into(),
+                }),
+            }
+        }
+        // 认证码：逐条校验形态，摘要非法的条目跳过（无法验证也就无法放行）。
+        if let Some(list) = obj.get("keys") {
+            match list.as_array() {
+                Some(items) => {
+                    let mut keys = Vec::new();
+                    let mut invalid = 0usize;
+                    for item in items {
+                        let Some(entry) = item.as_object() else {
+                            invalid += 1;
+                            continue;
+                        };
+                        let get_str = |field: &str| {
+                            entry.get(field).and_then(Value::as_str).unwrap_or_default()
+                        };
+                        let (id, sha256) = (get_str("id"), get_str("sha256"));
+                        if id.is_empty() || !valid_auth_digest(sha256) {
+                            invalid += 1;
+                            continue;
+                        }
+                        if keys.iter().any(|k: &AuthKeyRecord| k.sha256 == sha256) {
+                            continue; // 重复摘要静默去重
+                        }
+                        keys.push(AuthKeyRecord {
+                            id: id.to_string(),
+                            name: get_str("name").to_string(),
+                            prefix: get_str("prefix").to_string(),
+                            sha256: sha256.to_string(),
+                            created_at: get_str("createdAt").to_string(),
+                        });
+                        if keys.len() >= AUTH_KEYS_MAX {
+                            break;
+                        }
+                    }
+                    cfg.keys = keys;
+                    if invalid > 0 {
+                        cfg.issues.push(Diagnostic {
+                            level: "warn".into(),
+                            code: "auth_keys_pruned".into(),
+                            path: "auth.keys".into(),
+                            message: format!(
+                                "auth.keys 有 {invalid} 条无效，已跳过；保留 {} 条",
+                                cfg.keys.len()
+                            ),
+                            hint: "每条需要 id 与 sha256（64 位小写 hex）；上限 32 条".into(),
+                        });
+                    }
+                }
+                None => cfg.issues.push(Diagnostic {
+                    level: "warn".into(),
+                    code: "auth_keys_invalid".into(),
+                    path: "auth.keys".into(),
+                    message: "auth.keys 必须是数组，已按空列表处理".into(),
+                    hint: "认证码请在面板「接入 → 认证」生成，不要手写".into(),
+                }),
+            }
+        }
+        cfg
+    }
+}
+
+fn invalid_ip_diagnostic(idx: usize, reason: &str) -> Diagnostic {
+    Diagnostic {
+        level: "warn".into(),
+        code: "auth_allowlist_entry_invalid".into(),
+        path: format!("auth.ipAllowlist[{idx}]"),
+        message: format!("白名单条目无效（{reason}），已跳过"),
+        hint: "只接受精确 IP（IPv4/IPv6），例如 127.0.0.1 或 192.168.1.20".into(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub raw: Value,
@@ -1031,6 +1223,8 @@ pub struct Config {
     pub modules: Modules,
     /// 运行时资源控制（`runtime` 顶层键）。
     pub runtime: RuntimeConfig,
+    /// 接入认证（`auth` 顶层键）：客户端准入控制。
+    pub auth: AuthConfig,
 }
 
 impl Config {
@@ -1141,6 +1335,7 @@ impl Config {
             crate::pricing::PricingTable::from_value(obj.get("pricing").unwrap_or(&Value::Null));
         let modules = Modules::from_value(obj.get("modules"));
         let runtime = RuntimeConfig::from_value(obj.get("runtime"));
+        let auth = AuthConfig::from_value(obj.get("auth"));
 
         Self {
             raw,
@@ -1165,6 +1360,7 @@ impl Config {
             pricing,
             modules,
             runtime,
+            auth,
         }
     }
 
@@ -1533,6 +1729,7 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "aiConfig",
     "modules",
     "runtime",
+    "auth",
     "port",
     "host",
     "defaultModel",
@@ -1732,6 +1929,17 @@ impl Config {
                     .get("hint")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
+            );
+        }
+
+        // ── 接入认证诊断 ──────────────────────────────────────────
+        for issue in &self.auth.issues {
+            push(
+                &issue.level,
+                &issue.code,
+                &issue.path,
+                issue.message.clone(),
+                &issue.hint,
             );
         }
 
@@ -5541,3 +5749,134 @@ mod modules_tests {
         }
     }
 }
+
+/// 接入认证（auth 顶层键）的解析规则。
+#[cfg(test)]
+mod auth_config_tests {
+    use super::*;
+
+    #[test]
+    fn auth_defaults_enabled_with_loopback_only() {
+        // 无 auth 键 → 默认开启 + 仅本机白名单 + 无认证码。
+        let cfg = Config::from_value(json!({}));
+        assert!(cfg.auth.enabled);
+        assert_eq!(cfg.auth.ip_allowlist, vec!["127.0.0.1", "::1"]);
+        assert!(cfg.auth.keys.is_empty());
+        assert!(cfg.auth.issues.is_empty(), "缺省配置不应产生诊断");
+    }
+
+    #[test]
+    fn auth_parses_enabled_allowlist_and_keys() {
+        let digest = "a".repeat(64);
+        let cfg = Config::from_value(json!({
+            "auth": {
+                "enabled": false,
+                "ipAllowlist": ["192.168.1.20", "10.0.0.5"],
+                "keys": [
+                    {"id": "k1", "name": "笔记本", "prefix": "mgk_1a2b3c4d",
+                     "sha256": digest, "createdAt": "2026-11-17T00:00:00Z"}
+                ]
+            }
+        }));
+        assert!(!cfg.auth.enabled);
+        assert_eq!(cfg.auth.ip_allowlist, vec!["192.168.1.20", "10.0.0.5"]);
+        assert_eq!(cfg.auth.keys.len(), 1);
+        assert_eq!(cfg.auth.keys[0].id, "k1");
+        assert_eq!(cfg.auth.keys[0].name, "笔记本");
+        assert!(cfg.auth.issues.is_empty());
+    }
+
+    #[test]
+    fn auth_normalizes_ipv6_and_dedupes() {
+        let cfg = Config::from_value(json!({
+            "auth": {"ipAllowlist": ["::1", "::1", "127.0.0.1", "0:0:0:0:0:0:0:1"]}
+        }));
+        // "::1" 与全写 "0:0:0:0:0:0:0:1" 规范化后相同 → 去重为两条。
+        assert_eq!(cfg.auth.ip_allowlist, vec!["::1", "127.0.0.1"]);
+    }
+
+    #[test]
+    fn auth_invalid_ip_entries_are_skipped_with_diagnostics() {
+        let cfg = Config::from_value(json!({
+            "auth": {"ipAllowlist": ["not-an-ip", "192.168.1.0/24", 42, "10.1.1.7"]}
+        }));
+        // CIDR 与裸数字都不接受；只有合法 IP 进入白名单。
+        assert_eq!(cfg.auth.ip_allowlist, vec!["10.1.1.7"]);
+        let codes: Vec<&str> = cfg
+            .auth
+            .issues
+            .iter()
+            .map(|i| i.code.as_str())
+            .collect();
+        assert_eq!(codes.iter().filter(|c| **c == "auth_allowlist_entry_invalid").count(), 3);
+    }
+
+    #[test]
+    fn auth_invalid_keys_are_pruned_with_diagnostics() {
+        let good = "b".repeat(64);
+        let cfg = Config::from_value(json!({
+            "auth": {"keys": [
+                {"id": "ok", "sha256": good},
+                {"id": "bad-digest", "sha256": "zzz"},
+                {"id": "short-digest", "sha256": "abcd"},
+                "not-an-object"
+            ]}
+        }));
+        assert_eq!(cfg.auth.keys.len(), 1, "只有摘要形态合法的条目保留");
+        assert_eq!(cfg.auth.keys[0].sha256, good);
+        assert!(
+            cfg.auth
+                .issues
+                .iter()
+                .any(|i| i.code == "auth_keys_pruned"),
+            "被剪除的条目应给出诊断"
+        );
+    }
+
+    #[test]
+    fn auth_duplicate_digests_dedupe_silently() {
+        let good = "c".repeat(64);
+        let cfg = Config::from_value(json!({
+            "auth": {"keys": [
+                {"id": "a", "sha256": good},
+                {"id": "b", "sha256": good}
+            ]}
+        }));
+        assert_eq!(cfg.auth.keys.len(), 1);
+        assert!(cfg.auth.issues.is_empty());
+    }
+
+    #[test]
+    fn auth_keys_cap_enforced() {
+        let entries: Vec<Value> = (0..40)
+            .map(|i| json!({"id": format!("k{i}"), "sha256": format!("{i:064x}")}))
+            .collect();
+        let cfg = Config::from_value(json!({"auth": {"keys": entries}}));
+        assert_eq!(cfg.auth.keys.len(), AUTH_KEYS_MAX, "超过上限的条目被剪除");
+        assert_eq!(cfg.auth.keys[0].id, "k0");
+        assert_eq!(cfg.auth.keys[31].id, "k31");
+    }
+
+    #[test]
+    fn auth_non_object_block_falls_back_to_defaults() {
+        let cfg = Config::from_value(json!({"auth": "open"}));
+        assert!(cfg.auth.enabled, "非法 auth 块回落默认值");
+        assert_eq!(cfg.auth.ip_allowlist, vec!["127.0.0.1", "::1"]);
+        assert!(cfg.auth.issues.iter().any(|i| i.code == "auth_invalid"
+            && i.level == "error"));
+    }
+
+    #[test]
+    fn auth_unknown_subkeys_do_not_pollute_top_level_diagnostics() {
+        // auth 已是白名单顶层键：内部子键的宽容处理不产生顶层 unknown-field 报警。
+        let cfg = Config::from_value(json!({"auth": {"enabled": true, "future": 1}}));
+        assert!(
+            !cfg
+                .diagnostics()
+                .iter()
+                .any(|d| d.code == "unknown_field" && d.path == "auth"),
+            "auth 内部未知子键不应触发顶层未知字段诊断"
+        );
+    }
+}
+
