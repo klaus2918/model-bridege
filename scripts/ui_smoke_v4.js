@@ -9,7 +9,7 @@
  * 前置：base 指向一个已启动的 Model-Gate 实例（/ui/ 即控制台）。
  * 覆盖：页面无 JS 异常、五项一级导航（用量/会话/接入/插件/设置）、用量页
  *       （范围/KPI/统计卡/明细 + localStorage 记忆）、命令面板、会话页三页签、
- *       接入卡片与详情抽屉、次级页签（模型/定价/凭据池/免费来源/模板）、
+ *       接入卡片与详情抽屉、次级页签（模型/定价/凭据池/免费来源/模板/认证）、
  *       插件包管理与 ZCode 面板、路由与入口、设置与校验、维护页日志诊断、
  *       g→快捷键、窄屏布局与截图。
  *
@@ -400,7 +400,8 @@ async function main() {
       cards: document.querySelectorAll("#access-cards .acc-card").length,
       tabs: document.querySelectorAll("#access-tabs .seg-tab").length,
     })`);
-    if (data.tabs !== 5) throw new Error(`次级页签数量异常：${data.tabs}`);
+    // 4.8.0 起次级页签含「认证」，共 6 个。
+    if (data.tabs !== 6) throw new Error(`次级页签数量异常：${data.tabs}`);
     await evaluate(`document.querySelector("#access-cards .acc-card").click()`);
     await waitFor(() => evaluate(`!document.querySelector("#drawer").hidden`), 4000, "接入详情抽屉");
     const tabs = await evaluate(`Array.from(document.querySelectorAll(".drawer-tab")).map((b) => b.dataset.dtab)`);
@@ -431,6 +432,29 @@ async function main() {
     await evaluate(`document.querySelector("#drawer-close").click()`);
     await waitFor(() => evaluate(`document.querySelector("#drawer").hidden`), 3000, "关闭抽屉");
     return `${data.cards} 张接入卡 / 页签 ${tabs.join("·")} / ${fetchDetail}`;
+  });
+
+  await check("接入页：认证页签（开关 / 白名单 / 认证码空态）", async () => {
+    await navigate("access");
+    await evaluate(`document.querySelector('#access-tabs [data-access-tab="auth"]').click()`);
+    await waitFor(() => evaluate(`!document.querySelector("#access-pane-auth").hidden`), 4000, "认证 pane");
+    // 认证默认开启且白名单仅本机：冒烟走 127.0.0.1，/api/auth 可读。
+    await waitFor(
+      () => evaluate(`(document.querySelector("#auth-state-pill")?.textContent || "").includes("已开启")`),
+      6000,
+      "认证开关状态"
+    );
+    const data = await evaluate(`({
+      allowlist: document.querySelectorAll("#auth-allowlist .chip").length,
+      keyRows: document.querySelectorAll("#auth-key-table tbody tr").length,
+      emptyHidden: document.getElementById("auth-key-empty")?.hidden,
+    })`);
+    if (data.allowlist < 1) throw new Error("白名单 chips 未渲染（默认应为 127.0.0.1 与 ::1）");
+    await screenshot("v4-04c-auth");
+    // 切回接入列表页，避免影响后续检查。
+    await evaluate(`document.querySelector('#access-tabs [data-access-tab="list"]').click()`);
+    await sleep(300);
+    return `白名单 ${data.allowlist} 条 / 认证码 ${data.keyRows} 条`;
   });
 
   await check("用量筛选刷新后保留（localStorage）", async () => {
